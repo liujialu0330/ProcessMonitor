@@ -1,0 +1,4 @@
+PyQt5>=5.15.0
+PyQt-Fluent-Widgets>=1.1.0
+psutil>=5.9.0
+pyqtgraph>=0.13.0
