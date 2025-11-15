@@ -6,7 +6,7 @@ from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                              QGridLayout, QScrollArea, QSizePolicy)
 from qfluentwidgets import (
-    LineEdit, ComboBox, PushButton, PrimaryPushButton,
+    LineEdit, ComboBox, PushButton, PrimaryPushButton, SpinBox,
     CardWidget, FluentIcon, InfoBar, InfoBarPosition,
     BodyLabel, CaptionLabel, StrongBodyLabel
 )
@@ -111,11 +111,20 @@ class MonitorPage(QScrollArea):
         # 任务卡片字典 {task_id: TaskCard}
         self.task_cards = {}
 
+        # 进程列表缓存 {pid: name}
+        self.process_dict = {}
+
+        # 同步标志，防止循环触发
+        self._syncing = False
+
         # 初始化UI
         self._init_ui()
 
         # 连接信号
         self._connect_signals()
+
+        # 启动时自动加载进程列表
+        self._refresh_process_list()
 
     def _init_ui(self):
         """初始化UI"""
@@ -142,56 +151,55 @@ class MonitorPage(QScrollArea):
         title_label = StrongBodyLabel("创建监控任务")
         select_layout.addWidget(title_label, 0, 0, 1, 4)
 
-        # PID输入
-        pid_label = BodyLabel("进程PID:")
+        # 第一行：进程选择（PID输入框、进程下拉框、刷新按钮）
+        process_label = BodyLabel("选择进程:")
+        select_layout.addWidget(process_label, 1, 0)
+
+        # PID输入框
         self.pid_input = LineEdit()
         self.pid_input.setPlaceholderText("输入进程PID")
         self.pid_input.setFixedWidth(150)
-        select_layout.addWidget(pid_label, 1, 0)
+        self.pid_input.textChanged.connect(self._on_pid_changed)
         select_layout.addWidget(self.pid_input, 1, 1)
 
-        # 或者文本
-        or_label = BodyLabel("或")
-        select_layout.addWidget(or_label, 1, 2, Qt.AlignCenter)
-
         # 进程选择下拉框
-        process_label = BodyLabel("选择进程:")
         self.process_combo = ComboBox()
         self.process_combo.setPlaceholderText("从列表中选择进程")
-        self.process_combo.setMinimumWidth(250)
-        select_layout.addWidget(process_label, 2, 0)
-        select_layout.addWidget(self.process_combo, 2, 1, 1, 2)
+        self.process_combo.setMinimumWidth(300)
+        self.process_combo.currentIndexChanged.connect(self._on_process_selected)
+        select_layout.addWidget(self.process_combo, 1, 2)
 
         # 刷新进程列表按钮
         self.refresh_button = PushButton("刷新", self, FluentIcon.SYNC)
         self.refresh_button.clicked.connect(self._refresh_process_list)
-        select_layout.addWidget(self.refresh_button, 2, 3)
+        self.refresh_button.setFixedWidth(80)
+        select_layout.addWidget(self.refresh_button, 1, 3)
 
         # 监控指标选择
         metric_label = BodyLabel("监控指标:")
         self.metric_combo = ComboBox()
         self.metric_combo.setPlaceholderText("选择要监控的指标")
         self.metric_combo.setMinimumWidth(250)
-        select_layout.addWidget(metric_label, 3, 0)
-        select_layout.addWidget(self.metric_combo, 3, 1, 1, 2)
+        select_layout.addWidget(metric_label, 2, 0)
+        select_layout.addWidget(self.metric_combo, 2, 1, 1, 2)
 
         # 填充指标选项
         self._fill_metric_options()
 
-        # 采集周期
-        interval_label = BodyLabel("采集周期:")
-        self.interval_combo = ComboBox()
-        self.interval_combo.addItems(["0.5秒", "1秒", "2秒", "5秒", "10秒"])
-        self.interval_combo.setCurrentIndex(1)  # 默认1秒
-        self.interval_combo.setFixedWidth(150)
-        select_layout.addWidget(interval_label, 4, 0)
-        select_layout.addWidget(self.interval_combo, 4, 1)
+        # 采集周期（改为SpinBox）
+        interval_label = BodyLabel("采集周期(秒):")
+        self.interval_spinbox = SpinBox()
+        self.interval_spinbox.setRange(1, 3600)  # 1-3600秒
+        self.interval_spinbox.setValue(1)  # 默认1秒
+        self.interval_spinbox.setFixedWidth(150)
+        select_layout.addWidget(interval_label, 3, 0)
+        select_layout.addWidget(self.interval_spinbox, 3, 1)
 
         # 开始监控按钮
         self.start_button = PrimaryPushButton("开始监控", self, FluentIcon.PLAY)
         self.start_button.clicked.connect(self._on_start_clicked)
         self.start_button.setFixedWidth(150)
-        select_layout.addWidget(self.start_button, 5, 1, Qt.AlignRight)
+        select_layout.addWidget(self.start_button, 4, 1, Qt.AlignRight)
 
         main_layout.addWidget(select_card)
 
@@ -208,23 +216,68 @@ class MonitorPage(QScrollArea):
         main_layout.addWidget(self.tasks_container)
         main_layout.addStretch()
 
-        # 初始加载进程列表
-        self._refresh_process_list()
-
     def _fill_metric_options(self):
         """填充监控指标选项"""
         for category, metrics in AVAILABLE_METRICS.items():
             for metric in metrics:
                 display_name = get_metric_display_name(metric)
-                self.metric_combo.addItem(f"{category} - {display_name}", metric)
+                # 修复：使用setItemData单独设置userData
+                self.metric_combo.addItem(f"{category} - {display_name}")
+                # 设置最后一项的userData
+                index = self.metric_combo.count() - 1
+                self.metric_combo.setItemData(index, metric)
 
     def _refresh_process_list(self):
         """刷新进程列表"""
         self.process_combo.clear()
+        self.process_dict.clear()
+
         processes = ProcessCollector.get_all_processes()
 
         for pid, name in processes:
-            self.process_combo.addItem(f"{name} (PID: {pid})", (pid, name))
+            # 保存到字典
+            self.process_dict[pid] = name
+            # 修复：不传递第二个参数（icon），使用setItemData设置userData
+            self.process_combo.addItem(f"{name} (PID: {pid})")
+            # 为最后添加的项设置userData
+            index = self.process_combo.count() - 1
+            self.process_combo.setItemData(index, (pid, name))
+
+    def _on_pid_changed(self, text: str):
+        """PID输入框内容变化"""
+        if self._syncing:
+            return
+
+        if not text.strip():
+            return
+
+        try:
+            pid = int(text)
+            # 查找对应的进程并同步到下拉框
+            if pid in self.process_dict:
+                self._syncing = True
+                # 在下拉框中查找并选中该进程
+                for i in range(self.process_combo.count()):
+                    item_data = self.process_combo.itemData(i)
+                    if item_data and item_data[0] == pid:
+                        self.process_combo.setCurrentIndex(i)
+                        break
+                self._syncing = False
+        except ValueError:
+            pass
+
+    def _on_process_selected(self, index: int):
+        """进程下拉框选择变化"""
+        if self._syncing or index < 0:
+            return
+
+        item_data = self.process_combo.itemData(index)
+        if item_data:
+            pid, name = item_data
+            # 同步到PID输入框
+            self._syncing = True
+            self.pid_input.setText(str(pid))
+            self._syncing = False
 
     def _connect_signals(self):
         """连接信号"""
@@ -269,7 +322,17 @@ class MonitorPage(QScrollArea):
             # 使用进程选择
             index = self.process_combo.currentIndex()
             if index >= 0:
-                pid, process_name = self.process_combo.itemData(index)
+                item_data = self.process_combo.itemData(index)
+                if item_data:
+                    pid, process_name = item_data
+                else:
+                    InfoBar.warning(
+                        title="提示",
+                        content="请输入PID或从列表中选择进程",
+                        parent=self,
+                        position=InfoBarPosition.TOP
+                    )
+                    return
             else:
                 InfoBar.warning(
                     title="提示",
@@ -292,17 +355,13 @@ class MonitorPage(QScrollArea):
 
         metric_type = self.metric_combo.itemData(metric_index)
 
-        # 获取采集周期
-        interval_text = self.interval_combo.currentText()
-        interval = float(interval_text.replace("秒", ""))
+        # 获取采集周期（从SpinBox）
+        interval = float(self.interval_spinbox.value())
 
         # 创建并启动任务
         task_id = self.manager.create_task(pid, process_name, metric_type, interval)
         if task_id:
             self.manager.start_task(task_id)
-        else:
-            # 已在_on_limit_reached中处理
-            pass
 
     def _on_task_added(self, task_id: str):
         """任务添加事件"""

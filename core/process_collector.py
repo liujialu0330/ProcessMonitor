@@ -63,10 +63,6 @@ class ProcessCollector:
             if self._process is None:
                 self._process = psutil.Process(self.pid)
 
-            # 检查进程是否存在
-            if not self._process.is_running():
-                return None
-
             # 根据不同类型采集数据
             if metric_type == MetricType.MEMORY_RSS:
                 # 工作集内存（RSS），转换为MB
@@ -81,8 +77,9 @@ class ProcessCollector:
                 return self._process.memory_percent()
 
             elif metric_type == MetricType.CPU_PERCENT:
-                # CPU使用率（非阻塞模式）
-                return self._process.cpu_percent(interval=0)
+                # CPU使用率（使用0.1秒间隔，更准确）
+                # interval=0在第一次调用时可能返回0，使用0.1更稳定
+                return self._process.cpu_percent(interval=0.1)
 
             elif metric_type == MetricType.NUM_THREADS:
                 # 线程数
@@ -119,8 +116,16 @@ class ProcessCollector:
             else:
                 return None
 
-        except (psutil.NoSuchProcess, psutil.AccessDenied, AttributeError) as e:
+        except psutil.NoSuchProcess:
+            # 进程确实不存在
             return None
+        except (psutil.AccessDenied, psutil.ZombieProcess):
+            # 访问被拒绝或僵尸进程，进程可能仍存在但暂时无法访问
+            # 返回0而不是None，避免误判为进程终止
+            return 0.0
+        except Exception:
+            # 其他异常，进程可能仍存在
+            return 0.0
 
     def get_process_info(self) -> Optional[Dict[str, any]]:
         """

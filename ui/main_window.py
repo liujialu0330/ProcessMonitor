@@ -42,6 +42,9 @@ class MainWindow(FluentWindow):
 
     def _init_navigation(self):
         """初始化导航栏和页面"""
+        # 设置导航栏宽度（减少一半）
+        self.navigationInterface.setExpandWidth(150)  # 默认是250，现在设置为150
+
         # 创建页面实例
         self.monitor_page = MonitorPage(self)
         self.history_page = HistoryPage(self)
