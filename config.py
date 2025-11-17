@@ -6,7 +6,7 @@ import os
 
 # 应用信息
 APP_NAME = "进程监控助手"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.5"
 APP_AUTHOR = "Your Name"
 
 # 数据库配置
