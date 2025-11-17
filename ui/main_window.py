@@ -29,8 +29,8 @@ class MainWindow(FluentWindow):
 
     def _init_window(self):
         """初始化窗口属性"""
-        # 设置窗口标题
-        self.setWindowTitle(config.APP_NAME)
+        # 设置窗口标题（包含版本号）
+        self.setWindowTitle(f"{config.APP_NAME} v{config.APP_VERSION}")
 
         # 设置窗口大小
         self.resize(config.WINDOW_WIDTH, config.WINDOW_HEIGHT)
@@ -40,6 +40,9 @@ class MainWindow(FluentWindow):
         desktop = self.screen().geometry()
         w, h = desktop.width(), desktop.height()
         self.move(w // 2 - self.width() // 2, h // 2 - self.height() // 2)
+
+        # 设置窗口背景为透明，让Fluent Design的背景效果生效
+        self.setStyleSheet("MainWindow{background: transparent}")
 
     def _init_navigation(self):
         """初始化导航栏和页面"""

@@ -4,11 +4,11 @@
 """
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QScrollArea,
-                             QTableWidget, QTableWidgetItem, QHeaderView,
-                             QSizePolicy)
+                             QTableWidgetItem, QHeaderView, QSizePolicy)
 from qfluentwidgets import (
     ComboBox, CardWidget, PushButton, FluentIcon,
-    StrongBodyLabel, BodyLabel, InfoBar, InfoBarPosition
+    StrongBodyLabel, BodyLabel, InfoBar, InfoBarPosition,
+    TableWidget
 )
 import pyqtgraph as pg
 from datetime import datetime
@@ -47,8 +47,13 @@ class HistoryPage(QScrollArea):
         self.setWidgetResizable(True)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
+        # 移除边框，设置透明背景
+        self.setStyleSheet("QScrollArea{background: transparent; border: none}")
+        self.viewport().setStyleSheet("background: transparent")
+
         # 创建主容器
         container = QWidget()
+        container.setStyleSheet("background: transparent")
         self.setWidget(container)
 
         # 主布局
@@ -103,16 +108,22 @@ class HistoryPage(QScrollArea):
         table_label = StrongBodyLabel("详细数据")
         main_layout.addWidget(table_label)
 
-        # 创建表格
-        self.data_table = QTableWidget()
+        # 创建表格（使用Fluent-Widgets的TableWidget）
+        self.data_table = TableWidget()
         self.data_table.setColumnCount(3)
         self.data_table.setHorizontalHeaderLabels(['时间', '值', '原始值'])
         self.data_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.data_table.setAlternatingRowColors(True)
-        self.data_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.data_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.data_table.setEditTriggers(TableWidget.NoEditTriggers)
+        self.data_table.setSelectionBehavior(TableWidget.SelectRows)
         # 设置表格固定高度，显示更多行
         self.data_table.setFixedHeight(500)
+        # 设置Fluent Design样式
+        self.data_table.setBorderVisible(True)
+        self.data_table.setBorderRadius(8)
+        self.data_table.setWordWrap(False)
+        # 隐藏行号
+        self.data_table.verticalHeader().hide()
 
         table_card = CardWidget()
         table_layout = QVBoxLayout(table_card)

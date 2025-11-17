@@ -7,7 +7,6 @@ import os
 # 应用信息
 APP_NAME = "进程监控助手"
 APP_VERSION = "1.0.5"
-APP_AUTHOR = "Your Name"
 
 # 数据库配置
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -20,12 +19,9 @@ os.makedirs(DATA_DIR, exist_ok=True)
 # 监控配置
 MAX_MONITOR_TASKS = 5  # 最多同时监控5个进程
 DEFAULT_INTERVAL = 1.0  # 默认采集间隔（秒）
-MIN_INTERVAL = 0.1      # 最小采集间隔
-MAX_INTERVAL = 60.0     # 最大采集间隔
 
 # 数据保存配置
 SAVE_BATCH_SIZE = 1     # 批量保存数据的大小（改为1以便实时显示历史数据）
-MAX_DATA_POINTS = 10000 # 单个任务最多保存的数据点数
 
 # UI配置
 WINDOW_WIDTH = 1000
