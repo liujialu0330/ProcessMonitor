@@ -13,6 +13,7 @@ from qfluentwidgets import (
 
 from core.monitor_manager import MonitorManager
 from core.process_collector import ProcessCollector
+from data.database import Database
 from utils.metrics import (
     AVAILABLE_METRICS, get_metric_display_name,
     format_metric_value, MetricType
@@ -72,6 +73,10 @@ class TaskCard(CardWidget):
         self.value_label = BodyLabel("当前值: --")
         left_layout.addWidget(self.value_label)
 
+        # 记录条数
+        self.count_label = CaptionLabel("已记录: 0 条")
+        left_layout.addWidget(self.count_label)
+
         left_layout.addStretch()
 
         # 右侧：停止按钮
@@ -94,6 +99,15 @@ class TaskCard(CardWidget):
         formatted_value = format_metric_value(self.metric_type, value)
         self.value_label.setText(f"当前值: {formatted_value}")
 
+    def update_count(self, count: int):
+        """
+        更新记录条数
+
+        Args:
+            count: 记录条数
+        """
+        self.count_label.setText(f"已记录: {count} 条")
+
 
 class MonitorPage(QScrollArea):
     """实时监控页面"""
@@ -105,8 +119,9 @@ class MonitorPage(QScrollArea):
         # 设置对象名称
         self.setObjectName("monitorPage")
 
-        # 监控管理器
+        # 监控管理器和数据库
         self.manager = MonitorManager()
+        self.db = Database()
 
         # 任务卡片字典 {task_id: TaskCard}
         self.task_cards = {}
@@ -242,6 +257,10 @@ class MonitorPage(QScrollArea):
             # 为最后添加的项设置userData
             index = self.process_combo.count() - 1
             self.process_combo.setItemData(index, (pid, name))
+
+        # 如果列表不为空，默认选择第一个进程
+        if self.process_combo.count() > 0:
+            self.process_combo.setCurrentIndex(0)
 
     def _on_pid_changed(self, text: str):
         """PID输入框内容变化"""
@@ -422,6 +441,9 @@ class MonitorPage(QScrollArea):
         """数据更新事件"""
         if task_id in self.task_cards:
             self.task_cards[task_id].update_value(value)
+            # 同时更新记录条数
+            count = self.db.get_data_point_count(task_id)
+            self.task_cards[task_id].update_count(count)
 
     def _on_error(self, task_id: str, error_msg: str):
         """错误事件"""

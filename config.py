@@ -24,7 +24,7 @@ MIN_INTERVAL = 0.1      # 最小采集间隔
 MAX_INTERVAL = 60.0     # 最大采集间隔
 
 # 数据保存配置
-SAVE_BATCH_SIZE = 10    # 批量保存数据的大小
+SAVE_BATCH_SIZE = 1     # 批量保存数据的大小（改为1以便实时显示历史数据）
 MAX_DATA_POINTS = 10000 # 单个任务最多保存的数据点数
 
 # UI配置

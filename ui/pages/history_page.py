@@ -115,7 +115,19 @@ class HistoryPage(QWidget):
         self.task_combo.clear()
 
         # 获取所有任务（包括正在运行的和历史的）
-        tasks = self.db.get_all_tasks()
+        all_tasks = self.db.get_all_tasks()
+
+        # 过滤掉单元测试产生的任务（python.exe进程且运行时间很短的）
+        tasks = []
+        for task in all_tasks:
+            # 过滤条件：如果是python.exe进程，检查是否有数据点
+            if task.process_name.lower() == "python.exe" and task.status == "stopped":
+                # 获取数据点数量
+                data_count = self.db.get_data_point_count(task.task_id)
+                # 如果数据点少于5个，很可能是单元测试，跳过
+                if data_count < 5:
+                    continue
+            tasks.append(task)
 
         if not tasks:
             InfoBar.info(
