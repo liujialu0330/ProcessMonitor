@@ -46,8 +46,13 @@ class ExportPage(QScrollArea):
         self.setWidgetResizable(True)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
+        # 移除边框，设置透明背景
+        self.setStyleSheet("QScrollArea{background: transparent; border: none}")
+        self.viewport().setStyleSheet("background: transparent")
+
         # 创建主容器
         container = QWidget()
+        container.setStyleSheet("background: transparent")
         self.setWidget(container)
 
         # 主布局
