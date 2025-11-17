@@ -8,6 +8,7 @@ from qfluentwidgets import FluentWindow, NavigationItemPosition, FluentIcon
 
 from ui.pages.monitor_page import MonitorPage
 from ui.pages.history_page import HistoryPage
+from ui.pages.export_page import ExportPage
 from core.monitor_manager import MonitorManager
 import config
 
@@ -48,6 +49,7 @@ class MainWindow(FluentWindow):
         # 创建页面实例
         self.monitor_page = MonitorPage(self)
         self.history_page = HistoryPage(self)
+        self.export_page = ExportPage(self)
 
         # 添加子界面到导航栏
         self.addSubInterface(
@@ -61,6 +63,13 @@ class MainWindow(FluentWindow):
             self.history_page,
             FluentIcon.HISTORY,
             '历史数据',
+            NavigationItemPosition.TOP
+        )
+
+        self.addSubInterface(
+            self.export_page,
+            FluentIcon.DOWNLOAD,
+            '导出数据',
             NavigationItemPosition.TOP
         )
 
