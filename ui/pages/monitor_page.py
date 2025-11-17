@@ -244,21 +244,50 @@ class MonitorPage(QScrollArea):
 
     def _refresh_process_list(self):
         """刷新进程列表"""
+        # 1. 断开信号，避免中间状态触发不必要的事件
+        try:
+            self.process_combo.currentIndexChanged.disconnect(self._on_process_selected)
+        except:
+            pass  # 如果未连接则忽略
+
+        # 2. 保存当前选中的PID（如果有）
+        current_pid = None
+        current_index = self.process_combo.currentIndex()
+        if current_index >= 0:
+            item_data = self.process_combo.itemData(current_index)
+            if item_data:
+                current_pid = item_data[0]
+
+        # 3. 完全重置ComboBox
         self.process_combo.clear()
+        self.process_combo.setCurrentIndex(-1)
         self.process_dict.clear()
 
+        # 4. 获取并添加进程
         processes = ProcessCollector.get_all_processes()
 
         for pid, name in processes:
             # 保存到字典
             self.process_dict[pid] = name
-            # 修复：不传递第二个参数（icon），使用setItemData设置userData
+            # 添加到ComboBox
             self.process_combo.addItem(f"{name} (PID: {pid})")
             # 为最后添加的项设置userData
             index = self.process_combo.count() - 1
             self.process_combo.setItemData(index, (pid, name))
 
-        # 如果列表不为空，默认选择第一个进程
+        # 5. 重新连接信号
+        self.process_combo.currentIndexChanged.connect(self._on_process_selected)
+
+        # 6. 恢复之前的选择或选择第一个进程
+        if current_pid and current_pid in self.process_dict:
+            # 尝试恢复之前选中的进程
+            for i in range(self.process_combo.count()):
+                item_data = self.process_combo.itemData(i)
+                if item_data and item_data[0] == current_pid:
+                    self.process_combo.setCurrentIndex(i)
+                    return
+
+        # 如果无法恢复或首次加载，默认选择第一个进程
         if self.process_combo.count() > 0:
             self.process_combo.setCurrentIndex(0)
 

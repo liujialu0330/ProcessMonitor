@@ -159,7 +159,11 @@ class ProcessCollector:
         processes = []
         for proc in psutil.process_iter(['pid', 'name']):
             try:
-                processes.append((proc.info['pid'], proc.info['name']))
+                pid = proc.info['pid']
+                name = proc.info['name']
+                # 过滤掉进程名为空或None的进程
+                if name and name.strip():
+                    processes.append((pid, name))
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
 

@@ -3,7 +3,7 @@
 显示监控任务的历史数据，包括图表和表格
 """
 from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout,
+from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QScrollArea,
                              QTableWidget, QTableWidgetItem, QHeaderView,
                              QSizePolicy)
 from qfluentwidgets import (
@@ -18,7 +18,7 @@ from data.database import Database
 from utils.metrics import get_metric_display_name, format_metric_value
 
 
-class HistoryPage(QWidget):
+class HistoryPage(QScrollArea):
     """历史数据页面"""
 
     def __init__(self, parent=None):
@@ -43,8 +43,16 @@ class HistoryPage(QWidget):
 
     def _init_ui(self):
         """初始化UI"""
+        # 设置滚动区域属性
+        self.setWidgetResizable(True)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        # 创建主容器
+        container = QWidget()
+        self.setWidget(container)
+
         # 主布局
-        main_layout = QVBoxLayout(self)
+        main_layout = QVBoxLayout(container)
         main_layout.setContentsMargins(30, 30, 30, 30)
         main_layout.setSpacing(20)
 
@@ -81,7 +89,8 @@ class HistoryPage(QWidget):
         self.chart_widget.showGrid(x=True, y=True, alpha=0.3)
         self.chart_widget.setLabel('left', '值')
         self.chart_widget.setLabel('bottom', '时间')
-        self.chart_widget.setMinimumHeight(300)
+        # 设置图表固定高度，确保X轴完整显示
+        self.chart_widget.setFixedHeight(400)
 
         chart_card = CardWidget()
         chart_layout = QVBoxLayout(chart_card)
@@ -102,16 +111,24 @@ class HistoryPage(QWidget):
         self.data_table.setAlternatingRowColors(True)
         self.data_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.data_table.setSelectionBehavior(QTableWidget.SelectRows)
+        # 设置表格固定高度，显示更多行
+        self.data_table.setFixedHeight(500)
 
         table_card = CardWidget()
         table_layout = QVBoxLayout(table_card)
         table_layout.setContentsMargins(10, 10, 10, 10)
         table_layout.addWidget(self.data_table)
 
-        main_layout.addWidget(table_card, 1)
+        main_layout.addWidget(table_card)
+        # 添加底部伸缩空间
+        main_layout.addStretch()
 
     def _load_tasks(self):
         """加载任务列表"""
+        # 1. 保存当前选中的任务ID（如果有）
+        current_task_id = self.current_task_id
+
+        # 2. 清空ComboBox
         self.task_combo.clear()
 
         # 获取所有任务（包括正在运行的和历史的）
@@ -137,16 +154,44 @@ class HistoryPage(QWidget):
                 position=InfoBarPosition.TOP,
                 duration=2000
             )
+            # 清空显示和当前任务ID
+            self._clear_display()
+            self.current_task_id = None
             return
 
-        # 添加到下拉框
+        # 3. 添加到下拉框（使用setItemData设置userData）
         for task in tasks:
             display_text = (
                 f"{task.process_name} (PID: {task.pid}) - "
                 f"{get_metric_display_name(task.metric_type)} - "
                 f"{task.start_time.strftime('%Y-%m-%d %H:%M:%S')}"
             )
-            self.task_combo.addItem(display_text, task.task_id)
+            # 只传递文本，不传递第二个参数
+            self.task_combo.addItem(display_text)
+            # 使用setItemData单独设置userData
+            index = self.task_combo.count() - 1
+            self.task_combo.setItemData(index, task.task_id)
+
+        # 4. 尝试恢复之前选中的任务并重新加载数据
+        if current_task_id:
+            for i in range(self.task_combo.count()):
+                if self.task_combo.itemData(i) == current_task_id:
+                    # 找到之前选中的任务，恢复选中
+                    self.task_combo.setCurrentIndex(i)
+                    # 重新加载该任务的数据（这是刷新的关键！）
+                    self._load_task_data(current_task_id)
+                    return
+
+            # 之前的任务不在列表中了（可能被过滤），清空显示
+            self._clear_display()
+            self.current_task_id = None
+
+        # 5. 如果没有恢复之前的选择，且ComboBox不为空
+        # 强制设置currentIndex以确保触发信号
+        if self.task_combo.count() > 0:
+            # 先设置为-1，再设置为0，强制触发currentIndexChanged信号
+            self.task_combo.setCurrentIndex(-1)
+            self.task_combo.setCurrentIndex(0)
 
     def _on_task_selected(self, index: int):
         """任务选择事件"""
