@@ -4,9 +4,7 @@ __pycache__/
 *$py.class
 *.so
 .Python
-build/
 develop-eggs/
-dist/
 downloads/
 eggs/
 .eggs/
@@ -25,9 +23,11 @@ venv/
 env/
 ENV/
 
-# PyInstaller
+# PyInstaller打包相关
+# 保留build目录中的配置文件，忽略打包临时文件
+build/ProcessMonitor/
+dist/
 *.manifest
-*.spec
 
 # 数据库文件
 *.db
