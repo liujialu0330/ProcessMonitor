@@ -2,6 +2,24 @@
 
 一个基于 PyQt5 和 PyQt-Fluent-Widgets 构建的现代化 Windows 桌面应用程序，用于监控进程的性能指标。
 
+## 界面预览
+
+### 主界面
+![主界面](screenshots/main-window.png)
+
+### 实时监控
+![实时监控页面](screenshots/monitor-page.png)
+
+### 历史数据
+![历史数据页面](screenshots/history-page.png)
+
+### 数据导出
+![数据导出页面](screenshots/export-page.png)
+
+
+
+
+
 ## 功能特性
 
 - **实时监控**：监控进程的工作集内存、CPU使用率、线程数等多项性能指标
@@ -118,38 +136,52 @@ ProcessMonitor/
 
 ## 打包成可执行文件
 
-### 使用 PyInstaller 打包
+本项目提供完整的打包方案，支持一键生成安装包。
 
-1. 安装 PyInstaller：
+### 快速打包（推荐）
+
+**步骤1：一键打包exe**
 ```bash
-pip install pyinstaller
+cd build
+build.bat
 ```
 
-2. 打包命令：
-```bash
-pyinstaller --name="进程监控助手" --windowed --onefile --icon=app.ico main.py
+**步骤2：制作安装包**
+1. 下载并安装 [Inno Setup](https://jrsoftware.org/isdl.php)
+2. 用Inno Setup打开 `build\setup.iss`
+3. 点击菜单：`Build` → `Compile`
+4. 安装包位于 `dist\installer\进程监控助手_v1.0.5_Setup.exe`
+
+### 环境要求
+
+- Python 3.8+
+- PyInstaller：`pip install pyinstaller`
+- Inno Setup 6.x（仅制作安装包时需要）
+
+### 打包产物
+
+- **单文件exe**：`dist\进程监控助手.exe`（约80-100MB）
+- **安装包**：`dist\installer\进程监控助手_v1.0.5_Setup.exe`
+
+### 详细说明
+
+完整的打包文档请查看：[build/README_打包说明.md](build/README_打包说明.md)
+
+**打包方案特点**：
+- ✅ 一键自动化打包脚本
+- ✅ 单文件exe，无需安装即可运行
+- ✅ 专业的Windows安装向导
+- ✅ 支持自定义安装目录
+- ✅ 自动创建快捷方式
+- ✅ 卸载时可选保留用户数据
+
+**安装后目录结构**：
 ```
-
-参数说明：
-- `--name`：设置应用名称
-- `--windowed`：不显示控制台窗口
-- `--onefile`：打包成单个exe文件
-- `--icon`：设置应用图标（需要准备app.ico文件）
-
-3. 打包后的文件位于 `dist` 目录下
-
-### 创建安装包
-
-可以使用以下工具创建Windows安装包：
-
-1. **Inno Setup**（推荐）
-   - 下载：https://jrsoftware.org/isdl.php
-   - 创建安装脚本，包含exe文件和必要的资源
-   - 生成专业的Windows安装程序
-
-2. **NSIS**
-   - 下载：https://nsis.sourceforge.io/
-   - 功能强大的开源安装包制作工具
+安装目录\
+├── 进程监控助手.exe
+└── data\
+    └── monitor.db
+```
 
 ## 技术栈
 
