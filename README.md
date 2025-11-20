@@ -5,7 +5,7 @@
 ## 界面预览
 
 ### 主界面
-![主界面](screenshots/main-window.png)
+![主界面](screenshots/main-windows.png)
 
 ### 实时监控
 ![实时监控页面](screenshots/monitor-page.png)
