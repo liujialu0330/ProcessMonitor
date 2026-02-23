@@ -256,10 +256,12 @@ class ExportPage(QScrollArea):
             for i in range(self.task_combo.count()):
                 if self.task_combo.itemData(i) == current_task_id:
                     self.task_combo.setCurrentIndex(i)
+                    self._load_task_info(current_task_id)
                     return
 
         # 如果没有恢复成功，选择第一个
         if self.task_combo.count() > 0:
+            self.task_combo.setCurrentIndex(-1)
             self.task_combo.setCurrentIndex(0)
 
     def _on_task_selected(self, index: int):

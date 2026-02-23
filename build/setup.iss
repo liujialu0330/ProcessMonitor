@@ -2,7 +2,7 @@
 ; 进程监控助手安装程序配置
 
 #define MyAppName "进程监控助手"
-#define MyAppVersion "1.0.5"
+#define MyAppVersion "1.0.6"
 #define MyAppPublisher "软件测试工程师"
 #define MyAppExeName "进程监控助手.exe"
 
@@ -51,7 +51,7 @@ UninstallDisplayName={#MyAppName}
 ; 使用默认英文语言包（如果需要中文，需要单独下载安装中文语言包）
 ; Name: "english"; MessagesFile: "compiler:Default.isl"
 ; 使用已安装的中文语言包，可以取消下面的注释：
-Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加图标:"
@@ -101,6 +101,6 @@ begin
             mbConfirmation, MB_YESNO) = IDYES then
   begin
     { 用户选择删除数据 }
-    DelTree(ExpandConstant('{app}\data'), True, True, True);
+    DelTree(ExpandConstant('{localappdata}\{#MyAppName}'), True, True, True);
   end;
 end;

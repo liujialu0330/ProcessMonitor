@@ -124,8 +124,12 @@ class MonitorTask(QThread):
                 error_msg = f"采集数据时发生错误: {str(e)}"
                 self.error_occurred.emit(self.task_id, error_msg)
 
-            # 等待下一个采集周期
-            self.msleep(int(self.interval * 1000))
+            # 等待下一个采集周期，拆分为短间隔以便快速响应停止
+            remaining = int(self.interval * 1000)
+            while remaining > 0 and self._running:
+                sleep_time = min(remaining, 100)
+                self.msleep(sleep_time)
+                remaining -= sleep_time
 
         # 停止时保存剩余数据
         self._flush_buffer()

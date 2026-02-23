@@ -8,7 +8,7 @@ import os
 
 # 应用信息
 APP_NAME = "进程监控助手"
-APP_VERSION = "1.0.5"
+APP_VERSION = "1.0.6"
 
 
 def get_base_dir():
@@ -28,9 +28,28 @@ def get_base_dir():
         return os.path.dirname(os.path.abspath(__file__))
 
 
-# 数据库配置
+# 基础目录
 BASE_DIR = get_base_dir()
-DATA_DIR = os.path.join(BASE_DIR, "data")
+
+
+def get_data_dir():
+    """
+    获取数据目录
+
+    Returns:
+        str: 数据目录路径
+            - 开发环境：返回项目根目录下的data文件夹
+            - 打包环境：返回用户本地应用数据目录，避免Program Files权限问题
+    """
+    if getattr(sys, 'frozen', False):
+        local_appdata = os.environ.get('LOCALAPPDATA', os.path.expanduser('~'))
+        return os.path.join(local_appdata, APP_NAME, "data")
+    else:
+        return os.path.join(BASE_DIR, "data")
+
+
+# 数据库配置
+DATA_DIR = get_data_dir()
 DB_PATH = os.path.join(DATA_DIR, "monitor.db")
 
 # 确保数据目录存在

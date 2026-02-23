@@ -150,7 +150,7 @@ build.bat
 1. 下载并安装 [Inno Setup](https://jrsoftware.org/isdl.php)
 2. 用Inno Setup打开 `build\setup.iss`
 3. 点击菜单：`Build` → `Compile`
-4. 安装包位于 `dist\installer\进程监控助手_v1.0.5_Setup.exe`
+4. 安装包位于 `dist\installer\进程监控助手_v1.0.6_Setup.exe`
 
 ### 环境要求
 
@@ -161,7 +161,7 @@ build.bat
 ### 打包产物
 
 - **单文件exe**：`dist\进程监控助手.exe`（约80-100MB）
-- **安装包**：`dist\installer\进程监控助手_v1.0.5_Setup.exe`
+- **安装包**：`dist\installer\进程监控助手_v1.0.6_Setup.exe`
 
 ### 详细说明
 
@@ -179,6 +179,9 @@ build.bat
 ```
 安装目录\
 ├── 进程监控助手.exe
+└── app_green_icon.ico
+
+%LOCALAPPDATA%\进程监控助手\
 └── data\
     └── monitor.db
 ```
@@ -206,6 +209,12 @@ build.bat
 软件测试工程师
 
 ## 更新日志
+
+### v1.0.6 (2026-02-23)
+- 修复导出页面任务信息不自动刷新的问题（仅有1个监控任务时无法导出）
+- 修复安装到Program Files等受保护目录时因权限问题无法运行的问题
+- 数据库文件存储位置改为用户本地应用数据目录（%LOCALAPPDATA%）
+- 优化停止监控任务时的响应速度，消除界面卡顿
 
 ### v1.0.5 (2025-11-17)
 - 新增数据导出功能
