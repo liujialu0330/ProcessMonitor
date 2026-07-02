@@ -32,8 +32,9 @@ class HistoryPage(QScrollArea):
         self.manager = MonitorManager()
         self.db = Database()
 
-        # 当前选中的任务ID
+        # 当前选中的任务ID和指标类型
         self.current_task_id = None
+        self.current_metric = None
 
         # 初始化UI
         self._init_ui()
@@ -74,12 +75,21 @@ class HistoryPage(QScrollArea):
         self.task_combo.setMinimumWidth(400)
         self.task_combo.currentIndexChanged.connect(self._on_task_selected)
 
+        # 指标选择（多指标任务切换查看不同指标）
+        metric_label = BodyLabel("指标:")
+        self.metric_combo = ComboBox()
+        self.metric_combo.setPlaceholderText("选择指标")
+        self.metric_combo.setMinimumWidth(160)
+        self.metric_combo.currentIndexChanged.connect(self._on_metric_selected)
+
         # 刷新按钮
         self.refresh_button = PushButton("刷新", self, FluentIcon.SYNC)
         self.refresh_button.clicked.connect(self._load_tasks)
 
         select_layout.addWidget(task_label)
         select_layout.addWidget(self.task_combo, 1)
+        select_layout.addWidget(metric_label)
+        select_layout.addWidget(self.metric_combo)
         select_layout.addWidget(self.refresh_button)
 
         main_layout.addWidget(select_card)
@@ -136,8 +146,9 @@ class HistoryPage(QScrollArea):
 
     def _load_tasks(self):
         """加载任务列表"""
-        # 1. 保存当前选中的任务ID（如果有）
+        # 1. 保存当前选中的任务ID和指标（如果有）
         current_task_id = self.current_task_id
+        current_metric = self.current_metric
 
         # 2. 清空ComboBox
         self.task_combo.clear()
@@ -148,12 +159,12 @@ class HistoryPage(QScrollArea):
         # 过滤掉单元测试产生的任务（python.exe进程且运行时间很短的）
         tasks = []
         for task in all_tasks:
-            # 过滤条件：如果是python.exe进程，检查是否有数据点
+            # 过滤条件：如果是python.exe进程，检查采集次数
             if task.process_name.lower() == "python.exe" and task.status == "stopped":
-                # 获取数据点数量
-                data_count = self.db.get_data_point_count(task.task_id)
-                # 如果数据点少于5个，很可能是单元测试，跳过
-                if data_count < 5:
+                # 获取采集次数（同一时间戳的多指标数据点算一次采集）
+                sample_count = self.db.get_sample_count(task.task_id)
+                # 如果采集次数少于5次，很可能是单元测试，跳过
+                if sample_count < 5:
                     continue
             tasks.append(task)
 
@@ -165,16 +176,23 @@ class HistoryPage(QScrollArea):
                 position=InfoBarPosition.TOP,
                 duration=2000
             )
-            # 清空显示和当前任务ID
+            # 清空显示和当前任务ID、指标
             self._clear_display()
+            self._clear_metric_combo()
             self.current_task_id = None
+            self.current_metric = None
             return
 
         # 3. 添加到下拉框（使用setItemData设置userData）
         for task in tasks:
+            # 单指标保持原格式（显示指标名），多指标显示"N项指标"
+            if len(task.metric_types) == 1:
+                metric_text = get_metric_display_name(task.metric_types[0])
+            else:
+                metric_text = f"{len(task.metric_types)}项指标"
             display_text = (
                 f"{task.process_name} (PID: {task.pid}) - "
-                f"{get_metric_display_name(task.metric_type)} - "
+                f"{metric_text} - "
                 f"{task.start_time.strftime('%Y-%m-%d %H:%M:%S')}"
             )
             # 只传递文本，不传递第二个参数
@@ -183,19 +201,26 @@ class HistoryPage(QScrollArea):
             index = self.task_combo.count() - 1
             self.task_combo.setItemData(index, task.task_id)
 
-        # 4. 尝试恢复之前选中的任务并重新加载数据
+        # 4. 尝试恢复之前选中的任务和指标并重新加载数据
         if current_task_id:
             for i in range(self.task_combo.count()):
                 if self.task_combo.itemData(i) == current_task_id:
-                    # 找到之前选中的任务，恢复选中
+                    # 找到之前选中的任务，恢复选中（blockSignals防止级联触发重复加载）
+                    self.task_combo.blockSignals(True)
                     self.task_combo.setCurrentIndex(i)
+                    self.task_combo.blockSignals(False)
+                    self.current_task_id = current_task_id
+                    # 恢复指标下拉及之前选中的指标
+                    self._populate_metric_combo(current_task_id, current_metric)
                     # 重新加载该任务的数据（这是刷新的关键！）
-                    self._load_task_data(current_task_id)
+                    self._load_task_data(current_task_id, self.current_metric)
                     return
 
             # 之前的任务不在列表中了（可能被过滤），清空显示
             self._clear_display()
+            self._clear_metric_combo()
             self.current_task_id = None
+            self.current_metric = None
 
         # 5. 如果没有恢复之前的选择，且ComboBox不为空
         # 强制设置currentIndex以确保触发信号
@@ -216,15 +241,72 @@ class HistoryPage(QScrollArea):
 
         self.current_task_id = task_id
 
-        # 加载数据
-        self._load_task_data(task_id)
+        # 填充指标下拉（默认选中首指标）
+        self._populate_metric_combo(task_id)
 
-    def _load_task_data(self, task_id: str):
+        # 加载数据
+        self._load_task_data(task_id, self.current_metric)
+
+    def _on_metric_selected(self, index: int):
+        """指标选择事件"""
+        if index < 0 or not self.current_task_id:
+            return
+
+        # 获取指标类型
+        metric_type = self.metric_combo.itemData(index)
+        if not metric_type:
+            return
+
+        self.current_metric = metric_type
+
+        # 重新加载当前任务在该指标下的数据
+        self._load_task_data(self.current_task_id, metric_type)
+
+    def _populate_metric_combo(self, task_id: str, preferred_metric: str = None):
         """
-        加载任务数据并显示
+        填充指标下拉框（全程blockSignals，避免级联触发数据加载）
 
         Args:
             task_id: 任务ID
+            preferred_metric: 优先选中的指标（不在任务指标列表中则回退首指标）
+        """
+        task_info = self.db.get_task(task_id)
+        metric_types = task_info.metric_types if task_info else []
+
+        self.metric_combo.blockSignals(True)
+        self.metric_combo.clear()
+
+        # 添加指标项（使用setItemData设置userData）
+        for metric_type in metric_types:
+            self.metric_combo.addItem(get_metric_display_name(metric_type))
+            index = self.metric_combo.count() - 1
+            self.metric_combo.setItemData(index, metric_type)
+
+        if metric_types:
+            # 恢复之前选中的指标，否则默认首指标
+            select_index = 0
+            if preferred_metric in metric_types:
+                select_index = metric_types.index(preferred_metric)
+            self.metric_combo.setCurrentIndex(select_index)
+            self.current_metric = metric_types[select_index]
+        else:
+            self.current_metric = None
+
+        self.metric_combo.blockSignals(False)
+
+    def _clear_metric_combo(self):
+        """清空指标下拉框（blockSignals防止误触发）"""
+        self.metric_combo.blockSignals(True)
+        self.metric_combo.clear()
+        self.metric_combo.blockSignals(False)
+
+    def _load_task_data(self, task_id: str, metric_type: str = None):
+        """
+        加载任务指定指标的数据并显示
+
+        Args:
+            task_id: 任务ID
+            metric_type: 指标类型（首指标查询自动包含metric_type为NULL的旧数据）
         """
         # 获取任务信息
         task_info = self.db.get_task(task_id)
@@ -237,8 +319,8 @@ class HistoryPage(QScrollArea):
             )
             return
 
-        # 获取数据点
-        data_points = self.db.get_task_data_points(task_id)
+        # 获取指定指标的数据点
+        data_points = self.db.get_task_data_points(task_id, metric_type=metric_type)
 
         if not data_points:
             InfoBar.info(
@@ -252,10 +334,10 @@ class HistoryPage(QScrollArea):
             return
 
         # 更新图表
-        self._update_chart(data_points, task_info.metric_type)
+        self._update_chart(data_points, metric_type)
 
         # 更新表格
-        self._update_table(data_points, task_info.metric_type)
+        self._update_table(data_points, metric_type)
 
     def _update_chart(self, data_points, metric_type):
         """

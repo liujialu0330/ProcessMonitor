@@ -15,7 +15,7 @@ from qfluentwidgets import (
 )
 
 from data.database import Database
-from utils.metrics import get_metric_display_name, get_metric_unit, format_metric_value
+from utils.metrics import get_metric_display_name, get_metric_unit
 
 
 class ExportPage(QScrollArea):
@@ -241,9 +241,14 @@ class ExportPage(QScrollArea):
 
         # 添加到下拉框
         for task in tasks:
+            # 单指标保持原格式（显示指标名），多指标显示"N项指标"
+            if len(task.metric_types) == 1:
+                metric_text = get_metric_display_name(task.metric_types[0])
+            else:
+                metric_text = f"{len(task.metric_types)}项指标"
             display_text = (
                 f"{task.process_name} (PID: {task.pid}) - "
-                f"{get_metric_display_name(task.metric_type)} - "
+                f"{metric_text} - "
                 f"{task.start_time.strftime('%Y-%m-%d %H:%M:%S')}"
             )
             self.task_combo.addItem(display_text)
@@ -305,12 +310,14 @@ class ExportPage(QScrollArea):
         self.process_name_label.setText(task.process_name)
         self.pid_label.setText(str(task.pid))
 
-        # 更新监控指标
-        metric_display = get_metric_display_name(task.metric_type)
-        metric_unit = get_metric_unit(task.metric_type)
-        if metric_unit:
-            metric_display += f" ({metric_unit})"
+        # 更新监控指标（多指标显示"N 项: 名1、名2…"，超过3个截断并用tooltip显示全部）
+        metric_names = [get_metric_display_name(m) for m in task.metric_types]
+        if len(metric_names) > 3:
+            metric_display = f"{len(metric_names)} 项: {'、'.join(metric_names[:3])}…"
+        else:
+            metric_display = f"{len(metric_names)} 项: {'、'.join(metric_names)}"
         self.metric_label.setText(metric_display)
+        self.metric_label.setToolTip('、'.join(metric_names))
 
         # 更新时间范围
         self.start_time_label.setText(task.start_time.strftime('%Y-%m-%d %H:%M:%S'))
@@ -319,9 +326,10 @@ class ExportPage(QScrollArea):
         else:
             self.end_time_label.setText("进行中")
 
-        # 更新数据统计
+        # 更新数据统计（采集次数与数据点总数）
         data_count = self.db.get_data_point_count(task_id)
-        self.data_count_label.setText(f"{data_count} 个")
+        sample_count = self.db.get_sample_count(task_id)
+        self.data_count_label.setText(f"采集 {sample_count} 次（共 {data_count} 条数据）")
 
         # 更新任务状态
         status_text = "运行中" if task.status == "running" else "已停止"
@@ -332,6 +340,7 @@ class ExportPage(QScrollArea):
         self.process_name_label.setText("未选择任务")
         self.pid_label.setText("-")
         self.metric_label.setText("-")
+        self.metric_label.setToolTip("")
         self.start_time_label.setText("-")
         self.end_time_label.setText("-")
         self.data_count_label.setText("-")
@@ -349,9 +358,12 @@ class ExportPage(QScrollArea):
             )
             return
 
-        # 生成默认文件名
+        # 生成默认文件名（单指标保持指标名，多指标显示"N项指标"）
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        metric_name = get_metric_display_name(self.current_task.metric_type)
+        if len(self.current_task.metric_types) == 1:
+            metric_name = get_metric_display_name(self.current_task.metric_types[0])
+        else:
+            metric_name = f"{len(self.current_task.metric_types)}项指标"
         # 移除文件名中的非法字符
         process_name = self.current_task.process_name.replace('.exe', '')
         default_filename = f"{process_name}_{metric_name}_{timestamp}.csv"
@@ -405,50 +417,47 @@ class ExportPage(QScrollArea):
             )
             return
 
-        # 执行导出
+        # 执行导出（宽表：每次采集一行，各指标一列）
         try:
+            metrics = self.current_task.metric_types
+
+            # 按时间戳分组透视（dict 保持插入顺序，数据点按时间正序）
+            grouped = {}
+            for dp in data_points:
+                # metric_type 为空的旧数据兜底归入首指标
+                metric = dp.metric_type or metrics[0]
+                grouped.setdefault(dp.timestamp, {})[metric] = dp.value
+
             with open(save_path, 'w', newline='', encoding='utf-8-sig') as f:
                 writer = csv.writer(f)
 
-                # 写入表头
-                writer.writerow([
-                    '时间',
-                    '指标值',
-                    '原始值',
-                    '进程名称',
-                    'PID',
-                    '监控指标',
-                    '单位'
-                ])
+                # 写入表头：时间/进程名称/PID + 各指标列"指标名(单位)"
+                metric_headers = []
+                for metric in metrics:
+                    metric_display = get_metric_display_name(metric)
+                    metric_unit = get_metric_unit(metric)
+                    if metric_unit:
+                        metric_headers.append(f"{metric_display}({metric_unit})")
+                    else:
+                        metric_headers.append(metric_display)
+                writer.writerow(['时间', '进程名称', 'PID'] + metric_headers)
 
-                # 写入数据
-                metric_display = get_metric_display_name(self.current_task.metric_type)
-                metric_unit = get_metric_unit(self.current_task.metric_type)
-
-                for dp in data_points:
-                    # 格式化时间
-                    time_str = dp.timestamp.strftime('%Y-%m-%d %H:%M:%S')
-
-                    # 格式化值
-                    formatted_value = format_metric_value(
-                        self.current_task.metric_type,
-                        dp.value
-                    )
-
-                    writer.writerow([
-                        time_str,
-                        formatted_value,
-                        f"{dp.value:.4f}",
+                # 写入数据：每个时间戳一行，数值保留4位小数，缺失填空串
+                for timestamp, values in grouped.items():
+                    row = [
+                        timestamp.strftime('%Y-%m-%d %H:%M:%S'),
                         self.current_task.process_name,
                         self.current_task.pid,
-                        metric_display,
-                        metric_unit
-                    ])
+                    ]
+                    for metric in metrics:
+                        value = values.get(metric)
+                        row.append(f"{value:.4f}" if value is not None else "")
+                    writer.writerow(row)
 
             # 显示成功提示
             InfoBar.success(
                 title="导出成功",
-                content=f"已导出 {len(data_points)} 条数据到文件",
+                content=f"已导出 {len(grouped)} 次采集（{len(data_points)} 条数据）",
                 parent=self,
                 position=InfoBarPosition.TOP,
                 duration=3000

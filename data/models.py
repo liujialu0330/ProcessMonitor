@@ -4,7 +4,7 @@
 """
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
+from typing import List, Optional
 
 
 @dataclass
@@ -13,7 +13,7 @@ class MonitorTask:
     task_id: str                    # 任务唯一ID
     pid: int                        # 进程ID
     process_name: str               # 进程名称
-    metric_type: str                # 监控指标类型
+    metric_types: List[str]         # 监控指标类型列表（支持多指标）
     interval: float                 # 采集间隔（秒）
     start_time: datetime            # 开始时间
     end_time: Optional[datetime]    # 结束时间（None表示正在运行）
@@ -29,7 +29,7 @@ class MonitorTask:
             'task_id': self.task_id,
             'pid': self.pid,
             'process_name': self.process_name,
-            'metric_type': self.metric_type,
+            'metric_types': self.metric_types,
             'interval': self.interval,
             'start_time': self.start_time.isoformat() if self.start_time else None,
             'end_time': self.end_time.isoformat() if self.end_time else None,
@@ -38,12 +38,12 @@ class MonitorTask:
 
     @staticmethod
     def from_dict(data: dict) -> 'MonitorTask':
-        """从字典创建"""
+        """从字典创建（兼容旧版单指标 metric_type 字段）"""
         return MonitorTask(
             task_id=data['task_id'],
             pid=data['pid'],
             process_name=data['process_name'],
-            metric_type=data['metric_type'],
+            metric_types=data.get('metric_types') or [data['metric_type']],
             interval=data['interval'],
             start_time=datetime.fromisoformat(data['start_time']) if data['start_time'] else None,
             end_time=datetime.fromisoformat(data['end_time']) if data['end_time'] else None,
@@ -57,6 +57,7 @@ class DataPoint:
     task_id: str                # 所属任务ID
     timestamp: datetime         # 时间戳
     value: float                # 指标值
+    metric_type: str = ""       # 指标类型（空串兼容旧数据）
 
     def to_dict(self) -> dict:
         """转换为字典"""
@@ -64,6 +65,7 @@ class DataPoint:
             'task_id': self.task_id,
             'timestamp': self.timestamp.isoformat() if self.timestamp else None,
             'value': self.value,
+            'metric_type': self.metric_type,
         }
 
     @staticmethod
@@ -73,4 +75,5 @@ class DataPoint:
             task_id=data['task_id'],
             timestamp=datetime.fromisoformat(data['timestamp']) if data['timestamp'] else None,
             value=data['value'],
+            metric_type=data.get('metric_type', ''),
         )

@@ -10,6 +10,7 @@ from PyQt5.QtCore import QThread, pyqtSignal
 from core.process_collector import ProcessCollector
 from data.models import MonitorTask as TaskModel, DataPoint
 from data.database import Database
+from utils.metrics import MetricType
 import config
 
 
@@ -20,11 +21,11 @@ class MonitorTask(QThread):
     """
 
     # 信号定义
-    data_updated = pyqtSignal(str, float)  # 数据更新信号 (task_id, value)
+    data_updated = pyqtSignal(str, dict)    # 数据更新信号 (task_id, {指标类型: 指标值})
     task_stopped = pyqtSignal(str, str)     # 任务停止信号 (task_id, reason)
     error_occurred = pyqtSignal(str, str)   # 错误信号 (task_id, error_message)
 
-    def __init__(self, pid: int, process_name: str, metric_type: str,
+    def __init__(self, pid: int, process_name: str, metric_types: List[str],
                  interval: float = None, task_id: str = None):
         """
         初始化监控任务
@@ -32,7 +33,7 @@ class MonitorTask(QThread):
         Args:
             pid: 进程ID
             process_name: 进程名称
-            metric_type: 监控指标类型
+            metric_types: 监控指标类型列表
             interval: 采集间隔（秒），默认使用配置文件中的值
             task_id: 任务ID，默认自动生成
         """
@@ -42,7 +43,7 @@ class MonitorTask(QThread):
         self.task_id = task_id or str(uuid.uuid4())
         self.pid = pid
         self.process_name = process_name
-        self.metric_type = metric_type
+        self.metric_types = list(metric_types)
         self.interval = interval or config.DEFAULT_INTERVAL
 
         # 任务状态
@@ -63,7 +64,7 @@ class MonitorTask(QThread):
             task_id=self.task_id,
             pid=self.pid,
             process_name=self.process_name,
-            metric_type=self.metric_type,
+            metric_types=self.metric_types,
             interval=self.interval,
             start_time=None,  # 启动时设置
             end_time=None,
@@ -86,6 +87,10 @@ class MonitorTask(QThread):
             self._stop_task("进程不存在")
             return
 
+        # 含CPU使用率指标时先预热，丢弃cpu_percent首次返回的无效0值
+        if MetricType.CPU_PERCENT in self.metric_types:
+            self.collector.prime_cpu()
+
         # 主循环：定时采集数据
         while self._running:
             # 如果暂停，等待
@@ -95,23 +100,23 @@ class MonitorTask(QThread):
 
             # 采集数据
             try:
-                value = self.collector.collect_metric(self.metric_type)
+                values = self.collector.collect_metrics(self.metric_types)
 
-                if value is not None:
-                    # 创建数据点
-                    data_point = DataPoint(
-                        task_id=self.task_id,
-                        timestamp=datetime.now(),
-                        value=value,
-                    )
+                if values is not None:
+                    # 同一采集周期的多个指标共用同一时间戳
+                    timestamp = datetime.now()
+                    for metric_type, value in values.items():
+                        self._data_buffer.append(DataPoint(
+                            task_id=self.task_id,
+                            timestamp=timestamp,
+                            value=value,
+                            metric_type=metric_type,
+                        ))
 
-                    # 添加到缓冲区
-                    self._data_buffer.append(data_point)
+                    # 发送更新信号（新建dict，避免emit后被修改）
+                    self.data_updated.emit(self.task_id, dict(values))
 
-                    # 发送更新信号
-                    self.data_updated.emit(self.task_id, value)
-
-                    # 批量保存
+                    # 批量保存（SAVE_BATCH_SIZE=1时语义为每周期一批）
                     if len(self._data_buffer) >= config.SAVE_BATCH_SIZE:
                         self._flush_buffer()
 
@@ -195,17 +200,18 @@ if __name__ == "__main__":
     current_pid = os.getpid()
     print(f"测试监控当前进程: PID={current_pid}")
 
-    # 创建监控任务
+    # 创建监控任务（多指标）
     task = MonitorTask(
         pid=current_pid,
         process_name="python.exe",
-        metric_type="memory_rss",
+        metric_types=["memory_rss", "cpu_percent", "num_threads"],
         interval=1.0
     )
 
     # 连接信号
-    def on_data_updated(task_id, value):
-        print(f"[数据更新] 任务: {task_id[:8]}..., 值: {value:.2f} MB")
+    def on_data_updated(task_id, values):
+        formatted = ", ".join(f"{k}={v:.2f}" for k, v in values.items())
+        print(f"[数据更新] 任务: {task_id[:8]}..., 值: {formatted}")
 
     def on_task_stopped(task_id, reason):
         print(f"[任务停止] 任务: {task_id[:8]}..., 原因: {reason}")

@@ -2,6 +2,8 @@
 实时监控页面
 显示进程选择、监控任务列表等
 """
+from typing import Dict, List
+
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                              QGridLayout, QScrollArea, QSizePolicy)
@@ -14,9 +16,9 @@ from qfluentwidgets import (
 from core.monitor_manager import MonitorManager
 from core.process_collector import ProcessCollector
 from data.database import Database
+from ui.components import MetricSelectorDialog
 from utils.metrics import (
-    AVAILABLE_METRICS, get_metric_display_name,
-    format_metric_value, MetricType
+    get_metric_display_name, format_metric_value, MetricType
 )
 import config
 
@@ -27,8 +29,11 @@ class TaskCard(CardWidget):
     # 停止按钮点击信号
     stop_clicked = pyqtSignal(str)  # task_id
 
+    # 指标值网格每行列数
+    VALUE_COLUMNS = 3
+
     def __init__(self, task_id: str, process_name: str, pid: int,
-                 metric_type: str, parent=None):
+                 metric_types: List[str], parent=None):
         """
         初始化任务卡片
 
@@ -36,7 +41,7 @@ class TaskCard(CardWidget):
             task_id: 任务ID
             process_name: 进程名称
             pid: 进程ID
-            metric_type: 监控指标类型
+            metric_types: 监控指标类型列表
             parent: 父窗口
         """
         super().__init__(parent)
@@ -44,15 +49,18 @@ class TaskCard(CardWidget):
         self.task_id = task_id
         self.process_name = process_name
         self.pid = pid
-        self.metric_type = metric_type
-        self.current_value = 0.0
+        self.metric_types = list(metric_types)
+
+        # 指标值标签字典 {指标类型: CaptionLabel}
+        self.value_labels: Dict[str, CaptionLabel] = {}
 
         self._init_ui()
 
     def _init_ui(self):
         """初始化UI"""
-        # 设置卡片样式
-        self.setFixedHeight(100)
+        # 设置卡片样式（最小高度，多指标时自适应增高）
+        self.setMinimumHeight(100)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
 
         # 主布局
         layout = QHBoxLayout(self)
@@ -60,21 +68,25 @@ class TaskCard(CardWidget):
 
         # 左侧：进程信息和数据
         left_layout = QVBoxLayout()
+        left_layout.setSpacing(8)
 
         # 进程名和PID
         title_label = StrongBodyLabel(f"{self.process_name} (PID: {self.pid})")
         left_layout.addWidget(title_label)
 
-        # 监控指标
-        metric_label = CaptionLabel(f"指标: {get_metric_display_name(self.metric_type)}")
-        left_layout.addWidget(metric_label)
+        # 指标值网格（每行3个"指标名: 值"）
+        values_layout = QGridLayout()
+        values_layout.setHorizontalSpacing(20)
+        values_layout.setVerticalSpacing(5)
+        for i, metric_type in enumerate(self.metric_types):
+            value_label = CaptionLabel(f"{get_metric_display_name(metric_type)}: --")
+            self.value_labels[metric_type] = value_label
+            values_layout.addWidget(
+                value_label, i // self.VALUE_COLUMNS, i % self.VALUE_COLUMNS)
+        left_layout.addLayout(values_layout)
 
-        # 当前值
-        self.value_label = BodyLabel("当前值: --")
-        left_layout.addWidget(self.value_label)
-
-        # 记录条数
-        self.count_label = CaptionLabel("已记录: 0 条")
+        # 采集次数
+        self.count_label = CaptionLabel("已记录: 0 次采集")
         left_layout.addWidget(self.count_label)
 
         left_layout.addStretch()
@@ -88,25 +100,29 @@ class TaskCard(CardWidget):
         layout.addLayout(left_layout, 1)
         layout.addWidget(self.stop_button, 0, Qt.AlignRight | Qt.AlignVCenter)
 
-    def update_value(self, value: float):
+    def update_values(self, values: dict):
         """
-        更新显示值
+        批量更新指标显示值
 
         Args:
-            value: 新的值
+            values: 指标值字典 {指标类型: 指标值}
         """
-        self.current_value = value
-        formatted_value = format_metric_value(self.metric_type, value)
-        self.value_label.setText(f"当前值: {formatted_value}")
+        for metric_type, value in values.items():
+            value_label = self.value_labels.get(metric_type)
+            if value_label is None:
+                continue
+            formatted_value = format_metric_value(metric_type, value)
+            value_label.setText(
+                f"{get_metric_display_name(metric_type)}: {formatted_value}")
 
     def update_count(self, count: int):
         """
-        更新记录条数
+        更新采集次数
 
         Args:
-            count: 记录条数
+            count: 采集次数
         """
-        self.count_label.setText(f"已记录: {count} 条")
+        self.count_label.setText(f"已记录: {count} 次采集")
 
 
 class MonitorPage(QScrollArea):
@@ -128,6 +144,9 @@ class MonitorPage(QScrollArea):
 
         # 进程列表缓存 {pid: name}
         self.process_dict = {}
+
+        # 已选监控指标列表（默认预选工作集内存）
+        self.selected_metrics: List[str] = [MetricType.MEMORY_RSS]
 
         # 同步标志，防止循环触发
         self._syncing = False
@@ -195,16 +214,18 @@ class MonitorPage(QScrollArea):
         self.refresh_button.setFixedWidth(80)
         select_layout.addWidget(self.refresh_button, 1, 3)
 
-        # 监控指标选择
+        # 监控指标选择（弹出多选对话框）
         metric_label = BodyLabel("监控指标:")
-        self.metric_combo = ComboBox()
-        self.metric_combo.setPlaceholderText("选择要监控的指标")
-        self.metric_combo.setMinimumWidth(250)
+        self.metric_button = PushButton("选择指标", self, FluentIcon.CHECKBOX)
+        self.metric_button.clicked.connect(self._on_select_metric_clicked)
+        self.metric_button.setFixedWidth(150)
+        self.metric_summary_label = BodyLabel()
         select_layout.addWidget(metric_label, 2, 0)
-        select_layout.addWidget(self.metric_combo, 2, 1, 1, 2)
+        select_layout.addWidget(self.metric_button, 2, 1)
+        select_layout.addWidget(self.metric_summary_label, 2, 2, 1, 2)
 
-        # 填充指标选项
-        self._fill_metric_options()
+        # 初始化已选指标摘要
+        self._update_metric_summary()
 
         # 采集周期（改为SpinBox）
         interval_label = BodyLabel("采集周期(秒):")
@@ -236,16 +257,22 @@ class MonitorPage(QScrollArea):
         main_layout.addWidget(self.tasks_container)
         main_layout.addStretch()
 
-    def _fill_metric_options(self):
-        """填充监控指标选项"""
-        for category, metrics in AVAILABLE_METRICS.items():
-            for metric in metrics:
-                display_name = get_metric_display_name(metric)
-                # 修复：使用setItemData单独设置userData
-                self.metric_combo.addItem(f"{category} - {display_name}")
-                # 设置最后一项的userData
-                index = self.metric_combo.count() - 1
-                self.metric_combo.setItemData(index, metric)
+    def _on_select_metric_clicked(self):
+        """选择指标按钮点击事件：弹出多选对话框"""
+        dialog = MetricSelectorDialog(self.selected_metrics, self.window())
+        if dialog.exec():
+            self.selected_metrics = dialog.get_selected()
+            self._update_metric_summary()
+
+    def _update_metric_summary(self):
+        """更新已选指标摘要文案"""
+        names = [get_metric_display_name(m) for m in self.selected_metrics]
+        summary = f"已选 {len(names)} 项: " + "、".join(names)
+        # 完整内容放tooltip，超长时省略显示
+        self.metric_summary_label.setToolTip(summary)
+        if len(summary) > 40:
+            summary = summary[:40] + "…"
+        self.metric_summary_label.setText(summary)
 
     def _refresh_process_list(self):
         """刷新进程列表"""
@@ -396,23 +423,21 @@ class MonitorPage(QScrollArea):
                 return
 
         # 获取监控指标
-        metric_index = self.metric_combo.currentIndex()
-        if metric_index < 0:
+        if not self.selected_metrics:
             InfoBar.warning(
                 title="提示",
-                content="请选择要监控的指标",
+                content="请先选择要监控的指标",
                 parent=self,
                 position=InfoBarPosition.TOP
             )
             return
 
-        metric_type = self.metric_combo.itemData(metric_index)
-
         # 获取采集周期（从SpinBox）
         interval = float(self.interval_spinbox.value())
 
         # 创建并启动任务
-        task_id = self.manager.create_task(pid, process_name, metric_type, interval)
+        task_id = self.manager.create_task(
+            pid, process_name, list(self.selected_metrics), interval)
         if task_id:
             self.manager.start_task(task_id)
 
@@ -428,7 +453,7 @@ class MonitorPage(QScrollArea):
                 task_id=task_id,
                 process_name=task_info.process_name,
                 pid=task_info.pid,
-                metric_type=task_info.metric_type,
+                metric_types=task_info.metric_types,
                 parent=self
             )
 
@@ -471,12 +496,12 @@ class MonitorPage(QScrollArea):
             duration=2000
         )
 
-    def _on_data_updated(self, task_id: str, value: float):
+    def _on_data_updated(self, task_id: str, values: dict):
         """数据更新事件"""
         if task_id in self.task_cards:
-            self.task_cards[task_id].update_value(value)
-            # 同时更新记录条数
-            count = self.db.get_data_point_count(task_id)
+            self.task_cards[task_id].update_values(values)
+            # 同时更新采集次数
+            count = self.db.get_sample_count(task_id)
             self.task_cards[task_id].update_count(count)
 
     def _on_error(self, task_id: str, error_msg: str):

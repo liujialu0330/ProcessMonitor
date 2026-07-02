@@ -26,7 +26,7 @@ class MonitorManager(QObject):
     task_started = pyqtSignal(str)         # 任务启动信号 (task_id)
     task_stopped = pyqtSignal(str, str)    # 任务停止信号 (task_id, reason)
     task_removed = pyqtSignal(str)         # 任务移除信号 (task_id)
-    data_updated = pyqtSignal(str, float)  # 数据更新信号 (task_id, value)
+    data_updated = pyqtSignal(str, dict)   # 数据更新信号 (task_id, {指标类型: 指标值})
     error_occurred = pyqtSignal(str, str)  # 错误信号 (task_id, error_message)
     task_limit_reached = pyqtSignal()      # 任务数量达到上限信号
 
@@ -54,7 +54,7 @@ class MonitorManager(QObject):
         # 标记已初始化
         self._initialized = True
 
-    def create_task(self, pid: int, process_name: str, metric_type: str,
+    def create_task(self, pid: int, process_name: str, metric_types: List[str],
                    interval: float = None) -> Optional[str]:
         """
         创建新的监控任务
@@ -62,7 +62,7 @@ class MonitorManager(QObject):
         Args:
             pid: 进程ID
             process_name: 进程名称
-            metric_type: 监控指标类型
+            metric_types: 监控指标类型列表
             interval: 采集间隔（可选）
 
         Returns:
@@ -77,7 +77,7 @@ class MonitorManager(QObject):
         task = MonitorTask(
             pid=pid,
             process_name=process_name,
-            metric_type=metric_type,
+            metric_types=metric_types,
             interval=interval
         )
 
@@ -266,9 +266,9 @@ class MonitorManager(QObject):
 
     # ========== 私有方法：信号处理 ==========
 
-    def _on_task_data_updated(self, task_id: str, value: float):
+    def _on_task_data_updated(self, task_id: str, values: dict):
         """任务数据更新处理"""
-        self.data_updated.emit(task_id, value)
+        self.data_updated.emit(task_id, values)
 
     def _on_task_stopped(self, task_id: str, reason: str):
         """任务停止处理"""
@@ -302,8 +302,9 @@ if __name__ == "__main__":
     def on_task_stopped(task_id, reason):
         print(f"[任务停止] ID: {task_id[:8]}..., 原因: {reason}")
 
-    def on_data_updated(task_id, value):
-        print(f"[数据更新] ID: {task_id[:8]}..., 值: {value:.2f}")
+    def on_data_updated(task_id, values):
+        formatted = ", ".join(f"{k}={v:.2f}" for k, v in values.items())
+        print(f"[数据更新] ID: {task_id[:8]}..., 值: {formatted}")
 
     def on_error(task_id, error_msg):
         print(f"[错误] ID: {task_id[:8]}..., 错误: {error_msg}")
@@ -324,7 +325,7 @@ if __name__ == "__main__":
     task_id = manager.create_task(
         pid=current_pid,
         process_name="python.exe",
-        metric_type="memory_rss",
+        metric_types=["memory_rss", "cpu_percent"],
         interval=1.0
     )
     print(f"  任务已创建: {task_id[:8] if task_id else 'None'}...")

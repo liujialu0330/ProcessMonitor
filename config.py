@@ -8,7 +8,11 @@ import os
 
 # 应用信息
 APP_NAME = "进程监控助手"
-APP_VERSION = "1.0.6"
+APP_VERSION = "1.1.0"
+
+# GitHub 仓库信息（自动更新用）
+GITHUB_OWNER = "liujialu0330"
+GITHUB_REPO = "ProcessMonitor"
 
 
 def get_base_dir():
@@ -51,6 +55,9 @@ def get_data_dir():
 # 数据库配置
 DATA_DIR = get_data_dir()
 DB_PATH = os.path.join(DATA_DIR, "monitor.db")
+
+# 更新偏好文件（记录跳过的版本等）
+UPDATE_PREFS_PATH = os.path.join(DATA_DIR, "update_prefs.json")
 
 # 确保数据目录存在
 os.makedirs(DATA_DIR, exist_ok=True)

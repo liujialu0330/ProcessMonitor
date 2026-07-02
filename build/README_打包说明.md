@@ -22,7 +22,7 @@
 
 **打包产物**：
 - **单文件exe**：`dist\进程监控助手.exe`（约80-100MB）
-- **安装包**：`dist\installer\进程监控助手_v1.0.5_Setup.exe`（约80-100MB）
+- **安装包**：`dist\installer\进程监控助手_v1.1.0_Setup.exe`（约80-100MB）
 
 **安装后目录结构**：
 ```
@@ -81,7 +81,7 @@ build.bat
 2. 选择 `File` → `Open`，打开 `build\setup.iss`
 3. 点击 `Build` → `Compile`
 4. 等待编译完成（约30秒）
-5. 安装包位于 `dist\installer\进程监控助手_v1.0.5_Setup.exe`
+5. 安装包位于 `dist\installer\进程监控助手_v1.1.0_Setup.exe`
 
 ---
 
@@ -147,7 +147,7 @@ build\
 
 4. **查看结果**
    - 编译成功后，安装包位于：
-   - `dist\installer\进程监控助手_v1.0.5_Setup.exe`
+   - `dist\installer\进程监控助手_v1.1.0_Setup.exe`
 
 #### 命令行编译（高级）
 
@@ -367,4 +367,4 @@ build.bat
 
 **文档版本**：v1.0
 **最后更新**：2025-11-19
-**适用版本**：进程监控助手 v1.0.5
+**适用版本**：进程监控助手 v1.1.0
