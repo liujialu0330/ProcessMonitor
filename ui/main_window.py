@@ -2,13 +2,14 @@
 主窗口
 使用FluentWindow创建带有Fluent UI风格的主界面
 """
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QIcon
-from qfluentwidgets import FluentWindow, NavigationItemPosition, FluentIcon
+from qfluentwidgets import FluentWindow, NavigationItemPosition, FluentIcon, InfoBar, InfoBarPosition
 
 from ui.pages.monitor_page import MonitorPage
 from ui.pages.history_page import HistoryPage
 from ui.pages.export_page import ExportPage
+from ui.pages.about_page import AboutPage
 from core.monitor_manager import MonitorManager
 import config
 
@@ -26,6 +27,25 @@ class MainWindow(FluentWindow):
         # 初始化界面
         self._init_window()
         self._init_navigation()
+
+        # 启动3秒后静默检查更新（对齐参考实现，避免阻塞启动）
+        QTimer.singleShot(3000, lambda: self.about_page.check_update(silent=True))
+
+        # 数据库迁移失败时提示用户（延迟到窗口显示后弹出）
+        if self.monitor_manager.db.migration_failed:
+            QTimer.singleShot(500, self._show_migration_failed_tip)
+
+    def _show_migration_failed_tip(self):
+        """数据库迁移失败提示（已还原旧数据，本次会话新数据无法保存）"""
+        InfoBar.warning(
+            title="数据库迁移失败",
+            content="已还原旧数据，本次会话新采集的数据将无法保存，请重启应用重试。",
+            orient=Qt.Horizontal,
+            isClosable=True,
+            position=InfoBarPosition.TOP,
+            duration=-1,
+            parent=self
+        )
 
     def _init_window(self):
         """初始化窗口属性"""
@@ -53,6 +73,7 @@ class MainWindow(FluentWindow):
         self.monitor_page = MonitorPage(self)
         self.history_page = HistoryPage(self)
         self.export_page = ExportPage(self)
+        self.about_page = AboutPage(self)
 
         # 添加子界面到导航栏
         self.addSubInterface(
@@ -74,6 +95,13 @@ class MainWindow(FluentWindow):
             FluentIcon.DOWNLOAD,
             '导出数据',
             NavigationItemPosition.TOP
+        )
+
+        self.addSubInterface(
+            self.about_page,
+            FluentIcon.INFO,
+            '关于',
+            NavigationItemPosition.BOTTOM
         )
 
         # 默认显示实时监控页面

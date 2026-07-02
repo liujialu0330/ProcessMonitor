@@ -49,9 +49,205 @@ class ProcessCollector:
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             return None
 
+    def _collect_one(self, metric_type: str) -> Optional[float]:
+        """
+        采集单个性能指标（内部方法，不捕获psutil异常，由调用方统一处理）
+
+        Args:
+            metric_type: 指标类型（来自MetricType）
+
+        Returns:
+            Optional[float]: 指标值，未知指标返回None
+        """
+        if self._process is None:
+            self._process = psutil.Process(self.pid)
+
+        # 根据不同类型采集数据
+        if metric_type == MetricType.MEMORY_RSS:
+            # 工作集内存（RSS），转换为KB
+            return self._process.memory_info().rss / 1024
+
+        elif metric_type == MetricType.MEMORY_VMS:
+            # 虚拟内存大小，转换为KB
+            return self._process.memory_info().vms / 1024
+
+        elif metric_type == MetricType.MEMORY_PERCENT:
+            # 内存使用百分比
+            return self._process.memory_percent()
+
+        elif metric_type == MetricType.CPU_PERCENT:
+            # CPU使用率（interval=None非阻塞，基于上次调用以来的增量计算）
+            # 首次调用返回0，需先调用prime_cpu()预热
+            return self._process.cpu_percent(interval=None)
+
+        elif metric_type == MetricType.NUM_THREADS:
+            # 线程数
+            return float(self._process.num_threads())
+
+        elif metric_type == MetricType.NUM_HANDLES:
+            # 句柄数（仅Windows）
+            try:
+                return float(self._process.num_handles())
+            except AttributeError:
+                # 非Windows系统返回文件描述符数量
+                return float(self._process.num_fds())
+
+        elif metric_type == MetricType.IO_READ_BYTES:
+            # IO读取字节数，转换为KB
+            io_counters = self._process.io_counters()
+            return io_counters.read_bytes / 1024
+
+        elif metric_type == MetricType.IO_WRITE_BYTES:
+            # IO写入字节数，转换为KB
+            io_counters = self._process.io_counters()
+            return io_counters.write_bytes / 1024
+
+        elif metric_type == MetricType.IO_READ_COUNT:
+            # IO读取次数
+            io_counters = self._process.io_counters()
+            return float(io_counters.read_count)
+
+        elif metric_type == MetricType.IO_WRITE_COUNT:
+            # IO写入次数
+            io_counters = self._process.io_counters()
+            return float(io_counters.write_count)
+
+        elif metric_type == MetricType.IO_OTHER_COUNT:
+            # IO其他次数
+            io_counters = self._process.io_counters()
+            return float(io_counters.other_count)
+
+        elif metric_type == MetricType.IO_OTHER_BYTES:
+            # IO其他字节数，转换为KB
+            io_counters = self._process.io_counters()
+            return io_counters.other_bytes / 1024
+
+        # ========== 扩展内存指标 ==========
+        elif metric_type == MetricType.MEMORY_PEAK_WSET:
+            # 工作集峰值，转换为KB
+            return self._process.memory_info().peak_wset / 1024
+
+        elif metric_type == MetricType.MEMORY_PRIVATE:
+            # 专用工作集，转换为KB
+            return self._process.memory_info().private / 1024
+
+        elif metric_type == MetricType.MEMORY_PAGEFILE:
+            # 提交大小，转换为KB
+            return self._process.memory_info().pagefile / 1024
+
+        elif metric_type == MetricType.MEMORY_PEAK_PAGEFILE:
+            # 提交大小峰值，转换为KB
+            return self._process.memory_info().peak_pagefile / 1024
+
+        elif metric_type == MetricType.MEMORY_PAGED_POOL:
+            # 分页池，转换为KB
+            return self._process.memory_info().paged_pool / 1024
+
+        elif metric_type == MetricType.MEMORY_PEAK_PAGED_POOL:
+            # 分页池峰值，转换为KB
+            return self._process.memory_info().peak_paged_pool / 1024
+
+        elif metric_type == MetricType.MEMORY_NONPAGED_POOL:
+            # 非分页池，转换为KB
+            return self._process.memory_info().nonpaged_pool / 1024
+
+        elif metric_type == MetricType.MEMORY_PEAK_NONPAGED_POOL:
+            # 非分页池峰值，转换为KB
+            return self._process.memory_info().peak_nonpaged_pool / 1024
+
+        elif metric_type == MetricType.MEMORY_NUM_PAGE_FAULTS:
+            # 页面错误次数
+            return float(self._process.memory_info().num_page_faults)
+
+        elif metric_type == MetricType.MEMORY_USS:
+            # 唯一集大小，转换为KB
+            return self._process.memory_full_info().uss / 1024
+
+        # ========== CPU扩展指标 ==========
+        elif metric_type == MetricType.CPU_USER_TIME:
+            # CPU用户时间（秒）
+            return self._process.cpu_times().user
+
+        elif metric_type == MetricType.CPU_SYSTEM_TIME:
+            # CPU系统时间（秒）
+            return self._process.cpu_times().system
+
+        elif metric_type == MetricType.CPU_PRIORITY:
+            # 进程优先级
+            return float(self._process.nice())
+
+        # ========== 上下文切换 ==========
+        elif metric_type == MetricType.NUM_CTX_SWITCHES_VOL:
+            # 自愿上下文切换
+            return float(self._process.num_ctx_switches().voluntary)
+
+        elif metric_type == MetricType.NUM_CTX_SWITCHES_INVOL:
+            # 非自愿上下文切换
+            return float(self._process.num_ctx_switches().involuntary)
+
+        else:
+            # 未知指标类型
+            return None
+
+    def prime_cpu(self):
+        """
+        预热CPU采集
+        cpu_percent(interval=None)首次调用固定返回0，
+        监控含CPU指标的任务前先调用一次，丢弃首个无效值
+        """
+        try:
+            if self._process is None:
+                self._process = psutil.Process(self.pid)
+            self._process.cpu_percent(interval=None)
+        except psutil.Error:
+            # 预热失败不影响主流程，采集时会再次处理异常
+            pass
+
+    def collect_metrics(self, metric_types: List[str]) -> Optional[Dict[str, float]]:
+        """
+        批量采集多个性能指标（同一周期共用oneshot缓存）
+
+        Args:
+            metric_types: 指标类型列表（来自MetricType）
+
+        Returns:
+            Optional[Dict[str, float]]: {指标类型: 指标值}字典；
+                进程不存在时返回None（调用方据此停止任务）
+        """
+        try:
+            if self._process is None:
+                self._process = psutil.Process(self.pid)
+
+            values: Dict[str, float] = {}
+            with self._process.oneshot():
+                for metric_type in metric_types:
+                    try:
+                        value = self._collect_one(metric_type)
+                    except (psutil.AccessDenied, psutil.ZombieProcess):
+                        # 访问被拒绝或僵尸进程，进程可能仍存在但暂时无法访问
+                        # 单指标记0而不中断，避免误判为进程终止
+                        # 注意：ZombieProcess是NoSuchProcess的子类，必须先于父类捕获
+                        value = 0.0
+                    except psutil.NoSuchProcess:
+                        # 进程确实不存在，整体返回None停止任务
+                        return None
+                    except Exception:
+                        # 其他异常，进程可能仍存在，单指标记0继续
+                        value = 0.0
+
+                    if value is not None:
+                        values[metric_type] = value
+                    # 未知指标（value为None）跳过，不写入结果
+
+            return values
+
+        except psutil.NoSuchProcess:
+            # 创建Process对象时进程已不存在
+            return None
+
     def collect_metric(self, metric_type: str) -> Optional[float]:
         """
-        采集指定的性能指标
+        采集指定的性能指标（单指标兼容接口，语义与旧版一致）
 
         Args:
             metric_type: 指标类型（来自MetricType）
@@ -63,131 +259,11 @@ class ProcessCollector:
             if self._process is None:
                 self._process = psutil.Process(self.pid)
 
-            # 根据不同类型采集数据
-            if metric_type == MetricType.MEMORY_RSS:
-                # 工作集内存（RSS），转换为KB
-                return self._process.memory_info().rss / 1024
-
-            elif metric_type == MetricType.MEMORY_VMS:
-                # 虚拟内存大小，转换为KB
-                return self._process.memory_info().vms / 1024
-
-            elif metric_type == MetricType.MEMORY_PERCENT:
-                # 内存使用百分比
-                return self._process.memory_percent()
-
-            elif metric_type == MetricType.CPU_PERCENT:
-                # CPU使用率（使用0.1秒间隔，更准确）
-                # interval=0在第一次调用时可能返回0，使用0.1更稳定
+            if metric_type == MetricType.CPU_PERCENT:
+                # 单指标采集保持旧语义：使用0.1秒阻塞间隔，更准确
                 return self._process.cpu_percent(interval=0.1)
 
-            elif metric_type == MetricType.NUM_THREADS:
-                # 线程数
-                return float(self._process.num_threads())
-
-            elif metric_type == MetricType.NUM_HANDLES:
-                # 句柄数（仅Windows）
-                try:
-                    return float(self._process.num_handles())
-                except AttributeError:
-                    # 非Windows系统返回文件描述符数量
-                    return float(self._process.num_fds())
-
-            elif metric_type == MetricType.IO_READ_BYTES:
-                # IO读取字节数，转换为KB
-                io_counters = self._process.io_counters()
-                return io_counters.read_bytes / 1024
-
-            elif metric_type == MetricType.IO_WRITE_BYTES:
-                # IO写入字节数，转换为KB
-                io_counters = self._process.io_counters()
-                return io_counters.write_bytes / 1024
-
-            elif metric_type == MetricType.IO_READ_COUNT:
-                # IO读取次数
-                io_counters = self._process.io_counters()
-                return float(io_counters.read_count)
-
-            elif metric_type == MetricType.IO_WRITE_COUNT:
-                # IO写入次数
-                io_counters = self._process.io_counters()
-                return float(io_counters.write_count)
-
-            elif metric_type == MetricType.IO_OTHER_COUNT:
-                # IO其他次数
-                io_counters = self._process.io_counters()
-                return float(io_counters.other_count)
-
-            elif metric_type == MetricType.IO_OTHER_BYTES:
-                # IO其他字节数，转换为KB
-                io_counters = self._process.io_counters()
-                return io_counters.other_bytes / 1024
-
-            # ========== 扩展内存指标 ==========
-            elif metric_type == MetricType.MEMORY_PEAK_WSET:
-                # 工作集峰值，转换为KB
-                return self._process.memory_info().peak_wset / 1024
-
-            elif metric_type == MetricType.MEMORY_PRIVATE:
-                # 专用工作集，转换为KB
-                return self._process.memory_info().private / 1024
-
-            elif metric_type == MetricType.MEMORY_PAGEFILE:
-                # 提交大小，转换为KB
-                return self._process.memory_info().pagefile / 1024
-
-            elif metric_type == MetricType.MEMORY_PEAK_PAGEFILE:
-                # 提交大小峰值，转换为KB
-                return self._process.memory_info().peak_pagefile / 1024
-
-            elif metric_type == MetricType.MEMORY_PAGED_POOL:
-                # 分页池，转换为KB
-                return self._process.memory_info().paged_pool / 1024
-
-            elif metric_type == MetricType.MEMORY_PEAK_PAGED_POOL:
-                # 分页池峰值，转换为KB
-                return self._process.memory_info().peak_paged_pool / 1024
-
-            elif metric_type == MetricType.MEMORY_NONPAGED_POOL:
-                # 非分页池，转换为KB
-                return self._process.memory_info().nonpaged_pool / 1024
-
-            elif metric_type == MetricType.MEMORY_PEAK_NONPAGED_POOL:
-                # 非分页池峰值，转换为KB
-                return self._process.memory_info().peak_nonpaged_pool / 1024
-
-            elif metric_type == MetricType.MEMORY_NUM_PAGE_FAULTS:
-                # 页面错误次数
-                return float(self._process.memory_info().num_page_faults)
-
-            elif metric_type == MetricType.MEMORY_USS:
-                # 唯一集大小，转换为KB
-                return self._process.memory_full_info().uss / 1024
-
-            # ========== CPU扩展指标 ==========
-            elif metric_type == MetricType.CPU_USER_TIME:
-                # CPU用户时间（秒）
-                return self._process.cpu_times().user
-
-            elif metric_type == MetricType.CPU_SYSTEM_TIME:
-                # CPU系统时间（秒）
-                return self._process.cpu_times().system
-
-            elif metric_type == MetricType.CPU_PRIORITY:
-                # 进程优先级
-                return float(self._process.nice())
-
-            # ========== 上下文切换 ==========
-            elif metric_type == MetricType.NUM_CTX_SWITCHES_VOL:
-                # 自愿上下文切换
-                return float(self._process.num_ctx_switches().voluntary)
-
-            elif metric_type == MetricType.NUM_CTX_SWITCHES_INVOL:
-                # 非自愿上下文切换
-                return float(self._process.num_ctx_switches().involuntary)
-
-            else:
-                return None
+            return self._collect_one(metric_type)
 
         except psutil.NoSuchProcess:
             # 进程确实不存在
@@ -282,10 +358,25 @@ if __name__ == "__main__":
     # 测试进程名
     print(f"进程名: {collector.get_process_name()}")
 
-    # 测试各项指标
+    # 测试单指标接口（旧语义）
     print(f"工作集内存: {collector.collect_metric(MetricType.MEMORY_RSS):.2f} KB")
     print(f"CPU使用率: {collector.collect_metric(MetricType.CPU_PERCENT):.1f} %")
     print(f"线程数: {collector.collect_metric(MetricType.NUM_THREADS):.0f}")
+
+    # 测试多指标批量采集接口
+    collector.prime_cpu()
+    values = collector.collect_metrics([
+        MetricType.MEMORY_RSS,
+        MetricType.CPU_PERCENT,
+        MetricType.NUM_THREADS,
+    ])
+    print("\n批量采集结果:")
+    for metric_type, value in values.items():
+        print(f"  {metric_type}: {value:.2f}")
+
+    # 测试不存在的进程（应返回None）
+    dead_collector = ProcessCollector(999999)
+    print(f"\n不存在进程的批量采集结果: {dead_collector.collect_metrics([MetricType.MEMORY_RSS])}")
 
     # 测试获取所有进程
     all_processes = ProcessCollector.get_all_processes()

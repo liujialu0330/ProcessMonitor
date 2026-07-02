@@ -2,7 +2,7 @@
 ; 进程监控助手安装程序配置
 
 #define MyAppName "进程监控助手"
-#define MyAppVersion "1.0.6"
+#define MyAppVersion "1.1.0"
 #define MyAppPublisher "软件测试工程师"
 #define MyAppExeName "进程监控助手.exe"
 

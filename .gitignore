@@ -32,6 +32,11 @@ dist/
 # 数据库文件
 *.db
 data/*.db
+data/*.db.bak_*
+data/*.db.broken_*
+
+# 更新偏好文件（运行时生成）
+data/update_prefs.json
 
 # IDE
 .vscode/
