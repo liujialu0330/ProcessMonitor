@@ -1,5 +1,7 @@
 # 进程监控助手
 
+[![CI](https://github.com/liujialu0330/ProcessMonitor/actions/workflows/ci.yml/badge.svg)](https://github.com/liujialu0330/ProcessMonitor/actions/workflows/ci.yml)
+
 一个基于 PyQt5 和 PyQt-Fluent-Widgets 构建的现代化 Windows 桌面应用程序，用于监控进程的性能指标。
 
 ## 界面预览
