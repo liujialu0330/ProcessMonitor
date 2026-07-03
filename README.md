@@ -1,287 +1,128 @@
-# 进程监控助手
+<div align="center">
+
+# ProcessMonitor
+
+A lightweight Windows desktop tool for real-time per-process resource monitoring, history visualization and CSV export.
 
 [![CI](https://github.com/liujialu0330/ProcessMonitor/actions/workflows/ci.yml/badge.svg)](https://github.com/liujialu0330/ProcessMonitor/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/liujialu0330/ProcessMonitor)](https://github.com/liujialu0330/ProcessMonitor/releases)
+[![Downloads](https://img.shields.io/github/downloads/liujialu0330/ProcessMonitor/total)](https://github.com/liujialu0330/ProcessMonitor/releases)
+[![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6?logo=windows)](https://github.com/liujialu0330/ProcessMonitor)
+[![Python](https://img.shields.io/badge/python-3.11-blue?logo=python)](https://github.com/liujialu0330/ProcessMonitor)
+[![License](https://img.shields.io/github/license/liujialu0330/ProcessMonitor)](./LICENSE)
 
-一个基于 PyQt5 和 PyQt-Fluent-Widgets 构建的现代化 Windows 桌面应用程序，用于监控进程的性能指标。
+English | [简体中文](./README.zh-CN.md)
 
-## 界面预览
+![Main window](screenshots/main-windows.png)
 
-### 主界面
-![主界面](screenshots/main-windows.png)
+</div>
 
-### 实时监控
-![实时监控页面](screenshots/monitor-page.png)
+ProcessMonitor is a Windows 11 Fluent Design desktop app for keeping an eye on any running process. Pick a process by PID or from a live list, choose from 27 metrics across memory, CPU, system and I/O categories, and watch the numbers update on a configurable sampling interval — from every second up to once an hour. Every sample is persisted locally, so you can replay it as a chart, browse it as a table, or export it to CSV for further analysis.
 
-### 历史数据
-![历史数据页面](screenshots/history-page.png)
+## ✨ Features
 
-### 数据导出
-![数据导出页面](screenshots/export-page.png)
+### 🔍 Monitoring
+- **27 metrics, 4 categories** — memory (working set, private bytes, page faults, USS, ...), CPU (usage, user/kernel time, priority), system (threads, handles, context switches) and I/O (read/write bytes and counts)
+- **Multi-metric tasks** — check any combination of metrics for a single task; they're all sampled on the same clock and timestamp
+- **Up to 5 concurrent tasks** — monitor several processes side by side
+- **Configurable interval** — any integer from 1 to 3600 seconds, default 1s
 
+### 📊 Data & Export
+- **Downsampled history charts** — large tasks are bucketed on the database side (up to 2,000 buckets, min/max per bucket) so peaks and valleys stay visible without shipping every raw point
+- **Fast history table** — shows the most recent 2,000 samples for smooth scrolling even on long-running tasks (exports are never truncated — always the full dataset)
+- **Wide-format CSV export** — one row per sample, one column per metric, background-thread export with mid-export cancel support
+- **One-click cleanup** — delete a finished task's data straight from the History page
 
+### 🛡 Reliability
+- **Auto-update** — checks GitHub Releases on startup (or on demand), downloads and launches the installer for you
+- **Crash-resilient storage** — SQLite with WAL mode, automatic retry on failed writes, crash/error logging, and automatic recovery of orphaned "running" tasks after an unclean shutdown
+- **Automated test suite** — 66 test cases covering the data layer, schema migration, export and update-check logic
+- **Measured performance** — opening a 770k-row history task takes ~1.4s (down from 3.4s pre-v1.2.0; measured on the maintainer's dev machine)
 
+## 📸 Screenshots
 
+| Real-time Monitoring | History Data |
+|---|---|
+| ![Monitor page](screenshots/monitor-page.png) | ![History page](screenshots/history-page.png) |
 
-## 功能特性
+| Data Export | |
+|---|---|
+| ![Export page](screenshots/export-page.png) | |
 
-- **实时监控**：监控进程的工作集内存、CPU使用率、线程数等多项性能指标
-- **多指标监控**：单个监控任务可同时勾选多个指标，一次采集多项数据
-- **多任务支持**：最多同时监控5个进程
-- **历史数据**：保存监控数据并以图表和表格形式展示，支持按指标切换查看
-- **数据导出**：将监控数据导出为CSV宽表文件，支持Excel打开
-- **自动更新**：自动检测GitHub Release新版本，支持一键下载安装
-- **现代化UI**：采用 Windows 11 Fluent Design 风格界面
-- **灵活配置**：可自定义采集周期（1-3600秒）
+## 🚀 Getting Started
 
-## 系统要求
+### For Users
 
-- Windows 10/11
-- Python 3.8+
+1. Grab the latest installer from [Releases](https://github.com/liujialu0330/ProcessMonitor/releases) — `Windows_v*_Setup.exe`
+2. Run it and follow the setup wizard (custom install directory supported)
+3. Launch **ProcessMonitor** from the Start Menu
 
-## 安装依赖
+Installing a new version over an existing install keeps your history data.
+
+### For Developers
 
 ```bash
+git clone https://github.com/liujialu0330/ProcessMonitor.git
+cd ProcessMonitor
 pip install -r requirements.txt
-```
-
-## 运行应用
-
-```bash
 python main.py
 ```
 
-## 使用指南
+### Notes
 
-### 实时监控页面
+- **System requirements**: Windows 10/11 (64-bit); Python 3.8+ to run from source (CI and release builds use 3.11)
+- **Data storage**: `%LOCALAPPDATA%\进程监控助手\data\monitor.db` (SQLite, WAL mode); logs live under `%LOCALAPPDATA%\进程监控助手\logs\`
+- **Auto-update**: checks GitHub Releases on startup and from the About page; you can download and run the installer without leaving the app
 
-1. **选择进程**
-   - 方式1：直接输入进程PID
-   - 方式2：从下拉列表中选择进程（点击"刷新"按钮更新列表）
+## 🏗 Architecture
 
-2. **选择监控指标**（共支持27个指标，可多选）
-   - 点击"选择指标"按钮，在弹出的多选对话框中按分类勾选一个或多个指标
-   - 支持分类全选/取消全选，已选指标摘要实时显示在按钮旁
-   - 默认预选"工作集内存"，至少需勾选1个指标
-   - **内存相关**（13个）：工作集内存、虚拟内存、内存使用率、工作集峰值、专用工作集、提交大小、提交大小峰值、分页池、分页池峰值、非分页池、非分页池峰值、页面错误、唯一集大小
-   - **CPU相关**（4个）：CPU使用率、CPU用户时间、CPU系统时间、优先级
-   - **系统资源**（4个）：线程数、句柄数、自愿上下文切换、非自愿上下文切换
-   - **IO操作**（6个）：IO读取字节、IO写入字节、IO读取次数、IO写入次数、IO其他字节、IO其他次数
+ProcessMonitor is built with PyQt5 + PyQt-Fluent-Widgets for the UI, psutil for process metrics, pyqtgraph for charts, and SQLite for storage. It follows a layered design — UI, core business logic and data — connected through Qt signals/slots to keep cross-thread communication safe.
 
-3. **设置采集周期**
-   - 输入范围：1-3600秒的整数
-   - 默认值：1秒
-   - 说明：采用数值输入框，支持任意整数秒数
-
-4. **开始监控**
-   - 点击"开始监控"按钮启动监控任务
-   - 监控任务卡片会显示在下方列表中
-   - 卡片按指标逐项实时更新当前值，并显示已记录的采集次数
-
-5. **停止监控**
-   - 点击任务卡片右侧的"停止"按钮
-
-### 历史数据页面
-
-1. **选择任务**
-   - 从下拉列表中选择要查看的监控任务
-   - 包括正在运行的和已停止的任务
-
-2. **选择指标**
-   - 多指标任务可在"指标"下拉框中切换查看不同指标
-   - 图表和表格随所选指标同步刷新
-
-3. **查看数据**
-   - 上方图表：显示所选指标随时间的变化趋势
-   - 下方表格：显示详细的数据点记录
-
-### 导出数据页面
-
-1. **选择任务**
-   - 从下拉列表中选择要导出的监控任务
-   - 点击"刷新"按钮更新任务列表
-
-2. **查看任务信息**
-   - 自动显示选中任务的详细信息
-   - 包括进程名、PID、监控指标（多指标显示项数与名称）、时间范围、采集次数等
-
-3. **导出数据**
-   - 点击"浏览"按钮选择保存位置和文件名
-   - 点击"导出数据"按钮执行导出
-   - 导出格式为CSV宽表：每行对应一次采集，前三列为时间、进程名称、PID，其后每个监控指标各占一列（列头带单位），数值保留4位小数，缺失值留空
-   - CSV文件使用UTF-8编码，支持Excel直接打开
-   - 导出成功后自动打开文件所在文件夹
-
-## 项目结构
-
-```
-ProcessMonitor/
-├── main.py                      # 应用入口
-├── config.py                    # 全局配置
-├── requirements.txt             # 依赖列表
-├── ui/                          # UI层
-│   ├── main_window.py           # 主窗口
-│   ├── components/              # 通用组件
-│   │   └── metric_selector.py   # 指标多选对话框
-│   └── pages/                   # 页面
-│       ├── monitor_page.py      # 实时监控页面
-│       ├── history_page.py      # 历史数据页面
-│       ├── export_page.py       # 数据导出页面
-│       └── about_page.py        # 关于页面（版本信息与检查更新）
-├── core/                        # 核心业务逻辑层
-│   ├── monitor_manager.py       # 监控管理器
-│   ├── monitor_task.py          # 监控任务
-│   ├── process_collector.py     # 进程信息采集器
-│   └── update_checker.py        # 自动更新检查器
-├── data/                        # 数据层
-│   ├── database.py              # 数据库操作
-│   └── models.py                # 数据模型
-└── utils/                       # 工具层
-    └── metrics.py               # 指标定义
+```mermaid
+flowchart TD
+    subgraph UI["UI Layer (ui/)"]
+        MW[MainWindow] --> MP[Monitor Page]
+        MW --> HP[History Page]
+        MW --> EP[Export Page]
+    end
+    subgraph Core["Core Layer (core/)"]
+        MM[MonitorManager] --> MT[MonitorTask QThread]
+        MT --> PC[ProcessCollector / psutil]
+        EW[ExportWorker QThread]
+    end
+    subgraph Data["Data Layer (data/)"]
+        DB[(SQLite WAL)]
+    end
+    MP -->|start/stop| MM
+    MT -->|data_updated| MP
+    MT --> DB
+    HP --> DB
+    EP --> EW --> DB
 ```
 
-## 架构设计
+## 🛠 Development
 
-本项目采用**分层架构**设计，实现了前后端分离和高内聚低耦合：
-
-- **UI层**：负责用户界面展示和交互
-- **核心业务层**：负责监控任务管理和数据采集
-- **数据层**：负责数据持久化存储
-- **工具层**：提供通用工具和常量定义
-
-层与层之间通过**Qt信号槽机制**进行通信，确保线程安全。
-
-## 打包成可执行文件
-
-本项目提供完整的打包方案，支持一键生成安装包。
-
-### 快速打包（推荐）
-
-**步骤1：一键打包exe**
 ```bash
-cd build
-build.bat
+python -m pytest tests/
 ```
 
-**步骤2：制作安装包**
-1. 下载并安装 [Inno Setup](https://jrsoftware.org/isdl.php)
-2. 用Inno Setup打开 `build\setup.iss`
-3. 点击菜单：`Build` → `Compile`
-4. 安装包位于 `dist\installer\进程监控助手_v1.2.0_Setup.exe`
+- CI runs the test suite on every push and pull request (see the CI badge above)
+- To build a Windows installer, see [build/README_打包说明.md](build/README_打包说明.md)
 
-### 环境要求
+## 🗺 Roadmap
 
-- Python 3.8+
-- PyInstaller：`pip install pyinstaller`
-- Inno Setup 6.x（仅制作安装包时需要）
+- [ ] Export history data to Excel format
+- [ ] Multi-process comparison view
+- [ ] Fuzzy search by process name
 
-### 打包产物
+See [CHANGELOG.md](./CHANGELOG.md) or [GitHub Releases](https://github.com/liujialu0330/ProcessMonitor/releases) for the full release history.
 
-- **onedir目录**：`dist\进程监控助手\`（主exe + `_internal\` 依赖目录，v1.2.0起改用目录模式，不再是单文件exe，启动更快）
-- **安装包**：`dist\installer\进程监控助手_v1.2.0_Setup.exe`（约42.5MB）
+## 🤝 Contributing
 
-### 详细说明
+Issues and pull requests are welcome. Please make sure `python -m pytest tests/` passes and CI is green before submitting a PR.
 
-完整的打包文档请查看：[build/README_打包说明.md](build/README_打包说明.md)
+## 📄 License
 
-**打包方案特点**：
-- ✅ 一键自动化打包脚本
-- ✅ 单文件exe，无需安装即可运行
-- ✅ 专业的Windows安装向导
-- ✅ 支持自定义安装目录
-- ✅ 自动创建快捷方式
-- ✅ 卸载时可选保留用户数据
+Released under the [MIT License](./LICENSE).
 
-**安装后目录结构**：
-```
-安装目录\
-├── 进程监控助手.exe        # 主程序（引导exe）
-├── _internal\               # onedir依赖目录（Qt/Python运行时等）
-└── app_green_icon.ico
-
-%LOCALAPPDATA%\进程监控助手\
-├── data\
-│   └── monitor.db
-└── logs\
-    ├── app.log              # 应用运行日志（滚动保留，最近1MB×2份）
-    └── crash.log            # 崩溃日志（段错误等致命信号）
-```
-
-## 技术栈
-
-- **UI框架**：PyQt5 + PyQt-Fluent-Widgets
-- **进程监控**：psutil
-- **数据可视化**：pyqtgraph
-- **数据存储**：SQLite
-
-## 开发说明
-
-- 遵循PEP 8代码规范
-- 采用模块化设计，每个模块职责单一
-- 使用类型提示提高代码可读性
-- 完善的错误处理和用户提示
-
-## 许可证
-
-本项目仅供学习和测试使用。
-
-## 作者
-
-软件测试工程师
-
-## 更新日志
-
-### v1.2.0 (2026-07-03)
-- 历史数据页面大幅提速：表格改为只取最近2000次采集，图表改为数据库端分桶降采样（保留波峰波谷），77万行规模的实测任务打开耗时从3.4秒降至1.4秒，峰值内存占用从537MB降至96MB
-- 数据导出改为后台线程执行，导出大数据量任务不再卡住界面，支持导出中途取消
-- 历史数据页面新增"删除此任务数据"按钮，可手动清理不再需要的监控任务数据（运行中的任务需先停止才能删除）
-- 稳定性全面强化：新增程序崩溃自动记录日志并提示日志位置、数据库启用WAL模式提升读写稳定性、数据保存失败自动重试、数据库升级异常时提供更明确的处理与提示、程序意外退出后重新打开会自动修正遗留的"运行中"任务状态
-- 安装包瘦身并提速：打包方式改为目录模式（onedir），安装包体积从59.2MB降至42.5MB，应用启动更快
-- 提示：此前因规则被隐藏的部分短时/测试监控任务，本次升级后将重新出现在"历史数据"和"导出数据"页面的任务列表中，如不需要可使用新增的删除按钮清理
-
-### v1.1.0 (2026-07-02)
-- 新增多指标监控：单个监控任务可同时勾选多个指标，弹窗多选、分类全选、任务卡片逐项实时显示
-- 历史数据页面新增指标下拉框，多指标任务可切换查看各指标的图表与表格
-- 数据导出改为CSV宽表格式：每行一次采集，各指标独立成列，缺失值留空
-- 旧版本数据库自动迁移：升级后历史任务与数据完整保留（迁移前自动备份）
-- 新增自动更新功能：自动检测GitHub Release新版本，支持下载安装
-- 新增"关于"页面：显示版本信息，支持手动检查更新
-
-### v1.0.6 (2026-02-23)
-- 修复导出页面任务信息不自动刷新的问题（仅有1个监控任务时无法导出）
-- 修复安装到Program Files等受保护目录时因权限问题无法运行的问题
-- 数据库文件存储位置改为用户本地应用数据目录（%LOCALAPPDATA%）
-- 优化停止监控任务时的响应速度，消除界面卡顿
-
-### v1.0.5 (2025-11-17)
-- 新增数据导出功能
-- 支持将监控数据导出为CSV文件
-- CSV文件使用UTF-8 BOM编码，确保Excel正确打开中文
-- 导出数据包含时间、指标值、原始值、进程信息等完整信息
-- 导出成功后自动打开文件所在文件夹
-- 优化界面UI效果：标题栏显示版本号、透明背景、移除黑色边框
-- 升级历史数据表格为Fluent-Widgets TableWidget组件
-- 清理无效配置项（移除未使用的配置）
-
-### v1.0.4 (2025-11-17)
-- 内存单位统一改为KB
-- 新增18个监控指标
-- 支持更全面的进程性能监控
-
-### v1.0.3 (2025-11-16)
-- 修复历史数据页面显示和交互问题
-- 优化页面刷新逻辑
-
-### v1.0.2 (2025-11-16)
-- 优化UI界面
-- 修复已知Bug
-
-### v1.0.1 (2025-11-15)
-- 修复Bug
-- 优化UI体验
-
-### v1.0.0 (2025-11-15)
-- 首次发布
-- 实现基本的进程监控功能
-- 支持多种性能指标
-- 历史数据查看功能
-- Fluent UI 风格界面
+Maintained by [liujialu](https://github.com/liujialu0330).
