@@ -13,6 +13,7 @@ from ui.pages.history_page import HistoryPage
 from ui.pages.export_page import ExportPage
 from ui.pages.about_page import AboutPage
 from core.monitor_manager import MonitorManager
+from data.database import Database
 from utils.thread_utils import shutdown_thread
 import config
 
@@ -22,20 +23,28 @@ logger = logging.getLogger(__name__)
 class MainWindow(FluentWindow):
     """主窗口类"""
 
-    def __init__(self):
-        """初始化主窗口"""
+    def __init__(self, db=None):
+        """初始化主窗口
+
+        Args:
+            db: 数据库实例（可选，默认回退新建 Database()；测试可注入隔离的临时库）。
+                必须在构造 MonitorManager 之前赋值，确保全局唯一数据库向下分发。
+        """
         super().__init__()
 
-        # 初始化监控管理器
-        self.monitor_manager = MonitorManager()
+        # 唯一数据库实例：向下分发给 MonitorManager 与各页面
+        self.db = db if db is not None else Database()
+
+        # 初始化监控管理器（单例：仅首次构造时传入的 db 生效）
+        self.monitor_manager = MonitorManager(db=self.db)
 
         # 孤儿任务校正：上次运行未正常退出遗留的 running 状态任务本次启动时统一校正为
         # stopped。必须在任何任务启动前、每进程只调用一次；不能放进 Database.__init__。
-        self.monitor_manager.db.reconcile_orphan_tasks()
+        self.db.reconcile_orphan_tasks()
 
         # 启动自动清理：默认禁用（DATA_RETENTION_DAYS=0）。执行顺序固定在孤儿校正
         # 之后，避免把本次启动才校正为 stopped 的"刚崩溃"任务当作过期任务误删。
-        self.monitor_manager.db.cleanup_old_tasks(config.DATA_RETENTION_DAYS)
+        self.db.cleanup_old_tasks(config.DATA_RETENTION_DAYS)
 
         # 初始化界面
         self._init_window()
@@ -45,7 +54,7 @@ class MainWindow(FluentWindow):
         QTimer.singleShot(3000, lambda: self.about_page.check_update(silent=True))
 
         # 数据库迁移三态提示（延迟到窗口显示后弹出，三态互斥，按严重程度顺序判断）
-        db = self.monitor_manager.db
+        db = self.db
         if db.backup_aborted:
             QTimer.singleShot(500, self._show_backup_aborted_tip)
         elif db.data_reset:
@@ -111,10 +120,10 @@ class MainWindow(FluentWindow):
         # 设置导航栏宽度（减少一半）
         self.navigationInterface.setExpandWidth(150)  # 默认是250，现在设置为150
 
-        # 创建页面实例
-        self.monitor_page = MonitorPage(self)
-        self.history_page = HistoryPage(self)
-        self.export_page = ExportPage(self)
+        # 创建页面实例（注入统一数据库实例；about_page 不涉及数据库，不传）
+        self.monitor_page = MonitorPage(self, db=self.db)
+        self.history_page = HistoryPage(self, db=self.db)
+        self.export_page = ExportPage(self, db=self.db)
         self.about_page = AboutPage(self)
 
         # 添加子界面到导航栏

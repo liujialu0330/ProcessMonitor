@@ -15,7 +15,6 @@ from qfluentwidgets import (
 
 from core.monitor_manager import MonitorManager
 from core.process_collector import ProcessCollector
-from data.database import Database
 from ui.components import MetricSelectorDialog
 from utils.metrics import (
     get_metric_display_name, format_metric_value, MetricType
@@ -132,16 +131,21 @@ class TaskCard(CardWidget):
 class MonitorPage(QScrollArea):
     """实时监控页面"""
 
-    def __init__(self, parent=None):
-        """初始化页面"""
+    def __init__(self, parent=None, db=None):
+        """初始化页面
+
+        Args:
+            parent: 父窗口
+            db: 数据库实例（未使用，仅为与其他页面保持统一的构造签名；本页面
+                所有数据读写都经由 self.manager 完成）
+        """
         super().__init__(parent)
 
         # 设置对象名称
         self.setObjectName("monitorPage")
 
-        # 监控管理器和数据库
+        # 监控管理器（单例：仅首次构造时传入的 db 生效）
         self.manager = MonitorManager()
-        self.db = Database()
 
         # 任务卡片字典 {task_id: TaskCard}
         self.task_cards = {}

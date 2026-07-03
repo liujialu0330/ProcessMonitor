@@ -33,15 +33,17 @@ class MonitorManager(QObject):
     error_occurred = pyqtSignal(str, str)  # 错误信号 (task_id, error_message)
     task_limit_reached = pyqtSignal()      # 任务数量达到上限信号
 
-    def __new__(cls):
-        """单例模式实现"""
+    def __new__(cls, db=None):
+        """单例模式实现（Python 以相同实参先调 __new__ 再调 __init__，签名必须与
+        __init__ 保持一致，否则传 db 参数会 TypeError）"""
         if cls._instance is None:
             cls._instance = super().__new__(cls)
             cls._instance._initialized = False
         return cls._instance
 
-    def __init__(self):
-        """初始化管理器"""
+    def __init__(self, db=None):
+        """初始化管理器（单例：仅首次构造时传入的 db 生效，后续调用 MonitorManager(db=...)
+        不会替换已存在实例的数据库连接）"""
         # 避免重复初始化
         if self._initialized:
             return
@@ -51,8 +53,8 @@ class MonitorManager(QObject):
         # 任务字典 {task_id: MonitorTask}
         self._tasks: Dict[str, MonitorTask] = {}
 
-        # 数据库
-        self.db = Database()
+        # 数据库（生产路径应由 MainWindow 注入，回退仅为兼容兜底）
+        self.db = db if db is not None else Database()
 
         # 标记已初始化
         self._initialized = True
@@ -76,12 +78,13 @@ class MonitorManager(QObject):
             self.task_limit_reached.emit()
             return None
 
-        # 创建任务
+        # 创建任务（注入与 MonitorManager 相同的数据库实例，避免各自裸建连接）
         task = MonitorTask(
             pid=pid,
             process_name=process_name,
             metric_types=metric_types,
-            interval=interval
+            interval=interval,
+            db=self.db
         )
 
         # 连接任务信号
@@ -294,17 +297,17 @@ if __name__ == "__main__":
     from PyQt5.QtWidgets import QApplication
     from PyQt5.QtCore import QTimer
 
-    # 冒烟测试使用临时目录数据库，不写项目 data\monitor.db（须在创建 MonitorManager 前生效，
-    # Database() 默认取用 config.DB_PATH）
+    # 冒烟测试使用临时目录数据库，不写项目 data\monitor.db（显式注入 db 参数，不再
+    # 改写 config.DB_PATH）
     _tmp_dir = tempfile.mkdtemp(prefix="monitor_manager_smoke_")
-    config.DB_PATH = os.path.join(_tmp_dir, "smoke_monitor.db")
-    print(f"冒烟测试使用临时数据库: {config.DB_PATH}")
+    _tmp_db_path = os.path.join(_tmp_dir, "smoke_monitor.db")
+    print(f"冒烟测试使用临时数据库: {_tmp_db_path}")
 
     # 创建应用程序
     app = QApplication(sys.argv)
 
-    # 获取管理器实例
-    manager = MonitorManager()
+    # 获取管理器实例（显式注入临时数据库）
+    manager = MonitorManager(db=Database(_tmp_db_path))
 
     # 连接信号
     def on_task_added(task_id):
