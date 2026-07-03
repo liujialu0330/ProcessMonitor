@@ -3,6 +3,7 @@
 管理所有监控任务的创建、启动、停止等操作
 采用单例模式，确保全局唯一
 """
+import logging
 from typing import Dict, List, Optional
 from PyQt5.QtCore import QObject, pyqtSignal
 
@@ -10,6 +11,8 @@ from core.monitor_task import MonitorTask
 from data.database import Database
 from data.models import MonitorTask as TaskModel
 import config
+
+logger = logging.getLogger(__name__)
 
 
 class MonitorManager(QObject):
@@ -107,6 +110,7 @@ class MonitorManager(QObject):
         task = self._tasks.get(task_id)
         if task and not task.is_running():
             task.start()
+            logger.info("任务启动请求: task_id=%s pid=%s", task_id, task.pid)
             self.task_started.emit(task_id)
             return True
         return False
@@ -124,7 +128,10 @@ class MonitorManager(QObject):
         task = self._tasks.get(task_id)
         if task and task.is_running():
             task.stop()
-            task.wait()  # 等待线程结束
+            # wait() 在 P2-5 归位后会阻塞到 run() 内部完成 flush/写状态/emit 的完整收尾流程，
+            # 而不仅仅是等待 _running 标志被检测到，因此这里返回时数据已落库
+            task.wait()
+            logger.info("任务停止请求已完成: task_id=%s", task_id)
             return True
         return False
 
@@ -283,8 +290,15 @@ class MonitorManager(QObject):
 if __name__ == "__main__":
     import sys
     import os
+    import tempfile
     from PyQt5.QtWidgets import QApplication
     from PyQt5.QtCore import QTimer
+
+    # 冒烟测试使用临时目录数据库，不写项目 data\monitor.db（须在创建 MonitorManager 前生效，
+    # Database() 默认取用 config.DB_PATH）
+    _tmp_dir = tempfile.mkdtemp(prefix="monitor_manager_smoke_")
+    config.DB_PATH = os.path.join(_tmp_dir, "smoke_monitor.db")
+    print(f"冒烟测试使用临时数据库: {config.DB_PATH}")
 
     # 创建应用程序
     app = QApplication(sys.argv)

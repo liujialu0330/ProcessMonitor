@@ -28,12 +28,15 @@ ENV/
 build/ProcessMonitor/
 dist/
 *.manifest
+# version_info.txt 由 build\gen_version_info.py 从 config.APP_VERSION 动态生成，属打包产物
+build/version_info.txt
 
 # 数据库文件
 *.db
 data/*.db
 data/*.db.bak_*
 data/*.db.broken_*
+data/*.db-*
 
 # 更新偏好文件（运行时生成）
 data/update_prefs.json
@@ -47,6 +50,7 @@ data/update_prefs.json
 
 # 日志
 *.log
+logs/
 
 # 测试
 test_*.db

@@ -54,6 +54,12 @@ class TaskCard(CardWidget):
         # 指标值标签字典 {指标类型: CaptionLabel}
         self.value_labels: Dict[str, CaptionLabel] = {}
 
+        # 采集次数：内存计数，卡片创建时直接置0（v1.2.0 架构评审裁决——源码核实当前
+        # 无"重启后恢复运行中任务"的路径，建卡片时查库是死逻辑，故不查）；每次
+        # _on_data_updated 收到数据+1。未来若支持重启恢复任务，需按 task_id 从数据库
+        # 回填初值（get_sample_count 方法仍保留可用）。
+        self.count = 0
+
         self._init_ui()
 
     def _init_ui(self):
@@ -85,8 +91,10 @@ class TaskCard(CardWidget):
                 value_label, i // self.VALUE_COLUMNS, i % self.VALUE_COLUMNS)
         left_layout.addLayout(values_layout)
 
-        # 采集次数
+        # 采集次数（内存计数，非落库条数——两者在 flush 失败重试窗口内可能短暂不一致，
+        # 已知可接受行为）
         self.count_label = CaptionLabel("已记录: 0 次采集")
+        self.count_label.setToolTip("采集次数（非落库条数）")
         left_layout.addWidget(self.count_label)
 
         left_layout.addStretch()
@@ -115,14 +123,10 @@ class TaskCard(CardWidget):
             value_label.setText(
                 f"{get_metric_display_name(metric_type)}: {formatted_value}")
 
-    def update_count(self, count: int):
-        """
-        更新采集次数
-
-        Args:
-            count: 采集次数
-        """
-        self.count_label.setText(f"已记录: {count} 次采集")
+    def increment_count(self):
+        """采集次数+1并刷新文案（内存计数，每次收到 data_updated 调用一次）"""
+        self.count += 1
+        self.count_label.setText(f"已记录: {self.count} 次采集")
 
 
 class MonitorPage(QScrollArea):
@@ -500,9 +504,8 @@ class MonitorPage(QScrollArea):
         """数据更新事件"""
         if task_id in self.task_cards:
             self.task_cards[task_id].update_values(values)
-            # 同时更新采集次数
-            count = self.db.get_sample_count(task_id)
-            self.task_cards[task_id].update_count(count)
+            # 采集次数改为内存计数+1（v1.2.0 架构评审裁决），彻底删除每周期查库
+            self.task_cards[task_id].increment_count()
 
     def _on_error(self, task_id: str, error_msg: str):
         """错误事件"""

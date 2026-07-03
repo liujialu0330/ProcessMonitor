@@ -1,0 +1,24 @@
+# 依赖锁定文件（v1.2.0 架构重构批4新增）
+# 生成方式：干净 venv 中安装 requirements.txt 的4个运行依赖 + pyinstaller，
+# 再 pip freeze 导出，用于未来在干净环境中复现打包时验证过的确切依赖版本。
+# 不含 pytest（测试依赖不应进入打包环境）。
+# 本机实际打包仍使用全局环境（与 v1.1.0 发布口径一致，全局环境即发布环境）；
+# 本文件仅供需要搭建/复现干净打包环境时使用：
+#   pip install -r requirements-lock.txt
+altgraph==0.17.5
+colorama==0.4.6
+darkdetect==0.8.0
+numpy==2.4.6
+packaging==26.2
+pefile==2024.8.26
+psutil==7.2.2
+pyinstaller==6.21.0
+pyinstaller-hooks-contrib==2026.6
+PyQt-Fluent-Widgets==1.11.2
+PyQt5==5.15.11
+PyQt5-Frameless-Window==0.8.1
+PyQt5-Qt5==5.15.2
+PyQt5_sip==12.18.0
+pyqtgraph==0.14.0
+pywin32==312
+pywin32-ctypes==0.2.3

@@ -265,7 +265,7 @@ class AboutPage(QScrollArea):
         self.check_button.setEnabled(False)
 
         self._downloader = UpdateDownloader(
-            info['asset_url'], info['asset_name'], self)
+            info['asset_url'], info['asset_name'], info.get('asset_size', 0), self)
         self._downloader.download_progress.connect(self._on_download_progress)
         self._downloader.download_finished.connect(self._on_download_finished)
         self._downloader.error_occurred.connect(self._on_download_error)

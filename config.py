@@ -8,7 +8,7 @@ import os
 
 # 应用信息
 APP_NAME = "进程监控助手"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 # GitHub 仓库信息（自动更新用）
 GITHUB_OWNER = "liujialu0330"
@@ -34,6 +34,30 @@ def get_base_dir():
 
 # 基础目录
 BASE_DIR = get_base_dir()
+
+
+def get_icon_path():
+    """
+    获取应用图标（app_green_icon.ico）的运行时查找路径
+
+    图标查找单点（v1.2.0 架构重构批4收敛，原分散在 main.py 内的三分支逻辑）：
+        - 打包环境（onedir）：图标随 _internal\\ 目录一起收进 datas，
+          位于 exe 同级目录下（PyInstaller onedir 不再有 _MEIPASS 临时解压目录，
+          onefile 时代的 sys._MEIPASS 分支保留仅作兼容，理论上不会命中）。
+        - 开发环境：图标位于项目 build\\ 目录下。
+
+    Returns:
+        str: 图标文件的绝对路径（不保证文件一定存在，调用方应自行 os.path.exists 判断）
+    """
+    if getattr(sys, 'frozen', False):
+        if hasattr(sys, '_MEIPASS'):
+            # 兼容 onefile 打包方式（历史遗留，onedir 模式下通常不会走到这里）
+            return os.path.join(sys._MEIPASS, 'app_green_icon.ico')
+        # onedir 模式：Inno Setup 已将图标复制到 exe 同目录（{app} 根）
+        return os.path.join(BASE_DIR, 'app_green_icon.ico')
+    else:
+        # 开发环境：图标在 build 目录
+        return os.path.join(BASE_DIR, 'build', 'app_green_icon.ico')
 
 
 def get_data_dir():
@@ -67,7 +91,16 @@ MAX_MONITOR_TASKS = 5  # 最多同时监控5个进程
 DEFAULT_INTERVAL = 1.0  # 默认采集间隔（秒）
 
 # 数据保存配置
-SAVE_BATCH_SIZE = 1     # 批量保存数据的大小（改为1以便实时显示历史数据）
+# 固化为1，勿调大：v1.2.0 架构评审裁决——每周期立即落库，配合 flush 失败重试与 1000
+# 条缓冲上限保证"停止时数据不丢"的语义简单可靠；调大会引入"崩溃时丢一批未落库
+# 数据"的新风险，且与当前"实时显示历史数据"的产品预期冲突
+SAVE_BATCH_SIZE = 1
+
+# 数据保留天数（启动时自动清理已停止且过期的历史任务）
+# 默认 0 = 禁用自动清理（v1.2.0 架构评审裁决）：历史数据的删除应由用户在历史页显式点击
+# "删除此任务数据"完成，避免用户在不知情的情况下丢失数据；调大为正整数即可启用，
+# 启用时只清理 status='stopped' 且 结束时间早于"当前时间-该天数"的任务（含数据点）
+DATA_RETENTION_DAYS = 0
 
 # UI配置
 WINDOW_WIDTH = 1000
