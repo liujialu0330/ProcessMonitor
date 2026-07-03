@@ -26,16 +26,22 @@ CHART_MAX_BUCKETS = 2000
 class HistoryPage(QScrollArea):
     """历史数据页面"""
 
-    def __init__(self, parent=None):
-        """初始化页面"""
+    def __init__(self, parent=None, db=None):
+        """初始化页面
+
+        Args:
+            parent: 父窗口
+            db: 数据库实例（可选，默认回退新建 Database()；生产路径必须由
+                MainWindow 注入，回退仅为兼容兜底）
+        """
         super().__init__(parent)
 
         # 设置对象名称
         self.setObjectName("historyPage")
 
-        # 监控管理器和数据库
+        # 监控管理器（单例：仅首次构造时传入的 db 生效）和数据库
         self.manager = MonitorManager()
-        self.db = Database()
+        self.db = db if db is not None else Database()
 
         # 当前选中的任务ID、指标类型与任务状态（用于删除按钮的运行中保护）
         self.current_task_id = None

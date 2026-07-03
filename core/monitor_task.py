@@ -34,7 +34,7 @@ class MonitorTask(QThread):
     error_occurred = pyqtSignal(str, str)   # 错误信号 (task_id, error_message)
 
     def __init__(self, pid: int, process_name: str, metric_types: List[str],
-                 interval: float = None, task_id: str = None):
+                 interval: float = None, task_id: str = None, db: Database = None):
         """
         初始化监控任务
 
@@ -44,6 +44,7 @@ class MonitorTask(QThread):
             metric_types: 监控指标类型列表
             interval: 采集间隔（秒），默认使用配置文件中的值
             task_id: 任务ID，默认自动生成
+            db: 数据库实例（可选，默认回退新建 Database()；生产路径由 MonitorManager 注入）
         """
         super().__init__()
 
@@ -68,8 +69,8 @@ class MonitorTask(QThread):
         self._flush_fail_count = 0   # 连续 flush 失败次数，成功后归零
         self._notified = False       # 是否已因连续失败弹过一次 InfoBar（锁存，成功后复位）
 
-        # 数据库
-        self.db = Database()
+        # 数据库（生产路径应由 MonitorManager 注入，回退仅为兼容兜底）
+        self.db = db if db is not None else Database()
 
         # 任务模型
         self.task_model = TaskModel(
@@ -271,11 +272,11 @@ if __name__ == "__main__":
     import tempfile
     from PyQt5.QtWidgets import QApplication
 
-    # 冒烟测试使用临时目录数据库，不写项目 data\monitor.db（须在创建 MonitorTask 前生效，
-    # Database() 默认取用 config.DB_PATH）
+    # 冒烟测试使用临时目录数据库，不写项目 data\monitor.db（显式注入 db 参数，不再
+    # 改写 config.DB_PATH）
     _tmp_dir = tempfile.mkdtemp(prefix="monitor_task_smoke_")
-    config.DB_PATH = os.path.join(_tmp_dir, "smoke_monitor.db")
-    print(f"冒烟测试使用临时数据库: {config.DB_PATH}")
+    _tmp_db_path = os.path.join(_tmp_dir, "smoke_monitor.db")
+    print(f"冒烟测试使用临时数据库: {_tmp_db_path}")
 
     # 创建应用程序
     app = QApplication(sys.argv)
@@ -284,12 +285,13 @@ if __name__ == "__main__":
     current_pid = os.getpid()
     print(f"测试监控当前进程: PID={current_pid}")
 
-    # 创建监控任务（多指标）
+    # 创建监控任务（多指标，显式注入临时数据库）
     task = MonitorTask(
         pid=current_pid,
         process_name="python.exe",
         metric_types=["memory_rss", "cpu_percent", "num_threads"],
-        interval=1.0
+        interval=1.0,
+        db=Database(_tmp_db_path)
     )
 
     # 连接信号

@@ -21,15 +21,21 @@ from utils.metrics import get_metric_display_name
 class ExportPage(QScrollArea):
     """数据导出页面"""
 
-    def __init__(self, parent=None):
-        """初始化页面"""
+    def __init__(self, parent=None, db=None):
+        """初始化页面
+
+        Args:
+            parent: 父窗口
+            db: 数据库实例（可选，默认回退新建 Database()；生产路径必须由
+                MainWindow 注入，回退仅为兼容兜底）
+        """
         super().__init__(parent)
 
         # 设置对象名称
         self.setObjectName("exportPage")
 
         # 数据库实例
-        self.db = Database()
+        self.db = db if db is not None else Database()
 
         # 当前选中的任务ID
         self.current_task_id = None
