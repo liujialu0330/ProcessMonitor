@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      QT_QPA_PLATFORM: offscreen
+      # 防御性设置：与本机已验证的 offscreen 跑法配置对齐，避免字体缺失导致刷屏/报错
+      QT_QPA_FONTDIR: C:\Windows\Fonts
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements-lock.txt
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements-lock.txt
+          pip install pytest
+
+      - name: Run tests
+        run: pytest tests/ -v

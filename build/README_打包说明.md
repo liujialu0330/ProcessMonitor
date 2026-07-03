@@ -8,7 +8,8 @@
 4. [详细步骤](#详细步骤)
 5. [文件说明](#文件说明)
 6. [常见问题](#常见问题)
-7. [注意事项](#注意事项)
+7. [发布前冒烟](#发布前冒烟)
+8. [注意事项](#注意事项)
 
 ---
 
@@ -338,6 +339,32 @@ DLL 导致，属一次性开销。
 
 **调试方法**：
 查看Inno Setup编译器的错误提示信息
+
+---
+
+## 🧪 发布前冒烟
+
+除 `python -m pytest tests/ -v`（含 `tests/e2e/` 的 offscreen 断言态冒烟）全绿外，
+正式发布前建议额外用真窗口观察态跑一次 GUI 端到端冒烟测试（`tests/e2e/test_gui_smoke.py`），
+用肉眼确认"创建监控任务 → 采集数据 → 停止任务并落库 → 历史页查看图表/表格 →
+导出页导出 CSV → 关闭窗口"全链路在真实窗口下无异常——断言逻辑与 offscreen 跑法
+完全一致，仅追加了停顿方便观察，不会因为看不看窗口而改变通过/失败结果：
+
+```powershell
+$env:QT_QPA_PLATFORM = 'windows'
+$env:GUI_SMOKE_VISIBLE = '1'
+python -m pytest tests/e2e/test_gui_smoke.py -s
+```
+
+该命令会短暂弹出真实主窗口并自动完成整条链路操作（无需人工点击），肉眼确认无异常
+（不闪退、无卡死、无异常弹窗）即可。跑完后清除这两个环境变量，恢复默认的
+offscreen 断言态供日常回归/CI 使用：
+
+```powershell
+Remove-Item Env:\QT_QPA_PLATFORM -ErrorAction SilentlyContinue
+Remove-Item Env:\GUI_SMOKE_VISIBLE -ErrorAction SilentlyContinue
+python -m pytest tests/e2e/ -q
+```
 
 ---
 
