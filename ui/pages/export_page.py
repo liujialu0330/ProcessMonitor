@@ -2,7 +2,6 @@
 数据导出页面
 将监控任务的数据导出为CSV文件
 """
-import csv
 import os
 from datetime import datetime
 from PyQt5.QtCore import Qt
@@ -14,8 +13,9 @@ from qfluentwidgets import (
     InfoBar, InfoBarPosition
 )
 
+from core.export_worker import ExportWorker
 from data.database import Database
-from utils.metrics import get_metric_display_name, get_metric_unit
+from utils.metrics import get_metric_display_name
 
 
 class ExportPage(QScrollArea):
@@ -36,6 +36,9 @@ class ExportPage(QScrollArea):
 
         # 当前任务信息
         self.current_task = None
+
+        # 导出工作线程（持引用防GC；导出期间非None，closeEvent按shutdown_thread模式接入）
+        self._export_worker = None
 
         # 初始化UI
         self._init_ui()
@@ -201,6 +204,11 @@ class ExportPage(QScrollArea):
         button_layout.addStretch()
 
         main_layout.addLayout(button_layout)
+
+        # 导出进度提示（默认隐藏，导出期间显示已处理行数）
+        self.export_status_label = CaptionLabel("")
+        self.export_status_label.setAlignment(Qt.AlignCenter)
+        main_layout.addWidget(self.export_status_label)
 
         # 添加底部伸缩空间
         main_layout.addStretch()
@@ -380,7 +388,16 @@ class ExportPage(QScrollArea):
             self.path_edit.setText(file_path)
 
     def _export_data(self):
-        """导出数据到CSV文件"""
+        """
+        导出数据到CSV文件（v1.2.0 批3 线程化：大数据量导出不再阻塞UI）
+
+        实际的游标 fetchmany 分批读取 + pivot_rows 流式写文件在 ExportWorker
+        后台线程内完成，本方法只负责校验、禁用按钮、启动线程与持有引用防GC。
+        """
+        # 已有导出在进行中，忽略重复点击
+        if self._export_worker is not None and self._export_worker.isRunning():
+            return
+
         # 检查是否选择了任务
         if not self.current_task_id or not self.current_task:
             InfoBar.warning(
@@ -404,10 +421,8 @@ class ExportPage(QScrollArea):
             )
             return
 
-        # 获取数据点
-        data_points = self.db.get_task_data_points(self.current_task_id)
-
-        if not data_points:
+        # 轻量存在性检查（COUNT 查询，不拉取全部数据，避免为了校验而重复加载大数据集）
+        if self.db.get_data_point_count(self.current_task_id) == 0:
             InfoBar.warning(
                 title="提示",
                 content="该任务暂无数据可导出",
@@ -417,63 +432,61 @@ class ExportPage(QScrollArea):
             )
             return
 
-        # 执行导出（宽表：每次采集一行，各指标一列）
-        try:
-            metrics = self.current_task.metric_types
+        self.export_button.setEnabled(False)
+        self.export_status_label.setText("正在导出…")
 
-            # 按时间戳分组透视（dict 保持插入顺序，数据点按时间正序）
-            grouped = {}
-            for dp in data_points:
-                # metric_type 为空的旧数据兜底归入首指标
-                metric = dp.metric_type or metrics[0]
-                grouped.setdefault(dp.timestamp, {})[metric] = dp.value
+        self._export_worker = ExportWorker(
+            self.db.db_path, self.current_task, save_path, metric_type=None, parent=self)
+        self._export_worker.export_progress.connect(self._on_export_progress)
+        self._export_worker.export_finished.connect(self._on_export_finished)
+        self._export_worker.error_occurred.connect(self._on_export_error)
+        self._export_worker.start()
 
-            with open(save_path, 'w', newline='', encoding='utf-8-sig') as f:
-                writer = csv.writer(f)
+    def _on_export_progress(self, processed: int):
+        """导出进度更新（已处理的数据点行数）"""
+        self.export_status_label.setText(f"正在导出… 已处理 {processed} 条数据")
 
-                # 写入表头：时间/进程名称/PID + 各指标列"指标名(单位)"
-                metric_headers = []
-                for metric in metrics:
-                    metric_display = get_metric_display_name(metric)
-                    metric_unit = get_metric_unit(metric)
-                    if metric_unit:
-                        metric_headers.append(f"{metric_display}({metric_unit})")
-                    else:
-                        metric_headers.append(metric_display)
-                writer.writerow(['时间', '进程名称', 'PID'] + metric_headers)
+    def _on_export_finished(self, save_path: str, row_count: int, point_count: int):
+        """导出完成"""
+        self.export_button.setEnabled(True)
+        self.export_status_label.setText("")
 
-                # 写入数据：每个时间戳一行，数值保留4位小数，缺失填空串
-                for timestamp, values in grouped.items():
-                    row = [
-                        timestamp.strftime('%Y-%m-%d %H:%M:%S'),
-                        self.current_task.process_name,
-                        self.current_task.pid,
-                    ]
-                    for metric in metrics:
-                        value = values.get(metric)
-                        row.append(f"{value:.4f}" if value is not None else "")
-                    writer.writerow(row)
+        InfoBar.success(
+            title="导出成功",
+            content=f"已导出 {row_count} 次采集（{point_count} 条数据）",
+            parent=self,
+            position=InfoBarPosition.TOP,
+            duration=3000
+        )
 
-            # 显示成功提示
-            InfoBar.success(
-                title="导出成功",
-                content=f"已导出 {len(grouped)} 次采集（{len(data_points)} 条数据）",
-                parent=self,
-                position=InfoBarPosition.TOP,
-                duration=3000
-            )
+        # 询问是否打开文件所在文件夹
+        self._ask_open_folder(save_path)
 
-            # 询问是否打开文件所在文件夹
-            self._ask_open_folder(save_path)
+        self._release_export_worker()
 
-        except Exception as e:
-            InfoBar.error(
-                title="导出失败",
-                content=f"文件写入失败: {str(e)}",
-                parent=self,
-                position=InfoBarPosition.TOP,
-                duration=3000
-            )
+    def _on_export_error(self, msg: str):
+        """导出失败"""
+        self.export_button.setEnabled(True)
+        self.export_status_label.setText("")
+        InfoBar.error(
+            title="导出失败",
+            content=msg,
+            parent=self,
+            position=InfoBarPosition.TOP,
+            duration=3000
+        )
+
+        self._release_export_worker()
+
+    def _release_export_worker(self):
+        """
+        导出线程已结束（完成/失败）后释放引用：deleteLater() 交还给 Qt 的对象树，
+        并把 self._export_worker 置 None，避免每次导出都新建一个 ExportWorker 却
+        始终作为 self 的子对象常驻，多次导出后累积占用内存
+        """
+        if self._export_worker is not None:
+            self._export_worker.deleteLater()
+            self._export_worker = None
 
     def _ask_open_folder(self, file_path: str):
         """

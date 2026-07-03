@@ -2,6 +2,7 @@
 监控任务模块
 单个监控任务的实现，继承QThread在后台运行
 """
+import logging
 import uuid
 from datetime import datetime
 from typing import Optional, List
@@ -12,6 +13,13 @@ from data.models import MonitorTask as TaskModel, DataPoint
 from data.database import Database
 from utils.metrics import MetricType
 import config
+
+logger = logging.getLogger(__name__)
+
+# flush 失败缓冲上限：超过后丢弃最旧数据，防止长时间写库失败导致内存无界增长
+MAX_BUFFER_SIZE = 1000
+# 连续 flush 失败达到该次数后，通过 error_occurred 通知 UI 一次（_notified 锁存，避免刷屏）
+CONSECUTIVE_FAILURE_NOTIFY_THRESHOLD = 3
 
 
 class MonitorTask(QThread):
@@ -53,8 +61,12 @@ class MonitorTask(QThread):
         # 数据采集器
         self.collector = ProcessCollector(pid)
 
-        # 数据缓存（批量保存）
+        # 数据缓存（批量保存；SAVE_BATCH_SIZE 固化为1时语义为每周期一批）
         self._data_buffer: List[DataPoint] = []
+
+        # flush 失败重试状态
+        self._flush_fail_count = 0   # 连续 flush 失败次数，成功后归零
+        self._notified = False       # 是否已因连续失败弹过一次 InfoBar（锁存，成功后复位）
 
         # 数据库
         self.db = Database()
@@ -71,25 +83,36 @@ class MonitorTask(QThread):
             status='pending',
         )
 
+    def start(self, priority=QThread.InheritPriority):
+        """
+        启动线程（重写 QThread.start）：先置运行标志再调用 super().start()，
+        避免线程尚未真正执行到 run() 内部置位语句前 stop() 被提前调用导致状态错乱。
+        """
+        self._running = True
+        super().start(priority)
+
     def run(self):
         """线程运行函数（重写QThread.run）"""
-        self._running = True
-
         # 更新任务状态
         self.task_model.start_time = datetime.now()
         self.task_model.status = 'running'
         self.db.save_task(self.task_model)
+        logger.info("任务启动: task_id=%s pid=%s process=%s metrics=%s",
+                    self.task_id, self.pid, self.process_name, self.metric_types)
 
         # 检查进程是否存在
         if not self.collector.is_process_running():
             error_msg = f"进程 {self.process_name} (PID: {self.pid}) 不存在或无法访问"
             self.error_occurred.emit(self.task_id, error_msg)
-            self._stop_task("进程不存在")
+            self._running = False
+            self._teardown("进程不存在")
             return
 
         # 含CPU使用率指标时先预热，丢弃cpu_percent首次返回的无效0值
         if MetricType.CPU_PERCENT in self.metric_types:
             self.collector.prime_cpu()
+
+        stop_reason = "用户停止"
 
         # 主循环：定时采集数据
         while self._running:
@@ -122,11 +145,13 @@ class MonitorTask(QThread):
 
                 else:
                     # 进程已终止
-                    self._stop_task("进程已终止")
+                    stop_reason = "进程已终止"
+                    self._running = False
                     break
 
             except Exception as e:
                 error_msg = f"采集数据时发生错误: {str(e)}"
+                logger.error(error_msg, exc_info=True)
                 self.error_occurred.emit(self.task_id, error_msg)
 
             # 等待下一个采集周期，拆分为短间隔以便快速响应停止
@@ -136,12 +161,17 @@ class MonitorTask(QThread):
                 self.msleep(sleep_time)
                 remaining -= sleep_time
 
-        # 停止时保存剩余数据
-        self._flush_buffer()
+        # 主循环退出后统一收尾（无论因用户停止还是进程消亡，只走这一条路径，且始终在
+        # 工作线程内执行，修复"task_stopped 先于落库完成"与"GUI线程跨线程写库"两个隐患）
+        self._teardown(stop_reason)
 
     def stop(self):
-        """停止监控任务"""
-        self._stop_task("用户停止")
+        """
+        停止监控任务：只置运行标志，让 run() 主循环在下一次检查时自然退出。
+        收尾工作（flush/写状态/emit）全部移到 run() 内部完成，因此本方法能保持
+        近乎立即返回的响应速度——这是 v1.0.6 的专项优化，不得劣化。
+        """
+        self._running = False
 
     def pause(self):
         """暂停监控"""
@@ -152,7 +182,8 @@ class MonitorTask(QThread):
         self._paused = False
 
     def is_running(self) -> bool:
-        """任务是否正在运行"""
+        """任务是否正在运行（只读 _running，不与 isRunning() 做或运算，
+        否则 stop() 置的 False 会被冲回 True，导致 wait() 挂起）"""
         return self._running
 
     def is_paused(self) -> bool:
@@ -163,35 +194,88 @@ class MonitorTask(QThread):
         """获取任务信息"""
         return self.task_model
 
-    def _stop_task(self, reason: str):
+    def _teardown(self, reason: str):
         """
-        内部方法：停止任务
+        收尾（在 run() 主循环退出后于工作线程内调用且仅调用一次）：
+        最后一次 flush -> 写 stopped 状态 -> emit task_stopped
 
         Args:
             reason: 停止原因
         """
-        self._running = False
+        # 收尾 flush 没有下一轮重试机会，失败也要继续走完收尾流程
+        self._flush_buffer(is_teardown=True)
 
-        # 更新任务状态
         self.task_model.end_time = datetime.now()
         self.task_model.status = 'stopped'
         self.db.update_task_status(self.task_id, 'stopped', self.task_model.end_time)
+        logger.info("任务停止: task_id=%s 原因=%s", self.task_id, reason)
 
         # 发送停止信号
         self.task_stopped.emit(self.task_id, reason)
 
-    def _flush_buffer(self):
-        """将缓冲区数据保存到数据库"""
-        if self._data_buffer:
-            self.db.save_data_points(self._data_buffer)
+    def _flush_buffer(self, is_teardown: bool = False):
+        """
+        将缓冲区数据保存到数据库。
+
+        失败时保留缓冲，交给下一采集周期（或下一次显式调用）重试，不丢数据；
+        缓冲超过 MAX_BUFFER_SIZE 时丢弃最旧的数据并记日志；连续失败达到阈值
+        经 error_occurred 通知 UI 一次（_notified 锁存，成功后复位）。
+
+        Args:
+            is_teardown: 是否为收尾阶段的最后一次 flush（无重试机会，失败需明确记日志）
+        """
+        if not self._data_buffer:
+            return
+
+        success = self.db.save_data_points(self._data_buffer)
+
+        if success:
+            if self._flush_fail_count:
+                logger.info("task_id=%s flush 重试成功，落库 %d 条",
+                            self.task_id, len(self._data_buffer))
             self._data_buffer.clear()
+            self._flush_fail_count = 0
+            self._notified = False
+            return
+
+        # 失败：缓冲保留，等待下一轮重试
+        self._flush_fail_count += 1
+        logger.error("task_id=%s flush 失败（连续第%d次），缓冲保留待重试，当前缓冲 %d 条",
+                      self.task_id, self._flush_fail_count, len(self._data_buffer))
+
+        if len(self._data_buffer) > MAX_BUFFER_SIZE:
+            dropped = len(self._data_buffer) - MAX_BUFFER_SIZE
+            del self._data_buffer[:dropped]
+            logger.error("task_id=%s flush 缓冲超过上限 %d 条，丢弃最旧 %d 条数据",
+                         self.task_id, MAX_BUFFER_SIZE, dropped)
+
+        if (not is_teardown
+                and self._flush_fail_count >= CONSECUTIVE_FAILURE_NOTIFY_THRESHOLD
+                and not self._notified):
+            self._notified = True
+            self.error_occurred.emit(
+                self.task_id,
+                f"数据连续 {self._flush_fail_count} 次保存失败，可能丢失部分历史数据"
+            )
+
+        if is_teardown:
+            # 收尾阶段失败没有下一轮重试机会，明确记录未落库条数
+            logger.error("task_id=%s 任务收尾 flush 失败，%d 条数据未落库",
+                         self.task_id, len(self._data_buffer))
 
 
 # 单元测试
 if __name__ == "__main__":
     import sys
     import os
+    import tempfile
     from PyQt5.QtWidgets import QApplication
+
+    # 冒烟测试使用临时目录数据库，不写项目 data\monitor.db（须在创建 MonitorTask 前生效，
+    # Database() 默认取用 config.DB_PATH）
+    _tmp_dir = tempfile.mkdtemp(prefix="monitor_task_smoke_")
+    config.DB_PATH = os.path.join(_tmp_dir, "smoke_monitor.db")
+    print(f"冒烟测试使用临时数据库: {config.DB_PATH}")
 
     # 创建应用程序
     app = QApplication(sys.argv)

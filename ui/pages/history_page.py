@@ -7,8 +7,8 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QScrollArea,
                              QTableWidgetItem, QHeaderView, QSizePolicy)
 from qfluentwidgets import (
     ComboBox, CardWidget, PushButton, FluentIcon,
-    StrongBodyLabel, BodyLabel, InfoBar, InfoBarPosition,
-    TableWidget
+    StrongBodyLabel, BodyLabel, CaptionLabel, InfoBar, InfoBarPosition,
+    TableWidget, MessageBox
 )
 import pyqtgraph as pg
 from datetime import datetime
@@ -16,6 +16,11 @@ from datetime import datetime
 from core.monitor_manager import MonitorManager
 from data.database import Database
 from utils.metrics import get_metric_display_name, format_metric_value
+
+# 表格取数上限：只取最近 N 条采集（v1.2.0 批3 性能优化，避免大数据量下界面卡顿）
+TABLE_POINT_LIMIT = 2000
+# 图表分桶上限：按行号分桶后每桶取 MIN/MAX 两点，故图表最多 2*CHART_MAX_BUCKETS 个点
+CHART_MAX_BUCKETS = 2000
 
 
 class HistoryPage(QScrollArea):
@@ -32,9 +37,10 @@ class HistoryPage(QScrollArea):
         self.manager = MonitorManager()
         self.db = Database()
 
-        # 当前选中的任务ID和指标类型
+        # 当前选中的任务ID、指标类型与任务状态（用于删除按钮的运行中保护）
         self.current_task_id = None
         self.current_metric = None
+        self.current_task_status = None
 
         # 初始化UI
         self._init_ui()
@@ -86,13 +92,24 @@ class HistoryPage(QScrollArea):
         self.refresh_button = PushButton("刷新", self, FluentIcon.SYNC)
         self.refresh_button.clicked.connect(self._load_tasks)
 
+        # 删除此任务数据按钮
+        self.delete_button = PushButton("删除此任务数据", self, FluentIcon.DELETE)
+        self.delete_button.setEnabled(False)
+        self.delete_button.clicked.connect(self._on_delete_task_clicked)
+
         select_layout.addWidget(task_label)
         select_layout.addWidget(self.task_combo, 1)
         select_layout.addWidget(metric_label)
         select_layout.addWidget(self.metric_combo)
         select_layout.addWidget(self.refresh_button)
+        select_layout.addWidget(self.delete_button)
 
         main_layout.addWidget(select_card)
+
+        # 数据量提示（表格与图表均按最近 N 次采集限流展示，导出仍为全量）
+        limit_hint = CaptionLabel(f"表格显示最近 {TABLE_POINT_LIMIT} 次采集，图表按数据分桶展示（保留尖峰），导出数据仍为全量")
+        limit_hint.setStyleSheet("color: #666;")
+        main_layout.addWidget(limit_hint)
 
         # ========== 图表区域 ==========
         chart_label = StrongBodyLabel("数据趋势图")
@@ -106,6 +123,14 @@ class HistoryPage(QScrollArea):
         self.chart_widget.setLabel('bottom', '时间')
         # 设置图表固定高度，确保X轴完整显示
         self.chart_widget.setFixedHeight(400)
+        # 渲染优化：分桶数据已保留尖峰，这里叠加 pyqtgraph 自身的峰值抽稀与视口裁剪，
+        # 双保险应对缩放/大量点渲染时的卡顿。
+        # 注：架构方案文本写的关键字是 method='peak'，但本项目实际安装的 pyqtgraph
+        # 0.14.0 中 PlotWidget.setDownsampling 转发到 PlotItem.setDownsampling，
+        # 其形参名是 mode 而非 method（PlotDataItem.setDownsampling 才是 method），
+        # 这里按本项目实际依赖版本的真实签名改用 mode='peak'，效果（峰值保留抽稀）等价。
+        self.chart_widget.setDownsampling(auto=True, mode='peak')
+        self.chart_widget.setClipToView(True)
 
         chart_card = CardWidget()
         chart_layout = QVBoxLayout(chart_card)
@@ -156,17 +181,12 @@ class HistoryPage(QScrollArea):
         # 获取所有任务（包括正在运行的和历史的）
         all_tasks = self.db.get_all_tasks()
 
-        # 过滤掉单元测试产生的任务（python.exe进程且运行时间很短的）
+        # 任务可见性与导出页统一为"有数据即显示"（不再按进程名过滤）
         tasks = []
         for task in all_tasks:
-            # 过滤条件：如果是python.exe进程，检查采集次数
-            if task.process_name.lower() == "python.exe" and task.status == "stopped":
-                # 获取采集次数（同一时间戳的多指标数据点算一次采集）
-                sample_count = self.db.get_sample_count(task.task_id)
-                # 如果采集次数少于5次，很可能是单元测试，跳过
-                if sample_count < 5:
-                    continue
-            tasks.append(task)
+            data_count = self.db.get_data_point_count(task.task_id)
+            if data_count > 0:
+                tasks.append(task)
 
         if not tasks:
             InfoBar.info(
@@ -181,6 +201,8 @@ class HistoryPage(QScrollArea):
             self._clear_metric_combo()
             self.current_task_id = None
             self.current_metric = None
+            self.current_task_status = None
+            self._update_delete_button_state()
             return
 
         # 3. 添加到下拉框（使用setItemData设置userData）
@@ -210,17 +232,23 @@ class HistoryPage(QScrollArea):
                     self.task_combo.setCurrentIndex(i)
                     self.task_combo.blockSignals(False)
                     self.current_task_id = current_task_id
+                    # 恢复任务状态并刷新删除按钮可用性（blockSignals跳过了_on_task_selected）
+                    task_info = self.db.get_task(current_task_id)
+                    self.current_task_status = task_info.status if task_info else None
+                    self._update_delete_button_state()
                     # 恢复指标下拉及之前选中的指标
                     self._populate_metric_combo(current_task_id, current_metric)
                     # 重新加载该任务的数据（这是刷新的关键！）
                     self._load_task_data(current_task_id, self.current_metric)
                     return
 
-            # 之前的任务不在列表中了（可能被过滤），清空显示
+            # 之前的任务不在列表中了（可能被过滤/被删除），清空显示
             self._clear_display()
             self._clear_metric_combo()
             self.current_task_id = None
             self.current_metric = None
+            self.current_task_status = None
+            self._update_delete_button_state()
 
         # 5. 如果没有恢复之前的选择，且ComboBox不为空
         # 强制设置currentIndex以确保触发信号
@@ -232,6 +260,8 @@ class HistoryPage(QScrollArea):
     def _on_task_selected(self, index: int):
         """任务选择事件"""
         if index < 0:
+            self.current_task_status = None
+            self._update_delete_button_state()
             return
 
         # 获取任务ID
@@ -240,6 +270,11 @@ class HistoryPage(QScrollArea):
             return
 
         self.current_task_id = task_id
+
+        # 记录任务状态，用于删除按钮的运行中保护
+        task_info = self.db.get_task(task_id)
+        self.current_task_status = task_info.status if task_info else None
+        self._update_delete_button_state()
 
         # 填充指标下拉（默认选中首指标）
         self._populate_metric_combo(task_id)
@@ -302,7 +337,8 @@ class HistoryPage(QScrollArea):
 
     def _load_task_data(self, task_id: str, metric_type: str = None):
         """
-        加载任务指定指标的数据并显示
+        加载任务指定指标的数据并显示（v1.2.0 批3 性能优化：表格与图表均限流查询，
+        避免大数据量任务把整张表拖进内存/渲染导致界面卡顿；导出页仍走全量数据）
 
         Args:
             task_id: 任务ID
@@ -319,10 +355,11 @@ class HistoryPage(QScrollArea):
             )
             return
 
-        # 获取指定指标的数据点
-        data_points = self.db.get_task_data_points(task_id, metric_type=metric_type)
+        # 表格：最近 TABLE_POINT_LIMIT 条，新语义下子查询已按时间升序返回，无需再翻转
+        table_points = self.db.get_task_data_points(
+            task_id, metric_type=metric_type, limit=TABLE_POINT_LIMIT)
 
-        if not data_points:
+        if not table_points:
             InfoBar.info(
                 title="提示",
                 content="该任务暂无数据",
@@ -333,18 +370,22 @@ class HistoryPage(QScrollArea):
             self._clear_display()
             return
 
+        # 图表：SQL 分桶降采样（每桶 MIN/MAX 两点，保留尖峰），按时间升序返回
+        chart_points = self.db.get_task_data_points_bucketed(
+            task_id, metric_type=metric_type, max_buckets=CHART_MAX_BUCKETS)
+
         # 更新图表
-        self._update_chart(data_points, metric_type)
+        self._update_chart(chart_points, metric_type)
 
         # 更新表格
-        self._update_table(data_points, metric_type)
+        self._update_table(table_points, metric_type)
 
     def _update_chart(self, data_points, metric_type):
         """
         更新图表
 
         Args:
-            data_points: 数据点列表
+            data_points: 分桶降采样后的数据点列表（按 timestamp 升序）
             metric_type: 指标类型
         """
         # 清空图表
@@ -353,7 +394,7 @@ class HistoryPage(QScrollArea):
         if not data_points:
             return
 
-        # 准备数据
+        # 准备数据（分桶查询已按 timestamp 升序返回，直接用，无需再排序/翻转）
         times = []
         values = []
 
@@ -380,32 +421,101 @@ class HistoryPage(QScrollArea):
         更新表格
 
         Args:
-            data_points: 数据点列表
+            data_points: 数据点列表（limit 子查询新语义下已按 timestamp 升序返回；
+                         这里仍需 reversed() 翻转填充，使表格保持"倒序显示，最新的
+                         在前"的既有用户可见行为——方案原文"表格 reversed() 零改动"
+                         指的是保留这一步，之前误删已恢复，v1.2.0 批3 修正）
             metric_type: 指标类型
         """
-        # 设置行数
-        self.data_table.setRowCount(len(data_points))
+        # 大批量 setItem 前关闭界面更新与排序，避免逐行触发重排/重绘拖慢填表
+        self.data_table.setUpdatesEnabled(False)
+        self.data_table.setSortingEnabled(False)
+        try:
+            # 设置行数
+            self.data_table.setRowCount(len(data_points))
 
-        # 填充数据（倒序显示，最新的在前）
-        for i, dp in enumerate(reversed(data_points)):
-            # 时间
-            time_str = dp.timestamp.strftime('%H:%M:%S')
-            time_item = QTableWidgetItem(time_str)
-            self.data_table.setItem(i, 0, time_item)
+            # 倒序显示，最新的在前
+            for i, dp in enumerate(reversed(data_points)):
+                # 时间
+                time_str = dp.timestamp.strftime('%H:%M:%S')
+                time_item = QTableWidgetItem(time_str)
+                self.data_table.setItem(i, 0, time_item)
 
-            # 格式化的值
-            formatted_value = format_metric_value(metric_type, dp.value)
-            value_item = QTableWidgetItem(formatted_value)
-            self.data_table.setItem(i, 1, value_item)
+                # 格式化的值
+                formatted_value = format_metric_value(metric_type, dp.value)
+                value_item = QTableWidgetItem(formatted_value)
+                self.data_table.setItem(i, 1, value_item)
 
-            # 原始值
-            raw_value_item = QTableWidgetItem(f"{dp.value:.4f}")
-            self.data_table.setItem(i, 2, raw_value_item)
+                # 原始值
+                raw_value_item = QTableWidgetItem(f"{dp.value:.4f}")
+                self.data_table.setItem(i, 2, raw_value_item)
+        finally:
+            # 表格本就未开启排序（TableWidget 默认不排序），此处只需恢复界面更新
+            self.data_table.setUpdatesEnabled(True)
 
     def _clear_display(self):
         """清空显示"""
         self.chart_widget.clear()
         self.data_table.setRowCount(0)
+
+    def _update_delete_button_state(self):
+        """
+        根据当前选中任务状态刷新删除按钮可用性：运行中任务禁止直接删除（需先停止），
+        避免删掉正在写入的任务数据引发竞态
+        """
+        if not self.current_task_id:
+            self.delete_button.setEnabled(False)
+            self.delete_button.setToolTip("")
+        elif self.current_task_status == 'running':
+            self.delete_button.setEnabled(False)
+            self.delete_button.setToolTip("任务正在运行中，请先停止任务再删除")
+        else:
+            self.delete_button.setEnabled(True)
+            self.delete_button.setToolTip("")
+
+    def _on_delete_task_clicked(self):
+        """删除此任务数据按钮点击事件：确认对话框 -> delete_task -> 本页刷新"""
+        if not self.current_task_id:
+            return
+
+        if self.current_task_status == 'running':
+            InfoBar.warning(
+                title="提示",
+                content="任务正在运行中，请先停止任务再删除",
+                parent=self,
+                position=InfoBarPosition.TOP,
+                duration=2000
+            )
+            return
+
+        task = self.db.get_task(self.current_task_id)
+        task_desc = f"{task.process_name} (PID: {task.pid})" if task else self.current_task_id
+
+        dialog = MessageBox(
+            "确认删除",
+            f"确定要删除任务「{task_desc}」的全部历史数据吗？此操作不可恢复。",
+            self.window()
+        )
+        if not dialog.exec():
+            return
+
+        if self.db.delete_task(self.current_task_id):
+            InfoBar.success(
+                title="删除成功",
+                content="该任务的历史数据已删除",
+                parent=self,
+                position=InfoBarPosition.TOP,
+                duration=2000
+            )
+            self._load_tasks()
+        else:
+            InfoBar.error(
+                title="删除失败",
+                content="删除任务数据失败，请查看日志",
+                parent=self,
+                position=InfoBarPosition.TOP,
+                duration=3000
+            )
 
     def showEvent(self, event):
         """页面显示事件"""

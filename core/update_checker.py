@@ -3,6 +3,7 @@
 通过 GitHub Releases API 检测新版本，下载安装包并调起安装
 """
 import json
+import logging
 import os
 import tempfile
 import urllib.request
@@ -12,6 +13,8 @@ from typing import Optional
 from PyQt5.QtCore import QThread, pyqtSignal
 
 import config
+
+logger = logging.getLogger(__name__)
 
 
 # GitHub Releases API 地址
@@ -152,8 +155,10 @@ class UpdateChecker(QThread):
                 # 仓库尚无任何 release
                 self.error_occurred.emit("仓库暂无发布版本")
             else:
+                logger.error("检查更新失败（HTTP %s）", e.code, exc_info=True)
                 self.error_occurred.emit(f"检查更新失败（HTTP {e.code}）")
         except Exception as e:
+            logger.error("检查更新失败", exc_info=True)
             self.error_occurred.emit(f"检查更新失败：{e}")
 
 
@@ -167,10 +172,11 @@ class UpdateDownloader(QThread):
     # 下载失败信号
     error_occurred = pyqtSignal(str)
 
-    def __init__(self, url: str, filename: str, parent=None):
+    def __init__(self, url: str, filename: str, asset_size: int = 0, parent=None):
         super().__init__(parent)
         self.url = url
         self.filename = filename
+        self.asset_size = asset_size  # release 资产元数据里的字节数，Content-Length 缺失时的兜底
         self._cancelled = False
 
     def cancel(self):
@@ -201,10 +207,23 @@ class UpdateDownloader(QThread):
                                 self.download_progress.emit(percent)
                         else:
                             self.download_progress.emit(-1)
+
+            # 完整性校验：优先用响应头 Content-Length，缺失（total<=0）时退回 release 资产
+            # 元数据里的 asset_size；两者都拿不到时无法校验，视为通过（避免误判）
+            expected = total if total > 0 else self.asset_size
+            if expected > 0 and downloaded != expected:
+                logger.error("下载不完整: 已下载=%d 预期=%d url=%s",
+                              downloaded, expected, self.url)
+                self._cleanup(save_path)
+                self.error_occurred.emit(
+                    f"下载不完整：已下载 {downloaded} 字节，预期 {expected} 字节，请重试")
+                return
+
             self.download_finished.emit(save_path)
         except InterruptedError:
             self._cleanup(save_path)
         except Exception as e:
+            logger.error("下载更新失败", exc_info=True)
             self._cleanup(save_path)
             self.error_occurred.emit(f"下载更新失败：{e}")
 

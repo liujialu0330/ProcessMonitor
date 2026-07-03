@@ -14,23 +14,34 @@
 
 ## 🎯 打包方案概述
 
-本项目采用 **PyInstaller + Inno Setup** 的双阶段打包方案：
+本项目采用 **PyInstaller + Inno Setup** 的双阶段打包方案，`build\build.bat` 已封装为
+无人值守一键脚本（含版本号读取、version_info.txt 生成、PyInstaller 打包、冒烟测试、
+Inno Setup 编译、产物命名，全流程一次跑完）：
 
 ```
-源代码 → PyInstaller打包成exe → Inno Setup制作安装包 → 最终安装包
+源代码 → PyInstaller打包成onedir目录 → Inno Setup制作安装包 → 最终安装包
 ```
 
-**打包产物**：
-- **单文件exe**：`dist\进程监控助手.exe`（约80-100MB）
-- **安装包**：`dist\installer\进程监控助手_v1.1.0_Setup.exe`（约80-100MB）
+**打包产物**（v1.2.0 起改为 onedir 模式，不再是单文件exe）：
+- **onedir目录**：`dist\进程监控助手\`（主exe + `_internal\` 依赖目录）
+- **安装包**：`dist\installer\进程监控助手_v{版本}_Setup.exe`（另附一份
+  `dist\installer\Windows_v{版本}_Setup.exe`，供 release 资产命名使用）
+
+> 为什么改用 onedir：onefile 模式每次启动都要把依赖解压到系统临时目录，
+> 启动慢且临时文件可能被杀毒软件误报；onedir 模式启动更快、覆盖安装更可控。
 
 **安装后目录结构**：
 ```
 用户选择的安装目录\
-├── 进程监控助手.exe    # 主程序
-└── data\                # 数据目录（运行时自动创建）
-    └── monitor.db       # SQLite数据库
+├── 进程监控助手.exe        # 主程序（引导exe）
+├── _internal\               # PyInstaller onedir 依赖目录（Qt/Python运行时等）
+├── app_green_icon.ico       # 应用图标
+└── （数据目录不在安装目录内，见下方"数据存储位置"）
 ```
+
+**数据存储位置**：数据目录固定在 `%LOCALAPPDATA%\进程监控助手\data\monitor.db`
+（与安装目录无关，覆盖安装/卸载重装不影响该目录，详见 `config.py` 的
+`get_data_dir()`）。
 
 ---
 
@@ -41,64 +52,85 @@
 | 软件 | 用途 | 下载地址 |
 |------|------|---------|
 | **Python 3.8+** | 开发环境 | https://www.python.org/downloads/ |
-| **PyInstaller** | 打包exe | `pip install pyinstaller` |
-| **Inno Setup** | 制作安装包 | https://jrsoftware.org/isdl.php |
+| **PyInstaller** | 打包exe（本机实测 6.21.0，注意下方 PATH 提示） | `pip install pyinstaller` |
+| **Inno Setup 6** | 制作安装包 | https://jrsoftware.org/isdl.php |
+
+> **PyInstaller PATH 提示**：部分环境下 `pip install pyinstaller` 后裸命令
+> `pyinstaller` 不在 PATH 中，`build.bat` 已统一改用 `python -m PyInstaller`
+> 调用，手动打包时也建议这样调用以避免"命令未找到"。
 
 ### 安装步骤
 
-1. **安装Python依赖**：
+1. **安装Python依赖**（项目根目录下执行；推荐用 `requirements-lock.txt`
+   复现打包时验证过的确切依赖版本，`requirements.txt` 仅声明宽松的最低版本
+   约束供开发使用）：
    ```bash
-   cd D:\08_TestTool\ProcessMonitor
+   pip install -r requirements-lock.txt
+   ```
+   如需开发环境（不含 pyinstaller）：
+   ```bash
    pip install -r requirements.txt
-   pip install pyinstaller
    ```
 
 2. **下载安装Inno Setup**：
    - 访问 https://jrsoftware.org/isdl.php
    - 下载最新版本（推荐：Inno Setup 6.x）
    - 安装时选择安装语言包（Chinese Simplified）
+   - `build.bat` 会依次探测
+     `%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe`、
+     `%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe`、PATH 中的 `ISCC`，
+     三者都找不到会直接失败并给出提示
 
 ---
 
 ## 🚀 快速开始
 
-### 方式一：一键打包exe（推荐新手）
+### 一键打包（推荐，无人值守）
 
-1. 双击运行 `build\build.bat`
-2. 等待打包完成（约2-5分钟）
-3. 生成的exe位于 `dist\进程监控助手.exe`
+`build\build.bat` 已是全流程无人值守脚本，一次运行完成
+"读取版本号 → 生成 version_info.txt → PyInstaller 打包 onedir → 冒烟测试 →
+Inno Setup 编译安装包 → 产物重命名"，中途任何一步失败都会 `exit /b 1` 并停止，
+不会卡在交互提示上：
 
-### 方式二：制作完整安装包（推荐分发）
-
-**步骤1：打包exe**
 ```bash
 cd build
 build.bat
 ```
 
-**步骤2：制作安装包**
-1. 打开Inno Setup
-2. 选择 `File` → `Open`，打开 `build\setup.iss`
-3. 点击 `Build` → `Compile`
-4. 等待编译完成（约30秒）
-5. 安装包位于 `dist\installer\进程监控助手_v1.1.0_Setup.exe`
+完成后：
+- onedir 产物位于 `dist\进程监控助手\`
+- 安装包位于 `dist\installer\进程监控助手_v{版本}_Setup.exe` 与
+  `dist\installer\Windows_v{版本}_Setup.exe`（内容相同，仅文件名不同）
+
+### 手动分步执行（调试用）
+
+如需单独执行某一步排查问题，可参考下方"详细步骤"分别运行
+`gen_version_info.py`、`python -m PyInstaller`、`ISCC.exe`。
 
 ---
 
 ## 📝 详细步骤
 
-### 阶段一：PyInstaller打包exe
+### 阶段零：生成版本信息文件（version_info.txt）
+
+```bash
+# 从 config.APP_VERSION 单源动态生成 build\version_info.txt（4元组版本号）
+# 该文件是打包产物，已加入 .gitignore，不入库；每次打包前都会重新生成
+python build\gen_version_info.py
+```
+
+### 阶段一：PyInstaller打包（onedir模式）
 
 #### 手动打包命令
 
 ```bash
 # 切换到项目根目录
-cd D:\08_TestTool\ProcessMonitor
+cd <项目根目录>
 
-# 使用spec文件打包
-pyinstaller --clean build\ProcessMonitor.spec
+# 使用spec文件打包（注意用 python -m PyInstaller，避免PATH问题）
+python -m PyInstaller --clean build\ProcessMonitor.spec
 
-# 打包完成后，exe位于 dist\进程监控助手.exe
+# 打包完成后，产物位于 dist\进程监控助手\ 目录（主exe + _internal\依赖）
 ```
 
 #### spec配置说明
@@ -107,11 +139,13 @@ pyinstaller --clean build\ProcessMonitor.spec
 
 | 配置项 | 值 | 说明 |
 |-------|-----|------|
-| `onefile` | `True` | 打包成单个exe文件 |
+| 打包模式 | `EXE(exclude_binaries=True)` + `COLLECT` | onedir 模式，依赖收进 `_internal\` |
 | `console` | `False` | 不显示控制台窗口 |
-| `name` | `进程监控助手` | exe文件名 |
-| `icon` | `app.ico` | 应用图标（可选） |
-| `upx` | `True` | 使用UPX压缩（减小体积） |
+| `name` | `进程监控助手` | exe文件名 / onedir目录名 |
+| `icon` | `app_green_icon.ico` | 应用图标（编译期图标路径固定，不随版本变化） |
+| `version` | `version_info.txt` | 由 `gen_version_info.py` 动态生成 |
+| `upx` | `False` | onedir 模式下未启用UPX压缩 |
+| `excludes` | 含 `pytest`/`_pytest`/`pluggy`/`py` | 防止 `database.py` 的 `__main__` 里 `import pytest` 被静态收集进产物 |
 
 #### 打包时间
 
@@ -122,15 +156,20 @@ pyinstaller --clean build\ProcessMonitor.spec
 
 ```
 dist\
-└── 进程监控助手.exe    # 单文件exe（约80-100MB）
+└── 进程监控助手\        # onedir产物目录
+    ├── 进程监控助手.exe  # 引导exe
+    └── _internal\        # Python运行时、PyQt5、qfluentwidgets等依赖
 
 build\
-└── ProcessMonitor\     # 临时文件（可删除）
+└── ProcessMonitor\      # 临时文件（可删除）
 ```
 
 ---
 
 ### 阶段二：Inno Setup制作安装包
+
+`build.bat` 已自动完成本阶段（探测 ISCC.exe → 传入
+`/DMyAppVersion=%VER%` → 编译）。如需手动操作：
 
 #### 使用Inno Setup编译器
 
@@ -144,26 +183,31 @@ build\
 3. **编译安装包**
    - 菜单：`Build` → `Compile`
    - 或按快捷键：`Ctrl + F9`
+   - 注意：直接用 IDE 编译时版本号取 `setup.iss` 内 `#ifndef MyAppVersion`
+     兜底值，可能与 `config.py` 不一致，正式发布请用 `build.bat` 或命令行
+     显式传参
 
 4. **查看结果**
    - 编译成功后，安装包位于：
-   - `dist\installer\进程监控助手_v1.1.0_Setup.exe`
+   - `dist\installer\进程监控助手_v{版本}_Setup.exe`
 
 #### 命令行编译（高级）
 
 ```bash
-# 需要先将Inno Setup安装目录添加到环境变量
-"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" build\setup.iss
+# 需要先将Inno Setup安装目录添加到环境变量，或使用完整路径
+"C:\Users\<用户名>\AppData\Local\Programs\Inno Setup 6\ISCC.exe" /DMyAppVersion={版本号} build\setup.iss
 ```
 
 #### setup.iss配置说明
 
 | 配置项 | 值 | 说明 |
 |-------|-----|------|
+| `MyAppVersion` | 外部 `/DMyAppVersion` 传入，未传时取 `#ifndef` 兜底值 | 与 `config.APP_VERSION` 保持一致 |
 | `DefaultDirName` | `{autopf}\进程监控助手` | 默认安装目录 |
 | `PrivilegesRequired` | `lowest` | 普通用户即可安装 |
 | `Compression` | `lzma2/max` | 最大压缩率 |
 | `SolidCompression` | `yes` | 固实压缩 |
+| `[Files]` | `Source: "..\dist\进程监控助手\*"` + `ignoreversion recursesubdirs createallsubdirs` | 整体复制onedir目录；`ignoreversion` 防止Qt DLL被版本比较跳过覆盖 |
 
 #### 安装包功能
 
@@ -181,9 +225,11 @@ build\
 
 ```
 build\
-├── ProcessMonitor.spec       # PyInstaller配置文件
+├── ProcessMonitor.spec       # PyInstaller配置文件（onedir模式）
+├── gen_version_info.py       # 从config.APP_VERSION生成version_info.txt
 ├── setup.iss                 # Inno Setup脚本
-├── build.bat                 # 一键打包脚本
+├── build.bat                 # 一键打包脚本（无人值守，含冒烟测试）
+├── check_dependencies.py     # 打包前依赖检查
 └── README_打包说明.md        # 本文档
 ```
 
@@ -194,14 +240,21 @@ build\
 PyInstaller打包配置文件，主要功能：
 - 指定主入口文件 `main.py`
 - 配置隐藏导入（PyQt5、qfluentwidgets等）
-- 设置单文件模式
+- 设置 onedir 模式（`EXE(exclude_binaries=True)` + `COLLECT`）
 - 配置窗口模式（不显示控制台）
-- 排除不必要的模块（减小体积）
+- 排除不必要的模块（含测试相关的 `pytest`/`_pytest`/`pluggy`/`py`）
+
+#### gen_version_info.py
+
+从 `config.APP_VERSION` 单源动态生成 `build\version_info.txt`（Windows
+exe 版本信息4元组），供 spec 的 `version=` 参数引用；每次打包前由
+`build.bat` 自动调用，不需要手动维护版本号。
 
 #### setup.iss
 
 Inno Setup安装脚本，主要功能：
-- 设置应用信息（名称、版本、发布者）
+- 设置应用信息（名称、版本、发布者）——版本号由外部命令行 `/DMyAppVersion`
+  传入，`#ifndef` 提供兜底值
 - 配置安装目录和权限
 - 创建快捷方式
 - 配置卸载逻辑（保留用户数据选项）
@@ -209,12 +262,15 @@ Inno Setup安装脚本，主要功能：
 
 #### build.bat
 
-自动化打包脚本，主要流程：
-1. 检查Python和PyInstaller
-2. 清理旧的打包文件
-3. 执行PyInstaller打包
-4. 验证打包结果
-5. 提示下一步操作
+无人值守全流程打包脚本，主要流程：
+1. 检查Python、图标文件是否存在
+2. 读取版本号（`config.APP_VERSION` 单源）
+3. 检查项目依赖与PyInstaller
+4. 生成 `version_info.txt`
+5. 清理旧的打包文件
+6. 执行 `python -m PyInstaller` 打包（onedir）
+7. 验证打包结果（体积/文件数）并冒烟测试（启动exe → `tasklist` 确认 → `taskkill` 收尾）
+8. 探测 ISCC 并编译安装包，产物重命名为发布资产命名
 
 ---
 
@@ -250,11 +306,10 @@ excludes=[
 
 ### Q3: 打包后启动慢
 
-**原因**：单文件模式需要解压到临时目录
-
-**解决**：
-- 方式1：接受1-2秒的启动延迟（推荐）
-- 方式2：改用文件夹模式（修改spec文件，将所有binaries等放到one_dir模式）
+**说明**：v1.2.0 起已改用 onedir 模式（`dist\进程监控助手\` 目录，主exe +
+`_internal\` 依赖），不再需要每次启动解压到临时目录，启动速度已优于此前的
+onefile 模式。若仍觉得慢，通常是首次启动杀毒软件扫描 `_internal\` 内大量
+DLL 导致，属一次性开销。
 
 ### Q4: 安装时提示需要管理员权限
 
@@ -291,9 +346,9 @@ excludes=[
 ### 打包前检查
 
 - [ ] 确保代码无错误，能正常运行
-- [ ] 更新 `config.py` 中的版本号
-- [ ] 更新 `setup.iss` 中的版本号
-- [ ] 准备应用图标 `app.ico`（可选）
+- [ ] 更新 `config.py` 中的 `APP_VERSION`（版本号单源，`setup.iss`/`build.bat`
+  会自动读取，无需手动同步）
+- [ ] 确认应用图标 `build\app_green_icon.ico` 存在（`build.bat` 会检查，缺失直接失败）
 - [ ] 清理测试数据库文件
 
 ### 打包过程
@@ -328,18 +383,15 @@ excludes=[
 ## 🎯 完整打包流程总结
 
 ### 开发阶段
-1. 完成代码开发和测试
-2. 更新版本号（`config.py`、`setup.iss`）
+1. 完成代码开发和测试（`python -m pytest tests/ -v` 全绿）
+2. 更新版本号（仅需改 `config.py` 的 `APP_VERSION`，单源）
 3. 更新更新日志
 
 ### 打包阶段
 ```bash
-# 步骤1: 打包exe
+# 一步完成：打包exe + 制作安装包（无人值守）
 cd build
 build.bat
-
-# 步骤2: 制作安装包
-# 用Inno Setup打开setup.iss，点击编译
 ```
 
 ### 测试阶段
@@ -365,6 +417,6 @@ build.bat
 
 ---
 
-**文档版本**：v1.0
-**最后更新**：2025-11-19
-**适用版本**：进程监控助手 v1.1.0
+**文档版本**：v1.1
+**最后更新**：2026-07-03
+**适用版本**：进程监控助手 v1.2.0

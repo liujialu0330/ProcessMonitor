@@ -76,6 +76,12 @@ a = Analysis(
         'IPython',
         'setuptools',
         'distutils',
+        # 排除测试相关模块（data/database.py 的 __main__ 中 import pytest
+        # 会被 PyInstaller 静态依赖分析收集，此处显式排除兜底——批1评审遗留 M1）
+        'pytest',
+        '_pytest',
+        'pluggy',
+        'py',
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
@@ -85,20 +91,19 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
+# onedir 模式（v1.2.0 架构重构批4）：exe 仅含引导代码，依赖收进同目录
+# _internal\ 文件夹，配合 COLLECT 生成 dist\进程监控助手\ 目录。相比 onefile
+# 省去每次启动解压到临时目录的开销，安装/卸载/覆盖安装也更可控。
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
     [],
+    exclude_binaries=True,
     name='进程监控助手',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
-    upx_exclude=[],
-    runtime_tmpdir=None,
+    upx=False,
     console=False,  # 不显示控制台窗口
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -107,6 +112,16 @@ exe = EXE(
     entitlements_file=None,
     # 图标文件（和spec文件同目录）- 这个图标会应用到exe文件，显示在桌面、任务栏等
     icon='app_green_icon.ico',
-    # 版本信息
-    version_file=None,
+    # 版本信息：由 build\gen_version_info.py 从 config.APP_VERSION 动态生成
+    version='version_info.txt',
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=False,
+    name='进程监控助手',
 )
