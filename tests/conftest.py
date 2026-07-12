@@ -17,6 +17,8 @@ if PROJECT_ROOT not in sys.path:
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
 from data.database import Database  # noqa: E402
+import app_config  # noqa: E402
+from qfluentwidgets import qconfig, Theme  # noqa: E402
 
 
 @pytest.fixture(scope='session')
@@ -64,3 +66,40 @@ def _reset_migration_guard():
         'data_reset': False,
         'backup_aborted': False,
     }
+
+
+@pytest.fixture(autouse=True)
+def _reset_app_config():
+    """
+    重置 app_config 模块级单例 cfg 的状态（v1.3.0 批1，评审修订 M2）。
+
+    cfg 的三个自定义配置项（default_interval/retention_days/close_to_tray）以及
+    继承自 QConfig 基类的 themeMode，都是类级 ConfigItem 对象：进程内所有
+    AppConfig 实例（含用例中临时构造用于持久化 roundtrip 测试的实例）都引用
+    同一批对象；qconfig.load() 还会把 qfluentwidgets 模块级单例 qconfig 的
+    _cfg 属性重新指向被加载的 cfg 实例、并把 file 指向被加载的（可能是 tmp_path
+    下的）配置文件路径。这些都是跨用例持久存在的全局可变状态，若不在每个
+    用例前后重置，任一用例里的 load/set 都会泄漏给后续用例（包括与 app_config
+    完全无关的用例，因为 themeMode 与 qfluentwidgets 内部组件共用同一对象）——
+    这是"既有全量用例保持全绿"的前置条件。
+
+    直接操作 ConfigItem.value（而非调用 qconfig.set）：qconfig.set 对 themeMode
+    有特殊分支（联动更新已解析的主题值、emit themeChanged、save() 落盘），直接
+    赋值可以拿到同样的"回落默认值"效果，同时避免 teardown 阶段触发额外的磁盘
+    写入与主题联动级联。
+    """
+    def _reset():
+        item_cfg = app_config.cfg
+        item_cfg.default_interval.value = item_cfg.default_interval.defaultValue
+        item_cfg.retention_days.value = item_cfg.retention_days.defaultValue
+        item_cfg.close_to_tray.value = item_cfg.close_to_tray.defaultValue
+        # 主题复位为本应用语义上的默认值 AUTO（跟随系统），而非 qfluentwidgets
+        # 库自带的类默认值 Theme.LIGHT——与 load_app_config() 首启行为保持一致
+        item_cfg.themeMode.value = Theme.AUTO
+        item_cfg._theme = Theme.AUTO
+        qconfig._cfg = qconfig
+        qconfig._theme = Theme.AUTO
+
+    _reset()
+    yield
+    _reset()

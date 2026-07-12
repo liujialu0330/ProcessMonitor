@@ -6,11 +6,12 @@ import os
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QIcon
-from qfluentwidgets import setTheme, Theme
+from qfluentwidgets import setTheme
 
 from ui.main_window import MainWindow
 from utils.logger import setup_logging
 from utils.crash_handler import install_excepthook
+from app_config import load_app_config, cfg
 import config
 
 
@@ -30,6 +31,13 @@ def main():
     # 创建应用程序
     app = QApplication(sys.argv)
 
+    # 关闭主窗口不再意味着应用退出（v1.3.0 批4，D 托盘驻留）：默认 Qt 行为是
+    # "最后一个可见窗口关闭时自动 quit()"，托盘驻留要求"隐藏到托盘"时应用继续
+    # 在后台运行。关闭 QApplication 这条隐式退出路径后，唯一真退出路径变为
+    # MainWindow.closeEvent 清理完成后显式调用的 QApplication.quit()（该行也是
+    # 撤回本功能时唯一需要连带撤掉的开关，见方案风险登记表）。
+    app.setQuitOnLastWindowClosed(False)
+
     # 设置应用信息
     app.setApplicationName(config.APP_NAME)
     app.setApplicationVersion(config.APP_VERSION)
@@ -40,8 +48,17 @@ def main():
     if os.path.exists(icon_path):
         app.setWindowIcon(QIcon(icon_path))
 
-    # 设置主题（可选：Light或Auto）
-    setTheme(Theme.AUTO)
+    # 加载应用配置（qfluentwidgets QConfig 体系，JSON 落盘于 DATA_DIR/config.json）：
+    # 必须在 QApplication 创建之后（ConfigItem 依赖的 Qt 信号机制需要它）、
+    # MainWindow 创建之前（导航栏与各页面构造时已经会读取 cfg 的值，如设置页
+    # 主题单选状态、监控页采集周期默认值）调用
+    load_app_config()
+
+    # 应用已保存的主题偏好：这里必须传 cfg.get(cfg.themeMode) 这个原始配置值
+    # （可能是 Theme.AUTO），不能用 qconfig.theme（那是"跟随系统"解析后的具体
+    # 浅/深色值）——否则每次启动都会把用户"跟随系统"的选择静默覆写成当次启动时
+    # 系统所处的具体主题，设置页里的主题单选状态也会跟着显示错乱
+    setTheme(cfg.get(cfg.themeMode))
 
     # 创建并显示主窗口
     window = MainWindow()

@@ -6,12 +6,12 @@ import os
 import sys
 import webbrowser
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QScrollArea
 from qfluentwidgets import (
     CardWidget, PrimaryPushButton, FluentIcon,
     StrongBodyLabel, BodyLabel, CaptionLabel, HyperlinkLabel,
-    MessageBoxBase, SubtitleLabel, PushButton,
+    MessageBoxBase, SubtitleLabel, TitleLabel, PushButton,
     InfoBar, InfoBarPosition, ProgressBar
 )
 
@@ -80,6 +80,12 @@ class InstallConfirmDialog(MessageBoxBase):
 class AboutPage(QScrollArea):
     """关于页面"""
 
+    # 静默检查（启动3秒后自动检查）发现新版本时发出（v1.3.0 批4，C5，修复遗留
+    # P2-2："静默检查也弹模态对话框会打断用户"）：不再由本页面直接弹窗，改由
+    # 主窗口统一处理为非模态 InfoBar 提示；参数为 core.update_checker.
+    # parse_release_info 返回的 info 字典
+    update_available_silent = pyqtSignal(object)
+
     def __init__(self, parent=None):
         """初始化页面"""
         super().__init__(parent)
@@ -107,9 +113,9 @@ class AboutPage(QScrollArea):
         main_layout.setContentsMargins(30, 30, 30, 30)
         main_layout.setSpacing(20)
 
-        # 页面标题
-        title = StrongBodyLabel("关于")
-        title.setStyleSheet("font-size: 24px; font-weight: bold;")
+        # 页面标题（TitleLabel 自带 28px 粗体样式与浅/深色自适应文字颜色，
+        # 不再用内联样式硬编码字号/字重）
+        title = TitleLabel("关于")
         main_layout.addWidget(title)
 
         # ========== 应用信息区域 ==========
@@ -206,6 +212,16 @@ class AboutPage(QScrollArea):
             return
 
         self.status_label.setText(f"发现新版本 v{info['version']}")
+        if silent:
+            # C5：静默检查不再直接弹模态对话框打断用户，改为发信号，由主窗口
+            # 用非模态 InfoBar 提示（手动检查路径不变，仍直接弹下方模态对话框）
+            self.update_available_silent.emit(info)
+        else:
+            self._show_update_dialog(info)
+
+    def show_update_dialog_for(self, info: dict):
+        """供主窗口在用户点击 InfoBar「查看」按钮后调用：弹出与手动检查路径
+        一致的确认对话框（C5，内部直接复用 _show_update_dialog，不重复实现）"""
         self._show_update_dialog(info)
 
     def _on_check_error(self, msg: str, silent: bool):
@@ -293,8 +309,17 @@ class AboutPage(QScrollArea):
             except Exception as e:
                 self.status_label.setText(f"启动安装程序失败：{e}")
                 return
-            # 退出应用，交给安装向导
-            self.window().close()
+            # 退出应用，交给安装向导。评审修订 B3：必须调用 quit_for_install()
+            # 而非普通 close()——否则"关闭窗口时最小化到托盘"开启时，安装向导
+            # 已经启动，但主程序会被 closeEvent 的隐藏分支拦截、常驻托盘继续
+            # 占用文件，导致覆盖安装因文件占用而失败。hasattr 防御：AboutPage
+            # 可能被独立构造用于测试（此时 self.window() 是页面自身，没有
+            # quit_for_install 方法），仍需能正常关闭。
+            window = self.window()
+            if hasattr(window, 'quit_for_install'):
+                window.quit_for_install()
+            else:
+                window.close()
         else:
             self.status_label.setText(f"安装包已保存到: {path}")
 

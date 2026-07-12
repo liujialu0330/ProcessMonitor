@@ -2,7 +2,8 @@
 GUI 端到端冒烟测试（tests/e2e/，零生产代码改动）
 
 链路：创建监控任务 -> 采集数据 -> 停止任务（落库）-> 历史页查看（图表+表格）->
-导出页导出 CSV -> 关闭窗口（完整线程收尾）。
+导出页导出 CSV -> 设置页（分组卡片存在 + 主题切换实际生效）-> 关闭窗口（完整
+线程收尾）。
 
 双跑法：
     - 默认 offscreen 断言态（CI 可跑）：`pytest tests/e2e/test_gui_smoke.py -q`
@@ -20,7 +21,9 @@ import os
 import time
 
 from PyQt5.QtTest import QTest
+from qfluentwidgets import Theme, qconfig, isDarkTheme
 
+from app_config import cfg
 from ui.main_window import MainWindow
 from utils.metrics import MetricType
 
@@ -114,7 +117,7 @@ def test_gui_smoke_full_lifecycle(qapp, e2e_db, tmp_path, monkeypatch):
         # 表格首行为最新时间戳（既有"倒序显示，最新的在前"契约）
         points = e2e_db.get_task_data_points(task_id, metric_type=history_page.current_metric)
         assert points, "查询到的数据点不应为空"
-        latest_time_str = points[-1].timestamp.strftime('%H:%M:%S')
+        latest_time_str = points[-1].timestamp.strftime('%m-%d %H:%M:%S')
         first_row_time = history_page.data_table.item(0, 0).text()
         assert first_row_time == latest_time_str, (
             f"表格首行时间 {first_row_time} 应等于最新采集时间戳 {latest_time_str}")
@@ -154,7 +157,51 @@ def test_gui_smoke_full_lifecycle(qapp, e2e_db, tmp_path, monkeypatch):
         assert startfile_calls, "导出完成后应触发（被拦截的）打开文件夹调用"
 
         _pause()
+
+        # ========== 6. 设置页：分组卡片存在 + 主题切换实际生效（v1.3.0 批4，M4） ==========
+        window.switchTo(window.setting_page)
+        QTest.qWait(100)
+
+        setting_page = window.setting_page
+        assert setting_page.appearance_group is not None
+        assert setting_page.monitor_group is not None
+        assert setting_page.data_group is not None
+        assert setting_page.behavior_group is not None, "批4新增的“行为”分组应存在"
+        assert setting_page.cleanup_card is not None, "批4新增的“清理并压缩数据库”卡片应存在"
+        assert setting_page.open_dir_card is not None, "批4新增的“数据目录”卡片应存在"
+        assert setting_page.close_to_tray_card is not None, "批4新增的托盘开关卡片应存在"
+
+        # 【评审修订 M4】只断言"不抛异常"抓不住 themeMode 状态分裂类缺陷（如
+        # AppConfig 误重定义 themeMode 导致 setTheme 与设置页各改一个对象、
+        # 互不联动）：必须实际断言 isDarkTheme()/qconfig.theme 确实变为深色，
+        # 再切回浅色验证双向均生效。直接调用 qconfig.set(cfg.themeMode, ...)
+        # 与 OptionsSettingCard 点击单选按钮时内部触发的调用完全一致（见
+        # options_setting_card.py::__onButtonClicked），驱动的是与真实点击
+        # 相同的信号链路（setting_page._connect_signals 里的 qconfig.
+        # themeChanged -> setTheme 连接）。
+        #
+        # qconfig.set 默认 save=True 会落盘：本用例前没有任何代码调用过
+        # load_app_config()/qconfig.load()（刻意避免——那会读写真实
+        # data\config.json），此时 qconfig._cfg 仍是顶层 conftest.py 的
+        # _reset_app_config 夹具复位后的 qconfig 自身，其 .file 是库内置的
+        # 相对路径默认值 Path("config/config.json")，若不重定向会在项目根目录
+        # 写出一个游离的 config\ 目录。这里显式 qconfig.load 到 tmp_path 下的
+        # 一次性文件，重定向落盘目标（不影响已连接的信号与已构造的 SettingPage，
+        # 只改 cfg.file 指向与 _cfg 指针）。
+        qconfig.load(str(tmp_path / "e2e_theme_probe_config.json"), cfg)
+
+        qconfig.set(cfg.themeMode, Theme.DARK)
+        QTest.qWait(100)
+        assert isDarkTheme() is True, "切换到深色主题后 isDarkTheme() 应实际为 True"
+        assert qconfig.theme == Theme.DARK
+
+        qconfig.set(cfg.themeMode, Theme.LIGHT)
+        QTest.qWait(100)
+        assert isDarkTheme() is False, "切回浅色主题后 isDarkTheme() 应实际为 False"
+        assert qconfig.theme == Theme.LIGHT
+
+        _pause()
     finally:
-        # ========== 6. 关闭窗口：走完整 closeEvent 线程收尾，不挂不崩 ==========
+        # ========== 7. 关闭窗口：走完整 closeEvent 线程收尾，不挂不崩 ==========
         window.close()
         QTest.qWait(200)

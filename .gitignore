@@ -41,6 +41,9 @@ data/*.db-*
 # 更新偏好文件（运行时生成）
 data/update_prefs.json
 
+# 用户设置文件（运行时生成）
+data/config.json
+
 # IDE
 .vscode/
 .idea/
