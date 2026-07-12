@@ -24,19 +24,29 @@ ProcessMonitor is a Windows 11 Fluent Design desktop app for keeping an eye on a
 ### 🔍 Monitoring
 - **27 metrics, 4 categories** — memory (working set, private bytes, page faults, USS, ...), CPU (usage, user/kernel time, priority), system (threads, handles, context switches) and I/O (read/write bytes and counts)
 - **Multi-metric tasks** — check any combination of metrics for a single task; they're all sampled on the same clock and timestamp
-- **Up to 5 concurrent tasks** — monitor several processes side by side
+- **Up to 5 concurrent tasks** — monitor several processes side by side, with the current quota always shown (e.g. `3/5`)
 - **Configurable interval** — any integer from 1 to 3600 seconds, default 1s
+- **Process search** — filter the process list by typing part of its name or PID
+- **Pause & resume** — pause a running task without losing its history, and pick it back up anytime
+- **Mini trend sparkline** — every task card shows a 60-sample trend line for its primary metric at a glance
 
 ### 📊 Data & Export
+- **Interactive history charts** — hover crosshair with a live time/value readout, quick time-range switch (10m / 1h / 6h / 24h / all), a stats summary (current/min/max/avg), a real date/time axis, and one-click export to PNG or the clipboard
 - **Downsampled history charts** — large tasks are bucketed on the database side (up to 2,000 buckets, min/max per bucket) so peaks and valleys stay visible without shipping every raw point
 - **Fast history table** — shows the most recent 2,000 samples for smooth scrolling even on long-running tasks (exports are never truncated — always the full dataset)
 - **Wide-format CSV export** — one row per sample, one column per metric, background-thread export with mid-export cancel support
 - **One-click cleanup** — delete a finished task's data straight from the History page
 
+### ⚙️ Settings & Personalization
+- **Theme** — light, dark, or follow the system, switches instantly
+- **Defaults & retention** — set the default sampling interval and a history retention policy (forever / 7 / 30 / 90 / 180 days)
+- **Database maintenance** — see current disk usage and clean up + compact the database in one click
+- **System tray** — optionally minimize to tray on close and keep monitoring in the background
+
 ### 🛡 Reliability
-- **Auto-update** — checks GitHub Releases on startup (or on demand), downloads and launches the installer for you
+- **Auto-update** — checks GitHub Releases on startup (or on demand) and downloads/launches the installer for you; the startup check now shows a non-modal notice instead of interrupting you
 - **Crash-resilient storage** — SQLite with WAL mode, automatic retry on failed writes, crash/error logging, and automatic recovery of orphaned "running" tasks after an unclean shutdown
-- **Automated test suite** — 66 test cases covering the data layer, schema migration, export and update-check logic
+- **Automated test suite** — 96 test cases covering the data layer, schema migration, export and update-check logic
 - **Measured performance** — opening a 770k-row history task takes ~1.4s (down from 3.4s pre-v1.2.0; measured on the maintainer's dev machine)
 
 ## 📸 Screenshots
@@ -113,7 +123,6 @@ python -m pytest tests/
 
 - [ ] Export history data to Excel format
 - [ ] Multi-process comparison view
-- [ ] Fuzzy search by process name
 
 See [CHANGELOG.md](./CHANGELOG.md) or [GitHub Releases](https://github.com/liujialu0330/ProcessMonitor/releases) for the full release history.
 
