@@ -8,7 +8,7 @@ import os
 
 # 应用信息
 APP_NAME = "进程监控助手"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 # GitHub 仓库信息（自动更新用）
 GITHUB_OWNER = "liujialu0330"

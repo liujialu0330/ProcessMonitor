@@ -6,7 +6,7 @@
 ; config.APP_VERSION 单源）；此处 #ifndef 仅作直接用 Inno Setup IDE 打开
 ; 编译时的兜底，避免忘传参数时编译出错误版本号的安装包
 #ifndef MyAppVersion
-#define MyAppVersion "1.2.0"
+#define MyAppVersion "1.3.0"
 #endif
 #define MyAppPublisher "软件测试工程师"
 #define MyAppExeName "进程监控助手.exe"
