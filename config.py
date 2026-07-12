@@ -88,7 +88,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 # 监控配置
 MAX_MONITOR_TASKS = 5  # 最多同时监控5个进程
-DEFAULT_INTERVAL = 1.0  # 默认采集间隔（秒）
+DEFAULT_INTERVAL = 1.0  # 默认采集间隔（秒）；缺省值，运行时以设置页（app_config.cfg）为准
 
 # 数据保存配置
 # 固化为1，勿调大：v1.2.0 架构评审裁决——每周期立即落库，配合 flush 失败重试与 1000
@@ -100,6 +100,7 @@ SAVE_BATCH_SIZE = 1
 # 默认 0 = 禁用自动清理（v1.2.0 架构评审裁决）：历史数据的删除应由用户在历史页显式点击
 # "删除此任务数据"完成，避免用户在不知情的情况下丢失数据；调大为正整数即可启用，
 # 启用时只清理 status='stopped' 且 结束时间早于"当前时间-该天数"的任务（含数据点）
+# 缺省值，运行时以设置页（app_config.cfg，v1.3.0 起用户可在设置页调整此项）为准
 DATA_RETENTION_DAYS = 0
 
 # UI配置

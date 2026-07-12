@@ -533,7 +533,8 @@ class Database:
             return False
 
     def get_task_data_points(self, task_id: str, metric_type: Optional[str] = None,
-                             limit: Optional[int] = None) -> List[DataPoint]:
+                             limit: Optional[int] = None,
+                             since_iso: Optional[str] = None) -> List[DataPoint]:
         """
         获取任务的数据点
 
@@ -544,7 +545,14 @@ class Database:
             limit: 限制返回数量（可选）。指定时语义为"最近 limit 条，按时间升序返回"
                    （子查询先按时间倒序取最近 N 条，再包一层按时间升序排列输出，
                    v1.2.0 批3 变更——调用方按 limit 拿到的仍是时间升序序列，
-                   无需再自行 reversed()）；不指定则返回全部数据，按时间升序
+                   无需再自行 reversed()）；不指定则返回全部数据，按时间升序。
+                   与 since_iso 组合时语义 = "范围内最近 limit 条，升序"
+            since_iso: ISO 格式字符串（可选，datetime.isoformat() 产出的形态），
+                       只返回 timestamp >= since_iso 的点；None 表示不做时间过滤。
+                       【评审修订 B1】data_points.timestamp 在库中是 TEXT，SQLite
+                       类型亲和性下若传入 epoch float 会被转成 TEXT 参与字典序比较、
+                       恒小于任意 ISO 串，导致过滤静默失效——此参数只接受 ISO 字符串，
+                       绘图用的 epoch float（dp.timestamp.timestamp()）严禁传入这里
 
         Returns:
             List[DataPoint]: 数据点列表
@@ -565,6 +573,10 @@ class Database:
                     else:
                         where += ' AND metric_type = ?'
                     params.append(metric_type)
+
+                if since_iso is not None:
+                    where += ' AND timestamp >= ?'
+                    params.append(since_iso)
 
                 if limit:
                     cursor.execute(f'''
@@ -651,7 +663,8 @@ class Database:
             return 0
 
     def get_task_data_points_bucketed(self, task_id: str, metric_type: Optional[str] = None,
-                                       max_buckets: int = 2000) -> List[DataPoint]:
+                                       max_buckets: int = 2000,
+                                       since_iso: Optional[str] = None) -> List[DataPoint]:
         """
         按行号分桶查询任务数据点，供历史页图表降采样用（禁止使用行号取模抽稀，
         取模是等间隔跳采样，会规律性漏掉尖峰）。
@@ -668,6 +681,10 @@ class Database:
                          传 None 时按 task_id 下全部指标数据分桶（调用方需自行确保
                          该场景下语义合理，历史页图表始终应传具体指标）
             max_buckets: 最大分桶数，默认 2000（故最多返回 4000 个点）
+            since_iso: ISO 格式字符串（可选），语义同 get_task_data_points——只对
+                       timestamp >= since_iso 的数据分桶（总行数/桶归属均按过滤后的
+                       子集重新计算）；None 表示不做时间过滤。同样只接受 ISO 字符串，
+                       严禁传入 epoch float（评审修订 B1）
 
         Returns:
             List[DataPoint]: 按 timestamp 升序排列的降采样数据点
@@ -687,6 +704,10 @@ class Database:
                     else:
                         where += ' AND metric_type = ?'
                     params.append(metric_type)
+
+                if since_iso is not None:
+                    where += ' AND timestamp >= ?'
+                    params.append(since_iso)
 
                 cursor.execute(f'''
                     WITH numbered AS (
@@ -737,6 +758,97 @@ class Database:
             logger.error("获取分桶数据点失败: task_id=%s", task_id, exc_info=True)
             return []
 
+    def get_metric_stats(self, task_id: str, metric_type: str,
+                          since_iso: Optional[str] = None) -> Optional[dict]:
+        """
+        获取任务指定指标的统计信息（单条 SQL 聚合查询：count/min/max/avg）。
+
+        【评审修订 M3】刻意不含 last、不做 ORDER BY DESC 取最新值：范围内最新值
+        由调用方（历史页）复用表格查询结果的末元素（内层 DESC LIMIT 契约保证
+        末点即范围内最新），省一次无索引排序。
+
+        Args:
+            task_id: 任务ID
+            metric_type: 指标类型（查询任务首指标时自动包含 metric_type 为 NULL
+                         的旧数据，语义同 get_task_data_points）
+            since_iso: ISO 格式字符串（可选），只统计 timestamp >= since_iso 的
+                       数据点；None 表示统计全部。同样只接受 ISO 字符串，严禁传入
+                       epoch float（评审修订 B1）
+
+        Returns:
+            Optional[dict]: {'count': int, 'min': float, 'max': float, 'avg': float}；
+                            范围内无数据或查询失败时返回 None
+        """
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+
+                where = 'task_id = ?'
+                params: list = [task_id]
+
+                # 查询任务首指标时，NULL 数据点兜底归为首指标（兼容旧库回填遗漏），
+                # 语义与 get_task_data_points/get_task_data_points_bucketed 一致
+                cursor.execute('SELECT metric_type FROM tasks WHERE task_id = ?', (task_id,))
+                task_row = cursor.fetchone()
+                first_metric = self._parse_metric_types(task_row['metric_type'])[0] if task_row else None
+                if metric_type == first_metric:
+                    where += ' AND (metric_type = ? OR metric_type IS NULL)'
+                else:
+                    where += ' AND metric_type = ?'
+                params.append(metric_type)
+
+                if since_iso is not None:
+                    where += ' AND timestamp >= ?'
+                    params.append(since_iso)
+
+                cursor.execute(f'''
+                    SELECT COUNT(*) AS cnt, MIN(value) AS min_v, MAX(value) AS max_v, AVG(value) AS avg_v
+                    FROM data_points
+                    WHERE {where}
+                ''', params)
+                row = cursor.fetchone()
+                if not row or not row['cnt']:
+                    return None
+                return {
+                    'count': row['cnt'],
+                    'min': row['min_v'],
+                    'max': row['max_v'],
+                    'avg': row['avg_v'],
+                }
+        except Exception:
+            logger.error("获取指标统计失败: task_id=%s", task_id, exc_info=True)
+            return None
+
+    def get_last_point_timestamp(self, task_id: str) -> Optional[datetime]:
+        """
+        获取任务全部指标里最新一条数据点的时间戳（MAX(timestamp)）。
+
+        用于历史页"时间范围"筛选的锚点计算：锚定该任务最后一个数据点的时间，
+        而非当前时刻——停止已久的任务选"最近1小时"仍应能看到其最后一小时的数据。
+        现有索引 (task_id, metric_type) 不含 timestamp，本查询走全表 filter，由
+        调用方按任务缓存结果，避免切范围/切指标时重复触发（评审修订 M3）。
+
+        Args:
+            task_id: 任务ID
+
+        Returns:
+            Optional[datetime]: 解析后的 datetime；该任务无数据点或查询失败时返回 None
+        """
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    'SELECT MAX(timestamp) AS latest FROM data_points WHERE task_id = ?',
+                    (task_id,)
+                )
+                row = cursor.fetchone()
+                if not row or row['latest'] is None:
+                    return None
+                return datetime.fromisoformat(row['latest'])
+        except Exception:
+            logger.error("获取任务最新数据点时间戳失败: task_id=%s", task_id, exc_info=True)
+            return None
+
     # ========== 数据清理 ==========
 
     def cleanup_old_tasks(self, retention_days: int) -> int:
@@ -785,6 +897,52 @@ class Database:
         except Exception:
             logger.error("启动自动清理失败", exc_info=True)
             return 0
+
+    # ========== 数据库维护（v1.3.0 批4） ==========
+
+    def get_db_size_bytes(self) -> int:
+        """
+        获取数据库占用磁盘的总字节数：主库文件 + WAL 模式下的 -wal/-shm 边车
+        文件（三者中实际存在的部分求和）。WAL checkpoint 之前，最近写入的数据
+        实际存在 -wal 文件里，只统计主库文件会低估真实占用，故必须三者相加。
+
+        供设置页"清理并压缩数据库"卡片展示当前占用；单个文件缺失或权限异常
+        时该部分记 0，不整体失败（与本类其余方法的静默失败语义一致）。
+
+        Returns:
+            int: 总字节数
+        """
+        total = 0
+        for suffix in ('', '-wal', '-shm'):
+            path = self.db_path + suffix
+            try:
+                if os.path.exists(path):
+                    total += os.path.getsize(path)
+            except OSError:
+                logger.error("获取数据库文件大小失败: %s", path, exc_info=True)
+        return total
+
+    def vacuum(self) -> None:
+        """
+        压缩数据库文件：先 PRAGMA wal_checkpoint(TRUNCATE) 把 -wal 中的未落盘
+        数据合并进主文件并尽量清空 -wal，再执行 VACUUM 重建主文件、回收已删除
+        数据占用的空间（已用临时脚本实测：同连接内 checkpoint 后紧跟 VACUUM
+        不受 sqlite3 模块隐式事务影响，不会抛 "cannot VACUUM from within a
+        transaction"）。
+
+        VACUUM 期间需要对数据库有较独占的访问，调用方（设置页"立即清理"）应
+        只在确认当前无运行中监控任务时才提供入口；本方法自身不做任务运行状态
+        检查（不越权触达 core 层，遵守分层）。
+
+        静默失败语义：与本类其余方法一致，异常只记日志不向上抛出——调用方
+        （后台 QThread）无需再 try/except 包裹一层。
+        """
+        try:
+            with self._get_connection() as conn:
+                conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+                conn.execute('VACUUM')
+        except Exception:
+            logger.error("压缩数据库失败", exc_info=True)
 
 
 # 单元测试

@@ -9,7 +9,7 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QScrollArea,
                              QFileDialog, QSizePolicy)
 from qfluentwidgets import (
     ComboBox, CardWidget, PrimaryPushButton, PushButton, FluentIcon,
-    StrongBodyLabel, BodyLabel, CaptionLabel, LineEdit,
+    StrongBodyLabel, BodyLabel, CaptionLabel, LineEdit, TitleLabel,
     InfoBar, InfoBarPosition
 )
 
@@ -69,9 +69,9 @@ class ExportPage(QScrollArea):
         main_layout.setContentsMargins(30, 30, 30, 30)
         main_layout.setSpacing(20)
 
-        # 页面标题
-        title = StrongBodyLabel("数据导出")
-        title.setStyleSheet("font-size: 24px; font-weight: bold;")
+        # 页面标题（TitleLabel 自带 28px 粗体样式与浅/深色自适应文字颜色，
+        # 不再用内联样式硬编码字号/字重）
+        title = TitleLabel("数据导出")
         main_layout.addWidget(title)
 
         # ========== 任务选择区域 ==========
@@ -103,6 +103,14 @@ class ExportPage(QScrollArea):
         task_row_layout.addWidget(self.refresh_button)
 
         select_layout.addLayout(task_row_layout)
+
+        # 空状态占位（C3）：任务下拉为空时显示，同时禁用下拉框与浏览/导出按钮，
+        # 避免用户点击后触发既有"未选任务"提示与本占位重复打扰（评审修订 N6）
+        self.empty_state_label = BodyLabel(
+            "暂无可导出的监控任务数据，先到监控页创建监控任务")
+        self.empty_state_label.setAlignment(Qt.AlignCenter)
+        self.empty_state_label.setVisible(False)
+        select_layout.addWidget(self.empty_state_label)
 
         main_layout.addWidget(select_card)
 
@@ -191,9 +199,9 @@ class ExportPage(QScrollArea):
 
         export_layout.addLayout(path_layout)
 
-        # 格式说明
+        # 格式说明：沿用 CaptionLabel 默认主题色（浅/深色自适应），不再用内联样式
+        # 硬编码固定灰色——固定色在深色主题下对比度差，且不会随主题切换更新
         format_hint = CaptionLabel("导出格式: CSV文件 (逗号分隔值，支持Excel打开)")
-        format_hint.setStyleSheet("color: #666;")
         export_layout.addWidget(format_hint)
 
         main_layout.addWidget(export_card)
@@ -218,6 +226,28 @@ class ExportPage(QScrollArea):
 
         # 添加底部伸缩空间
         main_layout.addStretch()
+
+    def _set_empty_state(self, is_empty: bool) -> None:
+        """
+        切换空状态占位说明与控件禁用（C3，评审修订 N6）
+
+        任务下拉为空时显示占位说明并禁用下拉框、浏览按钮；导出按钮的可用性
+        额外与"导出是否正在进行中"做 AND——不能在导出线程运行期间被这里误
+        重新启用（例如导出耗时较长、用户中途切走页面又切回来触发 showEvent
+        重新加载任务列表的场景），也不能在导出线程结束后被空状态覆盖为禁用。
+        按钮禁用后，既有 _browse_save_path/_export_data 内的"未选任务"/
+        "未选路径"提示不会被用户点击触发，不与本占位重复打扰。
+
+        Args:
+            is_empty: 当前是否处于"无可导出任务"的空状态
+        """
+        self.empty_state_label.setVisible(is_empty)
+        self.task_combo.setEnabled(not is_empty)
+        self.browse_button.setEnabled(not is_empty)
+
+        is_exporting = self._export_worker is not None and self._export_worker.isRunning()
+        if not is_exporting:
+            self.export_button.setEnabled(not is_empty)
 
     def _load_tasks(self):
         """加载任务列表"""
@@ -251,7 +281,10 @@ class ExportPage(QScrollArea):
             self._clear_task_info()
             self.current_task_id = None
             self.current_task = None
+            self._set_empty_state(True)
             return
+
+        self._set_empty_state(False)
 
         # 添加到下拉框
         for task in tasks:

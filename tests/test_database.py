@@ -298,3 +298,210 @@ def test_cleanup_old_tasks_uses_start_time_when_end_time_null(db):
 
     assert deleted == 1
     assert db.get_task(task.task_id) is None
+
+
+# ========== v1.3.0 批2：since_iso 时间过滤 / 统计 / 最新时间戳 ==========
+# 评审修订 B1 是本批最高优先级事实：data_points.timestamp 在库里是 ISO TEXT，
+# SQL 过滤参数必须用 ISO 字符串。以下用例均显式断言"过滤后行数 < 全量行数"，
+# 防止重犯"float 过滤恒真、时间过滤静默失效"的回归（opus 评审已实测过该缺陷）。
+
+def test_data_points_since_filter(db):
+    """since_iso 只返回该时间及之后的点（取第6个点的 ISO 字符串），且行数必须收窄"""
+    task = _make_task()
+    db.save_task(task)
+
+    base = datetime(2026, 1, 1)
+    points = [
+        DataPoint(task_id=task.task_id, timestamp=base + timedelta(seconds=i),
+                  value=float(i), metric_type="memory_rss")
+        for i in range(10)
+    ]
+    db.save_data_points(points)
+
+    since_iso = points[5].timestamp.isoformat()  # 第6个点（i=5）
+    result = db.get_task_data_points(task.task_id, metric_type="memory_rss", since_iso=since_iso)
+
+    assert len(result) == 5  # i=5..9
+    assert len(result) < len(points), "过滤后行数必须收窄，否则时间过滤静默失效（B1 回归）"
+    assert [p.value for p in result] == [5.0, 6.0, 7.0, 8.0, 9.0]
+    assert result[0].timestamp < result[1].timestamp < result[-1].timestamp
+
+
+def test_data_points_since_with_limit(db):
+    """since 范围内 5 条、limit=3 时取"范围内最近 3 条"，仍按时间升序"""
+    task = _make_task()
+    db.save_task(task)
+
+    base = datetime(2026, 1, 1)
+    points = [
+        DataPoint(task_id=task.task_id, timestamp=base + timedelta(seconds=i),
+                  value=float(i), metric_type="memory_rss")
+        for i in range(10)
+    ]
+    db.save_data_points(points)
+
+    since_iso = points[5].timestamp.isoformat()
+    result = db.get_task_data_points(
+        task.task_id, metric_type="memory_rss", limit=3, since_iso=since_iso)
+
+    assert len(result) == 3
+    assert [p.value for p in result] == [7.0, 8.0, 9.0]
+    assert result[0].timestamp < result[1].timestamp < result[2].timestamp
+
+
+def test_bucketed_since_filter(db):
+    """分桶查询带 since 只对范围内数据分桶，行数（等价于覆盖的原始点数）必须收窄"""
+    task = _make_task()
+    db.save_task(task)
+
+    base = datetime(2026, 1, 1)
+    points = [
+        DataPoint(task_id=task.task_id, timestamp=base + timedelta(seconds=i),
+                  value=float(i), metric_type="memory_rss")
+        for i in range(20)
+    ]
+    db.save_data_points(points)
+
+    full = db.get_task_data_points_bucketed(task.task_id, metric_type="memory_rss", max_buckets=2000)
+    since_iso = points[15].timestamp.isoformat()
+    filtered = db.get_task_data_points_bucketed(
+        task.task_id, metric_type="memory_rss", max_buckets=2000, since_iso=since_iso)
+
+    assert len(full) == 20
+    assert len(filtered) == 5  # i=15..19，未超过 max_buckets，逐行成桶等价于全量返回
+    assert len(filtered) < len(full), "过滤后行数必须收窄，否则时间过滤静默失效（B1 回归）"
+    assert min(p.value for p in filtered) == 15.0
+    assert max(p.value for p in filtered) == 19.0
+    timestamps = [p.timestamp for p in filtered]
+    assert timestamps == sorted(timestamps)
+
+
+def test_metric_stats_basic(db):
+    """已知数据集校验 count/min/max/avg 精确值（不含 last，评审修订 M3）"""
+    task = _make_task()
+    db.save_task(task)
+
+    base = datetime(2026, 1, 1)
+    values = [10.0, 20.0, 30.0, 40.0, 50.0]
+    points = [
+        DataPoint(task_id=task.task_id, timestamp=base + timedelta(seconds=i),
+                  value=v, metric_type="memory_rss")
+        for i, v in enumerate(values)
+    ]
+    db.save_data_points(points)
+
+    stats = db.get_metric_stats(task.task_id, "memory_rss")
+
+    assert stats is not None
+    assert 'last' not in stats
+    assert stats['count'] == 5
+    assert stats['min'] == 10.0
+    assert stats['max'] == 50.0
+    assert stats['avg'] == 30.0
+
+
+def test_metric_stats_since_filter_narrows_range(db):
+    """stats 的 since_iso 过滤同样必须收窄，覆盖 get_metric_stats 自身的 B1 回归风险"""
+    task = _make_task()
+    db.save_task(task)
+
+    base = datetime(2026, 1, 1)
+    points = [
+        DataPoint(task_id=task.task_id, timestamp=base + timedelta(seconds=i),
+                  value=float(i), metric_type="memory_rss")
+        for i in range(10)
+    ]
+    db.save_data_points(points)
+
+    full_stats = db.get_metric_stats(task.task_id, "memory_rss")
+    since_iso = points[5].timestamp.isoformat()
+    filtered_stats = db.get_metric_stats(task.task_id, "memory_rss", since_iso=since_iso)
+
+    assert full_stats['count'] == 10
+    assert filtered_stats['count'] == 5
+    assert filtered_stats['count'] < full_stats['count'], "过滤后行数必须收窄（B1 回归）"
+    assert filtered_stats['min'] == 5.0
+    assert filtered_stats['max'] == 9.0
+
+
+def test_metric_stats_empty_returns_none(db):
+    """任务无数据（或过滤后范围内无数据）时返回 None，而不是 count=0 的字典"""
+    task = _make_task()
+    db.save_task(task)
+
+    assert db.get_metric_stats(task.task_id, "memory_rss") is None
+
+    # 有数据但 since_iso 晚于全部数据点时，范围内同样无数据
+    db.save_data_points([
+        DataPoint(task_id=task.task_id, timestamp=datetime(2026, 1, 1),
+                  value=1.0, metric_type="memory_rss"),
+    ])
+    future_iso = datetime(2099, 1, 1).isoformat()
+    assert db.get_metric_stats(task.task_id, "memory_rss", since_iso=future_iso) is None
+
+
+def test_last_point_timestamp(db):
+    """返回该任务全部指标里最新一条数据点的时间戳（跨指标取 MAX，不局限于单指标）"""
+    task = _make_task()
+    db.save_task(task)
+
+    base = datetime(2026, 1, 1)
+    db.save_data_points([
+        DataPoint(task_id=task.task_id, timestamp=base, value=1.0, metric_type="memory_rss"),
+        DataPoint(task_id=task.task_id, timestamp=base + timedelta(seconds=5),
+                  value=2.0, metric_type="cpu_percent"),
+        DataPoint(task_id=task.task_id, timestamp=base + timedelta(seconds=2),
+                  value=3.0, metric_type="memory_rss"),
+    ])
+
+    last_dt = db.get_last_point_timestamp(task.task_id)
+
+    assert last_dt == base + timedelta(seconds=5)
+    assert isinstance(last_dt, datetime)
+
+
+def test_last_point_timestamp_empty_none(db):
+    """任务无数据点时返回 None"""
+    task = _make_task()
+    db.save_task(task)
+
+    assert db.get_last_point_timestamp(task.task_id) is None
+
+
+# ========== v1.3.0 批4：数据库维护（get_db_size_bytes / vacuum） ==========
+
+def test_db_size_positive(db):
+    """写入数据后总占用字节数（db 主文件 + -wal/-shm 边车文件求和）应 > 0"""
+    task = _make_task()
+    db.save_task(task)
+    db.save_data_points([
+        DataPoint(task_id=task.task_id, timestamp=datetime.now(),
+                  value=1.0, metric_type="memory_rss"),
+    ])
+
+    assert db.get_db_size_bytes() > 0
+
+
+def test_vacuum_runs_and_shrinks_or_noop(db):
+    """删除大量行后 vacuum 不报错、且总占用不增大（不强断言一定缩小，避免对
+    SQLite 内部页面回收策略做过强假设——但已用临时脚本实测同等规模数据确实
+    会缩小，这里保留宽松断言以降低对实现细节的耦合）"""
+    task = _make_task()
+    db.save_task(task)
+
+    base = datetime(2026, 1, 1)
+    points = [
+        DataPoint(task_id=task.task_id, timestamp=base + timedelta(seconds=i),
+                  value=float(i), metric_type="memory_rss")
+        for i in range(5000)
+    ]
+    for i in range(0, len(points), 2000):
+        db.save_data_points(points[i:i + 2000])
+
+    db.delete_task(task.task_id)  # 只留下空壳：已删除行占用的页尚未回收
+
+    size_before = db.get_db_size_bytes()
+    db.vacuum()
+    size_after = db.get_db_size_bytes()
+
+    assert size_after <= size_before
