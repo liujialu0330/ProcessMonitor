@@ -84,7 +84,7 @@ def test_gui_smoke_full_lifecycle(qapp, e2e_db, tmp_path, monkeypatch):
         # ========== 2. 轮询等待至少 2 次采集 ==========
         got_two_samples = _poll_until(lambda: card.count >= 2)
         assert got_two_samples, f"15s 内未采集到 2 次数据，实际 count={card.count}"
-        assert card.count_label.text() == f"已记录: {card.count} 次采集"
+        assert card.count_label.text() == f"已记录：{card.count} 次采集"
 
         _pause()
 
@@ -154,7 +154,10 @@ def test_gui_smoke_full_lifecycle(qapp, e2e_db, tmp_path, monkeypatch):
             rows = list(csv.reader(f))
         assert len(rows) >= 3, f"导出 CSV 应至少含表头+2 行数据，实际 {len(rows)} 行"
 
-        assert startfile_calls, "导出完成后应触发（被拦截的）打开文件夹调用"
+        assert not startfile_calls, "导出完成后不应自动打开文件夹抢占焦点"
+        assert export_page.open_folder_button.isVisible()
+        export_page.open_folder_button.click()
+        assert startfile_calls == [str(tmp_path)], "用户点击后才应打开导出目录"
 
         _pause()
 

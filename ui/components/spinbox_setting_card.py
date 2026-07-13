@@ -20,7 +20,7 @@ class SpinBoxSettingCard(SettingCard):
     valueChanged = pyqtSignal(int)
 
     def __init__(self, configItem: RangeConfigItem, icon: Union[str, QIcon, FluentIconBase],
-                 title: str, content: str = None, parent=None):
+                 title: str, content: str = None, parent=None, suffix: str = ""):
         """
         Args:
             configItem: 绑定的 RangeConfigItem（SpinBox 取值范围取自 configItem.range）
@@ -28,6 +28,7 @@ class SpinBoxSettingCard(SettingCard):
             title: 卡片标题
             content: 卡片说明文字
             parent: 父窗口
+            suffix: 数值后缀，用于明确秒等单位
         """
         super().__init__(icon, title, content, parent)
         self.configItem = configItem
@@ -35,7 +36,8 @@ class SpinBoxSettingCard(SettingCard):
         self.spinBox = SpinBox(self)
         self.spinBox.setRange(*configItem.range)
         self.spinBox.setValue(qconfig.get(configItem))
-        self.spinBox.setMinimumWidth(150)
+        self.spinBox.setSuffix(suffix)
+        self.spinBox.setMinimumWidth(120)
 
         self.hBoxLayout.addWidget(self.spinBox, 0, Qt.AlignRight)
         self.hBoxLayout.addSpacing(16)

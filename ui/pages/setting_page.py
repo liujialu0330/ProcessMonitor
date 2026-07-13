@@ -1,8 +1,6 @@
 """
 设置页面
-外观 / 监控 / 数据 / 行为 四组配置（v1.3.0 批1 落地外观/监控/数据三组；批4
-在数据组补充"清理并压缩数据库""数据目录"两张卡片，并新增"行为"组"关闭窗口
-时最小化到托盘"开关）
+将主题、默认采集周期和托盘行为收敛为「常规」，保留「数据」作为独立分组。
 """
 import logging
 import os
@@ -17,6 +15,7 @@ from qfluentwidgets import (
 
 from app_config import cfg
 from ui.components.spinbox_setting_card import SpinBoxSettingCard
+from ui.typography import PageTitleLabel
 import config
 
 logger = logging.getLogger(__name__)
@@ -99,20 +98,23 @@ class SettingPage(ScrollArea):
         self._refresh_data_management_state()
 
     def _init_appearance_group(self):
-        """外观分组：应用主题"""
-        self.appearance_group = SettingCardGroup("外观", self.scroll_widget)
+        """常规分组：外观、监控默认值与窗口行为共享一个容器。"""
+        self.general_group = SettingCardGroup("常规", self.scroll_widget)
+        # 保留原有属性，兼容已有的 GUI 冒烟与外部读取。
+        self.appearance_group = self.general_group
         self.theme_card = OptionsSettingCard(
-            cfg.themeMode, FIF.BRUSH, "应用主题", "调整应用的外观主题",
-            texts=["浅色", "深色", "跟随系统"], parent=self.appearance_group)
-        self.appearance_group.addSettingCard(self.theme_card)
+            cfg.themeMode, FIF.BRUSH, "应用主题", "选择浅色、深色或跟随系统",
+            texts=["浅色", "深色", "跟随系统"], parent=self.general_group)
+        self.general_group.addSettingCard(self.theme_card)
 
     def _init_monitor_group(self):
-        """监控分组：默认采集周期"""
-        self.monitor_group = SettingCardGroup("监控", self.scroll_widget)
+        """常规分组：默认采集周期。"""
+        self.monitor_group = self.general_group
         self.default_interval_card = SpinBoxSettingCard(
             cfg.default_interval, FIF.STOP_WATCH, "默认采集周期",
-            "新建监控任务时采集周期的默认值（1~3600 秒）", parent=self.monitor_group)
-        self.monitor_group.addSettingCard(self.default_interval_card)
+            "用于新建任务，创建时仍可调整",
+            parent=self.general_group, suffix=" 秒")
+        self.general_group.addSettingCard(self.default_interval_card)
 
     def _init_data_group(self):
         """数据分组：历史数据保留策略 + 数据管理（v1.3.0 批4：清理压缩、打开
@@ -120,7 +122,7 @@ class SettingPage(ScrollArea):
         self.data_group = SettingCardGroup("数据", self.scroll_widget)
         self.retention_card = OptionsSettingCard(
             cfg.retention_days, FIF.DELETE, "历史数据保留",
-            "启动时自动清理已停止且超期的任务数据",
+            "启动时清理超过保留期限的已停止任务",
             texts=["永久保留", "7 天", "30 天", "90 天", "180 天"],
             parent=self.data_group)
         self.data_group.addSettingCard(self.retention_card)
@@ -128,23 +130,29 @@ class SettingPage(ScrollArea):
         # 清理并压缩数据库：content 显示当前占用，随 showEvent 刷新
         # （见 _refresh_data_management_state）；运行中有任务时按钮禁用
         self.cleanup_card = PushSettingCard(
-            "立即清理", FIF.BROOM, "清理并压缩数据库", "当前占用 --",
+            "立即清理", FIF.BROOM, "清理并压缩数据库", "当前占用 —",
             parent=self.data_group)
         self.data_group.addSettingCard(self.cleanup_card)
 
-        # 数据目录：content 固定显示路径，点击用系统资源管理器打开
+        # 长路径收敛为末两级，完整值放在 tooltip，避免卡片文字挤压按钮。
+        normalized_path = os.path.normpath(config.DATA_DIR)
+        parent_name = os.path.basename(os.path.dirname(normalized_path))
+        dir_name = os.path.basename(normalized_path)
+        compact_path = os.path.join("…", parent_name, dir_name)
         self.open_dir_card = PushSettingCard(
-            "打开", FIF.FOLDER, "数据目录", config.DATA_DIR, parent=self.data_group)
+            "打开", FIF.FOLDER, "数据目录", compact_path, parent=self.data_group)
+        self.open_dir_card.contentLabel.setToolTip(normalized_path)
+        self.open_dir_card.button.setToolTip(normalized_path)
         self.data_group.addSettingCard(self.open_dir_card)
 
     def _init_behavior_group(self):
-        """行为分组：关闭窗口时是否最小化到系统托盘（v1.3.0 批4，D 托盘驻留）"""
-        self.behavior_group = SettingCardGroup("行为", self.scroll_widget)
+        """常规分组：关闭窗口时是否最小化到系统托盘。"""
+        self.behavior_group = self.general_group
         self.close_to_tray_card = SwitchSettingCard(
-            FIF.MINIMIZE, "关闭窗口时最小化到托盘",
-            "开启后点击关闭按钮将隐藏窗口并继续采集，经托盘菜单「退出」结束程序",
-            configItem=cfg.close_to_tray, parent=self.behavior_group)
-        self.behavior_group.addSettingCard(self.close_to_tray_card)
+            FIF.MINIMIZE, "关闭到系统托盘",
+            "关闭窗口后继续采集，可从托盘菜单退出",
+            configItem=cfg.close_to_tray, parent=self.general_group)
+        self.general_group.addSettingCard(self.close_to_tray_card)
 
     def _init_layout(self):
         """整体布局：ScrollArea + ExpandLayout 承载各分组
@@ -157,12 +165,12 @@ class SettingPage(ScrollArea):
         普通 QVBoxLayout 感知不到这种手动 resize，会导致展开内容被裁切或与
         下方分组重叠。
         """
-        self.expand_layout.setSpacing(28)
-        self.expand_layout.setContentsMargins(30, 20, 30, 20)
+        self.expand_layout.setSpacing(20)
+        self.expand_layout.setContentsMargins(30, 24, 30, 24)
+        self.page_title = PageTitleLabel("设置", self.scroll_widget)
+        self.expand_layout.addWidget(self.page_title)
         self.expand_layout.addWidget(self.appearance_group)
-        self.expand_layout.addWidget(self.monitor_group)
         self.expand_layout.addWidget(self.data_group)
-        self.expand_layout.addWidget(self.behavior_group)
 
         self.setWidget(self.scroll_widget)
         self.setWidgetResizable(True)
@@ -236,7 +244,7 @@ class SettingPage(ScrollArea):
         if days > 0:
             content = f"将删除超过 {days} 天的已停止任务数据并压缩数据库文件，此操作不可撤销。"
         else:
-            content = "当前保留策略为永久保留，仅压缩数据库文件（VACUUM），不删除任何数据。"
+            content = "当前为永久保留，仅压缩数据库文件，不会删除数据。"
 
         box = MessageBox("清理并压缩数据库", content, self.window())
         if not box.exec():
@@ -244,7 +252,7 @@ class SettingPage(ScrollArea):
 
         self.cleanup_card.button.setEnabled(False)
         self._state_tooltip = StateToolTip(
-            "正在清理", "清理并压缩数据库中，请稍候…", self.window())
+            "正在清理数据", "正在压缩数据库，请稍候…", self.window())
         self._state_tooltip.move(self._state_tooltip.getSuitablePos())
         self._state_tooltip.show()
 
@@ -256,7 +264,7 @@ class SettingPage(ScrollArea):
         """清理线程完成：StateToolTip 收尾，刷新占用显示与按钮可用状态，并
         释放线程引用"""
         if self._state_tooltip is not None:
-            self._state_tooltip.setContent("清理并压缩完成")
+            self._state_tooltip.setContent("数据库清理完成")
             self._state_tooltip.setState(True)
             self._state_tooltip = None
         self._refresh_data_management_state()

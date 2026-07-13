@@ -28,17 +28,20 @@ ProcessMonitor is a Windows 11 Fluent Design desktop app for keeping an eye on a
 - **Configurable interval** — any integer from 1 to 3600 seconds, default 1s
 - **Process search** — filter the process list by typing part of its name or PID
 - **Pause & resume** — pause a running task without losing its history, and pick it back up anytime
+- **Process-first workflow** — the redesigned Fluent layout makes process search the primary entry point, summarizes the selected metrics, and presents task identity, state, live values, trends and actions in a clear hierarchy
 - **Mini trend sparkline** — every task card shows a 60-sample trend line for its primary metric at a glance
 
 ### 📊 Data & Export
-- **Interactive history charts** — hover crosshair with a live time/value readout, quick time-range switch (10m / 1h / 6h / 24h / all), a stats summary (current/min/max/avg), a real date/time axis, and one-click export to PNG or the clipboard
+- **Focused history workspace** — responsive two-row filters, a four-column stats strip, dedicated Trend/Details views, a 1-hour default range, and on-demand raw values and deletion actions
+- **Interactive history charts** — hover crosshair with a live time/value readout, quick time-range switch (10m / 1h / 6h / 24h / all), a real date/time axis, adaptive KB/MB/GB/TB display, reduced tick density, and one-click export to PNG or the clipboard
 - **Downsampled history charts** — large tasks are bucketed on the database side (up to 2,000 buckets, min/max per bucket) so peaks and valleys stay visible without shipping every raw point
 - **Fast history table** — shows the most recent 2,000 samples for smooth scrolling even on long-running tasks (exports are never truncated — always the full dataset)
-- **Wide-format CSV export** — one row per sample, one column per metric, background-thread export with mid-export cancel support
-- **One-click cleanup** — delete a finished task's data straight from the History page
+- **Wide-format CSV export** — a single continuous export flow with one row per sample, one column per metric, background execution and cancellation; the destination folder opens only when you ask for it
+- **Controlled cleanup** — delete a finished task from the History page's More menu, with confirmation and safeguards for running tasks
 
 ### ⚙️ Settings & Personalization
 - **Theme** — light, dark, or follow the system, switches instantly
+- **Fluent typography** — a consistent Segoe UI / Microsoft YaHei UI type system, 24px page titles and monospaced data labels across every page
 - **Defaults & retention** — set the default sampling interval and a history retention policy (forever / 7 / 30 / 90 / 180 days)
 - **Database maintenance** — see current disk usage and clean up + compact the database in one click
 - **System tray** — optionally minimize to tray on close and keep monitoring in the background
@@ -46,7 +49,7 @@ ProcessMonitor is a Windows 11 Fluent Design desktop app for keeping an eye on a
 ### 🛡 Reliability
 - **Auto-update** — checks GitHub Releases on startup (or on demand) and downloads/launches the installer for you; the startup check now shows a non-modal notice instead of interrupting you
 - **Crash-resilient storage** — SQLite with WAL mode, automatic retry on failed writes, crash/error logging, and automatic recovery of orphaned "running" tasks after an unclean shutdown
-- **Automated test suite** — 96 test cases covering the data layer, schema migration, export and update-check logic
+- **Automated test suite** — 100 test cases covering the data layer, schema migration, export, update checks, responsive history layout, typography and metric formatting
 - **Measured performance** — opening a 770k-row history task takes ~1.4s (down from 3.4s pre-v1.2.0; measured on the maintainer's dev machine)
 
 ## 📸 Screenshots
@@ -55,9 +58,9 @@ ProcessMonitor is a Windows 11 Fluent Design desktop app for keeping an eye on a
 |---|---|
 | ![Monitor page](screenshots/monitor-page.png) | ![History page](screenshots/history-page.png) |
 
-| Data Export | |
+| Data Export | Settings & About |
 |---|---|
-| ![Export page](screenshots/export-page.png) | |
+| ![Export page](screenshots/export-page.png) | ![Settings page](screenshots/setting-page.png)<br>![About page](screenshots/about-page.png) |
 
 ## 🚀 Getting Started
 
@@ -94,6 +97,9 @@ flowchart TD
         MW[MainWindow] --> MP[Monitor Page]
         MW --> HP[History Page]
         MW --> EP[Export Page]
+        MW --> SP[Settings Page]
+        MW --> AP[About Page]
+        TS[Typography System] --> MW
     end
     subgraph Core["Core Layer (core/)"]
         MM[MonitorManager] --> MT[MonitorTask QThread]

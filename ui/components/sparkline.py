@@ -18,8 +18,8 @@ FIXED_HEIGHT = 36
 # qconfig.themeChanged——任务卡片随监控任务动态创建/销毁，这样实现不必在卡片
 # 销毁时手动断开主题信号连接，零信号残留。颜色自含常量，不依赖批2的
 # ui/chart_theme.py（该模块服务于历史页图表，两者取色场景独立）。
-_LIGHT_COLOR = QColor("#0078D4")
-_DARK_COLOR = QColor("#4cc2ff")
+_LIGHT_COLOR = QColor("#0A8F8F")
+_DARK_COLOR = QColor("#44D7D1")
 
 
 class SparklineWidget(QWidget):

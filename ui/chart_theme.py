@@ -19,13 +19,13 @@ def chart_colors() -> dict:
             'background': '#2b2b2b',
             'axis': '#d0d0d0',
             'text': '#d0d0d0',
-            'curve': '#4cc2ff',
+            'curve': '#44D7D1',
             'crosshair': '#8a8a8a',
         }
     return {
         'background': '#ffffff',
         'axis': '#606060',
         'text': '#606060',
-        'curve': '#0078D4',
+        'curve': '#0A8F8F',
         'crosshair': '#a0a0a0',
     }

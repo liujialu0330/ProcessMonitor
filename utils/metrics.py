@@ -112,6 +112,33 @@ METRIC_UNITS = {
     MetricType.IO_OTHER_BYTES: "KB",
 }
 
+
+# 这些指标的底层采集单位固定为 KB；界面可按数值量级切换到 MB/GB/TB，数据库与
+# CSV 的原始单位不受影响。
+_KB_VALUE_METRICS = {
+    MetricType.MEMORY_RSS,
+    MetricType.MEMORY_VMS,
+    MetricType.MEMORY_PEAK_WSET,
+    MetricType.MEMORY_PRIVATE,
+    MetricType.MEMORY_PAGEFILE,
+    MetricType.MEMORY_PEAK_PAGEFILE,
+    MetricType.MEMORY_PAGED_POOL,
+    MetricType.MEMORY_PEAK_PAGED_POOL,
+    MetricType.MEMORY_NONPAGED_POOL,
+    MetricType.MEMORY_PEAK_NONPAGED_POOL,
+    MetricType.MEMORY_USS,
+    MetricType.IO_READ_BYTES,
+    MetricType.IO_WRITE_BYTES,
+    MetricType.IO_OTHER_BYTES,
+}
+
+_KB_DISPLAY_DIVISORS = {
+    "KB": 1.0,
+    "MB": 1024.0,
+    "GB": 1024.0 * 1024.0,
+    "TB": 1024.0 * 1024.0 * 1024.0,
+}
+
 # 可用的监控指标列表（按类别分组）
 AVAILABLE_METRICS = {
     "内存": [
@@ -162,29 +189,44 @@ def get_metric_unit(metric_type: str) -> str:
     return METRIC_UNITS.get(metric_type, "")
 
 
-def format_metric_value(metric_type: str, value: float) -> str:
+def get_metric_display_unit(metric_type: str, reference_value: float) -> str:
+    """按参考值选择界面显示单位；非 KB 指标保持定义单位。"""
+    if metric_type not in _KB_VALUE_METRICS:
+        return get_metric_unit(metric_type)
+
+    magnitude = abs(reference_value)
+    if magnitude >= _KB_DISPLAY_DIVISORS["TB"]:
+        return "TB"
+    if magnitude >= _KB_DISPLAY_DIVISORS["GB"]:
+        return "GB"
+    if magnitude >= _KB_DISPLAY_DIVISORS["MB"]:
+        return "MB"
+    return "KB"
+
+
+def format_metric_value(
+        metric_type: str, value: float, display_unit: str = None) -> str:
     """格式化指标值为可读字符串"""
     unit = get_metric_unit(metric_type)
 
-    # 内存类（KB），保留2位小数
-    if metric_type in [
-        MetricType.MEMORY_RSS, MetricType.MEMORY_VMS,
-        MetricType.MEMORY_PEAK_WSET, MetricType.MEMORY_PRIVATE,
-        MetricType.MEMORY_PAGEFILE, MetricType.MEMORY_PEAK_PAGEFILE,
-        MetricType.MEMORY_PAGED_POOL, MetricType.MEMORY_PEAK_PAGED_POOL,
-        MetricType.MEMORY_NONPAGED_POOL, MetricType.MEMORY_PEAK_NONPAGED_POOL,
-        MetricType.MEMORY_USS,
-        MetricType.IO_READ_BYTES, MetricType.IO_WRITE_BYTES, MetricType.IO_OTHER_BYTES
-    ]:
-        return f"{value:.2f} {unit}"
+    def compact_number(number: float, decimals: int = 2) -> str:
+        """添加千分位并去掉无信息量的尾随零。"""
+        return f"{number:,.{decimals}f}".rstrip("0").rstrip(".")
+
+    # 内存与 I/O 字节类自动选择 KB/MB/GB/TB；历史页可显式传 display_unit，
+    # 让同一图表里的统计、悬停、表格与坐标轴始终使用同一个单位。
+    if metric_type in _KB_VALUE_METRICS:
+        unit = display_unit or get_metric_display_unit(metric_type, value)
+        divisor = _KB_DISPLAY_DIVISORS.get(unit, 1.0)
+        return f"{compact_number(value / divisor)} {unit}"
 
     # 百分比，保留1位小数
     elif metric_type in [MetricType.MEMORY_PERCENT, MetricType.CPU_PERCENT]:
-        return f"{value:.1f} {unit}"
+        return f"{value:,.1f}{unit}"
 
     # 时间类（秒），保留2位小数
     elif metric_type in [MetricType.CPU_USER_TIME, MetricType.CPU_SYSTEM_TIME]:
-        return f"{value:.2f} {unit}"
+        return f"{value:,.2f} {unit}"
 
     # 整数类（次数、个数、优先级等）
     elif metric_type in [
@@ -193,8 +235,8 @@ def format_metric_value(metric_type: str, value: float) -> str:
         MetricType.IO_READ_COUNT, MetricType.IO_WRITE_COUNT, MetricType.IO_OTHER_COUNT,
         MetricType.MEMORY_NUM_PAGE_FAULTS, MetricType.CPU_PRIORITY
     ]:
-        return f"{int(value)} {unit}".strip()
+        return f"{int(value):,} {unit}".strip()
 
     # 默认保留2位小数
     else:
-        return f"{value:.2f} {unit}"
+        return f"{compact_number(value)} {unit}".strip()
