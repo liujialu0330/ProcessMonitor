@@ -7,12 +7,15 @@ import sys
 import webbrowser
 
 from PyQt5.QtCore import Qt, pyqtSignal
-from PyQt5.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QScrollArea
+from PyQt5.QtGui import QPixmap
+from PyQt5.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QScrollArea, QLabel, QSizePolicy
+)
 from qfluentwidgets import (
     CardWidget, PrimaryPushButton, FluentIcon,
-    StrongBodyLabel, BodyLabel, CaptionLabel, HyperlinkLabel,
-    MessageBoxBase, SubtitleLabel, TitleLabel, PushButton,
-    InfoBar, InfoBarPosition, ProgressBar
+    StrongBodyLabel, BodyLabel, CaptionLabel,
+    MessageBoxBase, SubtitleLabel, PushButton,
+    InfoBar, InfoBarPosition, ProgressBar, TextEdit
 )
 
 import config
@@ -20,6 +23,7 @@ from core.update_checker import (
     UpdateChecker, UpdateDownloader,
     get_skipped_version, set_skipped_version
 )
+from ui.typography import DataCaptionLabel, PageTitleLabel
 
 
 class UpdateAvailableDialog(MessageBoxBase):
@@ -35,17 +39,12 @@ class UpdateAvailableDialog(MessageBoxBase):
 
         notes = (info.get('notes') or '').strip()
         if notes:
-            # 更新说明过长时截断
-            if len(notes) > 500:
-                notes = notes[:500] + "…"
-            notes_label = BodyLabel(f"本次更新:\n{notes}")
-            notes_label.setWordWrap(True)
-            self.viewLayout.addWidget(notes_label)
-
-        hint = CaptionLabel(
-            '"现在更新"立即下载安装包；"跳过此版本"将不再提示该版本；"稍后"下次启动再提醒。')
-        hint.setWordWrap(True)
-        self.viewLayout.addWidget(hint)
+            self.viewLayout.addWidget(StrongBodyLabel("更新说明"))
+            self.notes_edit = TextEdit()
+            self.notes_edit.setReadOnly(True)
+            self.notes_edit.setPlainText(notes[:4000] + ("…" if len(notes) > 4000 else ""))
+            self.notes_edit.setFixedHeight(160)
+            self.viewLayout.addWidget(self.notes_edit)
 
         self.yesButton.setText("现在更新")
         self.cancelButton.setText("稍后")
@@ -113,35 +112,36 @@ class AboutPage(QScrollArea):
         main_layout.setContentsMargins(30, 30, 30, 30)
         main_layout.setSpacing(20)
 
-        # 页面标题（TitleLabel 自带 28px 粗体样式与浅/深色自适应文字颜色，
-        # 不再用内联样式硬编码字号/字重）
-        title = TitleLabel("关于")
+        title = PageTitleLabel("关于")
         main_layout.addWidget(title)
 
-        # ========== 应用信息区域 ==========
+        # 产品头：把应用身份、版本和项目入口放在同一个视觉单元。
         info_card = CardWidget()
-        info_layout = QVBoxLayout(info_card)
+        info_layout = QHBoxLayout(info_card)
         info_layout.setContentsMargins(20, 20, 20, 20)
-        info_layout.setSpacing(12)
+        info_layout.setSpacing(16)
 
-        info_layout.addWidget(StrongBodyLabel(config.APP_NAME))
+        icon_label = QLabel()
+        icon_label.setFixedSize(52, 52)
+        icon_label.setAlignment(Qt.AlignCenter)
+        icon_path = config.get_icon_path()
+        if os.path.exists(icon_path):
+            icon_label.setPixmap(
+                QPixmap(icon_path).scaled(
+                    48, 48, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        info_layout.addWidget(icon_label, 0, Qt.AlignTop)
 
-        version_layout = QHBoxLayout()
-        version_layout.setSpacing(20)
-        version_layout.addWidget(BodyLabel("当前版本:"))
-        version_layout.addWidget(CaptionLabel(f"v{config.APP_VERSION}"))
-        version_layout.addStretch()
-        info_layout.addLayout(version_layout)
+        product_layout = QVBoxLayout()
+        product_layout.setSpacing(3)
+        product_layout.addWidget(SubtitleLabel(config.APP_NAME))
+        product_layout.addWidget(BodyLabel("轻量的 Windows 进程性能监控工具"))
+        product_layout.addWidget(DataCaptionLabel(f"版本 v{config.APP_VERSION}"))
+        info_layout.addLayout(product_layout, 1)
 
-        repo_layout = QHBoxLayout()
-        repo_layout.setSpacing(20)
-        repo_layout.addWidget(BodyLabel("项目主页:"))
-        repo_url = f"https://github.com/{config.GITHUB_OWNER}/{config.GITHUB_REPO}"
-        repo_link = HyperlinkLabel(repo_url)
-        repo_link.setUrl(repo_url)
-        repo_layout.addWidget(repo_link)
-        repo_layout.addStretch()
-        info_layout.addLayout(repo_layout)
+        self.repo_url = f"https://github.com/{config.GITHUB_OWNER}/{config.GITHUB_REPO}"
+        self.repo_button = PushButton("访问项目主页", self, FluentIcon.GITHUB)
+        self.repo_button.clicked.connect(self._open_project_homepage)
+        info_layout.addWidget(self.repo_button, 0, Qt.AlignVCenter)
 
         main_layout.addWidget(info_card)
 
@@ -151,19 +151,20 @@ class AboutPage(QScrollArea):
         update_layout.setContentsMargins(20, 20, 20, 20)
         update_layout.setSpacing(12)
 
-        update_layout.addWidget(StrongBodyLabel("软件更新"))
-
-        button_layout = QHBoxLayout()
-        button_layout.setSpacing(15)
+        update_header_layout = QHBoxLayout()
+        update_header_layout.setSpacing(15)
+        update_header_layout.addWidget(StrongBodyLabel("软件更新"))
+        update_header_layout.addStretch()
         self.check_button = PrimaryPushButton("检查更新", self, FluentIcon.SYNC)
         self.check_button.setMaximumWidth(160)
-        self.check_button.clicked.connect(lambda: self.check_update(silent=False))
-        button_layout.addWidget(self.check_button)
+        self.check_button.clicked.connect(self._on_manual_check_clicked)
+        update_header_layout.addWidget(self.check_button)
+        update_layout.addLayout(update_header_layout)
 
-        self.status_label = CaptionLabel("")
-        button_layout.addWidget(self.status_label)
-        button_layout.addStretch()
-        update_layout.addLayout(button_layout)
+        self.status_label = BodyLabel("尚未检查更新")
+        self.status_label.setWordWrap(True)
+        self.status_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        update_layout.addWidget(self.status_label)
 
         # 下载进度条（默认隐藏）
         self.progress_bar = ProgressBar()
@@ -172,6 +173,14 @@ class AboutPage(QScrollArea):
 
         main_layout.addWidget(update_card)
         main_layout.addStretch()
+
+    def _open_project_homepage(self) -> None:
+        """打开 GitHub 项目主页。"""
+        webbrowser.open(self.repo_url)
+
+    def _on_manual_check_clicked(self) -> None:
+        """手动检查更新，避免用 lambda 隐藏按钮的操作语义。"""
+        self.check_update(silent=False)
 
     # ========== 更新流程 ==========
 
@@ -229,9 +238,9 @@ class AboutPage(QScrollArea):
         self.check_button.setEnabled(True)
         if silent:
             # 静默检查失败不打扰用户
-            self.status_label.setText("")
+            self.status_label.setText("自动检查未完成，可手动重试")
             return
-        self.status_label.setText(msg)
+        self.status_label.setText("检查更新失败，可稍后重试")
         InfoBar.warning(
             title="检查更新失败",
             content=msg,
@@ -263,7 +272,8 @@ class AboutPage(QScrollArea):
                 duration=4000,
                 parent=self
             )
-            self.status_label.setText(f"发现新版本 v{info['version']}（开发环境不自动安装）")
+            self.status_label.setText(
+                f"发现新版本 v{info['version']}；源码环境不支持自动安装")
             return
 
         if not info.get('asset_url'):
@@ -271,7 +281,7 @@ class AboutPage(QScrollArea):
             webbrowser.open(info['html_url'] or
                             f"https://github.com/{config.GITHUB_OWNER}/"
                             f"{config.GITHUB_REPO}/releases")
-            self.status_label.setText("该版本未提供安装包，已打开发布页面")
+            self.status_label.setText("未找到安装包，已打开发布页")
             return
 
         self._pending_info = info
@@ -321,13 +331,13 @@ class AboutPage(QScrollArea):
             else:
                 window.close()
         else:
-            self.status_label.setText(f"安装包已保存到: {path}")
+            self.status_label.setText(f"安装包已保存：{path}")
 
     def _on_download_error(self, msg: str):
         """下载失败"""
         self.progress_bar.setVisible(False)
         self.check_button.setEnabled(True)
-        self.status_label.setText(msg)
+        self.status_label.setText("下载失败，可稍后重试")
         InfoBar.warning(
             title="下载失败",
             content=msg,

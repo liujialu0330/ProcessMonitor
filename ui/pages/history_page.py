@@ -5,24 +5,35 @@
 """
 import bisect
 import logging
+import math
 from datetime import datetime, timedelta
 from typing import Optional
 
 from PyQt5.QtCore import Qt, QEvent
-from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QScrollArea,
-                             QTableWidgetItem, QHeaderView, QSizePolicy,
-                             QFileDialog, QApplication)
+from PyQt5.QtGui import QFont
+from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
+                             QScrollArea, QTableWidgetItem, QHeaderView,
+                             QSizePolicy, QFileDialog, QApplication,
+                             QStackedWidget)
 from qfluentwidgets import (
     ComboBox, CardWidget, PushButton, FluentIcon,
     StrongBodyLabel, BodyLabel, CaptionLabel, InfoBar, InfoBarPosition,
-    TableWidget, MessageBox, SegmentedWidget, TransparentToolButton, qconfig
+    TableWidget, MessageBox, SegmentedWidget, TransparentToolButton, qconfig,
+    TransparentDropDownPushButton, RoundMenu, Action, VerticalSeparator,
+    IconWidget, setCustomStyleSheet
 )
 import pyqtgraph as pg
 from pyqtgraph import exporters
 
 from data.database import Database
 from ui.chart_theme import chart_colors
-from utils.metrics import get_metric_display_name, format_metric_value
+from ui.typography import (
+    DataCaptionLabel, PageTitleLabel, StatValueLabel, TypeScale,
+    data_font, ui_font
+)
+from utils.metrics import (
+    format_metric_value, get_metric_display_name, get_metric_display_unit
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,10 +54,75 @@ TIME_RANGE_OPTIONS = [
     ('all', '全部', None),
 ]
 TIME_RANGE_SECONDS = {key: seconds for key, _text, seconds in TIME_RANGE_OPTIONS}
-DEFAULT_TIME_RANGE_KEY = 'all'
+DEFAULT_TIME_RANGE_KEY = '1h'
 
 # 表格时间列显示格式（A4）：真实时间轴替代原相对秒数展示，含月日避免跨天歧义
 TABLE_TIME_FORMAT = '%m-%d %H:%M:%S'
+
+# 指标原始值以 KB 存储；坐标轴只转换显示文本，不改动绘图数据与数据库语义。
+_DISPLAY_UNIT_DIVISORS = {
+    'KB': 1.0,
+    'MB': 1024.0,
+    'GB': 1024.0 ** 2,
+    'TB': 1024.0 ** 3,
+}
+
+
+class _MetricAxisItem(pg.AxisItem):
+    """历史指标 Y 轴：固定使用当前视图的显示单位并格式化千分位。
+
+    轴上仍接收数据库的原始数值，只在 tickStrings 中转换文本，
+    因此不会影响曲线、悬停吸附或导出图片的数据契约。
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.display_unit = ''
+
+    def set_display_unit(self, display_unit: str) -> None:
+        """设置当前视图固定的单位并使旧绘图缓存失效。"""
+        self.display_unit = display_unit or ''
+        self.picture = None
+        self.update()
+
+    def tickStrings(self, values, scale, spacing):
+        divisor = _DISPLAY_UNIT_DIVISORS.get(self.display_unit, 1.0)
+        scaled_spacing = abs(spacing * scale / divisor)
+        if not math.isfinite(scaled_spacing) or scaled_spacing <= 0:
+            decimals = 0
+        elif scaled_spacing >= 1:
+            decimals = 0
+        else:
+            decimals = min(4, max(0, math.ceil(-math.log10(scaled_spacing))))
+
+        strings = []
+        for value in values:
+            scaled_value = value * scale / divisor
+            strings.append(f"{scaled_value:,.{decimals}f}")
+        return strings
+
+
+class _ContextDateAxisItem(pg.DateAxisItem):
+    """在亚分钟缩放下保留完整时间上下文的 DateAxisItem。"""
+
+    def tickStrings(self, values, scale, spacing):
+        # DateAxisItem 在亚秒级默认只显示「36.500」一类秒数，
+        # 对性能监控读图而言缺少时分上下文。其他尺度仍交还
+        # pyqtgraph 的成熟自动分级逻辑。
+        if spacing >= 60:
+            return super().tickStrings(values, scale, spacing)
+
+        strings = []
+        try:
+            for value in values:
+                point_time = datetime.fromtimestamp(value)
+                if spacing < 1:
+                    strings.append(point_time.strftime('%H:%M:%S.%f')[:-3])
+                else:
+                    strings.append(point_time.strftime('%H:%M:%S'))
+        except (OverflowError, OSError, ValueError):
+            return super().tickStrings(values, scale, spacing)
+        return strings
 
 
 class HistoryPage(QScrollArea):
@@ -90,6 +166,7 @@ class HistoryPage(QScrollArea):
         self._chart_x = []
         self._chart_y = []
         self._chart_metric_type = None
+        self._chart_display_unit = ''
 
         # 初始化UI
         self._init_ui()
@@ -114,57 +191,84 @@ class HistoryPage(QScrollArea):
 
         # 主布局
         main_layout = QVBoxLayout(container)
-        main_layout.setContentsMargins(30, 30, 30, 30)
-        main_layout.setSpacing(20)
+        main_layout.setContentsMargins(24, 24, 24, 24)
+        main_layout.setSpacing(16)
 
-        # ========== 任务选择区域 ==========
+        # ========== 页面标题与低频操作 ==========
+        title_layout = QHBoxLayout()
+        title_layout.setSpacing(8)
+        title_layout.addWidget(PageTitleLabel("历史数据"))
+        title_layout.addStretch()
+
+        self.refresh_button = PushButton("刷新", self, FluentIcon.SYNC)
+        self.refresh_button.clicked.connect(self._load_tasks)
+        title_layout.addWidget(self.refresh_button)
+
+        # 删除是低频且高风险的操作，收纳到「更多」菜单，避免与筛选控件
+        # 等权常驻。隐藏的 delete_button 保留旧属性与 click() 能力，
+        # 不破坏已有调用方；界面实际入口是 delete_action。
+        self.more_button = TransparentDropDownPushButton(
+            "更多", self, FluentIcon.MORE)
+        self.more_menu = RoundMenu(parent=self)
+
+        self.raw_value_action = Action(FluentIcon.DOCUMENT, "显示原始值", self)
+        self.raw_value_action.setCheckable(True)
+        self.raw_value_action.toggled.connect(self._toggle_raw_values)
+        self.more_menu.addAction(self.raw_value_action)
+        self.more_menu.addSeparator()
+
+        self.delete_button = PushButton("删除此任务数据", self, FluentIcon.DELETE)
+        self.delete_button.hide()
+        self.delete_button.setEnabled(False)
+        self.delete_button.clicked.connect(self._on_delete_task_clicked)
+        self.delete_action = Action(FluentIcon.DELETE, "删除此任务数据", self)
+        self.delete_action.setEnabled(False)
+        self.delete_action.triggered.connect(self.delete_button.click)
+        self.more_menu.addAction(self.delete_action)
+        self.more_button.setMenu(self.more_menu)
+        title_layout.addWidget(self.more_button)
+        main_layout.addLayout(title_layout)
+
+        # ========== 任务与展示范围 ==========
         select_card = CardWidget()
-        select_layout = QHBoxLayout(select_card)
-        select_layout.setContentsMargins(20, 20, 20, 20)
-        select_layout.setSpacing(15)
+        self.select_layout = QGridLayout(select_card)
+        self.select_layout.setContentsMargins(16, 14, 16, 14)
+        self.select_layout.setHorizontalSpacing(12)
+        self.select_layout.setVerticalSpacing(10)
 
-        # 任务选择
-        task_label = BodyLabel("选择任务:")
+        # 任务选择独占一行，长进程名和时间不再与其他控件抢宽度
+        self.task_label = BodyLabel("监控任务")
         self.task_combo = ComboBox()
         self.task_combo.setPlaceholderText("选择要查看的监控任务")
-        self.task_combo.setMinimumWidth(400)
+        self.task_combo.setMinimumWidth(220)
+        self.task_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.task_combo.currentIndexChanged.connect(self._on_task_selected)
 
         # 指标选择（多指标任务切换查看不同指标）
-        metric_label = BodyLabel("指标:")
+        self.metric_label = BodyLabel("指标")
         self.metric_combo = ComboBox()
         self.metric_combo.setPlaceholderText("选择指标")
-        self.metric_combo.setMinimumWidth(160)
+        self.metric_combo.setMinimumWidth(140)
         self.metric_combo.currentIndexChanged.connect(self._on_metric_selected)
 
-        # 刷新按钮
-        self.refresh_button = PushButton("刷新", self, FluentIcon.SYNC)
-        self.refresh_button.clicked.connect(self._load_tasks)
+        self.range_label = BodyLabel("时间范围")
+        self.range_segmented = SegmentedWidget()
+        for route_key, text, _seconds in TIME_RANGE_OPTIONS:
+            self.range_segmented.addItem(routeKey=route_key, text=text)
+        self.range_segmented.currentItemChanged.connect(self._on_time_range_changed)
+        self.range_segmented.setCurrentItem(DEFAULT_TIME_RANGE_KEY)
 
-        # 删除此任务数据按钮
-        self.delete_button = PushButton("删除此任务数据", self, FluentIcon.DELETE)
-        self.delete_button.setEnabled(False)
-        self.delete_button.clicked.connect(self._on_delete_task_clicked)
-
-        select_layout.addWidget(task_label)
-        select_layout.addWidget(self.task_combo, 1)
-        select_layout.addWidget(metric_label)
-        select_layout.addWidget(self.metric_combo)
-        select_layout.addWidget(self.refresh_button)
-        select_layout.addWidget(self.delete_button)
+        self.select_layout.addWidget(self.task_label, 0, 0)
+        self.select_layout.addWidget(self.task_combo, 0, 1, 1, 3)
+        self.select_layout.addWidget(self.metric_label, 1, 0)
+        self.select_layout.addWidget(self.metric_combo, 1, 1)
+        self.select_layout.addWidget(self.range_label, 1, 2)
+        self.select_layout.addWidget(self.range_segmented, 1, 3)
+        self.select_layout.setColumnStretch(1, 2)
+        self.select_layout.setColumnStretch(3, 3)
+        self._filters_compact = None
 
         main_layout.addWidget(select_card)
-
-        # 数据量提示（表格与图表均按当前时间范围+最近 N 次采集限流展示，导出仍为全量）
-        # 沿用 CaptionLabel 默认主题色（浅/深色自适应），不再用内联样式硬编码固定灰色
-        limit_hint = CaptionLabel(
-            f"表格显示所选时间范围内最近 {TABLE_POINT_LIMIT} 次采集，图表按数据分桶展示"
-            "（保留尖峰），导出数据仍为全量")
-        main_layout.addWidget(limit_hint)
-
-        # ========== 图表区域 ==========
-        chart_label = StrongBodyLabel("数据趋势图")
-        main_layout.addWidget(chart_label)
 
         # 十字线（A1）：随图表数据一起在 _redraw_chart 中重新加入 PlotItem——
         # chart_widget.clear() 会清空 PlotItem 下全部 item，含本对象
@@ -174,12 +278,24 @@ class HistoryPage(QScrollArea):
         # 真实时间轴（A4）：x 轴改用 DateAxisItem 显示实际日期时间刻度；绘图 x 数据
         # 统一用 epoch float（dp.timestamp.timestamp()），仅用于绘图，严禁回流到
         # SQL 查询参数（评审修订 B1，SQL 过滤参数全链路走 ISO 字符串）
-        self.chart_widget = pg.PlotWidget(axisItems={'bottom': pg.DateAxisItem()})
-        self.chart_widget.showGrid(x=True, y=True, alpha=0.3)
+        self._value_axis = _MetricAxisItem(orientation='left')
+        self._value_axis.enableAutoSIPrefix(False)
+        self._time_axis = _ContextDateAxisItem(orientation='bottom')
+        self.chart_widget = pg.PlotWidget(axisItems={
+            'left': self._value_axis,
+            'bottom': self._time_axis,
+        })
+        self.chart_widget.showGrid(x=False, y=True, alpha=0.18)
         self.chart_widget.setLabel('left', '值')
         self.chart_widget.setLabel('bottom', '时间')
-        # 设置图表固定高度，确保X轴完整显示
-        self.chart_widget.setFixedHeight(400)
+        for axis in (self._value_axis, self._time_axis):
+            axis.setTickFont(data_font(TypeScale.CHART_TICK))
+            axis.setStyle(maxTickLevel=0, tickTextOffset=6)
+            axis.setTickDensity(0.55)
+            axis.label.setFont(ui_font(TypeScale.CAPTION))
+        # 保留约 360px 的有效读图高度，同时允许高窗口自动拉伸
+        self.chart_widget.setMinimumHeight(340)
+        self.chart_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         # 渲染优化：分桶数据已保留尖峰，这里叠加 pyqtgraph 自身的峰值抽稀与视口裁剪，
         # 双保险应对缩放/大量点渲染时的卡顿。
         # 注：架构方案文本写的关键字是 method='peak'，但本项目实际安装的 pyqtgraph
@@ -198,16 +314,15 @@ class HistoryPage(QScrollArea):
 
         chart_card = CardWidget()
         chart_layout = QVBoxLayout(chart_card)
-        chart_layout.setContentsMargins(10, 10, 10, 10)
+        chart_layout.setContentsMargins(16, 12, 16, 16)
         chart_layout.setSpacing(8)
 
-        # 图表工具行：时间范围切换（A2）+ 导出按钮（A5）
+        # 图表工具行只保留当前读数和图片快捷操作；两个透明图标
+        # 是低强调入口，不再与时间范围争夺注意力。
         chart_toolbar = QHBoxLayout()
-        self.range_segmented = SegmentedWidget()
-        for route_key, text, _seconds in TIME_RANGE_OPTIONS:
-            self.range_segmented.addItem(routeKey=route_key, text=text)
-        self.range_segmented.currentItemChanged.connect(self._on_time_range_changed)
-        self.range_segmented.setCurrentItem(DEFAULT_TIME_RANGE_KEY)
+        self.hover_label = DataCaptionLabel("")
+        chart_toolbar.addWidget(self.hover_label)
+        chart_toolbar.addStretch()
 
         self.save_png_button = TransparentToolButton(FluentIcon.SAVE, chart_card)
         self.save_png_button.setToolTip("保存图表为图片")
@@ -217,58 +332,167 @@ class HistoryPage(QScrollArea):
         self.copy_chart_button.setToolTip("复制图表到剪贴板")
         self.copy_chart_button.clicked.connect(self._copy_chart_to_clipboard)
 
-        chart_toolbar.addWidget(self.range_segmented)
-        chart_toolbar.addStretch()
         chart_toolbar.addWidget(self.save_png_button)
         chart_toolbar.addWidget(self.copy_chart_button)
         chart_layout.addLayout(chart_toolbar)
-
-        # 统计摘要行（A3）+ 悬停读数（A1，右侧独立 label）
-        stats_row = QHBoxLayout()
-        self.stats_label = BodyLabel(self._EMPTY_STATS_TEXT)
-        self.hover_label = CaptionLabel("")
-        stats_row.addWidget(self.stats_label)
-        stats_row.addStretch()
-        stats_row.addWidget(self.hover_label)
-        chart_layout.addLayout(stats_row)
-
         chart_layout.addWidget(self.chart_widget)
 
-        main_layout.addWidget(chart_card)
-
         # ========== 数据表格区域 ==========
-        table_label = StrongBodyLabel("详细数据")
-        main_layout.addWidget(table_label)
-
         # 创建表格（使用Fluent-Widgets的TableWidget）
         self.data_table = TableWidget()
+        self.data_table.setFont(data_font(TypeScale.BODY))
         self.data_table.setColumnCount(3)
         self.data_table.setHorizontalHeaderLabels(['时间', '值', '原始值'])
         self.data_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.data_table.setAlternatingRowColors(True)
         self.data_table.setEditTriggers(TableWidget.NoEditTriggers)
         self.data_table.setSelectionBehavior(TableWidget.SelectRows)
-        # 设置表格固定高度，显示更多行
-        self.data_table.setFixedHeight(500)
+        self.data_table.setMinimumHeight(340)
+        self.data_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         # 设置Fluent Design样式
         self.data_table.setBorderVisible(True)
         self.data_table.setBorderRadius(8)
         self.data_table.setWordWrap(False)
+        self.data_table.setColumnHidden(2, True)
         # 隐藏行号
         self.data_table.verticalHeader().hide()
+        self.data_table.verticalHeader().setDefaultSectionSize(36)
+        header_font = ui_font(TypeScale.CAPTION, QFont.DemiBold)
+        self.data_table.horizontalHeader().setFont(header_font)
+        header_families = ','.join(
+            f"'{family}'" for family in header_font.families())
+        header_qss = (
+            "QHeaderView::section {"
+            f"font-family: {header_families};"
+            f"font-size: {TypeScale.CAPTION}px;"
+            "font-weight: 600;"
+            "}"
+        )
+        setCustomStyleSheet(self.data_table, header_qss, header_qss)
 
         table_card = CardWidget()
         table_layout = QVBoxLayout(table_card)
-        table_layout.setContentsMargins(10, 10, 10, 10)
+        table_layout.setContentsMargins(16, 12, 16, 16)
+        table_header = QHBoxLayout()
+        table_header.addWidget(StrongBodyLabel("采样明细"))
+        table_header.addStretch()
+        table_header.addWidget(CaptionLabel("最新数据优先"))
+        table_layout.addLayout(table_header)
         table_layout.addWidget(self.data_table)
 
-        main_layout.addWidget(table_card)
-        # 添加底部伸缩空间
-        main_layout.addStretch()
+        # ========== 统计带 + 趋势/明细子视图 ==========
+        self.analysis_page = QWidget()
+        analysis_layout = QVBoxLayout(self.analysis_page)
+        analysis_layout.setContentsMargins(0, 0, 0, 0)
+        analysis_layout.setSpacing(12)
+
+        stats_card = CardWidget()
+        stats_layout = QHBoxLayout(stats_card)
+        stats_layout.setContentsMargins(16, 10, 16, 10)
+        stats_layout.setSpacing(0)
+        self.stat_value_labels = {}
+        for index, key in enumerate(("当前", "最小", "最大", "平均")):
+            stat_widget = QWidget(stats_card)
+            stat_layout = QVBoxLayout(stat_widget)
+            stat_layout.setContentsMargins(12, 0, 12, 0)
+            stat_layout.setSpacing(3)
+            stat_layout.addWidget(CaptionLabel(key))
+            value_label = StatValueLabel("--")
+            value_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            stat_layout.addWidget(value_label)
+            stats_layout.addWidget(stat_widget, 1)
+            self.stat_value_labels[key] = value_label
+            if index < 3:
+                stats_layout.addWidget(VerticalSeparator(stats_card))
+        analysis_layout.addWidget(stats_card)
+
+        # 兼容旧的 stats_label 文本 API，但不再把一大段统计文字渲染在界面。
+        self.stats_label = BodyLabel(self._EMPTY_STATS_TEXT, self.analysis_page)
+        self.stats_label.hide()
+
+        view_header = QHBoxLayout()
+        self.view_segmented = SegmentedWidget()
+        self.view_segmented.setFixedWidth(180)
+        self.view_segmented.addItem(routeKey='trend', text='趋势')
+        self.view_segmented.addItem(routeKey='detail', text='明细')
+        self.view_segmented.currentItemChanged.connect(self._on_view_changed)
+        view_header.addWidget(self.view_segmented)
+        view_header.addStretch()
+        analysis_layout.addLayout(view_header)
+
+        self.view_stack = QStackedWidget()
+        self.view_stack.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.view_stack.addWidget(chart_card)
+        self.view_stack.addWidget(table_card)
+        self.view_segmented.setCurrentItem('trend')
+        analysis_layout.addWidget(self.view_stack, 1)
+
+        # 空状态作为内容区的一种状态，不再反复用 InfoBar 打断操作。
+        self.empty_state_page = CardWidget()
+        empty_layout = QVBoxLayout(self.empty_state_page)
+        empty_layout.setContentsMargins(24, 48, 24, 48)
+        empty_layout.setSpacing(8)
+        empty_layout.addStretch()
+        empty_icon = IconWidget(FluentIcon.HISTORY, self.empty_state_page)
+        empty_icon.setFixedSize(32, 32)
+        empty_layout.addWidget(empty_icon, 0, Qt.AlignHCenter)
+        self.empty_title_label = StrongBodyLabel("暂无历史数据")
+        self.empty_title_label.setAlignment(Qt.AlignCenter)
+        empty_layout.addWidget(self.empty_title_label)
+        self.empty_detail_label = CaptionLabel("完成一次监控后，数据会显示在这里")
+        self.empty_detail_label.setAlignment(Qt.AlignCenter)
+        self.empty_detail_label.setWordWrap(True)
+        empty_layout.addWidget(self.empty_detail_label)
+        empty_layout.addStretch()
+
+        self.content_stack = QStackedWidget()
+        self.content_stack.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.content_stack.setMinimumHeight(430)
+        self.content_stack.addWidget(self.empty_state_page)
+        self.content_stack.addWidget(self.analysis_page)
+        self.content_stack.setCurrentWidget(self.empty_state_page)
+        main_layout.addWidget(self.content_stack, 1)
+
+        self._update_filter_layout(self.viewport().width())
 
         # 图表主题适配（A6）：构造时应用一次当前主题配色，并随全局主题切换实时重绘
         self._apply_chart_theme()
         qconfig.themeChanged.connect(self._on_theme_changed)
+
+    def _update_filter_layout(self, available_width: int):
+        """在窄窗口下将时间范围自动换到下一行。
+
+        常规宽度仍是「任务独占一行，指标+时间范围第二行」；
+        当内容区不足时让时间范围换行，避免分段控件被裁切。
+        """
+        compact = available_width < 720
+        if self._filters_compact == compact:
+            return
+
+        self._filters_compact = compact
+        self.select_layout.removeWidget(self.range_label)
+        self.select_layout.removeWidget(self.range_segmented)
+        if compact:
+            self.select_layout.addWidget(self.range_label, 2, 0)
+            self.select_layout.addWidget(self.range_segmented, 2, 1, 1, 3)
+        else:
+            self.select_layout.addWidget(self.range_label, 1, 2)
+            self.select_layout.addWidget(self.range_segmented, 1, 3)
+
+    def _toggle_raw_values(self, checked: bool):
+        """按需显示原始值列，默认只保留用户最常用的时间与格式化值。"""
+        self.data_table.setColumnHidden(2, not checked)
+        self.raw_value_action.setText("隐藏原始值" if checked else "显示原始值")
+
+    def _on_view_changed(self, route_key: str):
+        """切换趋势/明细子视图，避免图表与长表格纵向堆叠。"""
+        self.view_stack.setCurrentIndex(0 if route_key == 'trend' else 1)
+
+    def _show_empty_state(self, title: str, detail: str):
+        """在页面内展示空状态，不使用短暂且重复的浮层提示。"""
+        self.empty_title_label.setText(title)
+        self.empty_detail_label.setText(detail)
+        self.content_stack.setCurrentWidget(self.empty_state_page)
 
     def _load_tasks(self):
         """加载任务列表"""
@@ -290,33 +514,27 @@ class HistoryPage(QScrollArea):
                 tasks.append(task)
 
         if not tasks:
-            InfoBar.info(
-                title="提示",
-                content="暂无监控任务数据",
-                parent=self,
-                position=InfoBarPosition.TOP,
-                duration=2000
-            )
             # 清空显示和当前任务ID、指标
-            self._clear_display()
+            self._clear_display(
+                "暂无历史数据",
+                "完成一次监控后，数据会显示在这里")
             self._clear_metric_combo()
             self.current_task_id = None
             self.current_metric = None
             self.current_task_status = None
+            self.task_combo.setEnabled(False)
             self._update_delete_button_state()
             return
 
+        self.task_combo.setEnabled(True)
+
         # 3. 添加到下拉框（使用setItemData设置userData）
         for task in tasks:
-            # 单指标保持原格式（显示指标名），多指标显示"N项指标"
-            if len(task.metric_types) == 1:
-                metric_text = get_metric_display_name(task.metric_types[0])
-            else:
-                metric_text = f"{len(task.metric_types)}项指标"
+            # 下拉框只承载任务身份；指标由下一行专门的选择器展示，避免把
+            # 进程、PID、指标和完整秒级时间拼成难以扫描的长句。
             display_text = (
-                f"{task.process_name} (PID: {task.pid}) - "
-                f"{metric_text} - "
-                f"{task.start_time.strftime('%Y-%m-%d %H:%M:%S')}"
+                f"{task.process_name}  ·  PID {task.pid}  ·  "
+                f"{task.start_time.strftime('%m-%d %H:%M')}"
             )
             # 只传递文本，不传递第二个参数
             self.task_combo.addItem(display_text)
@@ -344,7 +562,9 @@ class HistoryPage(QScrollArea):
                     return
 
             # 之前的任务不在列表中了（可能被过滤/被删除），清空显示
-            self._clear_display()
+            self._clear_display(
+                "请选择监控任务",
+                "选定任务和指标后即可查看历史数据")
             self._clear_metric_combo()
             self.current_task_id = None
             self.current_metric = None
@@ -435,8 +655,10 @@ class HistoryPage(QScrollArea):
                 select_index = metric_types.index(preferred_metric)
             self.metric_combo.setCurrentIndex(select_index)
             self.current_metric = metric_types[select_index]
+            self.metric_combo.setEnabled(True)
         else:
             self.current_metric = None
+            self.metric_combo.setEnabled(False)
 
         self.metric_combo.blockSignals(False)
 
@@ -444,6 +666,7 @@ class HistoryPage(QScrollArea):
         """清空指标下拉框（blockSignals防止误触发）"""
         self.metric_combo.blockSignals(True)
         self.metric_combo.clear()
+        self.metric_combo.setEnabled(False)
         self.metric_combo.blockSignals(False)
 
     def _get_cached_last_dt(self, task_id: str) -> Optional[datetime]:
@@ -507,22 +730,13 @@ class HistoryPage(QScrollArea):
 
         if not table_points:
             if self.current_range_key != DEFAULT_TIME_RANGE_KEY:
-                InfoBar.info(
-                    title="提示",
-                    content="所选时间范围内暂无数据，可切换到「全部」查看完整历史",
-                    parent=self,
-                    position=InfoBarPosition.TOP,
-                    duration=2500
-                )
+                self._clear_display(
+                    "所选时间范围内暂无数据",
+                    "尝试切换到「全部」查看完整历史")
             else:
-                InfoBar.info(
-                    title="提示",
-                    content="该任务暂无数据",
-                    parent=self,
-                    position=InfoBarPosition.TOP,
-                    duration=2000
-                )
-            self._clear_display()
+                self._clear_display(
+                    "该任务暂无数据",
+                    "产生新的采样数据后此处会自动更新")
             return
 
         # 图表：SQL 分桶降采样（每桶 MIN/MAX 两点，保留尖峰），按时间升序返回，
@@ -538,6 +752,7 @@ class HistoryPage(QScrollArea):
 
         # 更新统计摘要行（A3）
         self._update_stats(table_points, metric_type, since_iso)
+        self.content_stack.setCurrentWidget(self.analysis_page)
 
     def _update_chart(self, data_points, metric_type):
         """
@@ -558,10 +773,21 @@ class HistoryPage(QScrollArea):
             self._chart_x = []
             self._chart_y = []
 
+        reference_value = max((abs(value) for value in self._chart_y), default=0.0)
+        self._chart_display_unit = (
+            get_metric_display_unit(metric_type, reference_value)
+            if metric_type else '')
+        self._value_axis.set_display_unit(self._chart_display_unit)
+
         self._redraw_chart()
 
-        self.chart_widget.setLabel(
-            'left', get_metric_display_name(metric_type) if metric_type else '值')
+        if metric_type:
+            metric_name = get_metric_display_name(metric_type)
+            unit = self._chart_display_unit
+            axis_text = f"{metric_name}（{unit}）" if unit else metric_name
+        else:
+            axis_text = '值'
+        self.chart_widget.setLabel('left', axis_text)
         self.chart_widget.setLabel('bottom', '时间')
 
     def _redraw_chart(self):
@@ -620,7 +846,9 @@ class HistoryPage(QScrollArea):
         self.crosshair_line.setVisible(True)
 
         time_str = datetime.fromtimestamp(x_val).strftime(TABLE_TIME_FORMAT)
-        formatted_value = format_metric_value(self._chart_metric_type, y_val)
+        formatted_value = format_metric_value(
+            self._chart_metric_type, y_val,
+            display_unit=self._chart_display_unit)
         self.hover_label.setText(f"{time_str} · {formatted_value}")
 
     def eventFilter(self, obj, event):
@@ -652,19 +880,33 @@ class HistoryPage(QScrollArea):
         """
         if not table_points or not self.current_task_id or not metric_type:
             self.stats_label.setText(self._EMPTY_STATS_TEXT)
+            self._set_stat_values("--", "--", "--", "--")
             return
 
-        current_text = format_metric_value(metric_type, table_points[-1].value)
+        current_text = format_metric_value(
+            metric_type, table_points[-1].value,
+            display_unit=self._chart_display_unit)
         stats = self.db.get_metric_stats(self.current_task_id, metric_type, since_iso=since_iso)
         if stats:
-            min_text = format_metric_value(metric_type, stats['min'])
-            max_text = format_metric_value(metric_type, stats['max'])
-            avg_text = format_metric_value(metric_type, stats['avg'])
+            min_text = format_metric_value(
+                metric_type, stats['min'], display_unit=self._chart_display_unit)
+            max_text = format_metric_value(
+                metric_type, stats['max'], display_unit=self._chart_display_unit)
+            avg_text = format_metric_value(
+                metric_type, stats['avg'], display_unit=self._chart_display_unit)
         else:
             min_text = max_text = avg_text = "--"
 
         self.stats_label.setText(
             f"当前 {current_text} ｜ 最小 {min_text} ｜ 最大 {max_text} ｜ 平均 {avg_text}")
+        self._set_stat_values(current_text, min_text, max_text, avg_text)
+
+    def _set_stat_values(self, current: str, minimum: str, maximum: str, average: str):
+        """更新四列统计带，保持各数值纵向对齐便于快速比较。"""
+        for key, value in zip(
+                ("当前", "最小", "最大", "平均"),
+                (current, minimum, maximum, average)):
+            self.stat_value_labels[key].setText(value)
 
     def _update_table(self, data_points, metric_type):
         """
@@ -690,28 +932,40 @@ class HistoryPage(QScrollArea):
                 # 仅 HH:MM:SS 展示，避免跨天数据歧义）
                 time_str = dp.timestamp.strftime(TABLE_TIME_FORMAT)
                 time_item = QTableWidgetItem(time_str)
+                time_item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
                 self.data_table.setItem(i, 0, time_item)
 
                 # 格式化的值
-                formatted_value = format_metric_value(metric_type, dp.value)
+                formatted_value = format_metric_value(
+                    metric_type, dp.value,
+                    display_unit=self._chart_display_unit)
                 value_item = QTableWidgetItem(formatted_value)
+                value_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 self.data_table.setItem(i, 1, value_item)
 
                 # 原始值
                 raw_value_item = QTableWidgetItem(f"{dp.value:.4f}")
+                raw_value_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 self.data_table.setItem(i, 2, raw_value_item)
         finally:
             # 表格本就未开启排序（TableWidget 默认不排序），此处只需恢复界面更新
             self.data_table.setUpdatesEnabled(True)
 
-    def _clear_display(self):
-        """清空显示（图表、表格、统计摘要与悬停读数）"""
+    def _clear_display(
+            self,
+            empty_title: str = "请选择监控任务",
+            empty_detail: str = "选定任务和指标后即可查看历史数据"):
+        """清空图表、表格和统计值，并显示对应的内联空状态。"""
         self._chart_x = []
         self._chart_y = []
         self._chart_metric_type = None
+        self._chart_display_unit = ''
+        self._value_axis.set_display_unit('')
         self._redraw_chart()
         self.data_table.setRowCount(0)
         self.stats_label.setText(self._EMPTY_STATS_TEXT)
+        self._set_stat_values("--", "--", "--", "--")
+        self._show_empty_state(empty_title, empty_detail)
 
     def _update_delete_button_state(self):
         """
@@ -721,12 +975,18 @@ class HistoryPage(QScrollArea):
         if not self.current_task_id:
             self.delete_button.setEnabled(False)
             self.delete_button.setToolTip("")
+            self.delete_action.setEnabled(False)
+            self.delete_action.setToolTip("")
         elif self.current_task_status == 'running':
             self.delete_button.setEnabled(False)
             self.delete_button.setToolTip("任务正在运行中，请先停止任务再删除")
+            self.delete_action.setEnabled(False)
+            self.delete_action.setToolTip("任务正在运行中，请先停止任务再删除")
         else:
             self.delete_button.setEnabled(True)
             self.delete_button.setToolTip("")
+            self.delete_action.setEnabled(True)
+            self.delete_action.setToolTip("")
 
     def _on_delete_task_clicked(self):
         """删除此任务数据按钮点击事件：确认对话框 -> delete_task -> 本页刷新"""
@@ -875,6 +1135,12 @@ class HistoryPage(QScrollArea):
     def _on_theme_changed(self, theme):
         """qconfig.themeChanged 回调：全局主题切换时重新取色重绘图表（A6）"""
         self._apply_chart_theme()
+
+    def resizeEvent(self, event):
+        """页面宽度改变时更新筛选区的响应式排列。"""
+        super().resizeEvent(event)
+        if getattr(self, 'select_layout', None) is not None:
+            self._update_filter_layout(self.viewport().width())
 
     def showEvent(self, event):
         """页面显示事件"""

@@ -17,6 +17,7 @@ from qfluentwidgets import (
 from core.monitor_manager import MonitorManager
 from core.process_collector import ProcessCollector
 from ui.components import MetricSelectorDialog, SparklineWidget
+from ui.typography import DataCaptionLabel, DataLabel, PageTitleLabel
 from utils.metrics import (
     get_metric_display_name, format_metric_value, MetricType
 )
@@ -64,7 +65,7 @@ class TaskCard(CardWidget):
         self.metric_types = list(metric_types)
 
         # 指标值标签字典 {指标类型: CaptionLabel}
-        self.value_labels: Dict[str, CaptionLabel] = {}
+        self.value_labels: Dict[str, QLabel] = {}
 
         # 采集次数：内存计数，卡片创建时直接置0（v1.2.0 架构评审裁决——源码核实当前
         # 无"重启后恢复运行中任务"的路径，建卡片时查库是死逻辑，故不查）；每次
@@ -80,74 +81,119 @@ class TaskCard(CardWidget):
 
     def _init_ui(self):
         """初始化UI"""
-        # 设置卡片样式（最小高度，多指标时自适应增高）
-        self.setMinimumHeight(100)
+        # 卡片随指标数量自适应增高，水平方向由页面宽度决定
+        self.setMinimumHeight(140)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
 
-        # 主布局
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(20, 15, 20, 15)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(12)
 
-        # 左侧：进程信息和数据
-        left_layout = QVBoxLayout()
-        left_layout.setSpacing(8)
+        # 顶部：进程身份、状态和任务操作保持在同一视觉层级
+        header_layout = QHBoxLayout()
+        header_layout.setSpacing(12)
 
-        # 进程名和PID，后面追加"已暂停"状态提示（C4，默认隐藏）
+        identity_layout = QVBoxLayout()
+        identity_layout.setSpacing(3)
+
         title_row = QHBoxLayout()
         title_row.setSpacing(8)
-        title_label = StrongBodyLabel(f"{self.process_name} (PID: {self.pid})")
-        title_row.addWidget(title_label)
+        self.title_label = StrongBodyLabel(self.process_name)
+        self.title_label.setToolTip(self.process_name)
+        # 长进程名允许被布局压缩，不与右侧操作按钮共同撑宽卡片
+        self.title_label.setMinimumWidth(1)
+        self.title_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        title_row.addWidget(self.title_label, 1)
+
+        self.running_label = CaptionLabel("运行中")
+        title_row.addWidget(self.running_label)
         self.paused_label = CaptionLabel("已暂停")
         self.paused_label.setTextColor(PAUSED_LABEL_LIGHT_COLOR, PAUSED_LABEL_DARK_COLOR)
         self.paused_label.setVisible(False)
         title_row.addWidget(self.paused_label)
-        title_row.addStretch()
-        left_layout.addLayout(title_row)
+        identity_layout.addLayout(title_row)
 
-        # 指标值网格（每行3个"指标名: 值"）
-        values_layout = QGridLayout()
-        values_layout.setHorizontalSpacing(20)
-        values_layout.setVerticalSpacing(5)
-        for i, metric_type in enumerate(self.metric_types):
-            value_label = CaptionLabel(f"{get_metric_display_name(metric_type)}: --")
-            self.value_labels[metric_type] = value_label
-            values_layout.addWidget(
-                value_label, i // self.VALUE_COLUMNS, i % self.VALUE_COLUMNS)
-        left_layout.addLayout(values_layout)
+        identity_caption = DataCaptionLabel(
+            f"PID {self.pid} · {len(self.metric_types)} 项指标")
+        identity_caption.setToolTip(
+            f"PID {self.pid} · 监控 {len(self.metric_types)} 项指标")
+        identity_caption.setMinimumWidth(1)
+        identity_caption.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        identity_layout.addWidget(identity_caption)
+        header_layout.addLayout(identity_layout, 1)
 
-        # 趋势图（E）：数值网格下方整行，只跟踪首指标（metric_types[0]）
-        self.sparkline = SparklineWidget(maxlen=60)
-        if self.metric_types:
-            self.sparkline.setToolTip(
-                f"最近 60 次采集趋势（{get_metric_display_name(self.metric_types[0])}）")
-        left_layout.addWidget(self.sparkline)
-
-        # 采集次数（内存计数，非落库条数——两者在 flush 失败重试窗口内可能短暂不一致，
-        # 已知可接受行为）
-        self.count_label = CaptionLabel("已记录: 0 次采集")
-        self.count_label.setToolTip("采集次数（非落库条数）")
-        left_layout.addWidget(self.count_label)
-
-        left_layout.addStretch()
-
-        # 右侧：暂停/恢复按钮 + 停止按钮（C4：暂停按钮在停止按钮左侧）
+        # 暂停/恢复按钮在停止按钮左侧，保留既有操作契约
         button_layout = QHBoxLayout()
-        button_layout.setSpacing(10)
+        button_layout.setSpacing(8)
 
         self.pause_button = PushButton("暂停", self, FluentIcon.PAUSE)
         self.pause_button.clicked.connect(self._on_pause_button_clicked)
-        self.pause_button.setFixedWidth(100)
+        self.pause_button.setFixedWidth(88)
         button_layout.addWidget(self.pause_button)
 
         self.stop_button = PushButton("停止", self, FluentIcon.CANCEL)
         self.stop_button.clicked.connect(lambda: self.stop_clicked.emit(self.task_id))
-        self.stop_button.setFixedWidth(100)
+        self.stop_button.setFixedWidth(88)
         button_layout.addWidget(self.stop_button)
 
-        # 添加到主布局
-        layout.addLayout(left_layout, 1)
-        layout.addLayout(button_layout)
-        layout.setAlignment(button_layout, Qt.AlignRight | Qt.AlignVCenter)
+        header_layout.addLayout(button_layout)
+        header_layout.setAlignment(button_layout, Qt.AlignRight | Qt.AlignTop)
+        layout.addLayout(header_layout)
+
+        # 中部：指标名与值分行，用等宽列增强快速比较能力
+        values_layout = QGridLayout()
+        values_layout.setHorizontalSpacing(20)
+        values_layout.setVerticalSpacing(8)
+        for i, metric_type in enumerate(self.metric_types):
+            metric_widget = QWidget(self)
+            metric_layout = QVBoxLayout(metric_widget)
+            metric_layout.setContentsMargins(0, 0, 0, 0)
+            metric_layout.setSpacing(2)
+
+            metric_name = CaptionLabel(get_metric_display_name(metric_type))
+            metric_name.setToolTip(get_metric_display_name(metric_type))
+            metric_name.setMinimumWidth(1)
+            metric_name.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            value_label = DataLabel("--")
+            value_label.setToolTip(get_metric_display_name(metric_type))
+            value_label.setMinimumWidth(1)
+            value_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            metric_layout.addWidget(metric_name)
+            metric_layout.addWidget(value_label)
+
+            self.value_labels[metric_type] = value_label
+            values_layout.addWidget(
+                metric_widget, i // self.VALUE_COLUMNS, i % self.VALUE_COLUMNS)
+        for column in range(self.VALUE_COLUMNS):
+            values_layout.setColumnStretch(column, 1)
+        layout.addLayout(values_layout)
+
+        # 底部：在图表上方明示标注趋势对应的首指标
+        trend_header = QHBoxLayout()
+        trend_header.setSpacing(8)
+        trend_metric_name = (
+            get_metric_display_name(self.metric_types[0])
+            if self.metric_types else "指标"
+        )
+        self.sparkline_label = CaptionLabel(
+            f"{trend_metric_name} · 最近 60 次趋势")
+        self.sparkline_label.setToolTip(
+            f"{trend_metric_name}：最近 60 次采集趋势")
+        self.sparkline_label.setMinimumWidth(1)
+        self.sparkline_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        trend_header.addWidget(self.sparkline_label, 1)
+
+        # 采集次数（内存计数，非落库条数）作为趋势的辅助上下文
+        self.count_label = DataCaptionLabel("已记录：0 次采集")
+        self.count_label.setToolTip("采集次数（非落库条数）")
+        trend_header.addWidget(self.count_label)
+        layout.addLayout(trend_header)
+
+        self.sparkline = SparklineWidget(maxlen=60)
+        if self.metric_types:
+            self.sparkline.setToolTip(
+                f"最近 60 次采集趋势（{get_metric_display_name(self.metric_types[0])}）")
+        layout.addWidget(self.sparkline)
 
     def update_values(self, values: dict):
         """
@@ -161,8 +207,9 @@ class TaskCard(CardWidget):
             if value_label is None:
                 continue
             formatted_value = format_metric_value(metric_type, value)
-            value_label.setText(
-                f"{get_metric_display_name(metric_type)}: {formatted_value}")
+            value_label.setText(formatted_value)
+            value_label.setToolTip(
+                f"{get_metric_display_name(metric_type)}：{formatted_value}")
 
         # 趋势图只跟踪首指标（E，方案3.5）。暂停期间 core 不采集、不 emit
         # data_updated，本方法根本不会被调用，趋势图自然随之静止，无需在这里
@@ -175,7 +222,7 @@ class TaskCard(CardWidget):
     def increment_count(self):
         """采集次数+1并刷新文案（内存计数，每次收到 data_updated 调用一次）"""
         self.count += 1
-        self.count_label.setText(f"已记录: {self.count} 次采集")
+        self.count_label.setText(f"已记录：{self.count} 次采集")
 
     def _on_pause_button_clicked(self):
         """
@@ -213,6 +260,7 @@ class TaskCard(CardWidget):
         else:
             self.pause_button.setText("暂停")
             self.pause_button.setIcon(FluentIcon.PAUSE)
+        self.running_label.setVisible(not is_paused)
         self.paused_label.setVisible(is_paused)
 
 
@@ -273,39 +321,45 @@ class MonitorPage(QScrollArea):
 
         # 主布局
         main_layout = QVBoxLayout(container)
-        main_layout.setContentsMargins(30, 30, 30, 30)
-        main_layout.setSpacing(20)
+        main_layout.setContentsMargins(24, 24, 24, 24)
+        main_layout.setSpacing(16)
+
+        # 页面层级与其他主导航页保持一致，标题与副标题紧密组成一组
+        page_header_layout = QVBoxLayout()
+        page_header_layout.setSpacing(2)
+        page_title = PageTitleLabel("实时监控")
+        page_header_layout.addWidget(page_title)
+        page_subtitle = CaptionLabel("选择进程和指标，快速创建实时采集任务")
+        page_header_layout.addWidget(page_subtitle)
+        main_layout.addLayout(page_header_layout)
 
         # ========== 进程选择区域 ==========
         select_card = CardWidget()
         select_layout = QGridLayout(select_card)
-        select_layout.setContentsMargins(20, 20, 20, 20)
-        select_layout.setSpacing(15)
+        select_layout.setContentsMargins(18, 16, 18, 16)
+        select_layout.setHorizontalSpacing(10)
+        select_layout.setVerticalSpacing(12)
+        select_layout.setColumnStretch(1, 1)
+        select_layout.setColumnStretch(2, 0)
 
         # 标题
-        title_label = StrongBodyLabel("创建监控任务")
+        title_label = StrongBodyLabel("新建监控任务")
         select_layout.addWidget(title_label, 0, 0, 1, 4)
 
-        # 第一行：进程选择（PID输入框、进程下拉框、刷新按钮）
-        process_label = BodyLabel("选择进程:")
+        # 进程搜索是主入口；PID 仍保留为紧凑的快捷/高级入口
+        process_label = BodyLabel("进程")
         select_layout.addWidget(process_label, 1, 0)
-
-        # PID输入框
-        self.pid_input = LineEdit()
-        self.pid_input.setPlaceholderText("输入进程PID")
-        self.pid_input.setFixedWidth(150)
-        self.pid_input.textChanged.connect(self._on_pid_changed)
-        select_layout.addWidget(self.pid_input, 1, 1)
 
         # 进程选择下拉框（C1 进程搜索）：EditableComboBox + 标准 QCompleter 子串
         # 搜索（MatchContains + 大小写不敏感）。completer 模型与 process_combo
-        # 自身 items 使用同一份"{name} (PID: {pid})"文本，从补全下拉选中后，
+        # 自身 items 使用同一份"{name} · PID {pid}"文本，从补全下拉选中后，
         # EditableComboBox 内部据精确文本匹配定位回 itemData（见 qfluentwidgets
         # combo_box.py::_onComboTextChanged），currentIndexChanged 能正常触发，
         # 不破坏既有 _syncing 双向同步与"手输不匹配走 warning 路径"的契约。
         self.process_combo = EditableComboBox()
-        self.process_combo.setPlaceholderText("输入进程名/PID搜索，或从列表中选择")
-        self.process_combo.setMinimumWidth(300)
+        self.process_combo.setPlaceholderText("搜索进程名或 PID")
+        self.process_combo.setMinimumWidth(0)
+        self.process_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.process_combo.currentIndexChanged.connect(self._on_process_selected)
 
         self._process_completer_model = QStringListModel(self)
@@ -314,7 +368,7 @@ class MonitorPage(QScrollArea):
         process_completer.setCaseSensitivity(Qt.CaseInsensitive)
         self.process_combo.setCompleter(process_completer)
 
-        select_layout.addWidget(self.process_combo, 1, 2)
+        select_layout.addWidget(self.process_combo, 1, 1, 1, 2)
 
         # 刷新进程列表按钮
         self.refresh_button = PushButton("刷新", self, FluentIcon.SYNC)
@@ -322,33 +376,42 @@ class MonitorPage(QScrollArea):
         self.refresh_button.setFixedWidth(80)
         select_layout.addWidget(self.refresh_button, 1, 3)
 
+        pid_label = CaptionLabel("PID（快捷）")
+        select_layout.addWidget(pid_label, 2, 0)
+
+        self.pid_input = LineEdit()
+        self.pid_input.setPlaceholderText("直接输入 PID")
+        self.pid_input.setMinimumWidth(60)
+        self.pid_input.setMaximumWidth(140)
+        self.pid_input.textChanged.connect(self._on_pid_changed)
+        select_layout.addWidget(self.pid_input, 2, 1)
+
+        # 采集周期与 PID 共用次要参数行，减少卡片纵向占用
+        interval_label = CaptionLabel("周期（秒）")
+        select_layout.addWidget(interval_label, 2, 2, Qt.AlignRight)
+
+        self.interval_spinbox = SpinBox()
+        self.interval_spinbox.setRange(1, 3600)  # 1-3600秒
+        self.interval_spinbox.setValue(cfg.get(cfg.default_interval))  # 默认值取自设置页
+        self.interval_spinbox.setFixedWidth(84)
+        select_layout.addWidget(self.interval_spinbox, 2, 3)
+
         # 监控指标选择（弹出多选对话框）
-        metric_label = BodyLabel("监控指标:")
         self.metric_button = PushButton("选择指标", self, FluentIcon.CHECKBOX)
         self.metric_button.clicked.connect(self._on_select_metric_clicked)
-        self.metric_button.setFixedWidth(150)
-        self.metric_summary_label = BodyLabel()
-        select_layout.addWidget(metric_label, 2, 0)
-        select_layout.addWidget(self.metric_button, 2, 1)
-        select_layout.addWidget(self.metric_summary_label, 2, 2, 1, 2)
+        self.metric_button.setFixedWidth(112)
+        self.metric_summary_label = CaptionLabel()
+        select_layout.addWidget(self.metric_button, 3, 0)
+        select_layout.addWidget(self.metric_summary_label, 3, 1, 1, 2)
 
         # 初始化已选指标摘要
         self._update_metric_summary()
 
-        # 采集周期（改为SpinBox）
-        interval_label = BodyLabel("采集周期(秒):")
-        self.interval_spinbox = SpinBox()
-        self.interval_spinbox.setRange(1, 3600)  # 1-3600秒
-        self.interval_spinbox.setValue(cfg.get(cfg.default_interval))  # 默认值取自设置页
-        self.interval_spinbox.setFixedWidth(150)
-        select_layout.addWidget(interval_label, 3, 0)
-        select_layout.addWidget(self.interval_spinbox, 3, 1)
-
         # 开始监控按钮
         self.start_button = PrimaryPushButton("开始监控", self, FluentIcon.PLAY)
         self.start_button.clicked.connect(self._on_start_clicked)
-        self.start_button.setFixedWidth(150)
-        select_layout.addWidget(self.start_button, 4, 1, Qt.AlignRight)
+        self.start_button.setFixedWidth(116)
+        select_layout.addWidget(self.start_button, 3, 3)
 
         main_layout.addWidget(select_card)
 
@@ -360,12 +423,13 @@ class MonitorPage(QScrollArea):
         # 任务列表容器
         self.tasks_container = QWidget()
         self.tasks_layout = QVBoxLayout(self.tasks_container)
+        self.tasks_layout.setContentsMargins(0, 0, 0, 0)
         self.tasks_layout.setSpacing(10)
 
         # 空状态占位（C3）：无监控任务时居中显示，随卡片增删切换可见性
-        self.empty_state_label = BodyLabel(
-            "暂无监控任务：在上方选择进程、勾选指标后点击「开始监控」")
+        self.empty_state_label = BodyLabel("暂无运行中的任务")
         self.empty_state_label.setAlignment(Qt.AlignCenter)
+        self.empty_state_label.setMinimumHeight(72)
         self.tasks_layout.addWidget(self.empty_state_label)
 
         self.tasks_layout.addStretch()
@@ -399,12 +463,10 @@ class MonitorPage(QScrollArea):
     def _update_metric_summary(self):
         """更新已选指标摘要文案"""
         names = [get_metric_display_name(m) for m in self.selected_metrics]
-        summary = f"已选 {len(names)} 项: " + "、".join(names)
-        # 完整内容放tooltip，超长时省略显示
-        self.metric_summary_label.setToolTip(summary)
-        if len(summary) > 40:
-            summary = summary[:40] + "…"
+        summary = f"已选 {len(names)} 项" if names else "未选择指标"
+        details = "、".join(names) if names else "请选择至少一项监控指标"
         self.metric_summary_label.setText(summary)
+        self.metric_summary_label.setToolTip(details)
 
     def _refresh_process_list(self):
         """刷新进程列表"""
@@ -434,7 +496,7 @@ class MonitorPage(QScrollArea):
             # 保存到字典
             self.process_dict[pid] = name
             # 添加到ComboBox
-            self.process_combo.addItem(f"{name} (PID: {pid})")
+            self.process_combo.addItem(f"{name} · PID {pid}")
             # 为最后添加的项设置userData
             index = self.process_combo.count() - 1
             self.process_combo.setItemData(index, (pid, name))
@@ -442,7 +504,7 @@ class MonitorPage(QScrollArea):
         # 4.1 重建 completer 子串搜索模型（C1），文本需与上面的 items 保持一致，
         # 否则补全选中后回填的文本会在 process_combo.items 里找不到精确匹配
         self._process_completer_model.setStringList(
-            [f"{name} (PID: {pid})" for pid, name in processes])
+            [f"{name} · PID {pid}" for pid, name in processes])
 
         # 5. 重新连接信号
         self.process_combo.currentIndexChanged.connect(self._on_process_selected)
@@ -530,7 +592,7 @@ class MonitorPage(QScrollArea):
             except ValueError:
                 InfoBar.error(
                     title="错误",
-                    content="PID必须是数字",
+                    content="PID 必须是数字",
                     parent=self,
                     position=InfoBarPosition.TOP
                 )
@@ -545,7 +607,7 @@ class MonitorPage(QScrollArea):
                 else:
                     InfoBar.warning(
                         title="提示",
-                        content="请输入PID或从列表中选择进程",
+                        content="请输入 PID 或从列表中选择进程",
                         parent=self,
                         position=InfoBarPosition.TOP
                     )
@@ -553,7 +615,7 @@ class MonitorPage(QScrollArea):
             else:
                 InfoBar.warning(
                     title="提示",
-                    content="请输入PID或从列表中选择进程",
+                    content="请输入 PID 或从列表中选择进程",
                     parent=self,
                     position=InfoBarPosition.TOP
                 )
@@ -585,7 +647,8 @@ class MonitorPage(QScrollArea):
         天然一致；在 _on_task_added 与 _on_task_stopped（卡片移除处）调用。
         """
         count = len(self.task_cards)
-        self.tasks_label.setText(f"监控任务列表（{count}/{config.MAX_MONITOR_TASKS}）")
+        self.tasks_label.setText(
+            f"监控任务 · {count}/{config.MAX_MONITOR_TASKS}")
         self.empty_state_label.setVisible(count == 0)
 
     def _on_task_added(self, task_id: str):
@@ -645,7 +708,7 @@ class MonitorPage(QScrollArea):
 
         InfoBar.info(
             title="任务已停止",
-            content=f"原因: {reason}",
+            content=f"原因：{reason}",
             parent=self,
             position=InfoBarPosition.TOP,
             duration=2000
@@ -672,7 +735,7 @@ class MonitorPage(QScrollArea):
         """任务数量达到上限"""
         InfoBar.warning(
             title="提示",
-            content=f"最多只能同时监控{config.MAX_MONITOR_TASKS}个任务",
+            content=f"最多只能同时监控 {config.MAX_MONITOR_TASKS} 个任务",
             parent=self,
             position=InfoBarPosition.TOP,
             duration=2000

@@ -9,6 +9,7 @@ from PyQt5.QtGui import QIcon
 from qfluentwidgets import setTheme
 
 from ui.main_window import MainWindow
+from ui.typography import configure_application_typography
 from utils.logger import setup_logging
 from utils.crash_handler import install_excepthook
 from app_config import load_app_config, cfg
@@ -53,6 +54,10 @@ def main():
     # MainWindow 创建之前（导航栏与各页面构造时已经会读取 cfg 的值，如设置页
     # 主题单选状态、监控页采集周期默认值）调用
     load_app_config()
+
+    # 统一中文界面、原生 Qt 控件与 pyqtgraph 的字体继承链。必须在窗口构造前
+    # 执行，否则已创建的 Fluent 标签会保留各自构造时拿到的旧字体。
+    configure_application_typography(app)
 
     # 应用已保存的主题偏好：这里必须传 cfg.get(cfg.themeMode) 这个原始配置值
     # （可能是 Theme.AUTO），不能用 qconfig.theme（那是"跟随系统"解析后的具体
