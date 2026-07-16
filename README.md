@@ -49,7 +49,7 @@ ProcessMonitor is a Windows 11 Fluent Design desktop app for keeping an eye on a
 ### 🛡 Reliability
 - **Auto-update** — checks GitHub Releases on startup (or on demand) and downloads/launches the installer for you; the startup check now shows a non-modal notice instead of interrupting you
 - **Crash-resilient storage** — SQLite with WAL mode, automatic retry on failed writes, crash/error logging, and automatic recovery of orphaned "running" tasks after an unclean shutdown
-- **Automated test suite** — 100 test cases covering the data layer, schema migration, export, update checks, responsive history layout, typography and metric formatting
+- **Automated test suite** — 101 test cases covering the data layer, schema migration, export, update checks, responsive monitor/history layouts, typography and metric formatting
 - **Measured performance** — opening a 770k-row history task takes ~1.4s (down from 3.4s pre-v1.2.0; measured on the maintainer's dev machine)
 
 ## 📸 Screenshots

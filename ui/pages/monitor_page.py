@@ -393,7 +393,8 @@ class MonitorPage(QScrollArea):
         self.interval_spinbox = SpinBox()
         self.interval_spinbox.setRange(1, 3600)  # 1-3600秒
         self.interval_spinbox.setValue(cfg.get(cfg.default_interval))  # 默认值取自设置页
-        self.interval_spinbox.setFixedWidth(84)
+        # 普通 Fluent SpinBox 横排两个步进按钮，宽度交由其尺寸提示计算，
+        # 避免紧凑布局把内部数值编辑区压缩为 0。
         select_layout.addWidget(self.interval_spinbox, 2, 3)
 
         # 监控指标选择（弹出多选对话框）
