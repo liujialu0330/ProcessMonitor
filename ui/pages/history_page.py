@@ -58,6 +58,12 @@ DEFAULT_TIME_RANGE_KEY = '1h'
 
 # 表格时间列显示格式（A4）：真实时间轴替代原相对秒数展示，含月日避免跨天歧义
 TABLE_TIME_FORMAT = '%m-%d %H:%M:%S'
+# 明细表是单指标采样账本，而不是需要占满窗口的数据网格。限制阅读轨道宽度可避免
+# 宽屏下时间和值被拉到卡片两端；窄窗口仍由 Expanding sizePolicy 自动填满可用空间。
+DETAIL_TABLE_MAX_WIDTH = 960
+DETAIL_TABLE_MIN_COLUMN_WIDTH = 144
+DETAIL_TABLE_HEADER_HEIGHT = 40
+DETAIL_TABLE_ROW_HEIGHT = 38
 
 # 指标原始值以 KB 存储；坐标轴只转换显示文本，不改动绘图数据与数据库语义。
 _DISPLAY_UNIT_DIVISORS = {
@@ -340,10 +346,15 @@ class HistoryPage(QScrollArea):
         # ========== 数据表格区域 ==========
         # 创建表格（使用Fluent-Widgets的TableWidget）
         self.data_table = TableWidget()
-        self.data_table.setFont(data_font(TypeScale.BODY))
+        self._detail_data_font = data_font(TypeScale.BODY)
+        self.data_table.setFont(self._detail_data_font)
         self.data_table.setColumnCount(3)
-        self.data_table.setHorizontalHeaderLabels(['时间', '值', '原始值'])
-        self.data_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.data_table.setHorizontalHeaderLabels(['采样时间', '指标值', '原始值'])
+        table_header_view = self.data_table.horizontalHeader()
+        table_header_view.setSectionResizeMode(QHeaderView.Stretch)
+        table_header_view.setDefaultAlignment(Qt.AlignCenter)
+        table_header_view.setMinimumSectionSize(DETAIL_TABLE_MIN_COLUMN_WIDTH)
+        table_header_view.setFixedHeight(DETAIL_TABLE_HEADER_HEIGHT)
         self.data_table.setAlternatingRowColors(True)
         self.data_table.setEditTriggers(TableWidget.NoEditTriggers)
         self.data_table.setSelectionBehavior(TableWidget.SelectRows)
@@ -356,9 +367,10 @@ class HistoryPage(QScrollArea):
         self.data_table.setColumnHidden(2, True)
         # 隐藏行号
         self.data_table.verticalHeader().hide()
-        self.data_table.verticalHeader().setDefaultSectionSize(36)
+        self.data_table.verticalHeader().setDefaultSectionSize(
+            DETAIL_TABLE_ROW_HEIGHT)
         header_font = ui_font(TypeScale.CAPTION, QFont.DemiBold)
-        self.data_table.horizontalHeader().setFont(header_font)
+        table_header_view.setFont(header_font)
         header_families = ','.join(
             f"'{family}'" for family in header_font.families())
         header_qss = (
@@ -371,14 +383,28 @@ class HistoryPage(QScrollArea):
         setCustomStyleSheet(self.data_table, header_qss, header_qss)
 
         table_card = CardWidget()
-        table_layout = QVBoxLayout(table_card)
-        table_layout.setContentsMargins(16, 12, 16, 16)
+        table_outer_layout = QHBoxLayout(table_card)
+        table_outer_layout.setContentsMargins(16, 12, 16, 16)
+        table_outer_layout.setSpacing(0)
+
+        # 卡片保持与趋势视图同宽，标题和表格则共享一条居中的阅读轨道：
+        # 窄窗口填满卡片，宽屏最多 960px，避免一条记录被撕到屏幕两端。
+        self.detail_table_content = QWidget(table_card)
+        self.detail_table_content.setMaximumWidth(DETAIL_TABLE_MAX_WIDTH)
+        self.detail_table_content.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Expanding)
+        table_layout = QVBoxLayout(self.detail_table_content)
+        table_layout.setContentsMargins(0, 0, 0, 0)
+        table_layout.setSpacing(8)
         table_header = QHBoxLayout()
         table_header.addWidget(StrongBodyLabel("采样明细"))
         table_header.addStretch()
         table_header.addWidget(CaptionLabel("最新数据优先"))
         table_layout.addLayout(table_header)
         table_layout.addWidget(self.data_table)
+        table_outer_layout.addStretch()
+        table_outer_layout.addWidget(self.detail_table_content, 1)
+        table_outer_layout.addStretch()
 
         # ========== 统计带 + 趋势/明细子视图 ==========
         self.analysis_page = QWidget()
@@ -932,7 +958,8 @@ class HistoryPage(QScrollArea):
                 # 仅 HH:MM:SS 展示，避免跨天数据歧义）
                 time_str = dp.timestamp.strftime(TABLE_TIME_FORMAT)
                 time_item = QTableWidgetItem(time_str)
-                time_item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+                time_item.setFont(self._detail_data_font)
+                time_item.setTextAlignment(Qt.AlignCenter)
                 self.data_table.setItem(i, 0, time_item)
 
                 # 格式化的值
@@ -940,12 +967,14 @@ class HistoryPage(QScrollArea):
                     metric_type, dp.value,
                     display_unit=self._chart_display_unit)
                 value_item = QTableWidgetItem(formatted_value)
-                value_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                value_item.setFont(self._detail_data_font)
+                value_item.setTextAlignment(Qt.AlignCenter)
                 self.data_table.setItem(i, 1, value_item)
 
                 # 原始值
                 raw_value_item = QTableWidgetItem(f"{dp.value:.4f}")
-                raw_value_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                raw_value_item.setFont(self._detail_data_font)
+                raw_value_item.setTextAlignment(Qt.AlignCenter)
                 self.data_table.setItem(i, 2, raw_value_item)
         finally:
             # 表格本就未开启排序（TableWidget 默认不排序），此处只需恢复界面更新
