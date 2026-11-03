@@ -141,7 +141,7 @@ def test_migrated_tasks_metric_type_is_json_array_in_raw_db(db_path):
     assert json.loads(raw_value) == ['memory_rss']
 
 
-# ========== 批2新增：迁移失败三态 + 进程级 guard ==========
+# ========== 迁移失败三态 + 进程级 guard ==========
 
 def test_migration_failed_restores_backup_and_sets_flag(db_path, monkeypatch):
     """迁移两次尝试均失败但还原备份成功：置 migration_failed，旧数据（未迁移）保留"""

@@ -23,7 +23,7 @@ def _restore_last_metrics():
     cfg.last_metrics.value = list(LEAK_CHECK_PRESET)
 
 
-# ---------- A1：预设 ----------
+# ---------- 预设 ----------
 
 def test_leak_check_preset_content():
     """泄漏排查预设：私有字节、句柄数、GDI、USER、线程数，且都是可监控指标"""
@@ -81,7 +81,7 @@ def test_last_metrics_roundtrip_through_config_file(tmp_path):
     assert cfg.get(cfg.last_metrics) == ["memory_private"]
 
 
-# ---------- A2：说明 ----------
+# ---------- 说明 ----------
 
 def test_every_metric_has_one_sentence_description():
     """全部 27 项指标都有说明，且键集合与显示名一致"""
@@ -101,7 +101,7 @@ def test_key_metric_descriptions_mention_leak_signals():
     assert get_metric_description("no_such_metric") == ""
 
 
-# ---------- A5：变化量 / 增速格式化 ----------
+# ---------- 变化量 / 增速格式化 ----------
 
 def test_format_metric_delta_bytes_adaptive_unit_with_sign():
     assert format_metric_delta(MetricType.MEMORY_PRIVATE, 2048.0) == "+2 MB"

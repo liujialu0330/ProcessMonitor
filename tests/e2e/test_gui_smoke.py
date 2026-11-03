@@ -163,7 +163,7 @@ def test_gui_smoke_full_lifecycle(qapp, e2e_db, tmp_path, monkeypatch):
 
         _pause()
 
-        # ========== 6. 设置页：分组卡片存在 + 主题切换实际生效（v1.3.0 批4，M4） ==========
+        # ========== 6. 设置页：分组卡片存在 + 主题切换实际生效 ==========
         window.switchTo(window.setting_page)
         QTest.qWait(100)
 
@@ -171,12 +171,12 @@ def test_gui_smoke_full_lifecycle(qapp, e2e_db, tmp_path, monkeypatch):
         assert setting_page.appearance_group is not None
         assert setting_page.monitor_group is not None
         assert setting_page.data_group is not None
-        assert setting_page.behavior_group is not None, "批4新增的“行为”分组应存在"
-        assert setting_page.cleanup_card is not None, "批4新增的“清理并压缩数据库”卡片应存在"
-        assert setting_page.open_dir_card is not None, "批4新增的“数据目录”卡片应存在"
-        assert setting_page.close_to_tray_card is not None, "批4新增的托盘开关卡片应存在"
+        assert setting_page.behavior_group is not None, "“行为”分组应存在"
+        assert setting_page.cleanup_card is not None, "“清理并压缩数据库”卡片应存在"
+        assert setting_page.open_dir_card is not None, "“数据目录”卡片应存在"
+        assert setting_page.close_to_tray_card is not None, "托盘开关卡片应存在"
 
-        # 【评审修订 M4】只断言"不抛异常"抓不住 themeMode 状态分裂类缺陷（如
+        # 只断言"不抛异常"抓不住 themeMode 状态分裂类缺陷（如
         # AppConfig 误重定义 themeMode 导致 setTheme 与设置页各改一个对象、
         # 互不联动）：必须实际断言 isDarkTheme()/qconfig.theme 确实变为深色，
         # 再切回浅色验证双向均生效。直接调用 qconfig.set(cfg.themeMode, ...)

@@ -247,9 +247,11 @@ class SettingPage(ScrollArea):
             return
 
         size_text = _format_bytes(self.db.get_db_size_bytes())
-        self.cleanup_card.contentLabel.setText(f"当前占用 {size_text}")
-
         has_running = bool(self.manager and self.manager.has_running_tasks())
+        # 按钮禁用的原因直接写在说明里：禁用按钮上的 tooltip 很难被发现
+        suffix = " · 有任务在监控，停止后可清理" if has_running else ""
+        self.cleanup_card.contentLabel.setText(f"当前占用 {size_text}{suffix}")
+
         # 清理进行中保持禁用，不因任务状态信号被误启用
         self.cleanup_card.button.setEnabled(
             not has_running and not self._is_cleanup_running())

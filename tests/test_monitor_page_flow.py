@@ -82,7 +82,7 @@ def _add_card(page, manager, metrics=None, note="", pid=None):
     return task_id, page.task_cards[task_id]
 
 
-# ---------- 依赖注入与默认值（A1） ----------
+# ---------- 依赖注入与默认值 ----------
 
 def test_page_uses_injected_manager(page, manager):
     assert page.manager is manager
@@ -120,7 +120,7 @@ def test_confirming_metric_dialog_remembers_selection(page, monkeypatch):
     assert cfg.get(cfg.last_metrics) == [MetricType.NUM_THREADS, MetricType.MEMORY_PRIVATE]
 
 
-# ---------- 指标对话框（A2） ----------
+# ---------- 指标对话框 ----------
 
 def test_metric_dialog_has_tooltips_and_preset_button(qapp):
     host = QWidget()
@@ -141,7 +141,7 @@ def test_metric_dialog_has_tooltips_and_preset_button(qapp):
     host.close()
 
 
-# ---------- 进程选择（A3） ----------
+# ---------- 进程选择 ----------
 
 def test_startup_selects_no_process_and_fills_no_pid(page):
     assert page.process_combo.count() == len(FAKE_PROCESSES)
@@ -238,7 +238,7 @@ def test_no_confirmation_when_pid_not_running(page, manager, monkeypatch):
     page._start_monitoring(1001, "alpha.exe", [MetricType.NUM_THREADS], 1.0)
 
 
-# ---------- 备注（A4） ----------
+# ---------- 备注 ----------
 
 def test_note_is_passed_to_create_task(page, manager, monkeypatch):
     calls = []
@@ -269,7 +269,7 @@ def test_note_defaults_to_empty_and_shows_on_card(page, manager, monkeypatch):
     assert not card.note_label.isHidden()
 
 
-# ---------- 卡片较开始变化量（A5） ----------
+# ---------- 卡片较开始变化量 ----------
 
 def test_card_shows_delta_against_first_valid_value(page, manager):
     _, card = _add_card(page, manager)
@@ -309,7 +309,7 @@ def test_card_trend_covers_whole_task_with_bounded_points(page, manager):
     assert "任务开始至今" in card.sparkline_label.text()
 
 
-# ---------- 打点（A7） ----------
+# ---------- 打点 ----------
 
 def test_marker_flow_writes_via_manager_with_incrementing_default_label(
         page, manager, db, infobar, monkeypatch):
@@ -346,7 +346,7 @@ def test_marker_failure_is_reported(page, manager, infobar, monkeypatch):
     assert card.next_marker_label() == "标记 1"
 
 
-# ---------- 停止确认（A8） ----------
+# ---------- 停止确认 ----------
 
 def test_stop_requires_confirmation(page, manager, monkeypatch):
     task_id, card = _add_card(page, manager)
@@ -389,7 +389,7 @@ def test_pause_resume_false_is_tolerated(page, manager, monkeypatch):
     assert card.is_paused and card.pause_button.text() == "恢复"
 
 
-# ---------- 任务结束后卡片保留（A9） ----------
+# ---------- 任务结束后卡片保留 ----------
 
 def test_card_is_kept_in_finished_state_after_stop(page, manager, infobar):
     task_id, card = _add_card(page, manager, note="备注A")
@@ -485,7 +485,7 @@ def test_find_pids_by_name_is_case_insensitive(page):
     assert page._find_pids_by_name("nothing.exe") == []
 
 
-# ---------- 异常结束提醒（A10） ----------
+# ---------- 异常结束提醒 ----------
 
 def test_abnormal_stop_is_prominent_and_signals_main_window(page, manager, infobar):
     task_id, card = _add_card(page, manager)
@@ -510,3 +510,14 @@ def test_user_stop_does_not_signal_abnormal(page, manager, infobar):
 
     assert received == []
     assert infobar.calls[-1][0] == "info"
+
+
+def test_find_pids_by_name_excludes_own_process(page, monkeypatch):
+    """被测的同名进程退出后，"重新监控"不能因为只剩本程序同名而监控起自己。"""
+    monkeypatch.setattr(ProcessCollector, "get_all_processes", staticmethod(
+        lambda: [(os.getpid(), "python.exe"), (99999, "python.exe"), (12345, "other.exe")]))
+    assert page._find_pids_by_name("PYTHON.EXE") == [99999]
+
+    monkeypatch.setattr(ProcessCollector, "get_all_processes", staticmethod(
+        lambda: [(os.getpid(), "python.exe")]))
+    assert page._find_pids_by_name("python.exe") == []

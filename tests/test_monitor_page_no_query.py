@@ -1,5 +1,5 @@
 """
-监控页周期路径无查库验证（v1.2.0 批3）
+监控页周期路径无查库验证
 TaskCard 计数改为内存计数（卡片建时置0，_on_data_updated 内+1），彻底删除
 每采集周期调用 Database.get_sample_count 的查库路径。用源码静态检查（等价于
 grep 调用点）钉死这条回归线：_on_data_updated 是 data_updated 信号槽，每采集

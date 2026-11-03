@@ -214,3 +214,17 @@ def test_export_end_to_end_releases_worker_on_thread_finished(
     assert rows[0][-1] == "打点"
     assert [row[-1] for row in rows[1:]] == ["", "", "第1轮", "", ""] or \
         [row[-1] for row in rows[1:]].count("第1轮") == 1
+
+
+def test_export_finished_refreshes_task_summary(page, db, silent_infobar, tmp_path):
+    """运行中任务导出期间仍在采集：导出完成后摘要的采集次数要同步更新。"""
+    task = _seed_task(db, samples=3)
+    page._load_tasks()
+    assert "3 次采集" in page.data_count_label.text()
+
+    db.save_data_points([
+        DataPoint(task.task_id, BASE + timedelta(seconds=10 + i), 1.0,
+                  MetricType.NUM_THREADS)
+        for i in range(2)])
+    page._on_export_finished(str(tmp_path / "x.csv"), 5, 5)
+    assert "5 次采集" in page.data_count_label.text()

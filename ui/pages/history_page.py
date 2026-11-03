@@ -121,6 +121,9 @@ class HistoryPage(QScrollArea):
 
         # 当前选中的任务ID、指标类型与任务状态（用于删除按钮的运行中保护）
         self.current_task_id = None
+        # 当前选中是否只是列表默认选中（用户没主动选过）：是的话，列表里出现更新的任务
+        # （如刚开始的监控）时自动切到最新任务，而不是一直停在启动时的旧任务上
+        self._selection_is_auto = False
         self.current_metric = None
         self.current_task_status = None
 
@@ -460,7 +463,8 @@ class HistoryPage(QScrollArea):
 
         self.content_stack = QStackedWidget()
         self.content_stack.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.content_stack.setMinimumHeight(430)
+        # 不要显式设置最小高度：显式值会覆盖布局算出的最小尺寸（统计条 + 图表），
+        # 小窗口下滚动区不再出现滚动条，图表被压出卡片、横轴被裁掉
         self.content_stack.addWidget(self.empty_state_page)
         self.content_stack.addWidget(self.analysis_page)
         self.content_stack.setCurrentWidget(self.empty_state_page)
@@ -557,6 +561,7 @@ class HistoryPage(QScrollArea):
         """
         self.current_task_id = task_id
         self.current_metric = None
+        self._selection_is_auto = False
         self._load_tasks()
         if self.current_task_id != task_id:
             InfoBar.info(
@@ -613,7 +618,12 @@ class HistoryPage(QScrollArea):
             self.task_combo.setItemData(index, task.task_id)
             self._task_tooltips[task.task_id] = format_task_tooltip(task, running, now)
 
-        # 4. 尝试恢复之前选中的任务和指标并重新加载数据
+        # 4. 尝试恢复之前选中的任务和指标并重新加载数据。
+        # 之前只是默认选中、且列表最前面（最新）的任务已经换了：改为选中最新任务
+        if (current_task_id and self._selection_is_auto
+                and tasks[0].task_id != current_task_id):
+            current_task_id = None
+            self.current_metric = None
         if current_task_id:
             for i in range(self.task_combo.count()):
                 if self.task_combo.itemData(i) == current_task_id:
@@ -657,6 +667,7 @@ class HistoryPage(QScrollArea):
             # 先设置为-1，再设置为0，强制触发currentIndexChanged信号
             self.task_combo.setCurrentIndex(-1)
             self.task_combo.setCurrentIndex(0)
+            self._selection_is_auto = True
 
     def _on_task_selected(self, index: int):
         """任务选择事件"""
@@ -671,6 +682,7 @@ class HistoryPage(QScrollArea):
             return
 
         self.current_task_id = task_id
+        self._selection_is_auto = False
         self._auto_refresh_was_running = False
         self.task_combo.setToolTip(self._task_tooltips.get(task_id, ""))
 

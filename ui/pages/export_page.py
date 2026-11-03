@@ -358,7 +358,9 @@ class ExportPage(QScrollArea):
 
     def _default_save_path(self) -> str:
         """当前任务的默认保存路径：上次使用的目录 + 进程名_PID_开始时间.csv"""
-        return os.path.join(self._last_dir, default_export_filename(self.current_task))
+        # normpath：上次目录来自文件对话框（正斜杠），统一成 Windows 反斜杠显示
+        return os.path.normpath(
+            os.path.join(self._last_dir, default_export_filename(self.current_task)))
 
     def _reset_save_path(self):
         """把保存路径重置为当前任务的默认路径"""
@@ -368,7 +370,7 @@ class ExportPage(QScrollArea):
         """弹出保存对话框，返回所选路径（取消返回空串）；抽成方法便于测试替换"""
         file_path, _ = QFileDialog.getSaveFileName(
             self, "选择保存位置", default_path, "CSV 文件 (*.csv)")
-        return file_path
+        return os.path.normpath(file_path) if file_path else ""
 
     def _confirm_overwrite(self, file_path: str) -> bool:
         """目标文件已存在：确认是否覆盖；抽成方法便于测试替换"""
@@ -400,7 +402,7 @@ class ExportPage(QScrollArea):
 
     def _export_data(self):
         """
-        导出数据到CSV文件（v1.2.0 批3 线程化：大数据量导出不再阻塞UI）
+        导出数据到CSV文件（在工作线程中执行，大数据量导出不阻塞界面）
 
         实际的游标 fetchmany 分批读取 + pivot_rows 流式写文件在 ExportWorker
         后台线程内完成，本方法只负责校验、禁用按钮、启动线程与持有引用防GC。
@@ -468,6 +470,9 @@ class ExportPage(QScrollArea):
         """导出完成"""
         self.export_status_label.setText("")
         self._last_dir = os.path.dirname(save_path) or self._last_dir
+        # 运行中任务在导出期间仍在采集：刷新摘要，避免与"已导出 N 次采集"对不上
+        if self.current_task is not None:
+            self._load_task_info(self.current_task.task_id)
 
         info_bar = InfoBar.success(
             title="导出成功",
