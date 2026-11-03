@@ -5,5 +5,8 @@
 from ui.components.metric_selector import MetricSelectorDialog
 from ui.components.spinbox_setting_card import SpinBoxSettingCard
 from ui.components.sparkline import SparklineWidget
+from ui.components.task_card import TaskCard
 
-__all__ = ['MetricSelectorDialog', 'SpinBoxSettingCard', 'SparklineWidget']
+__all__ = [
+    'MetricSelectorDialog', 'SpinBoxSettingCard', 'SparklineWidget', 'TaskCard',
+]

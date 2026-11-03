@@ -57,6 +57,8 @@ def test_gui_smoke_full_lifecycle(qapp, e2e_db, tmp_path, monkeypatch):
     startfile_calls = []
     monkeypatch.setattr(os, 'startfile', lambda path: startfile_calls.append(path),
                          raising=False)
+    # 关闭确认是模态对话框：用例中途失败时若仍有任务在跑，收尾的 close() 不能被它阻塞
+    monkeypatch.setattr(MainWindow, '_ask_close_action', lambda self: 'quit')
 
     window = MainWindow(db=e2e_db)
     # 覆写为 no-op：防止 3 秒后 QTimer 触发真实联网检查更新；MainWindow 内部 QTimer

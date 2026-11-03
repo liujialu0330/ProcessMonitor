@@ -2,6 +2,8 @@
 core/update_checker.py 纯函数用例
 覆盖 compare_version 全边界与 parse_release_info（mock JSON dict）
 """
+import os
+
 import config
 from core.update_checker import compare_version, parse_release_info
 
@@ -113,3 +115,60 @@ def test_parse_release_info_strips_v_prefix_and_empty_body():
     info = parse_release_info(data)
     assert info["version"] == "1.3.0"
     assert info["notes"] == ""
+
+
+# ========== asset digest / 偏好读写日志 ==========
+
+def test_parse_release_info_reads_asset_digest(monkeypatch):
+    monkeypatch.setattr(config, "APP_VERSION", "1.1.0")
+    digest = "sha256:" + "ab" * 32
+    data = _base_release(assets=[
+        {"name": "Windows_v1.2.0_Setup.exe",
+         "browser_download_url": "https://github.com/x/y/releases/download/v1.2.0/s.exe",
+         "size": 10, "digest": digest},
+    ])
+    assert parse_release_info(data)["asset_digest"] == digest
+
+
+def test_parse_release_info_missing_or_invalid_digest_is_none():
+    for digest_field in ({}, {"digest": None}, {"digest": ""}, {"digest": "md5:abc"},
+                         {"digest": "sha256:short"}):
+        asset = {"name": "Windows_v1.2.0_Setup.exe",
+                 "browser_download_url": "https://github.com/x", "size": 1}
+        asset.update(digest_field)
+        assert parse_release_info(_base_release(assets=[asset]))["asset_digest"] is None
+
+
+def test_no_setup_asset_digest_is_none():
+    info = parse_release_info(_base_release(assets=[]))
+    assert info["asset_digest"] is None
+
+
+def test_load_update_prefs_logs_on_corrupt_file(caplog):
+    """偏好文件损坏：返回空配置，并记录警告（不再静默吞掉）"""
+    import logging
+    from core.update_checker import load_update_prefs
+    with open(config.UPDATE_PREFS_PATH, 'w', encoding='utf-8') as f:
+        f.write("{not json")
+    with caplog.at_level(logging.WARNING, logger="core.update_checker"):
+        assert load_update_prefs() == {}
+    assert any("读取更新偏好失败" in r.getMessage() for r in caplog.records)
+
+
+def test_load_update_prefs_missing_file_is_silent(caplog):
+    import logging
+    from core.update_checker import load_update_prefs
+    assert not os.path.exists(config.UPDATE_PREFS_PATH)
+    with caplog.at_level(logging.WARNING, logger="core.update_checker"):
+        assert load_update_prefs() == {}
+    assert not caplog.records
+
+
+def test_save_update_prefs_failure_is_logged(monkeypatch, caplog):
+    import logging
+    from core.update_checker import save_update_prefs
+    monkeypatch.setattr(config, "UPDATE_PREFS_PATH", os.path.join(
+        config.DATA_DIR, "no_such_dir", "prefs.json"))
+    with caplog.at_level(logging.WARNING, logger="core.update_checker"):
+        save_update_prefs({"skipped_version": "1.0.0"})
+    assert any("保存更新偏好失败" in r.getMessage() for r in caplog.records)

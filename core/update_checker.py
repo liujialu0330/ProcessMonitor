@@ -2,12 +2,16 @@
 自动更新模块
 通过 GitHub Releases API 检测新版本，下载安装包并调起安装
 """
+import hashlib
 import json
 import logging
 import os
+import re
+import shutil
 import tempfile
-import urllib.request
 import urllib.error
+import urllib.parse
+import urllib.request
 from typing import Optional
 
 from PyQt5.QtCore import QThread, pyqtSignal
@@ -30,6 +34,58 @@ REQUEST_HEADERS = {
     'User-Agent': f'{config.GITHUB_REPO}/{config.APP_VERSION}',
     'Accept': 'application/vnd.github+json',
 }
+
+# 安装包下载只允许来自这些域名（含其子域）；GitHub Release 资产会 302 到后两者
+ALLOWED_DOWNLOAD_HOSTS = (
+    'github.com',
+    'objects.githubusercontent.com',
+    'release-assets.githubusercontent.com',
+)
+# 缺少 SHA-256 摘要时的提示：不下载、不安装
+MSG_CANNOT_VERIFY = "无法校验安装包，请从发布页手动下载"
+
+_SHA256_DIGEST_RE = re.compile(r'^sha256:([0-9a-fA-F]{64})$')
+
+
+def is_allowed_download_url(url: str) -> bool:
+    """
+    下载地址白名单校验：必须是 https，且主机名等于白名单域名或为其子域。
+    子域判定要求以 "." 分隔（evilgithub.com、github.com.evil.com 均不通过）；
+    使用解析出的 hostname，避免 https://github.com@evil.com/ 之类的 userinfo 欺骗。
+    """
+    try:
+        parsed = urllib.parse.urlparse(url or '')
+        host = (parsed.hostname or '').lower().rstrip('.')
+        port = parsed.port
+    except ValueError:
+        return False
+    if parsed.scheme.lower() != 'https' or not host:
+        return False
+    if port not in (None, 443):
+        return False
+    return any(host == allowed or host.endswith('.' + allowed)
+               for allowed in ALLOWED_DOWNLOAD_HOSTS)
+
+
+def parse_sha256_digest(digest: Optional[str]) -> Optional[str]:
+    """解析 GitHub asset 的 digest 字段（形如 "sha256:<64位hex>"），无效返回 None，结果统一小写"""
+    match = _SHA256_DIGEST_RE.match((digest or '').strip())
+    return match.group(1).lower() if match else None
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """重定向目标同样必须通过白名单，防止从可信域名被跳转到任意地址"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not is_allowed_download_url(newurl):
+            raise urllib.error.URLError(f"重定向目标不在允许的下载域名内: {newurl}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _open_download(request, timeout):
+    """打开下载连接（带重定向白名单校验；独立成函数便于测试替换网络层）"""
+    opener = urllib.request.build_opener(_SafeRedirectHandler())
+    return opener.open(request, timeout=timeout)
 
 
 def compare_version(a: str, b: str) -> int:
@@ -74,6 +130,7 @@ def parse_release_info(data: dict) -> dict:
             'asset_url': 安装包下载地址（无则为 None）,
             'asset_name': 安装包文件名（无则为 None）,
             'asset_size': 安装包字节数（无则为 0）,
+            'asset_digest': 安装包摘要，形如 "sha256:<hex>"（缺失或格式无效为 None）,
         }
     """
     tag = data.get('tag_name') or data.get('name') or ''
@@ -82,12 +139,15 @@ def parse_release_info(data: dict) -> dict:
     asset_url = None
     asset_name = None
     asset_size = 0
+    asset_digest = None
     for asset in data.get('assets') or []:
         name = asset.get('name') or ''
         if 'setup' in name.lower() and name.lower().endswith('.exe'):
             asset_url = asset.get('browser_download_url')
             asset_name = name
             asset_size = asset.get('size') or 0
+            digest = asset.get('digest')
+            asset_digest = digest if parse_sha256_digest(digest) else None
             break
 
     return {
@@ -98,6 +158,7 @@ def parse_release_info(data: dict) -> dict:
         'asset_url': asset_url,
         'asset_name': asset_name,
         'asset_size': asset_size,
+        'asset_digest': asset_digest,
     }
 
 
@@ -108,8 +169,10 @@ def load_update_prefs() -> dict:
             data = json.load(f)
             if isinstance(data, dict):
                 return data
+    except FileNotFoundError:
+        pass  # 尚无偏好文件属正常情况
     except Exception:
-        pass
+        logger.warning("读取更新偏好失败: %s", config.UPDATE_PREFS_PATH, exc_info=True)
     return {}
 
 
@@ -119,7 +182,7 @@ def save_update_prefs(prefs: dict):
         with open(config.UPDATE_PREFS_PATH, 'w', encoding='utf-8') as f:
             json.dump(prefs, f, ensure_ascii=False, indent=2)
     except Exception:
-        pass
+        logger.warning("保存更新偏好失败: %s", config.UPDATE_PREFS_PATH, exc_info=True)
 
 
 def get_skipped_version() -> str:
@@ -163,7 +226,14 @@ class UpdateChecker(QThread):
 
 
 class UpdateDownloader(QThread):
-    """下载安装包的后台线程"""
+    """
+    下载安装包的后台线程。
+
+    安全约束：下载地址必须通过 https + 域名白名单；必须提供 asset 的 SHA-256
+    摘要（digest），下载完成后逐字节校验，不一致视为失败并删除文件；缺少摘要时
+    不下载，经 error_occurred 提示用户去发布页手动下载。文件落在 mkdtemp 生成
+    的唯一目录内。
+    """
 
     # 下载进度信号（0-100；总大小未知时报 -1）
     download_progress = pyqtSignal(int)
@@ -172,11 +242,22 @@ class UpdateDownloader(QThread):
     # 下载失败信号
     error_occurred = pyqtSignal(str)
 
-    def __init__(self, url: str, filename: str, asset_size: int = 0, parent=None):
+    def __init__(self, url: str, filename: str, asset_size: int = 0, parent=None,
+                 digest: Optional[str] = None):
+        """
+        Args:
+            url: 安装包下载地址
+            filename: 保存的文件名
+            asset_size: release 资产元数据里的字节数，Content-Length 缺失时的兜底
+            parent: 父对象
+            digest: asset 的摘要字符串，形如 "sha256:<hex>"（parse_release_info 的
+                    asset_digest）；缺失或格式无效则拒绝下载
+        """
         super().__init__(parent)
         self.url = url
         self.filename = filename
-        self.asset_size = asset_size  # release 资产元数据里的字节数，Content-Length 缺失时的兜底
+        self.asset_size = asset_size
+        self.digest = digest
         self._cancelled = False
 
     def cancel(self):
@@ -184,10 +265,23 @@ class UpdateDownloader(QThread):
         self._cancelled = True
 
     def run(self):
-        save_path = os.path.join(tempfile.gettempdir(), self.filename)
+        if not is_allowed_download_url(self.url):
+            logger.error("拒绝下载：地址不在允许范围内: %s", self.url)
+            self.error_occurred.emit("安装包下载地址不受信任，请从发布页手动下载")
+            return
+
+        expected_sha256 = parse_sha256_digest(self.digest)
+        if expected_sha256 is None:
+            logger.error("拒绝下载：release 资产缺少有效的 SHA-256 摘要: %s", self.url)
+            self.error_occurred.emit(MSG_CANNOT_VERIFY)
+            return
+
+        work_dir = tempfile.mkdtemp(prefix='ProcessMonitor_update_')
+        save_path = os.path.join(work_dir, os.path.basename(self.filename) or 'setup.exe')
         try:
             request = urllib.request.Request(self.url, headers=REQUEST_HEADERS)
-            with urllib.request.urlopen(request, timeout=DOWNLOAD_TIMEOUT) as resp:
+            sha256 = hashlib.sha256()
+            with _open_download(request, DOWNLOAD_TIMEOUT) as resp:
                 total = int(resp.headers.get('Content-Length') or 0)
                 downloaded = 0
                 last_percent = -1
@@ -199,6 +293,7 @@ class UpdateDownloader(QThread):
                         if not chunk:
                             break
                         f.write(chunk)
+                        sha256.update(chunk)
                         downloaded += len(chunk)
                         if total > 0:
                             percent = downloaded * 100 // total
@@ -209,32 +304,39 @@ class UpdateDownloader(QThread):
                             self.download_progress.emit(-1)
 
             # 完整性校验：优先用响应头 Content-Length，缺失（total<=0）时退回 release 资产
-            # 元数据里的 asset_size；两者都拿不到时无法校验，视为通过（避免误判）
+            # 元数据里的 asset_size；两者都拿不到时跳过长度检查（由 SHA-256 兜底）
             expected = total if total > 0 else self.asset_size
             if expected > 0 and downloaded != expected:
                 logger.error("下载不完整: 已下载=%d 预期=%d url=%s",
-                              downloaded, expected, self.url)
-                self._cleanup(save_path)
+                             downloaded, expected, self.url)
+                self._cleanup(work_dir)
                 self.error_occurred.emit(
                     f"下载不完整：已下载 {downloaded} 字节，预期 {expected} 字节，请重试")
                 return
 
+            if sha256.hexdigest() != expected_sha256:
+                logger.error("安装包 SHA-256 校验失败: 实际=%s 预期=%s url=%s",
+                             sha256.hexdigest(), expected_sha256, self.url)
+                self._cleanup(work_dir)
+                self.error_occurred.emit(
+                    "安装包校验失败（SHA-256 不一致），已删除下载文件，请重试或从发布页手动下载")
+                return
+
             self.download_finished.emit(save_path)
         except InterruptedError:
-            self._cleanup(save_path)
+            self._cleanup(work_dir)
         except Exception as e:
             logger.error("下载更新失败", exc_info=True)
-            self._cleanup(save_path)
+            self._cleanup(work_dir)
             self.error_occurred.emit(f"下载更新失败：{e}")
 
     @staticmethod
-    def _cleanup(path: str):
-        """删除下载残留的不完整文件"""
+    def _cleanup(work_dir: str):
+        """删除下载残留（整个唯一临时目录，其中只有本次下载的文件）"""
         try:
-            if os.path.exists(path):
-                os.remove(path)
+            shutil.rmtree(work_dir, ignore_errors=True)
         except Exception:
-            pass
+            logger.error("清理下载残留失败: %s", work_dir, exc_info=True)
 
 
 if __name__ == "__main__":

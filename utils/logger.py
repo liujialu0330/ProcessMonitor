@@ -9,9 +9,9 @@ import sys
 
 import config
 
-# 单文件大小上限与保留份数（固化：1MB x 2，超出即滚动，历史日志累计最多约 3MB）
-LOG_MAX_BYTES = 1 * 1024 * 1024
-LOG_BACKUP_COUNT = 2
+# 单文件大小上限与保留份数（固化：5MB x 5，超出即滚动，历史日志累计最多约 30MB）
+LOG_MAX_BYTES = 5 * 1024 * 1024
+LOG_BACKUP_COUNT = 5
 
 # 幂等标记，避免重复调用 setup_logging 时重复添加 Handler
 _configured = False

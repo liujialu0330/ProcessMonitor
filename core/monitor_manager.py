@@ -4,6 +4,7 @@
 采用单例模式，确保全局唯一
 """
 import logging
+from datetime import datetime
 from typing import Dict, List, Optional
 from PyQt5.QtCore import QObject, pyqtSignal
 
@@ -31,6 +32,7 @@ class MonitorManager(QObject):
     task_removed = pyqtSignal(str)         # 任务移除信号 (task_id)
     data_updated = pyqtSignal(str, dict)   # 数据更新信号 (task_id, {指标类型: 指标值})
     error_occurred = pyqtSignal(str, str)  # 错误信号 (task_id, error_message)
+    metrics_unavailable = pyqtSignal(str, dict)  # 指标不可用信号 (task_id, {指标类型: 原因})
     task_limit_reached = pyqtSignal()      # 任务数量达到上限信号
 
     def __new__(cls, db=None):
@@ -53,6 +55,9 @@ class MonitorManager(QObject):
         # 任务字典 {task_id: MonitorTask}
         self._tasks: Dict[str, MonitorTask] = {}
 
+        # 维护锁：数据库清理/压缩期间禁止创建、启动任务
+        self._maintenance = False
+
         # 数据库（生产路径应由 MainWindow 注入，回退仅为兼容兜底）
         self.db = db if db is not None else Database()
 
@@ -60,7 +65,7 @@ class MonitorManager(QObject):
         self._initialized = True
 
     def create_task(self, pid: int, process_name: str, metric_types: List[str],
-                   interval: float = None) -> Optional[str]:
+                    interval: float = None, note: str = '') -> Optional[str]:
         """
         创建新的监控任务
 
@@ -69,10 +74,16 @@ class MonitorManager(QObject):
             process_name: 进程名称
             metric_types: 监控指标类型列表
             interval: 采集间隔（可选）
+            note: 任务备注（可选）
 
         Returns:
-            Optional[str]: 任务ID，创建失败返回None
+            Optional[str]: 任务ID，创建失败（数据库维护中/任务数达上限）返回None
         """
+        # 数据库清理/压缩期间不允许新建任务
+        if self._maintenance:
+            self.error_occurred.emit('', '正在清理数据库，请稍后再试')
+            return None
+
         # 检查任务数量限制
         if len(self._tasks) >= config.MAX_MONITOR_TASKS:
             self.task_limit_reached.emit()
@@ -84,13 +95,15 @@ class MonitorManager(QObject):
             process_name=process_name,
             metric_types=metric_types,
             interval=interval,
-            db=self.db
+            db=self.db,
+            note=note,
         )
 
         # 连接任务信号
         task.data_updated.connect(self._on_task_data_updated)
         task.task_stopped.connect(self._on_task_stopped)
         task.error_occurred.connect(self._on_task_error)
+        task.metrics_unavailable.connect(self._on_task_metrics_unavailable)
 
         # 添加到字典
         self._tasks[task.task_id] = task
@@ -104,6 +117,10 @@ class MonitorManager(QObject):
         """
         启动监控任务
 
+        已结束（isFinished）的任务一律拒绝：任务停止后线程对象不可复用，
+        重新监控应通过 create_task 创建新任务。线程仍在收尾（isRunning）
+        时同样拒绝，避免 start() 把刚置位的停止标志冲掉。
+
         Args:
             task_id: 任务ID
 
@@ -111,36 +128,40 @@ class MonitorManager(QObject):
             bool: 启动是否成功
         """
         task = self._tasks.get(task_id)
-        if task and not task.is_running():
-            task.start()
-            logger.info("任务启动请求: task_id=%s pid=%s", task_id, task.pid)
-            self.task_started.emit(task_id)
-            return True
-        return False
+        if self._maintenance or task is None:
+            return False
+        if task.is_running() or task.isRunning() or task.isFinished():
+            return False
+        task.start()
+        logger.info("任务启动请求: task_id=%s pid=%s", task_id, task.pid)
+        self.task_started.emit(task_id)
+        return True
 
     def stop_task(self, task_id: str) -> bool:
         """
-        停止监控任务
+        请求停止监控任务（非阻塞）：只置停止标志后立即返回，不等待线程结束。
+        任务收尾（flush/写状态）在其工作线程内完成，随后经 task_stopped 信号通知；
+        UI 收到信号后再调用 remove_task（此时只需极短 wait）。
 
         Args:
             task_id: 任务ID
 
         Returns:
-            bool: 停止是否成功
+            bool: 是否已发出停止请求
         """
         task = self._tasks.get(task_id)
         if task and task.is_running():
             task.stop()
-            # wait() 在 P2-5 归位后会阻塞到 run() 内部完成 flush/写状态/emit 的完整收尾流程，
-            # 而不仅仅是等待 _running 标志被检测到，因此这里返回时数据已落库
-            task.wait()
-            logger.info("任务停止请求已完成: task_id=%s", task_id)
+            logger.info("任务停止请求已发出: task_id=%s", task_id)
             return True
         return False
 
     def remove_task(self, task_id: str) -> bool:
         """
         移除监控任务（停止并删除）
+
+        只要线程仍在运行（含停止收尾中）就等待其结束，而不只看运行标志，
+        保证对象被丢弃时线程一定已退出。
 
         Args:
             task_id: 任务ID
@@ -150,8 +171,7 @@ class MonitorManager(QObject):
         """
         task = self._tasks.get(task_id)
         if task:
-            # 如果正在运行，先停止
-            if task.is_running():
+            if task.isRunning():
                 task.stop()
                 task.wait()
 
@@ -245,9 +265,75 @@ class MonitorManager(QObject):
         return len(self._tasks) < config.MAX_MONITOR_TASKS
 
     def stop_all_tasks(self):
-        """停止所有任务"""
-        for task_id in list(self._tasks.keys()):
-            self.stop_task(task_id)
+        """
+        停止所有任务（退出路径，阻塞）：先给全部任务置停止标志，再逐个无超时 wait。
+        无超时 join 是退出时 os._exit 的数据安全前提——每个任务的收尾 flush 与
+        状态落库都已完成才会返回，勿给 wait 加超时。
+        """
+        tasks = list(self._tasks.values())
+        for task in tasks:
+            if task.isRunning():
+                task.stop()
+        for task in tasks:
+            if task.isRunning():
+                task.wait()
+
+    # ========== 运行状态与维护 ==========
+
+    def running_task_count(self) -> int:
+        """仍有线程在运行的任务数（含暂停中与停止收尾中的任务）"""
+        return sum(1 for task in self._tasks.values() if task.isRunning())
+
+    def has_running_tasks(self) -> bool:
+        """是否存在仍在运行的任务"""
+        return self.running_task_count() > 0
+
+    def begin_maintenance(self) -> bool:
+        """
+        进入数据库维护状态（清理/压缩前调用）。有运行中任务时拒绝返回 False；
+        否则置位并返回 True，此后 create_task / start_task 被拒绝，直到 end_maintenance。
+        """
+        if self.has_running_tasks():
+            return False
+        self._maintenance = True
+        return True
+
+    def end_maintenance(self):
+        """退出数据库维护状态"""
+        self._maintenance = False
+
+    def is_maintenance_running(self) -> bool:
+        """是否处于数据库维护状态"""
+        return self._maintenance
+
+    # ========== 任务数据与标记 ==========
+
+    def add_marker(self, task_id: str, label: str) -> Optional[datetime]:
+        """
+        以当前时间为任务添加一个时间标记。
+
+        Returns:
+            Optional[datetime]: 标记时间戳；任务不存在、标签为空或写库失败返回 None
+        """
+        label = (label or '').strip()
+        if not label:
+            return None
+        if task_id not in self._tasks and self.db.get_task(task_id) is None:
+            return None
+        timestamp = datetime.now()
+        if not self.db.add_marker(task_id, timestamp, label):
+            return None
+        return timestamp
+
+    def delete_task_data(self, task_id: str) -> bool:
+        """
+        删除任务的全部数据（任务行、数据点、标记）。
+        任务仍在 _tasks 中且线程在运行时拒绝，返回 False。
+        """
+        task = self._tasks.get(task_id)
+        if task is not None and task.isRunning():
+            return False
+        return self.db.delete_task(task_id)
 
     def get_task_info(self, task_id: str) -> Optional[TaskModel]:
         """
@@ -287,6 +373,10 @@ class MonitorManager(QObject):
     def _on_task_error(self, task_id: str, error_msg: str):
         """任务错误处理"""
         self.error_occurred.emit(task_id, error_msg)
+
+    def _on_task_metrics_unavailable(self, task_id: str, reasons: dict):
+        """任务指标不可用处理"""
+        self.metrics_unavailable.emit(task_id, reasons)
 
 
 # 单元测试

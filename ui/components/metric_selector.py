@@ -5,10 +5,16 @@
 from typing import Dict, List
 
 from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import QWidget, QVBoxLayout, QGridLayout, QScrollArea
-from qfluentwidgets import MessageBoxBase, SubtitleLabel, CheckBox
+from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
+                             QScrollArea)
+from qfluentwidgets import (
+    MessageBoxBase, SubtitleLabel, CheckBox, PushButton, CaptionLabel, FluentIcon
+)
 
-from utils.metrics import AVAILABLE_METRICS, get_metric_display_name
+from utils.metrics import (
+    AVAILABLE_METRICS, LEAK_CHECK_PRESET, get_metric_description,
+    get_metric_display_name
+)
 
 
 class MetricSelectorDialog(MessageBoxBase):
@@ -45,6 +51,18 @@ class MetricSelectorDialog(MessageBoxBase):
         title_label = SubtitleLabel("选择监控指标", self)
         self.viewLayout.addWidget(title_label)
 
+        # 一键勾选"泄漏排查"预设；悬停每个指标可看含义与适用场景
+        preset_row = QHBoxLayout()
+        preset_row.setSpacing(12)
+        self.preset_button = PushButton("泄漏排查预设", self, FluentIcon.CHECKBOX)
+        self.preset_button.setToolTip(
+            "私有字节、句柄数、GDI对象数、USER对象数、线程数：判断内存/句柄/界面资源泄漏的最小指标集")
+        self.preset_button.clicked.connect(self.select_leak_check_preset)
+        preset_row.addWidget(self.preset_button)
+        preset_row.addWidget(CaptionLabel("鼠标悬停在指标上可查看含义"))
+        preset_row.addStretch()
+        self.viewLayout.addLayout(preset_row)
+
         # 滚动区域
         scroll_area = QScrollArea(self)
         scroll_area.setWidgetResizable(True)
@@ -78,6 +96,7 @@ class MetricSelectorDialog(MessageBoxBase):
             for i, metric in enumerate(metrics):
                 metric_checkbox = CheckBox(get_metric_display_name(metric))
                 metric_checkbox.setChecked(metric in selected)
+                metric_checkbox.setToolTip(get_metric_description(metric))
                 metric_checkbox.stateChanged.connect(
                     lambda state, c=category: self._on_metric_changed(c))
                 self.metric_checkboxes[metric] = metric_checkbox
@@ -100,6 +119,21 @@ class MetricSelectorDialog(MessageBoxBase):
         for category in AVAILABLE_METRICS:
             self._update_category_state(category)
         self._update_yes_button()
+
+    def select_metrics(self, metrics: List[str]) -> None:
+        """把勾选状态整体设为给定指标集合，并联动分类三态与确认按钮。"""
+        wanted = set(metrics)
+        for metric, checkbox in self.metric_checkboxes.items():
+            checkbox.blockSignals(True)
+            checkbox.setChecked(metric in wanted)
+            checkbox.blockSignals(False)
+        for category in AVAILABLE_METRICS:
+            self._update_category_state(category)
+        self._update_yes_button()
+
+    def select_leak_check_preset(self) -> None:
+        """一键勾选"泄漏排查"预设（覆盖当前勾选）。"""
+        self.select_metrics(LEAK_CHECK_PRESET)
 
     def _on_category_clicked(self, category: str):
         """

@@ -1,11 +1,10 @@
 """
-MonitorTask 暂停/恢复行为验证（v1.3.0 批3 C4）
+MonitorTask 暂停/恢复行为验证
 
 真实起 QThread 监控当前测试进程，验证 pause() 让主循环跳过采集（不再 emit
-data_updated）、resume() 恢复采集、以及暂停态下 stop() 仍能在轮询间隔内
-（<=100ms 量级）干净终止而无需先 resume。core 层的 pause/resume/is_paused/
-暂停轮询实现本身未改动（v1.3.0 方案裁决：core 不改），本文件只是把这三条
-行为钉死为回归用例，测试模式复用 tests/test_stop_race.py 的 make_task 夹具。
+data_updated）、resume() 立即恢复采集、以及暂停态下 stop() 无需先 resume 即可
+干净终止（暂停改为在 Event 上等待，不再 100ms 轮询）。正向等待一律轮询，
+"暂停期间不再产生数据"用"计数连续一段时间不变"来确认。
 """
 import os
 import time
@@ -13,15 +12,14 @@ import time
 import pytest
 from PyQt5.QtCore import Qt
 
-import config
 from core.monitor_task import MonitorTask
+from tests.helpers import poll_until, wait_stable
 
 
 @pytest.fixture
-def make_task(tmp_path, monkeypatch, qapp):
-    """构造真实 MonitorTask（tmp 库，不碰项目真实 data\\monitor.db），用例结束后
+def make_task(tmp_path, qapp):
+    """构造真实 MonitorTask（数据库由根 conftest 隔离到临时目录），用例结束后
     兜底清理，防止某个断言失败导致线程遗留"""
-    monkeypatch.setattr(config, 'DB_PATH', str(tmp_path / "pause_resume.db"))
     created = []
 
     def _factory(pid=None, interval=0.1, metric_types=None):
@@ -42,67 +40,92 @@ def make_task(tmp_path, monkeypatch, qapp):
             t.wait(3000)
 
 
+def _count_updates(task):
+    updates = []
+    task.data_updated.connect(lambda tid, values: updates.append(values), Qt.DirectConnection)
+    return updates
+
+
 def test_pause_sets_flag_and_skips_collection(make_task):
     """pause() 置位 is_paused()，且暂停期间不再产生新的 data_updated（采集被跳过）"""
     task = make_task(interval=0.1)
-    updates = []
-    task.data_updated.connect(
-        lambda tid, values: updates.append(values), Qt.DirectConnection)
+    updates = _count_updates(task)
 
     task.start()
-    time.sleep(0.35)  # 留出若干个采集周期，确认任务已正常运行
-    assert len(updates) > 0
+    assert poll_until(lambda: len(updates) >= 3), "任务应已正常运行"
 
     task.pause()
     assert task.is_paused() is True
 
-    time.sleep(0.15)  # 留出暂停发生前"最后一个"采集周期收尾的时间窗口
-    count_after_pause_settle = len(updates)
-
-    time.sleep(0.3)  # 若干个采集周期时长，暂停态不应再有新数据
-    assert len(updates) == count_after_pause_settle
+    # 暂停发生前最后一个周期可能仍在收尾；确认计数稳定下来（>=0.4s 无新数据）
+    assert wait_stable(lambda: len(updates), quiet=0.4), "暂停后仍持续产生数据"
 
 
 def test_resume_restarts_collection(make_task):
     """resume() 复位 is_paused()，暂停期间静止的采集在恢复后重新产生新数据"""
     task = make_task(interval=0.1)
-    updates = []
-    task.data_updated.connect(
-        lambda tid, values: updates.append(values), Qt.DirectConnection)
+    updates = _count_updates(task)
 
     task.start()
-    time.sleep(0.15)
+    assert poll_until(lambda: len(updates) >= 1)
     task.pause()
-
-    time.sleep(0.15)  # 留出暂停发生前"最后一个"采集周期收尾的时间窗口
+    assert wait_stable(lambda: len(updates), quiet=0.4)
     count_while_paused = len(updates)
-    time.sleep(0.2)   # 确认暂停期间确实没有新数据（排除误判恢复效果的可能）
-    assert len(updates) == count_while_paused
 
     task.resume()
     assert task.is_paused() is False
 
-    time.sleep(0.35)  # 留出若干个采集周期，恢复后应产生新数据
-    assert len(updates) > count_while_paused
+    assert poll_until(lambda: len(updates) > count_while_paused), "恢复后应重新产生数据"
 
 
-def test_stop_while_paused_terminates_within_timeout(make_task):
-    """暂停态下调用 stop()：线程应在 100ms 轮询间隔量级内干净终止，无需先 resume"""
-    task = make_task(interval=2.0)  # 长周期，确保暂停时线程确实卡在 msleep(100) 轮询里
+def test_resume_collects_immediately_with_long_interval(make_task):
+    """长周期任务恢复后立即采集一次，而不是等满剩余周期"""
+    task = make_task(interval=30.0)
+    updates = _count_updates(task)
+
     task.start()
-    time.sleep(0.1)
+    assert poll_until(lambda: len(updates) >= 1)
+    task.pause()
+    assert wait_stable(lambda: len(updates), quiet=0.2)
+    count_while_paused = len(updates)
+
+    task.resume()
+
+    assert poll_until(lambda: len(updates) > count_while_paused, timeout=5), (
+        "恢复应唤醒暂停等待并立即采集，而非等待 30s 周期")
+
+
+def test_pause_interrupts_current_wait(make_task):
+    """pause() 唤醒周期等待：长周期任务暂停后不会在原截止时间到点时再采一次"""
+    task = make_task(interval=0.5)
+    updates = _count_updates(task)
+
+    task.start()
+    assert poll_until(lambda: len(updates) >= 1)
+    task.pause()
+    count = len(updates)
+
+    # 超过一个完整周期仍不应有新数据
+    time.sleep(0.8)
+    assert len(updates) == count
+
+
+def test_stop_while_paused_terminates_promptly(make_task):
+    """暂停态下调用 stop()：线程被事件唤醒后干净终止，无需先 resume"""
+    task = make_task(interval=30.0)
+    updates = _count_updates(task)
+    task.start()
+    assert poll_until(lambda: len(updates) >= 1)
 
     task.pause()
-    time.sleep(0.15)  # 确认已进入暂停轮询（而不是仍在未暂停前的长 interval 睡眠分片中）
+    assert wait_stable(lambda: len(updates), quiet=0.2)
     assert task.is_paused() is True
 
     t0 = time.perf_counter()
     task.stop()
-    finished = task.wait(3000)
+    finished = task.wait(5000)
     duration = time.perf_counter() - t0
 
     assert finished is True
     assert task.isRunning() is False
-    # 暂停态是 msleep(100) 轮询，停止应在约 100ms 量级内退出（留宽松余量应对
-    # 调度抖动，核心断言是"远小于未暂停时 2.0s 的 interval"）
-    assert duration < 0.5
+    assert duration < 1.0

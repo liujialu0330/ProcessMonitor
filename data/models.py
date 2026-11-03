@@ -18,6 +18,9 @@ class MonitorTask:
     start_time: datetime            # 开始时间
     end_time: Optional[datetime]    # 结束时间（None表示正在运行）
     status: str                     # 状态：running/stopped
+    note: str = ''                          # 任务备注
+    sample_count: int = 0                   # 已采集次数（同一周期多指标算一次）
+    last_sample_at: Optional[datetime] = None  # 最后一次采样时间
 
     def is_running(self) -> bool:
         """判断任务是否正在运行"""
@@ -34,6 +37,9 @@ class MonitorTask:
             'start_time': self.start_time.isoformat() if self.start_time else None,
             'end_time': self.end_time.isoformat() if self.end_time else None,
             'status': self.status,
+            'note': self.note,
+            'sample_count': self.sample_count,
+            'last_sample_at': self.last_sample_at.isoformat() if self.last_sample_at else None,
         }
 
     @staticmethod
@@ -48,6 +54,10 @@ class MonitorTask:
             start_time=datetime.fromisoformat(data['start_time']) if data['start_time'] else None,
             end_time=datetime.fromisoformat(data['end_time']) if data['end_time'] else None,
             status=data['status'],
+            note=data.get('note') or '',
+            sample_count=data.get('sample_count') or 0,
+            last_sample_at=(datetime.fromisoformat(data['last_sample_at'])
+                            if data.get('last_sample_at') else None),
         )
 
 
@@ -77,3 +87,12 @@ class DataPoint:
             value=data['value'],
             metric_type=data.get('metric_type', ''),
         )
+
+
+@dataclass
+class Marker:
+    """任务时间标记（事件打点）"""
+    task_id: str                # 所属任务ID
+    timestamp: datetime         # 标记时间
+    label: str                  # 标记文字
+    id: Optional[int] = None    # 数据库自增ID（未入库时为 None）

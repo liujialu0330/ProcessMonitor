@@ -23,13 +23,42 @@ themeMode` 为 True。
 """
 import os
 
+from typing import Iterable, List
+
 from qfluentwidgets import (
-    QConfig, ConfigItem, OptionsConfigItem, RangeConfigItem,
+    QConfig, ConfigItem, ConfigValidator, OptionsConfigItem, RangeConfigItem,
     BoolValidator, OptionsValidator, RangeValidator, qconfig,
     Theme, setTheme
 )
 
 import config
+from utils.metrics import LEAK_CHECK_PRESET, all_metric_types, canonical_metric_type
+
+
+def normalize_metrics(value) -> List[str]:
+    """把配置里读出的指标列表归一：非列表/未知键丢弃，旧键经
+    canonical_metric_type 归一，去重保序；结果为空则回落到"泄漏排查"预设。"""
+    known = set(all_metric_types())
+    result: List[str] = []
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            if not isinstance(item, str):
+                continue
+            key = canonical_metric_type(item)
+            if key in known and key not in result:
+                result.append(key)
+    return result or list(LEAK_CHECK_PRESET)
+
+
+class MetricListValidator(ConfigValidator):
+    """监控指标列表校验器：加载与赋值时都按 normalize_metrics 纠正，
+    配置文件被手改或指标键随版本变化时不会让监控页拿到非法指标。"""
+
+    def validate(self, value) -> bool:
+        return value == normalize_metrics(value)
+
+    def correct(self, value) -> List[str]:
+        return normalize_metrics(value)
 
 
 class AppConfig(QConfig):
@@ -47,13 +76,16 @@ class AppConfig(QConfig):
         "Data", "RetentionDays",
         config.DATA_RETENTION_DAYS, OptionsValidator([0, 7, 30, 90, 180]))
 
-    # 关闭窗口时是否最小化到系统托盘（批1 暂未接入设置页 UI 与主窗口逻辑，
-    # 批4 托盘驻留功能会用到；本批先随配置基础设施一并声明，默认关闭=原有行为）
+    # 关闭窗口时是否最小化到系统托盘：设置页开关控制，默认关闭（直接退出）
     close_to_tray = ConfigItem("Behavior", "CloseToTray", False, BoolValidator())
+
+    # 监控页上次选择的指标：新建任务时沿用，默认"泄漏排查"预设
+    last_metrics = ConfigItem(
+        "Monitor", "LastMetrics", list(LEAK_CHECK_PRESET), MetricListValidator())
 
 
 # 全局单例：进程内所有代码统一通过该实例读写配置（不要自行 AppConfig() 构造新实例
-# 用于生产代码路径——三个自定义 ConfigItem 是类属性，天然全进程共享同一份值，
+# 用于生产代码路径——自定义 ConfigItem 是类属性，天然全进程共享同一份值，
 # 但只有这一个实例会被 qconfig.load() 接管、参与自动落盘）
 cfg = AppConfig()
 
@@ -79,3 +111,13 @@ def load_app_config() -> None:
 
     if is_first_launch:
         setTheme(Theme.AUTO, save=True)
+
+
+def remember_last_metrics(metrics: Iterable[str]) -> None:
+    """记住监控页的指标选择。
+
+    只在应用配置已由 load_app_config() 接管时才落盘：配置尚未加载（单元测试、
+    独立脚本）时只更新内存值，避免 qconfig 把文件写到当前目录下的默认路径。
+    """
+    loaded = getattr(qconfig, "_cfg", None) is cfg
+    qconfig.set(cfg.last_metrics, normalize_metrics(list(metrics)), save=loaded)

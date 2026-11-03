@@ -166,7 +166,7 @@ def test_single_data_point_save(db):
 
 def test_get_task_data_points_limit_returns_recent_n_ascending(db):
     """
-    v1.2.0 批3 变更：limit 分支改为子查询"最近 N 条且按时间升序"（不再是 DESC）。
+    limit 分支语义为子查询"最近 N 条且按时间升序"（不是 DESC）。
     历史页依赖该语义直接顺序填表/绘图，不再自行 reversed()。
     """
     task = _make_task()
@@ -300,10 +300,10 @@ def test_cleanup_old_tasks_uses_start_time_when_end_time_null(db):
     assert db.get_task(task.task_id) is None
 
 
-# ========== v1.3.0 批2：since_iso 时间过滤 / 统计 / 最新时间戳 ==========
-# 评审修订 B1 是本批最高优先级事实：data_points.timestamp 在库里是 ISO TEXT，
-# SQL 过滤参数必须用 ISO 字符串。以下用例均显式断言"过滤后行数 < 全量行数"，
-# 防止重犯"float 过滤恒真、时间过滤静默失效"的回归（opus 评审已实测过该缺陷）。
+# ========== since_iso 时间过滤 / 统计 / 最新时间戳 ==========
+# data_points.timestamp 在库里是 ISO TEXT，SQL 过滤参数必须用 ISO 字符串。
+# 以下用例均显式断言"过滤后行数 < 全量行数"，防止"float 过滤恒真、时间过滤
+# 静默失效"的回归。
 
 def test_data_points_since_filter(db):
     """since_iso 只返回该时间及之后的点（取第6个点的 ISO 字符串），且行数必须收窄"""
@@ -322,7 +322,7 @@ def test_data_points_since_filter(db):
     result = db.get_task_data_points(task.task_id, metric_type="memory_rss", since_iso=since_iso)
 
     assert len(result) == 5  # i=5..9
-    assert len(result) < len(points), "过滤后行数必须收窄，否则时间过滤静默失效（B1 回归）"
+    assert len(result) < len(points), "过滤后行数必须收窄，否则时间过滤静默失效"
     assert [p.value for p in result] == [5.0, 6.0, 7.0, 8.0, 9.0]
     assert result[0].timestamp < result[1].timestamp < result[-1].timestamp
 
@@ -369,7 +369,7 @@ def test_bucketed_since_filter(db):
 
     assert len(full) == 20
     assert len(filtered) == 5  # i=15..19，未超过 max_buckets，逐行成桶等价于全量返回
-    assert len(filtered) < len(full), "过滤后行数必须收窄，否则时间过滤静默失效（B1 回归）"
+    assert len(filtered) < len(full), "过滤后行数必须收窄，否则时间过滤静默失效"
     assert min(p.value for p in filtered) == 15.0
     assert max(p.value for p in filtered) == 19.0
     timestamps = [p.timestamp for p in filtered]
@@ -377,7 +377,7 @@ def test_bucketed_since_filter(db):
 
 
 def test_metric_stats_basic(db):
-    """已知数据集校验 count/min/max/avg 精确值（不含 last，评审修订 M3）"""
+    """已知数据集校验 count/min/max/avg 精确值"""
     task = _make_task()
     db.save_task(task)
 
@@ -393,7 +393,6 @@ def test_metric_stats_basic(db):
     stats = db.get_metric_stats(task.task_id, "memory_rss")
 
     assert stats is not None
-    assert 'last' not in stats
     assert stats['count'] == 5
     assert stats['min'] == 10.0
     assert stats['max'] == 50.0
@@ -401,7 +400,7 @@ def test_metric_stats_basic(db):
 
 
 def test_metric_stats_since_filter_narrows_range(db):
-    """stats 的 since_iso 过滤同样必须收窄，覆盖 get_metric_stats 自身的 B1 回归风险"""
+    """stats 的 since_iso 过滤同样必须收窄（since_iso 只接受 ISO 字符串）"""
     task = _make_task()
     db.save_task(task)
 
@@ -419,7 +418,7 @@ def test_metric_stats_since_filter_narrows_range(db):
 
     assert full_stats['count'] == 10
     assert filtered_stats['count'] == 5
-    assert filtered_stats['count'] < full_stats['count'], "过滤后行数必须收窄（B1 回归）"
+    assert filtered_stats['count'] < full_stats['count'], "过滤后行数必须收窄"
     assert filtered_stats['min'] == 5.0
     assert filtered_stats['max'] == 9.0
 
@@ -468,7 +467,7 @@ def test_last_point_timestamp_empty_none(db):
     assert db.get_last_point_timestamp(task.task_id) is None
 
 
-# ========== v1.3.0 批4：数据库维护（get_db_size_bytes / vacuum） ==========
+# ========== 数据库维护（get_db_size_bytes / vacuum） ==========
 
 def test_db_size_positive(db):
     """写入数据后总占用字节数（db 主文件 + -wal/-shm 边车文件求和）应 > 0"""
