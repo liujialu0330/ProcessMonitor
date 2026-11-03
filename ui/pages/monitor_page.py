@@ -2,6 +2,7 @@
 实时监控页面
 进程选择、新建监控任务，并以任务卡片编排各任务的实时数据与结束后的回看入口
 """
+import os
 from datetime import datetime
 from typing import List, Optional, Tuple
 
@@ -489,8 +490,11 @@ class MonitorPage(QScrollArea):
     def _find_pids_by_name(self, process_name: str) -> List[int]:
         """按进程名（不区分大小写）查找当前正在运行的进程 PID"""
         wanted = process_name.lower()
+        # 排除本程序自身：被测的同名进程（如 python.exe）退出后，"重新监控"
+        # 不能因为只剩本程序同名而自动监控起自己
+        own_pid = os.getpid()
         return [pid for pid, name in ProcessCollector.get_all_processes()
-                if name.lower() == wanted]
+                if name.lower() == wanted and pid != own_pid]
 
     # ========== 任务列表 ==========
 

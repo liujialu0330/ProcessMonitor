@@ -35,6 +35,13 @@ class MarkerDialog(MessageBoxBase):
         # 回车直接确认
         self.label_edit.returnPressed.connect(self.yesButton.click)
 
+    def showEvent(self, event):
+        # MessageBoxBase 默认把焦点给"添加"按钮：用户直接打字会落空、回车按默认标签提交。
+        # 显示后把焦点交给输入框（默认标签已全选，打字即覆盖）
+        super().showEvent(event)
+        self.label_edit.setFocus()
+        self.label_edit.selectAll()
+
     def get_label(self) -> str:
         """输入的标签（已去除首尾空白）。"""
         return self.label_edit.text().strip()

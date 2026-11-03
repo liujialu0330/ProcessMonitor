@@ -232,3 +232,15 @@ def test_pivot_rows_empty_markers_list_gives_empty_column():
     rows = list(pivot_rows(task, [
         DataPoint(task_id="task-1", timestamp=ts, value=1.0, metric_type="memory_rss")], []))
     assert rows == [["2026-01-01 00:00:00", "test.exe", 1234, "1.0000", ""]]
+
+
+def test_pivot_rows_writes_count_metrics_as_integers():
+    """计数类指标（句柄/GDI 等）写成整数，字节类仍保留 4 位小数。"""
+    task = _make_task(["memory_private", "num_gdi_objects"])
+    ts = datetime(2026, 1, 1, 0, 0, 0)
+    data_points = [
+        DataPoint(task_id="task-1", timestamp=ts, value=2048.5, metric_type="memory_private"),
+        DataPoint(task_id="task-1", timestamp=ts, value=415.0, metric_type="num_gdi_objects"),
+    ]
+    rows = list(pivot_rows(task, data_points))
+    assert rows == [["2026-01-01 00:00:00", "test.exe", 1234, "2048.5000", "415"]]

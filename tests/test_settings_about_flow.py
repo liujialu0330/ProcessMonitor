@@ -45,7 +45,7 @@ def setting(qapp, db, manager):
     page.close()
 
 
-# ---------- D2：开关文案 ----------
+# ---------- 开关文案 ----------
 
 def test_close_to_tray_switch_uses_chinese_text(setting, tmp_path):
     # SwitchSettingCard.setValue 会经 qconfig.set 落盘：先把配置文件重定向到 tmp，
@@ -127,7 +127,7 @@ def test_cleanup_button_follows_manager_signals(setting, manager, db, monkeypatc
     assert setting.cleanup_card.button.isEnabled()
 
 
-# ---------- D3：关于页 ----------
+# ---------- 关于页 ----------
 
 @pytest.fixture
 def about(qapp):

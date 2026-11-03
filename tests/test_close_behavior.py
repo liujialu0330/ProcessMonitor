@@ -177,7 +177,7 @@ def test_cleanup_exception_still_quits(window, monkeypatch):
     quit_mock.assert_called_once()
 
 
-# ========== D1：仍有任务在监控时的关闭确认 ==========
+# ========== 仍有任务在监控时的关闭确认 ==========
 
 def _start_running_task(window):
     """在真实 MonitorManager 上启动一个监控当前进程的任务（真线程）"""

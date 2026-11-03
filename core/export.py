@@ -6,12 +6,21 @@
 from typing import Iterator, Iterable, List, Optional
 
 from data.models import MonitorTask, DataPoint, Marker
-from utils.metrics import get_metric_display_name, get_metric_unit
+from utils.metrics import get_metric_display_name, get_metric_unit, is_integer_metric
 
 # 打点列的表头
 MARKER_COLUMN_NAME = '打点'
 # 同一行有多个打点时标签之间的分隔符
 MARKER_LABEL_SEPARATOR = '; '
+
+
+def _format_value(metric: str, value) -> str:
+    """CSV 单元格文本：计数类指标写整数（124 而不是 124.0000），其余保留 4 位小数。"""
+    if value is None:
+        return ""
+    if is_integer_metric(metric):
+        return str(int(round(value)))
+    return f"{value:.4f}"
 
 
 def build_csv_header(task: MonitorTask, include_markers: bool = False) -> List[str]:
@@ -77,8 +86,7 @@ def pivot_rows(task: MonitorTask, data_point_iter: Iterable[DataPoint],
             task.pid,
         ]
         for metric in metrics:
-            value = current_values.get(metric)
-            row.append(f"{value:.4f}" if value is not None else "")
+            row.append(_format_value(metric, current_values.get(metric)))
         if with_markers:
             labels = []
             while (marker_index < len(pending_markers)

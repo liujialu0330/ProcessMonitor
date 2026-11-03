@@ -48,7 +48,7 @@ def page(qapp, db, manager):
     widget.close()
 
 
-# ---------- B2：默认范围与空状态 ----------
+# ---------- 默认范围与空状态 ----------
 
 def test_default_range_is_all_and_initial_empty_state(page):
     assert page.current_range_key == 'all'
@@ -101,7 +101,7 @@ def test_cache_is_reused_between_range_switches(page, db, monkeypatch):
     assert len(calls) <= 1
 
 
-# ---------- B3：自动刷新 ----------
+# ---------- 自动刷新 ----------
 
 def test_auto_refresh_timer_follows_visibility(page):
     assert AUTO_REFRESH_INTERVAL_MS == 5000
@@ -151,7 +151,7 @@ def test_auto_refresh_stops_when_page_not_visible(page):
     assert not page._auto_refresh_timer.isActive()
 
 
-# ---------- B4：自适应范围 ----------
+# ---------- 自适应范围 ----------
 
 def test_reload_enables_auto_range_unless_keep_view(page, db, monkeypatch):
     task = _seed_task(db, samples=5)
@@ -166,7 +166,7 @@ def test_reload_enables_auto_range_unless_keep_view(page, db, monkeypatch):
     assert calls == [1]
 
 
-# ---------- B5：统计条 ----------
+# ---------- 统计条 ----------
 
 def test_stats_strip_shows_six_cells_from_metric_stats(page, db):
     task = _seed_task(db, samples=10)   # 100 MB -> 109 MB，每秒涨 1 MB
@@ -195,7 +195,7 @@ def test_stats_strip_wraps_responsively(page, width, columns):
     assert max(used_columns) + 1 == columns
 
 
-# ---------- B6：打点竖线 ----------
+# ---------- 打点竖线 ----------
 
 def test_markers_are_drawn_as_vertical_lines(page, db):
     task = _seed_task(db, samples=10, markers=[(2, "第1轮"), (6, "第2轮")])
@@ -217,7 +217,7 @@ def test_no_marker_lines_for_task_without_markers(page, db):
     assert lines == []
 
 
-# ---------- B7：表格提示 ----------
+# ---------- 表格提示 ----------
 
 def test_table_hint_shows_shown_over_total(page, db, monkeypatch):
     task = _seed_task(db, samples=10)
@@ -235,7 +235,7 @@ def test_table_hint_uses_thousands_separator(page):
     assert "共 12,345 条" in page.table_hint_label.text()
 
 
-# ---------- B8：任务下拉 ----------
+# ---------- 任务下拉 ----------
 
 def test_task_combo_text_and_single_query(page, db, manager, monkeypatch):
     long_note = "建模 200 次回归测试，连续运行过夜观察内存增长"
@@ -277,7 +277,7 @@ def test_select_task_picks_given_task(page, db):
     assert page.current_task_id in (first.task_id, second.task_id, None)
 
 
-# ---------- B9：删除经 manager ----------
+# ---------- 删除经 manager ----------
 
 def test_delete_goes_through_manager(page, db, manager, monkeypatch):
     task = _seed_task(db, samples=5)
@@ -328,3 +328,53 @@ def test_delete_failure_keeps_task(page, db, manager, monkeypatch):
 
     assert len(errors) == 1
     assert db.get_task(task.task_id) is not None
+
+
+def test_small_window_scrolls_instead_of_clipping_chart(qapp, db, manager):
+    """默认窗口尺寸下图表不能被压出卡片：内容放不下时页面应出现滚动条。"""
+    task = _seed_task(db, samples=20)
+    page = HistoryPage(db=db, manager=manager)
+    page.resize(930, 640)
+    page.show()
+    try:
+        page.select_task(task.task_id)
+        qapp.processEvents()
+        chart = page.chart_widget
+        card = chart.parentWidget()
+        assert chart.geometry().bottom() <= card.rect().bottom()
+        content = page.widget()
+        if content.minimumSizeHint().height() > page.viewport().height():
+            assert page.verticalScrollBar().maximum() > 0
+    finally:
+        page._auto_refresh_timer.stop()
+        page.close()
+
+
+def test_auto_selection_follows_newest_task_but_user_choice_is_kept(page, db):
+    """启动时默认选中的旧任务：出现更新的任务后切到最新；用户主动选过的任务保持不变。"""
+    old = _seed_task(db, samples=5, name="old.exe", start=BASE)
+    page._load_tasks()
+    assert page.current_task_id == old.task_id
+
+    newer = _seed_task(db, samples=5, name="newer.exe", start=BASE + timedelta(hours=1))
+    page._load_tasks()
+    assert page.current_task_id == newer.task_id
+
+    # 用户主动选回旧任务后，再出现新任务也不切走
+    old_index = next(i for i in range(page.task_combo.count())
+                     if page.task_combo.itemData(i) == old.task_id)
+    page.task_combo.setCurrentIndex(old_index)
+    assert page.current_task_id == old.task_id
+    _seed_task(db, samples=5, name="newest.exe", start=BASE + timedelta(hours=2))
+    page._load_tasks()
+    assert page.current_task_id == old.task_id
+
+
+def test_select_task_is_an_explicit_choice(page, db):
+    """从监控页"查看历史"跳转选中的任务，即便不是最新也不被自动切走。"""
+    old = _seed_task(db, samples=5, name="old.exe", start=BASE)
+    _seed_task(db, samples=5, name="newer.exe", start=BASE + timedelta(hours=1))
+    page._load_tasks()
+    page.select_task(old.task_id)
+    page._load_tasks()
+    assert page.current_task_id == old.task_id
