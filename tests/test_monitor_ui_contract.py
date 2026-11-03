@@ -18,3 +18,19 @@ def test_interval_spinbox_keeps_maximum_value_visible(qapp, monkeypatch):
     assert spinbox.lineEdit().width() >= value_width
 
     page.close()
+
+
+def test_task_card_mark_unavailable_shows_text_and_tooltip(qapp):
+    """不可用指标显示"不可用"并给出原因；之后采到值会正常覆盖"""
+    from ui.pages.monitor_page import TaskCard
+    card = TaskCard("t1", "demo.exe", 1234, ["memory_rss", "memory_uss"])
+
+    card.mark_unavailable({"memory_uss": "权限不足"})
+    label = card.value_labels["memory_uss"]
+    assert label.text() == "不可用"
+    assert "权限不足" in label.toolTip()
+    assert "不会记为 0" in label.toolTip()
+    assert card.value_labels["memory_rss"].text() == "--"
+
+    card.update_values({"memory_uss": 2048.0})
+    assert label.text() == "2 MB"

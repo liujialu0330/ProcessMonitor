@@ -8,15 +8,22 @@ import os
 import shutil
 import sqlite3
 from datetime import datetime, timedelta
-from typing import List, Optional
+from typing import Dict, Iterator, List, Optional
 from contextlib import contextmanager
-from data.models import MonitorTask, DataPoint
+from data.models import MonitorTask, DataPoint, Marker
 import config
 
 logger = logging.getLogger(__name__)
 
-# 数据库 Schema 版本（v1：多指标支持，tasks.metric_type 存 JSON 数组，data_points 新增 metric_type 列）
-SCHEMA_VERSION = 1
+# 数据库 Schema 版本
+# v1：多指标支持，tasks.metric_type 存 JSON 数组，data_points 新增 metric_type 列
+# v2：合并重复内存指标（memory_vms / memory_pagefile 并入 memory_private，表结构不变）
+# v3：tasks 增加 note / sample_count / last_sample_at；新增 task_markers 表；
+#     清理孤儿数据点并回填 NULL 的 metric_type；索引收敛为 (task_id, metric_type, timestamp)
+SCHEMA_VERSION = 3
+
+# 批量写数据点持续失败时的日志节流间隔（首次记堆栈，之后每隔该次数记一条）
+SAVE_FAILURE_LOG_INTERVAL = 100
 
 
 class Database:
@@ -47,6 +54,7 @@ class Database:
         self.migration_failed: bool = False
         self.data_reset: bool = False
         self.backup_aborted: bool = False
+        self._save_failures = 0   # save_data_points 连续失败次数（日志节流用）
         self._init_database()
 
     @contextmanager
@@ -73,27 +81,52 @@ class Database:
         finally:
             conn.close()
 
-    def _init_database(self):
-        """初始化数据库表结构（新库直接建 v1 结构并置 user_version=1，旧库走迁移）"""
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
+    @contextmanager
+    def _transaction(self):
+        """
+        显式事务上下文：isolation_level=None 关闭 sqlite3 模块的隐式事务管理，
+        用 BEGIN IMMEDIATE ... COMMIT 包住整段逻辑（失败 ROLLBACK）。
+        与默认模式不同，这样 DDL（CREATE/ALTER/DROP）与 PRAGMA user_version
+        也真正处于同一个事务内，迁移链任一步失败都能整体回滚。
+        """
+        conn = sqlite3.connect(self.db_path, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        try:
+            # 这些 PRAGMA 必须在 BEGIN 之前执行（journal_mode 不能在事务内切换）
+            conn.execute('PRAGMA journal_mode=WAL')
+            conn.execute('PRAGMA busy_timeout=5000')
+            conn.execute('PRAGMA synchronous=NORMAL')
+            conn.execute('BEGIN IMMEDIATE')
+            try:
+                yield conn.cursor()
+                conn.execute('COMMIT')
+            except BaseException:
+                try:
+                    conn.execute('ROLLBACK')
+                except sqlite3.Error:
+                    logger.error("事务回滚失败", exc_info=True)
+                raise
+        finally:
+            conn.close()
 
+    def _init_database(self):
+        """初始化数据库表结构（新库直接建当前结构并置 user_version=SCHEMA_VERSION，旧库走迁移）"""
+        with self._transaction() as cursor:
             # 判断是否为全新数据库（tasks 表尚不存在）
             cursor.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'tasks'"
             )
-            is_new_db = cursor.fetchone() is None
-
-            if is_new_db:
-                self._create_schema_v1(cursor)
+            if cursor.fetchone() is None:
+                self._create_schema_current(cursor)
 
         # 旧库按需迁移到当前版本
         self._migrate_if_needed()
 
     @staticmethod
-    def _create_schema_v1(cursor: sqlite3.Cursor):
-        """创建 v1 版本的表结构与索引，并置 user_version=1"""
-        # 创建任务表（metric_type 列存 JSON 数组文本，如 ["memory_rss","cpu_percent"]）
+    def _create_schema_current(cursor: sqlite3.Cursor):
+        """创建当前版本（v3）的表结构与索引，并置 user_version=SCHEMA_VERSION"""
+        # tasks.metric_type 列存 JSON 数组文本，如 ["memory_rss","cpu_percent"]；
+        # 后三列与 _migrate_v2_to_v3 的 ALTER TABLE ADD COLUMN 顺序保持一致
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS tasks (
                 task_id TEXT PRIMARY KEY,
@@ -103,11 +136,14 @@ class Database:
                 interval REAL NOT NULL,
                 start_time TEXT NOT NULL,
                 end_time TEXT,
-                status TEXT NOT NULL
+                status TEXT NOT NULL,
+                note TEXT NOT NULL DEFAULT '',
+                sample_count INTEGER NOT NULL DEFAULT 0,
+                last_sample_at TEXT
             )
         ''')
 
-        # 创建数据点表（metric_type 允许 NULL，兼容旧数据）
+        # metric_type 列保持可空：SQLite 无法原地改列约束，迁移库与新库须结构一致
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS data_points (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -119,30 +155,34 @@ class Database:
             )
         ''')
 
-        # 创建索引以提高查询性能
         cursor.execute('''
-            CREATE INDEX IF NOT EXISTS idx_data_points_task_id
-            ON data_points(task_id)
+            CREATE TABLE IF NOT EXISTS task_markers (
+                id INTEGER PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                label TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
         ''')
 
+        # data_points 唯一的索引：覆盖按任务/指标/时间范围的过滤、排序与首尾点查询
         cursor.execute('''
-            CREATE INDEX IF NOT EXISTS idx_data_points_timestamp
-            ON data_points(timestamp)
+            CREATE INDEX IF NOT EXISTS idx_data_points_task_metric_ts
+            ON data_points(task_id, metric_type, timestamp)
+        ''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_task_markers_task_ts
+            ON task_markers(task_id, timestamp)
         ''')
 
-        cursor.execute('''
-            CREATE INDEX IF NOT EXISTS idx_data_points_task_metric
-            ON data_points(task_id, metric_type)
-        ''')
-
-        # 新库直接标记为当前版本（PRAGMA 不能参数化，使用常量拼接）
+        # PRAGMA 不能参数化，使用常量拼接
         cursor.execute(f'PRAGMA user_version = {SCHEMA_VERSION}')
 
     # ========== 迁移相关 ==========
 
     def _migrate_if_needed(self):
         """
-        检查 user_version，低于当前版本则执行迁移。
+        检查 user_version，低于当前版本则按版本链式执行迁移（v0→v1→v2→v3，同一显式事务内）。
         迁移前先对旧库做 WAL checkpoint + 文件级备份，备份失败直接中止（backup_aborted）；
         备份成功后迁移失败，从备份还原后重试一次（应对磁盘满/文件锁等瞬时故障），仍失败则
         置 migration_failed（还原成功）或 data_reset（还原也失败，_restore_from_backup 内部置位）。
@@ -168,7 +208,7 @@ class Database:
 
         Database._migration_attempted = True
 
-        backup_path = self.db_path + '.bak_v0'
+        backup_path = self.db_path + f'.bak_v{version}'
         if not self._backup_before_migration(backup_path):
             # 备份失败：中止迁移，旧库原样保留，不做任何写入
             self.backup_aborted = True
@@ -179,10 +219,14 @@ class Database:
         # 首次失败从备份还原后立即重试一次
         for attempt in (1, 2):
             try:
-                # 单事务执行迁移，失败自动回滚
-                with self._get_connection() as conn:
-                    cursor = conn.cursor()
-                    self._migrate_v0_to_v1(cursor)
+                # 单事务执行迁移（含 DDL），整条链任一步失败整体回滚
+                with self._transaction() as cursor:
+                    if version < 1:
+                        self._migrate_v0_to_v1(cursor)
+                    if version < 2:
+                        self._migrate_v1_to_v2(cursor)
+                    if version < 3:
+                        self._migrate_v2_to_v3(cursor)
                 logger.info("数据库迁移完成: v%s -> v%s", version, SCHEMA_VERSION)
                 self._save_migration_state()
                 return
@@ -231,7 +275,7 @@ class Database:
         2. 用任务当前的裸指标名回填数据点的 metric_type
         3. tasks.metric_type 裸字符串转换为 JSON 数组文本
         4. 建复合索引
-        5. 置 user_version=1
+        5. 置 user_version=1（迁移代码不引用会演进的 SCHEMA_VERSION）
         """
         # 步骤1: 增加列（先检查列是否已存在，保证幂等）
         cursor.execute('PRAGMA table_info(data_points)')
@@ -264,7 +308,128 @@ class Database:
         ''')
 
         # 步骤5: 更新版本号（PRAGMA 不能参数化，使用常量拼接）
-        cursor.execute(f'PRAGMA user_version = {SCHEMA_VERSION}')
+        cursor.execute('PRAGMA user_version = 1')
+
+    @classmethod
+    def _migrate_v1_to_v2(cls, cursor: sqlite3.Cursor):
+        """
+        v1 -> v2 迁移：合并重复内存指标（Windows 上 vms/pagefile/private 数值完全相同）
+
+        1. tasks：memory_vms / memory_pagefile 映射为 memory_private，保持原顺序去重
+        2. data_points：同一 (task_id, timestamp) 下三者只保留一行，再统一改名为 memory_private
+        3. 置 user_version=2
+
+        别名映射用字面量写死，迁移代码不依赖会演进的常量。metric_type 为 NULL 的旧行不动。
+        """
+        legacy = {'memory_vms': 'memory_private', 'memory_pagefile': 'memory_private'}
+
+        # 步骤1: 任务指标列表改名并去重（保持原顺序）
+        cursor.execute('SELECT task_id, metric_type FROM tasks')
+        for task_id, text in cursor.fetchall():
+            old_list = cls._parse_metric_types(text)
+            new_list: List[str] = []
+            for metric in old_list:
+                metric = legacy.get(metric, metric)
+                if metric not in new_list:
+                    new_list.append(metric)
+            if new_list != old_list:
+                cursor.execute(
+                    'UPDATE tasks SET metric_type = ? WHERE task_id = ?',
+                    (json.dumps(new_list), task_id)
+                )
+
+        # 步骤2: 数据点去重（同一采集周期在 psutil oneshot 内取值，三者数值相同，
+        # 保留哪行都正确），再统一改名
+        cursor.execute('''
+            DELETE FROM data_points
+            WHERE metric_type IN ('memory_private', 'memory_vms', 'memory_pagefile')
+              AND id NOT IN (
+                SELECT MIN(id) FROM data_points
+                WHERE metric_type IN ('memory_private', 'memory_vms', 'memory_pagefile')
+                GROUP BY task_id, timestamp
+              )
+        ''')
+        cursor.execute('''
+            UPDATE data_points SET metric_type = 'memory_private'
+            WHERE metric_type IN ('memory_vms', 'memory_pagefile')
+        ''')
+
+        # 步骤3: 更新版本号
+        cursor.execute('PRAGMA user_version = 2')
+
+    @classmethod
+    def _migrate_v2_to_v3(cls, cursor: sqlite3.Cursor):
+        """
+        v2 -> v3 迁移：
+
+        1. tasks 增加 note / sample_count / last_sample_at（幂等：先查列是否存在）
+        2. 新建 task_markers 表与 (task_id, timestamp) 索引
+        3. 删除孤儿数据点（task_id 不在 tasks 中）
+        4. 仍为 NULL 的 data_points.metric_type 回填为所属任务的首指标
+        5. 索引收敛为 (task_id, metric_type, timestamp)，删除三个旧索引
+        6. 回填 sample_count = COUNT(DISTINCT timestamp)、last_sample_at = MAX(timestamp)
+        7. 置 user_version=3
+        """
+        # 步骤1
+        cursor.execute('PRAGMA table_info(tasks)')
+        task_columns = {row[1] for row in cursor.fetchall()}
+        if 'note' not in task_columns:
+            cursor.execute("ALTER TABLE tasks ADD COLUMN note TEXT NOT NULL DEFAULT ''")
+        if 'sample_count' not in task_columns:
+            cursor.execute(
+                'ALTER TABLE tasks ADD COLUMN sample_count INTEGER NOT NULL DEFAULT 0')
+        if 'last_sample_at' not in task_columns:
+            cursor.execute('ALTER TABLE tasks ADD COLUMN last_sample_at TEXT')
+
+        # 步骤2
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS task_markers (
+                id INTEGER PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                label TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        ''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_task_markers_task_ts
+            ON task_markers(task_id, timestamp)
+        ''')
+
+        # 步骤3
+        cursor.execute(
+            'DELETE FROM data_points WHERE task_id NOT IN (SELECT task_id FROM tasks)')
+
+        # 步骤4：按任务回填（首指标取自 tasks.metric_type，兼容 JSON 数组与裸指标名）
+        cursor.execute('SELECT task_id, metric_type FROM tasks')
+        for task_id, text in cursor.fetchall():
+            first_metric = cls._parse_metric_types(text)[0]
+            cursor.execute(
+                'UPDATE data_points SET metric_type = ? '
+                'WHERE task_id = ? AND metric_type IS NULL',
+                (first_metric, task_id))
+
+        # 步骤5：先建新索引再删旧索引
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_data_points_task_metric_ts
+            ON data_points(task_id, metric_type, timestamp)
+        ''')
+        for old_index in ('idx_data_points_timestamp', 'idx_data_points_task_id',
+                          'idx_data_points_task_metric'):
+            cursor.execute(f'DROP INDEX IF EXISTS {old_index}')
+
+        # 步骤6：一次扫描按任务聚合后逐任务回写
+        cursor.execute('''
+            SELECT task_id, COUNT(DISTINCT timestamp), MAX(timestamp)
+            FROM data_points GROUP BY task_id
+        ''')
+        for task_id, sample_count, last_sample_at in cursor.fetchall():
+            cursor.execute(
+                'UPDATE tasks SET sample_count = ?, last_sample_at = ? WHERE task_id = ?',
+                (sample_count, last_sample_at, task_id))
+
+        # 步骤7
+        cursor.execute('PRAGMA user_version = 3')
 
     def _restore_from_backup(self, backup_path: str):
         """迁移失败后从备份还原；还原也失败则将损坏库改名并新建空库（置 data_reset）"""
@@ -279,9 +444,9 @@ class Database:
                 logger.warning("损坏的数据库已改名保留: %s", broken_path)
             except Exception:
                 logger.error("保留损坏数据库失败", exc_info=True)
-            # 新建空库（v1 结构）
-            with self._get_connection() as conn:
-                self._create_schema_v1(conn.cursor())
+            # 新建空库（当前结构）
+            with self._transaction() as cursor:
+                self._create_schema_current(cursor)
             self.data_reset = True
 
     # ========== 孤儿任务校正 ==========
@@ -289,7 +454,8 @@ class Database:
     def reconcile_orphan_tasks(self) -> int:
         """
         孤儿任务校正：上一次运行未正常退出（崩溃/被强制结束）时遗留的 status='running'
-        任务，本次启动时统一校正为 stopped。
+        任务，本次启动时统一校正为 stopped；结束时间取该任务最后一次采样时间
+        （last_sample_at，为空再用当前时间），而不是"下次启动的时刻"。
 
         刻意不放进 _init_database/__init__：必须由调用方（MainWindow 持有
         monitor_manager.db 之后）在任何新任务启动前显式调用一次，避免每次
@@ -303,7 +469,9 @@ class Database:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
-                    UPDATE tasks SET status = 'stopped', end_time = COALESCE(end_time, ?)
+                    UPDATE tasks
+                    SET status = 'stopped',
+                        end_time = COALESCE(last_sample_at, end_time, ?)
                     WHERE status = 'running'
                 ''', (now,))
                 count = cursor.rowcount
@@ -312,6 +480,52 @@ class Database:
             return count
         except Exception:
             logger.error("孤儿任务校正失败", exc_info=True)
+            return 0
+
+    def reconcile_sample_counts(self) -> int:
+        """
+        校正 sample_count：sample_count / last_sample_at 只由新版本写入路径维护。
+        用户回退到旧版本运行后再升级回来，旧版写入的任务数据点存在但 sample_count=0，
+        会在历史页/导出页（按 sample_count > 0 过滤）里永久消失。
+
+        对 sample_count=0 且存在数据点的任务重算 sample_count（不同时间戳个数）与
+        last_sample_at（最大时间戳）。存在性判断用 EXISTS，走
+        (task_id, metric_type, timestamp) 索引前缀，不扫全表；只处理少数异常任务，
+        正常任务（sample_count>0）与无数据任务不受影响。
+
+        必须在任何新任务启动前（与 reconcile_orphan_tasks 一起）由调用方显式调用一次。
+
+        Returns:
+            int: 被校正的任务条数
+        """
+        try:
+            fixed = 0
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT task_id FROM tasks
+                    WHERE sample_count = 0
+                      AND EXISTS (SELECT 1 FROM data_points d WHERE d.task_id = tasks.task_id)
+                ''')
+                task_ids = [row['task_id'] for row in cursor.fetchall()]
+                for task_id in task_ids:
+                    cursor.execute('''
+                        SELECT COUNT(DISTINCT timestamp) AS cnt, MAX(timestamp) AS latest
+                        FROM data_points WHERE task_id = ?
+                    ''', (task_id,))
+                    row = cursor.fetchone()
+                    if not row or not row['cnt']:
+                        continue
+                    cursor.execute(
+                        'UPDATE tasks SET sample_count = ?, last_sample_at = ? '
+                        'WHERE task_id = ?',
+                        (row['cnt'], row['latest'], task_id))
+                    fixed += 1
+            if fixed:
+                logger.warning("采样计数校正: %d 条任务的 sample_count 由数据点重算", fixed)
+            return fixed
+        except Exception:
+            logger.error("采样计数校正失败", exc_info=True)
             return 0
 
     # ========== 内部工具方法 ==========
@@ -337,7 +551,10 @@ class Database:
         return [text]
 
     def _row_to_task(self, row: sqlite3.Row) -> MonitorTask:
-        """将数据库行转换为 MonitorTask 对象"""
+        """将数据库行转换为 MonitorTask 对象（v3 新增列缺失时按默认值处理，
+        兼容迁移失败后仍停留在旧版本的库）"""
+        columns = row.keys()
+        last_sample_at = row['last_sample_at'] if 'last_sample_at' in columns else None
         return MonitorTask(
             task_id=row['task_id'],
             pid=row['pid'],
@@ -347,13 +564,19 @@ class Database:
             start_time=datetime.fromisoformat(row['start_time']),
             end_time=datetime.fromisoformat(row['end_time']) if row['end_time'] else None,
             status=row['status'],
+            note=row['note'] if 'note' in columns else '',
+            sample_count=row['sample_count'] if 'sample_count' in columns else 0,
+            last_sample_at=datetime.fromisoformat(last_sample_at) if last_sample_at else None,
         )
 
     # ========== 任务相关操作 ==========
 
     def save_task(self, task: MonitorTask) -> bool:
         """
-        保存任务到数据库
+        保存任务到数据库（upsert：不存在则插入，存在则更新模型携带的列）。
+
+        sample_count / last_sample_at 由 save_data_points 在写数据点的同一事务内
+        维护，这里刻意不覆盖，避免重复保存任务时把累计值清零。
 
         Args:
             task: 监控任务对象
@@ -365,9 +588,19 @@ class Database:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
-                    INSERT OR REPLACE INTO tasks
-                    (task_id, pid, process_name, metric_type, interval, start_time, end_time, status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO tasks
+                    (task_id, pid, process_name, metric_type, interval, start_time,
+                     end_time, status, note)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(task_id) DO UPDATE SET
+                        pid = excluded.pid,
+                        process_name = excluded.process_name,
+                        metric_type = excluded.metric_type,
+                        interval = excluded.interval,
+                        start_time = excluded.start_time,
+                        end_time = excluded.end_time,
+                        status = excluded.status,
+                        note = excluded.note
                 ''', (
                     task.task_id,
                     task.pid,
@@ -377,6 +610,7 @@ class Database:
                     task.start_time.isoformat() if task.start_time else None,
                     task.end_time.isoformat() if task.end_time else None,
                     task.status,
+                    task.note or '',
                 ))
             return True
         except Exception:
@@ -424,6 +658,32 @@ class Database:
             logger.error("获取所有任务失败", exc_info=True)
             return []
 
+    def get_tasks_with_data(self) -> List[MonitorTask]:
+        """
+        获取至少有一次采样的任务（sample_count > 0），按开始时间倒序。
+        单条 SQL，不逐任务统计数据点。
+
+        库仍停留在旧版本（迁移失败、tasks 缺 sample_count 列）时回退为按 data_points
+        判断"有数据"的单条 EXISTS 查询，而不是返回空列表。
+        """
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                try:
+                    cursor.execute(
+                        'SELECT * FROM tasks WHERE sample_count > 0 ORDER BY start_time DESC')
+                except sqlite3.OperationalError:
+                    logger.warning("tasks 缺少 sample_count 列，回退到按数据点判断有数据的任务")
+                    cursor.execute('''
+                        SELECT * FROM tasks t
+                        WHERE EXISTS (SELECT 1 FROM data_points d WHERE d.task_id = t.task_id)
+                        ORDER BY start_time DESC
+                    ''')
+                return [self._row_to_task(row) for row in cursor.fetchall()]
+        except Exception:
+            logger.error("获取有数据的任务失败", exc_info=True)
+            return []
+
     def update_task_status(self, task_id: str, status: str, end_time: Optional[datetime] = None) -> bool:
         """
         更新任务状态
@@ -458,7 +718,7 @@ class Database:
 
     def delete_task(self, task_id: str) -> bool:
         """
-        删除任务及其所有数据点
+        删除任务及其所有数据点、标记
 
         Args:
             task_id: 任务ID
@@ -468,17 +728,57 @@ class Database:
         """
         try:
             with self._get_connection() as conn:
-                cursor = conn.cursor()
-                # 删除数据点
-                cursor.execute('DELETE FROM data_points WHERE task_id = ?', (task_id,))
-                # 删除任务
-                cursor.execute('DELETE FROM tasks WHERE task_id = ?', (task_id,))
+                self._delete_task_rows(conn.cursor(), task_id)
             return True
         except Exception:
             logger.error("删除任务失败: task_id=%s", task_id, exc_info=True)
             return False
 
+    @staticmethod
+    def _delete_task_rows(cursor: sqlite3.Cursor, task_id: str) -> int:
+        """
+        在给定游标（调用方管理事务）上删除任务的 data_points / task_markers / tasks。
+        外键约束未启用，级联删除只能手工完成；delete_task 与 cleanup_old_tasks 共用。
+
+        Returns:
+            int: 被删除的数据点行数
+        """
+        cursor.execute('DELETE FROM data_points WHERE task_id = ?', (task_id,))
+        point_count = cursor.rowcount
+        cursor.execute('DELETE FROM task_markers WHERE task_id = ?', (task_id,))
+        cursor.execute('DELETE FROM tasks WHERE task_id = ?', (task_id,))
+        return point_count
+
     # ========== 数据点相关操作 ==========
+
+    @staticmethod
+    def _insert_data_points(cursor: sqlite3.Cursor, data_points: List[DataPoint]):
+        """
+        在调用方的事务内写入数据点，并同步更新所属任务的 sample_count / last_sample_at：
+        sample_count 增加本批中该任务不同时间戳的个数（同一周期多指标只算一次采样），
+        last_sample_at 取本批最大时间戳与既有值中较大者。
+        """
+        cursor.executemany('''
+            INSERT INTO data_points (task_id, timestamp, value, metric_type)
+            VALUES (?, ?, ?, ?)
+        ''', [
+            (dp.task_id, dp.timestamp.isoformat(), dp.value, dp.metric_type)
+            for dp in data_points
+        ])
+
+        stamps: Dict[str, set] = {}
+        for dp in data_points:
+            stamps.setdefault(dp.task_id, set()).add(dp.timestamp.isoformat())
+        for task_id, timestamps in stamps.items():
+            latest = max(timestamps)
+            cursor.execute('''
+                UPDATE tasks
+                SET sample_count = sample_count + ?,
+                    last_sample_at = CASE
+                        WHEN last_sample_at IS NULL OR last_sample_at < ? THEN ?
+                        ELSE last_sample_at END
+                WHERE task_id = ?
+            ''', (len(timestamps), latest, latest, task_id))
 
     def save_data_point(self, data_point: DataPoint) -> bool:
         """
@@ -492,16 +792,7 @@ class Database:
         """
         try:
             with self._get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute('''
-                    INSERT INTO data_points (task_id, timestamp, value, metric_type)
-                    VALUES (?, ?, ?, ?)
-                ''', (
-                    data_point.task_id,
-                    data_point.timestamp.isoformat(),
-                    data_point.value,
-                    data_point.metric_type,
-                ))
+                self._insert_data_points(conn.cursor(), [data_point])
             return True
         except Exception:
             logger.error("保存数据点失败: task_id=%s", data_point.task_id, exc_info=True)
@@ -509,7 +800,7 @@ class Database:
 
     def save_data_points(self, data_points: List[DataPoint]) -> bool:
         """
-        批量保存数据点
+        批量保存数据点（同一事务内更新任务的 sample_count / last_sample_at）
 
         Args:
             data_points: 数据点列表
@@ -519,17 +810,17 @@ class Database:
         """
         try:
             with self._get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.executemany('''
-                    INSERT INTO data_points (task_id, timestamp, value, metric_type)
-                    VALUES (?, ?, ?, ?)
-                ''', [
-                    (dp.task_id, dp.timestamp.isoformat(), dp.value, dp.metric_type)
-                    for dp in data_points
-                ])
+                self._insert_data_points(conn.cursor(), data_points)
+            self._save_failures = 0
             return True
         except Exception:
-            logger.error("批量保存数据点失败: 条数=%d", len(data_points), exc_info=True)
+            # 日志节流：持续失败（如磁盘满）时每个采集周期都会走到这里，
+            # 首次记完整堆栈，之后每 SAVE_FAILURE_LOG_INTERVAL 次记一条累计次数
+            self._save_failures += 1
+            if self._save_failures == 1:
+                logger.error("批量保存数据点失败: 条数=%d", len(data_points), exc_info=True)
+            elif self._save_failures % SAVE_FAILURE_LOG_INTERVAL == 0:
+                logger.error("批量保存数据点持续失败，累计连续失败 %d 次", self._save_failures)
             return False
 
     def get_task_data_points(self, task_id: str, metric_type: Optional[str] = None,
@@ -540,18 +831,17 @@ class Database:
 
         Args:
             task_id: 任务ID
-            metric_type: 指标类型（可选），None 返回全部指标的数据点；
-                         查询任务首指标时自动包含 metric_type 为 NULL 的旧数据
+            metric_type: 指标类型（可选），None 返回全部指标的数据点
             limit: 限制返回数量（可选）。指定时语义为"最近 limit 条，按时间升序返回"
                    （子查询先按时间倒序取最近 N 条，再包一层按时间升序排列输出，
-                   v1.2.0 批3 变更——调用方按 limit 拿到的仍是时间升序序列，
-                   无需再自行 reversed()）；不指定则返回全部数据，按时间升序。
+                   调用方拿到的始终是时间升序序列，无需再自行 reversed()）；
+                   不指定则返回全部数据，按时间升序。
                    与 since_iso 组合时语义 = "范围内最近 limit 条，升序"
             since_iso: ISO 格式字符串（可选，datetime.isoformat() 产出的形态），
                        只返回 timestamp >= since_iso 的点；None 表示不做时间过滤。
-                       【评审修订 B1】data_points.timestamp 在库中是 TEXT，SQLite
-                       类型亲和性下若传入 epoch float 会被转成 TEXT 参与字典序比较、
-                       恒小于任意 ISO 串，导致过滤静默失效——此参数只接受 ISO 字符串，
+                       data_points.timestamp 在库中是 TEXT，SQLite 类型亲和性下若传入
+                       epoch float 会被转成 TEXT 参与字典序比较、恒小于任意 ISO 串，
+                       导致过滤静默失效——此参数只接受 ISO 字符串，
                        绘图用的 epoch float（dp.timestamp.timestamp()）严禁传入这里
 
         Returns:
@@ -564,14 +854,7 @@ class Database:
                 where = 'task_id = ?'
                 params: list = [task_id]
                 if metric_type is not None:
-                    # 查询任务首指标时，NULL 数据点兜底归为首指标（兼容旧库回填遗漏）
-                    cursor.execute('SELECT metric_type FROM tasks WHERE task_id = ?', (task_id,))
-                    task_row = cursor.fetchone()
-                    first_metric = self._parse_metric_types(task_row['metric_type'])[0] if task_row else None
-                    if metric_type == first_metric:
-                        where += ' AND (metric_type = ? OR metric_type IS NULL)'
-                    else:
-                        where += ' AND metric_type = ?'
+                    where += ' AND metric_type = ?'
                     params.append(metric_type)
 
                 if since_iso is not None:
@@ -641,7 +924,9 @@ class Database:
 
     def get_sample_count(self, task_id: str) -> int:
         """
-        获取任务的采集次数（同一时间戳的多指标数据点算一次采集）
+        获取任务的采集次数（同一时间戳的多指标数据点算一次采集），
+        读取 tasks.sample_count（由 save_data_points 在写入时累加，不再扫描数据点）；
+        库仍停留在旧版本（tasks 缺 sample_count 列）时回退为按不同时间戳计数。
 
         Args:
             task_id: 任务ID
@@ -652,12 +937,18 @@ class Database:
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute(
-                    'SELECT COUNT(DISTINCT timestamp) as count FROM data_points WHERE task_id = ?',
-                    (task_id,)
-                )
-                row = cursor.fetchone()
-                return row['count'] if row else 0
+                try:
+                    cursor.execute(
+                        'SELECT sample_count FROM tasks WHERE task_id = ?', (task_id,))
+                    row = cursor.fetchone()
+                    return row['sample_count'] if row else 0
+                except sqlite3.OperationalError:
+                    logger.warning("tasks 缺少 sample_count 列，回退到按数据点统计采集次数")
+                    cursor.execute(
+                        'SELECT COUNT(DISTINCT timestamp) AS count FROM data_points '
+                        'WHERE task_id = ?', (task_id,))
+                    row = cursor.fetchone()
+                    return row['count'] if row else 0
         except Exception:
             logger.error("获取采集次数失败: task_id=%s", task_id, exc_info=True)
             return 0
@@ -684,7 +975,7 @@ class Database:
             since_iso: ISO 格式字符串（可选），语义同 get_task_data_points——只对
                        timestamp >= since_iso 的数据分桶（总行数/桶归属均按过滤后的
                        子集重新计算）；None 表示不做时间过滤。同样只接受 ISO 字符串，
-                       严禁传入 epoch float（评审修订 B1）
+                       严禁传入 epoch float
 
         Returns:
             List[DataPoint]: 按 timestamp 升序排列的降采样数据点
@@ -696,13 +987,7 @@ class Database:
                 where = 'task_id = ?'
                 params: list = [task_id]
                 if metric_type is not None:
-                    cursor.execute('SELECT metric_type FROM tasks WHERE task_id = ?', (task_id,))
-                    task_row = cursor.fetchone()
-                    first_metric = self._parse_metric_types(task_row['metric_type'])[0] if task_row else None
-                    if metric_type == first_metric:
-                        where += ' AND (metric_type = ? OR metric_type IS NULL)'
-                    else:
-                        where += ' AND metric_type = ?'
+                    where += ' AND metric_type = ?'
                     params.append(metric_type)
 
                 if since_iso is not None:
@@ -761,59 +1046,83 @@ class Database:
     def get_metric_stats(self, task_id: str, metric_type: str,
                           since_iso: Optional[str] = None) -> Optional[dict]:
         """
-        获取任务指定指标的统计信息（单条 SQL 聚合查询：count/min/max/avg）。
-
-        【评审修订 M3】刻意不含 last、不做 ORDER BY DESC 取最新值：范围内最新值
-        由调用方（历史页）复用表格查询结果的末元素（内层 DESC LIMIT 契约保证
-        末点即范围内最新），省一次无索引排序。
+        获取任务指定指标的统计信息。
 
         Args:
             task_id: 任务ID
-            metric_type: 指标类型（查询任务首指标时自动包含 metric_type 为 NULL
-                         的旧数据，语义同 get_task_data_points）
+            metric_type: 指标类型
             since_iso: ISO 格式字符串（可选），只统计 timestamp >= since_iso 的
                        数据点；None 表示统计全部。同样只接受 ISO 字符串，严禁传入
-                       epoch float（评审修订 B1）
+                       epoch float
 
         Returns:
-            Optional[dict]: {'count': int, 'min': float, 'max': float, 'avg': float}；
-                            范围内无数据或查询失败时返回 None
+            Optional[dict]: 范围内无数据或查询失败时返回 None，否则包含
+                count / min / max / avg，以及
+                first / first_ts（范围内最早一点的值与时间）、
+                last / last_ts（范围内最新一点的值与时间）、
+                slope_per_hour（最小二乘线性回归斜率，单位 = 指标单位/小时；
+                数据点少于 2 个或时间跨度为 0 时为 None）。
+                first/last 经 (task_id, metric_type, timestamp) 复合索引
+                ORDER BY ... LIMIT 1 取得。
         """
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
 
-                where = 'task_id = ?'
-                params: list = [task_id]
-
-                # 查询任务首指标时，NULL 数据点兜底归为首指标（兼容旧库回填遗漏），
-                # 语义与 get_task_data_points/get_task_data_points_bucketed 一致
-                cursor.execute('SELECT metric_type FROM tasks WHERE task_id = ?', (task_id,))
-                task_row = cursor.fetchone()
-                first_metric = self._parse_metric_types(task_row['metric_type'])[0] if task_row else None
-                if metric_type == first_metric:
-                    where += ' AND (metric_type = ? OR metric_type IS NULL)'
-                else:
-                    where += ' AND metric_type = ?'
-                params.append(metric_type)
-
+                where = 'task_id = ? AND metric_type = ?'
+                params: list = [task_id, metric_type]
                 if since_iso is not None:
                     where += ' AND timestamp >= ?'
                     params.append(since_iso)
 
                 cursor.execute(f'''
-                    SELECT COUNT(*) AS cnt, MIN(value) AS min_v, MAX(value) AS max_v, AVG(value) AS avg_v
-                    FROM data_points
-                    WHERE {where}
+                    SELECT timestamp, value FROM data_points
+                    WHERE {where} ORDER BY timestamp ASC LIMIT 1
                 ''', params)
-                row = cursor.fetchone()
-                if not row or not row['cnt']:
+                first_row = cursor.fetchone()
+                if first_row is None:
                     return None
+                cursor.execute(f'''
+                    SELECT timestamp, value FROM data_points
+                    WHERE {where} ORDER BY timestamp DESC LIMIT 1
+                ''', params)
+                last_row = cursor.fetchone()
+
+                # x 取相对最早一点的小时数：先在 SQL 内用 julianday 差值换算，
+                # 避免直接对儒略日（约 2.4e6）求平方和造成的浮点精度损失
+                cursor.execute(f'''
+                    SELECT COUNT(*) AS cnt, MIN(v) AS min_v, MAX(v) AS max_v,
+                           AVG(v) AS avg_v, SUM(x) AS sx, SUM(x * x) AS sxx,
+                           SUM(v) AS sy, SUM(x * v) AS sxy
+                    FROM (
+                        SELECT value AS v,
+                               (julianday(timestamp) - julianday(?)) * 24.0 AS x
+                        FROM data_points
+                        WHERE {where}
+                    )
+                ''', [first_row['timestamp'], *params])
+                agg = cursor.fetchone()
+
+                first_ts = datetime.fromisoformat(first_row['timestamp'])
+                last_ts = datetime.fromisoformat(last_row['timestamp'])
+
+                slope = None
+                count = agg['cnt']
+                if count >= 2 and last_ts > first_ts:
+                    denominator = count * agg['sxx'] - agg['sx'] ** 2
+                    if denominator > 0:
+                        slope = (count * agg['sxy'] - agg['sx'] * agg['sy']) / denominator
+
                 return {
-                    'count': row['cnt'],
-                    'min': row['min_v'],
-                    'max': row['max_v'],
-                    'avg': row['avg_v'],
+                    'count': count,
+                    'min': agg['min_v'],
+                    'max': agg['max_v'],
+                    'avg': agg['avg_v'],
+                    'first': first_row['value'],
+                    'first_ts': first_ts,
+                    'last': last_row['value'],
+                    'last_ts': last_ts,
+                    'slope_per_hour': slope,
                 }
         except Exception:
             logger.error("获取指标统计失败: task_id=%s", task_id, exc_info=True)
@@ -825,8 +1134,8 @@ class Database:
 
         用于历史页"时间范围"筛选的锚点计算：锚定该任务最后一个数据点的时间，
         而非当前时刻——停止已久的任务选"最近1小时"仍应能看到其最后一小时的数据。
-        现有索引 (task_id, metric_type) 不含 timestamp，本查询走全表 filter，由
-        调用方按任务缓存结果，避免切范围/切指标时重复触发（评审修订 M3）。
+        任务所有指标合在一起取最大值，无法直接走 (task_id, metric_type, timestamp)
+        索引的有序扫描，调用方应按任务缓存结果，避免切范围/切指标时重复触发。
 
         Args:
             task_id: 任务ID
@@ -848,6 +1157,94 @@ class Database:
         except Exception:
             logger.error("获取任务最新数据点时间戳失败: task_id=%s", task_id, exc_info=True)
             return None
+
+    def iter_data_points(self, task_id: str, batch_size: int = 5000) -> Iterator[List[DataPoint]]:
+        """
+        按 timestamp 升序、分批流式产出任务的全部数据点（自建连接，游标 fetchmany），
+        避免大数据量时一次性 fetchall 占用大量内存。
+
+        与本类其余方法不同，这里不吞异常：导出等调用方必须知道读取是否完整，
+        出错时直接抛出。提前终止迭代（生成器被关闭）时连接会随之关闭。
+
+        Args:
+            task_id: 任务ID
+            batch_size: 每批行数
+
+        Yields:
+            List[DataPoint]: 一批数据点（非空）
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT task_id, timestamp, value, metric_type FROM data_points
+                WHERE task_id = ?
+                ORDER BY timestamp ASC, id ASC
+            ''', (task_id,))
+            while True:
+                rows = cursor.fetchmany(batch_size)
+                if not rows:
+                    return
+                yield [
+                    DataPoint(
+                        task_id=row['task_id'],
+                        timestamp=datetime.fromisoformat(row['timestamp']),
+                        value=row['value'],
+                        metric_type=row['metric_type'] or '',
+                    )
+                    for row in rows
+                ]
+
+    # ========== 标记（事件打点） ==========
+
+    def add_marker(self, task_id: str, timestamp: datetime, label: str) -> bool:
+        """
+        为任务添加一个时间标记（如"点击了开始扫描"）。
+
+        Returns:
+            bool: 是否写入成功
+        """
+        try:
+            with self._get_connection() as conn:
+                conn.execute('''
+                    INSERT INTO task_markers (task_id, timestamp, label, created_at)
+                    VALUES (?, ?, ?, ?)
+                ''', (task_id, timestamp.isoformat(), label, datetime.now().isoformat()))
+            return True
+        except Exception:
+            logger.error("添加标记失败: task_id=%s", task_id, exc_info=True)
+            return False
+
+    def get_markers(self, task_id: str, since_iso: Optional[str] = None) -> List[Marker]:
+        """
+        获取任务的标记，按时间升序。
+
+        Args:
+            task_id: 任务ID
+            since_iso: ISO 格式字符串（可选），只返回 timestamp >= since_iso 的标记
+        """
+        try:
+            with self._get_connection() as conn:
+                where = 'task_id = ?'
+                params: list = [task_id]
+                if since_iso is not None:
+                    where += ' AND timestamp >= ?'
+                    params.append(since_iso)
+                rows = conn.execute(f'''
+                    SELECT id, task_id, timestamp, label FROM task_markers
+                    WHERE {where} ORDER BY timestamp ASC, id ASC
+                ''', params).fetchall()
+                return [
+                    Marker(
+                        task_id=row['task_id'],
+                        timestamp=datetime.fromisoformat(row['timestamp']),
+                        label=row['label'],
+                        id=row['id'],
+                    )
+                    for row in rows
+                ]
+        except Exception:
+            logger.error("获取标记失败: task_id=%s", task_id, exc_info=True)
+            return []
 
     # ========== 数据清理 ==========
 
@@ -885,20 +1282,16 @@ class Database:
                     return 0
 
                 for task_id in task_ids:
-                    cursor.execute(
-                        'SELECT COUNT(*) as cnt FROM data_points WHERE task_id = ?', (task_id,))
-                    point_count = cursor.fetchone()['cnt']
+                    point_count = self._delete_task_rows(cursor, task_id)
                     logger.info("启动自动清理: 删除过期任务 task_id=%s 数据点=%d 条",
                                 task_id, point_count)
-                    cursor.execute('DELETE FROM data_points WHERE task_id = ?', (task_id,))
-                    cursor.execute('DELETE FROM tasks WHERE task_id = ?', (task_id,))
 
                 return len(task_ids)
         except Exception:
             logger.error("启动自动清理失败", exc_info=True)
             return 0
 
-    # ========== 数据库维护（v1.3.0 批4） ==========
+    # ========== 数据库维护 ==========
 
     def get_db_size_bytes(self) -> int:
         """

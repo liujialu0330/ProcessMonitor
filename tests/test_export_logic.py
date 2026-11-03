@@ -146,3 +146,89 @@ def test_pivot_rows_accepts_generator_input():
 
     rows = list(pivot_rows(task, gen()))
     assert rows == [["2026-01-01 00:00:00", "test.exe", 1234, "1.0000"]]
+
+
+# ---------- 打点列 ----------
+
+def _marker(ts, label):
+    from data.models import Marker
+    return Marker(task_id="task-1", timestamp=ts, label=label)
+
+
+def test_header_marker_column_is_optional():
+    task = _make_task(["memory_rss"])
+    assert build_csv_header(task)[-1] == '工作集内存(KB)'
+    assert build_csv_header(task, include_markers=True)[-1] == '打点'
+
+
+def test_pivot_rows_without_markers_param_has_no_marker_column():
+    """不传 markers 时行结构保持原样（向后兼容）"""
+    task = _make_task(["memory_rss"])
+    ts = datetime(2026, 1, 1, 0, 0, 0)
+    rows = list(pivot_rows(task, [
+        DataPoint(task_id="task-1", timestamp=ts, value=1.0, metric_type="memory_rss")]))
+    assert len(rows[0]) == 4
+
+
+def test_pivot_rows_marker_goes_to_first_row_at_or_after_marker_time():
+    """打点写在时间不早于打点时刻的第一行；其余行该列为空"""
+    task = _make_task(["memory_rss"])
+    base = datetime(2026, 1, 1, 0, 0, 0)
+    points = [
+        DataPoint(task_id="task-1", timestamp=base + timedelta(seconds=i),
+                  value=float(i), metric_type="memory_rss")
+        for i in range(5)
+    ]
+    markers = [
+        _marker(base + timedelta(seconds=1.5), "第1轮"),   # 落在 1s 与 2s 之间 -> 2s 行
+        _marker(base + timedelta(seconds=3), "第2轮"),     # 恰好等于 3s 行时刻 -> 3s 行
+    ]
+    rows = list(pivot_rows(task, points, markers))
+    assert [row[-1] for row in rows] == ["", "", "第1轮", "第2轮", ""]
+
+
+def test_pivot_rows_multiple_markers_same_row_joined_and_sorted():
+    task = _make_task(["memory_rss"])
+    base = datetime(2026, 1, 1, 0, 0, 0)
+    points = [
+        DataPoint(task_id="task-1", timestamp=base + timedelta(seconds=i),
+                  value=1.0, metric_type="memory_rss")
+        for i in range(3)
+    ]
+    # 故意乱序传入
+    markers = [
+        _marker(base + timedelta(seconds=1.8), "B"),
+        _marker(base + timedelta(seconds=1.2), "A"),
+    ]
+    rows = list(pivot_rows(task, points, markers))
+    assert rows[2][-1] == "A; B"
+    assert rows[0][-1] == rows[1][-1] == ""
+
+
+def test_pivot_rows_marker_after_last_sample_attaches_to_last_row():
+    """晚于最后一次采集的打点并入最后一行，不丢信息"""
+    task = _make_task(["memory_rss"])
+    base = datetime(2026, 1, 1, 0, 0, 0)
+    points = [
+        DataPoint(task_id="task-1", timestamp=base + timedelta(seconds=i),
+                  value=1.0, metric_type="memory_rss")
+        for i in range(2)
+    ]
+    rows = list(pivot_rows(task, points, [_marker(base + timedelta(seconds=30), "收尾")]))
+    assert [row[-1] for row in rows] == ["", "收尾"]
+
+
+def test_pivot_rows_marker_before_first_sample_attaches_to_first_row():
+    task = _make_task(["memory_rss"])
+    base = datetime(2026, 1, 1, 0, 0, 5)
+    points = [DataPoint(task_id="task-1", timestamp=base, value=1.0, metric_type="memory_rss")]
+    rows = list(pivot_rows(task, points, [_marker(base - timedelta(seconds=3), "早")]))
+    assert rows[0][-1] == "早"
+
+
+def test_pivot_rows_empty_markers_list_gives_empty_column():
+    task = _make_task(["memory_rss"])
+    ts = datetime(2026, 1, 1, 0, 0, 0)
+    rows = list(pivot_rows(task, [
+        DataPoint(task_id="task-1", timestamp=ts, value=1.0, metric_type="memory_rss")], []))
+    assert rows == [["2026-01-01 00:00:00", "test.exe", 1234, "1.0000", ""]]

@@ -1,15 +1,15 @@
 """
 历史数据页面
-显示监控任务的历史数据，包括图表和表格（v1.3.0 批2：时间范围筛选、统计摘要、
-真实时间轴、悬停十字线、图表导出、主题联动）
+显示监控任务的历史数据：时间范围筛选、统计条（起点/当前/变化/增速/最小/最大）、
+真实时间轴图表（悬停十字线、打点竖线）、采样明细表，以及图表导出与主题联动。
+运行中任务在页面可见时自动刷新（间隔按数据量自适应，见 AUTO_REFRESH_* 常量）。
 """
 import bisect
 import logging
-import math
 from datetime import datetime, timedelta
 from typing import Optional
 
-from PyQt5.QtCore import Qt, QEvent
+from PyQt5.QtCore import Qt, QEvent, QTimer
 from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
                              QScrollArea, QTableWidgetItem, QHeaderView,
@@ -19,30 +19,39 @@ from qfluentwidgets import (
     ComboBox, CardWidget, PushButton, FluentIcon,
     StrongBodyLabel, BodyLabel, CaptionLabel, InfoBar, InfoBarPosition,
     TableWidget, MessageBox, SegmentedWidget, TransparentToolButton, qconfig,
-    TransparentDropDownPushButton, RoundMenu, Action, VerticalSeparator,
+    TransparentDropDownPushButton, RoundMenu, Action,
     IconWidget, setCustomStyleSheet
 )
 import pyqtgraph as pg
 from pyqtgraph import exporters
 
+from core.history_refresh_worker import HistoryRefreshResult, HistoryRefreshWorker
+from core.monitor_manager import MonitorManager
 from data.database import Database
 from ui.chart_theme import chart_colors
+from ui.components.chart_axes import ContextDateAxisItem, MetricAxisItem
+from ui.components.sparkline import compute_y_range
+from ui.formatting import (
+    build_stat_texts, format_task_option_text, format_task_tooltip,
+    marker_context
+)
 from ui.typography import (
     DataCaptionLabel, PageTitleLabel, StatValueLabel, TypeScale,
     data_font, ui_font
 )
 from utils.metrics import (
-    format_metric_value, get_metric_display_name, get_metric_display_unit
+    format_metric_value, get_metric_display_name, get_metric_display_unit,
+    is_integer_metric
 )
 
 logger = logging.getLogger(__name__)
 
-# 表格取数上限：只取最近 N 条采集（v1.2.0 批3 性能优化，避免大数据量下界面卡顿）
+# 表格取数上限：只取最近 N 条采集，避免大数据量下界面卡顿
 TABLE_POINT_LIMIT = 2000
 # 图表分桶上限：按行号分桶后每桶取 MIN/MAX 两点，故图表最多 2*CHART_MAX_BUCKETS 个点
 CHART_MAX_BUCKETS = 2000
 
-# 时间范围选项（A2）：(SegmentedWidget routeKey, 显示文本, 范围秒数)；
+# 时间范围选项：(SegmentedWidget routeKey, 显示文本, 范围秒数)；
 # 秒数为 None 表示"全部"（不做时间过滤）。语义锚点见 _compute_since_iso：
 # 锚定该任务最后一个数据点的时间，而非当前时刻——停止已久的任务选"最近1小时"
 # 仍应能看到其最后一小时的数据。
@@ -54,9 +63,32 @@ TIME_RANGE_OPTIONS = [
     ('all', '全部', None),
 ]
 TIME_RANGE_SECONDS = {key: seconds for key, _text, seconds in TIME_RANGE_OPTIONS}
-DEFAULT_TIME_RANGE_KEY = '1h'
+# 默认看全部数据：泄漏判断要看从开始至今的整体趋势，而不是最近一小时的局部
+DEFAULT_TIME_RANGE_KEY = 'all'
 
-# 表格时间列显示格式（A4）：真实时间轴替代原相对秒数展示，含月日避免跨天歧义
+# 运行中任务的自动刷新间隔（毫秒）：按当前范围内数据点数自适应，数据越多每次刷新
+# （统计聚合 + 分桶在后台线程，填充在主线程）越重，间隔相应拉长，避免长时间监控后资源占用过高。
+# 数据点数 < AUTO_REFRESH_TIER1_COUNT 用 AUTO_REFRESH_INTERVAL_MS（5 秒）；
+# < AUTO_REFRESH_TIER2_COUNT 用 AUTO_REFRESH_INTERVAL_MID_MS（15 秒）；更大用
+# AUTO_REFRESH_INTERVAL_SLOW_MS（30 秒）。
+AUTO_REFRESH_INTERVAL_MS = 5000
+AUTO_REFRESH_INTERVAL_MID_MS = 15000
+AUTO_REFRESH_INTERVAL_SLOW_MS = 30000
+AUTO_REFRESH_TIER1_COUNT = 200_000
+AUTO_REFRESH_TIER2_COUNT = 1_000_000
+
+# 统计条各格的名称（顺序即显示顺序）
+STAT_KEYS = ("起点", "当前", "变化", "增速", "最小", "最大")
+_STAT_TOOLTIPS = {
+    "起点": "所选范围内最早一次采集的值",
+    "当前": "所选范围内最新一次采集的值",
+    "变化": "当前值相对起点的变化量（绝对值与百分比）",
+    "增速": "对所选范围内全部数据做线性回归得到的每小时变化量，持续为正说明在持续上涨",
+    "最小": "所选范围内的最小值",
+    "最大": "所选范围内的最大值",
+}
+
+# 表格时间列显示格式：含月日避免跨天歧义
 TABLE_TIME_FORMAT = '%m-%d %H:%M:%S'
 # 明细表是单指标采样账本，而不是需要占满窗口的数据网格。限制阅读轨道宽度可避免
 # 宽屏下时间和值被拉到卡片两端；窄窗口仍由 Expanding sizePolicy 自动填满可用空间。
@@ -65,85 +97,19 @@ DETAIL_TABLE_MIN_COLUMN_WIDTH = 144
 DETAIL_TABLE_HEADER_HEIGHT = 40
 DETAIL_TABLE_ROW_HEIGHT = 38
 
-# 指标原始值以 KB 存储；坐标轴只转换显示文本，不改动绘图数据与数据库语义。
-_DISPLAY_UNIT_DIVISORS = {
-    'KB': 1.0,
-    'MB': 1024.0,
-    'GB': 1024.0 ** 2,
-    'TB': 1024.0 ** 3,
-}
-
-
-class _MetricAxisItem(pg.AxisItem):
-    """历史指标 Y 轴：固定使用当前视图的显示单位并格式化千分位。
-
-    轴上仍接收数据库的原始数值，只在 tickStrings 中转换文本，
-    因此不会影响曲线、悬停吸附或导出图片的数据契约。
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.display_unit = ''
-
-    def set_display_unit(self, display_unit: str) -> None:
-        """设置当前视图固定的单位并使旧绘图缓存失效。"""
-        self.display_unit = display_unit or ''
-        self.picture = None
-        self.update()
-
-    def tickStrings(self, values, scale, spacing):
-        divisor = _DISPLAY_UNIT_DIVISORS.get(self.display_unit, 1.0)
-        scaled_spacing = abs(spacing * scale / divisor)
-        if not math.isfinite(scaled_spacing) or scaled_spacing <= 0:
-            decimals = 0
-        elif scaled_spacing >= 1:
-            decimals = 0
-        else:
-            decimals = min(4, max(0, math.ceil(-math.log10(scaled_spacing))))
-
-        strings = []
-        for value in values:
-            scaled_value = value * scale / divisor
-            strings.append(f"{scaled_value:,.{decimals}f}")
-        return strings
-
-
-class _ContextDateAxisItem(pg.DateAxisItem):
-    """在亚分钟缩放下保留完整时间上下文的 DateAxisItem。"""
-
-    def tickStrings(self, values, scale, spacing):
-        # DateAxisItem 在亚秒级默认只显示「36.500」一类秒数，
-        # 对性能监控读图而言缺少时分上下文。其他尺度仍交还
-        # pyqtgraph 的成熟自动分级逻辑。
-        if spacing >= 60:
-            return super().tickStrings(values, scale, spacing)
-
-        strings = []
-        try:
-            for value in values:
-                point_time = datetime.fromtimestamp(value)
-                if spacing < 1:
-                    strings.append(point_time.strftime('%H:%M:%S.%f')[:-3])
-                else:
-                    strings.append(point_time.strftime('%H:%M:%S'))
-        except (OverflowError, OSError, ValueError):
-            return super().tickStrings(values, scale, spacing)
-        return strings
-
-
 class HistoryPage(QScrollArea):
     """历史数据页面"""
 
-    # 统计摘要行占位文案（未选任务/所选范围内无数据时展示）
-    _EMPTY_STATS_TEXT = "当前 -- ｜ 最小 -- ｜ 最大 -- ｜ 平均 --"
-
-    def __init__(self, parent=None, db=None):
+    def __init__(self, parent=None, db=None, manager=None):
         """初始化页面
 
         Args:
             parent: 父窗口
             db: 数据库实例（可选，默认回退新建 Database()；生产路径必须由
                 MainWindow 注入，回退仅为兼容兜底）
+            manager: 监控管理器（可选；生产路径由 MainWindow 注入。用于判断任务
+                是否仍在运行，以及经它删除任务数据——UI 写库一律走 manager。
+                为 None 时按需回退到 MonitorManager(db=self.db)）
         """
         super().__init__(parent)
 
@@ -151,28 +117,47 @@ class HistoryPage(QScrollArea):
         self.setObjectName("historyPage")
 
         self.db = db if db is not None else Database()
+        self.manager = manager
 
         # 当前选中的任务ID、指标类型与任务状态（用于删除按钮的运行中保护）
         self.current_task_id = None
         self.current_metric = None
         self.current_task_status = None
 
-        # 时间范围选择（A2）：默认"全部"，切任务/切指标时保持不变，只有用户主动
+        # 时间范围选择：默认"全部"，切任务/切指标时保持不变，只有用户主动
         # 切换 SegmentedWidget 才会改变
         self.current_range_key = DEFAULT_TIME_RANGE_KEY
 
-        # last_dt 按任务缓存（评审修订 M3）：仅切任务时重新查询 MAX(timestamp)，
-        # 切范围/切指标复用缓存值
+        # last_dt 按任务缓存：切范围/切指标复用缓存值，避免重复查询 MAX(timestamp)；
+        # 点击刷新、重新载入任务列表与自动刷新时失效，保证锚点跟上新数据
         self._last_dt_cache_task_id = None
         self._last_dt_cache_value = None
 
-        # 当前图表缓存的 x（epoch float）/y 数组，供悬停吸附（A1）与主题切换重绘
-        # （A6）复用，避免重新查库；仅用于绘图相关计算，严禁回流作为 SQL 查询参数
-        # （评审修订 B1：SQL 过滤参数全链路走 ISO 字符串）
+        # 当前图表缓存的 x（epoch float）/y 数组，供悬停吸附与主题切换重绘复用，
+        # 避免重新查库；仅用于绘图相关计算，严禁回流作为 SQL 查询参数
+        # （SQL 过滤参数全链路走 ISO 字符串）
         self._chart_x = []
         self._chart_y = []
         self._chart_metric_type = None
         self._chart_display_unit = ''
+
+        # 当前范围内的打点（按时间升序）：图上画竖线，悬停读数据此提示所处区间
+        self._markers: list = []
+
+        # 任务下拉项 tooltip {task_id: 文本}（ComboBox 没有逐项 tooltip，
+        # 选中某项时把它设到下拉框上）
+        self._task_tooltips = {}
+
+        # 运行中任务自动刷新：页面可见时才计时，每次触发先检查所选任务是否仍在运行
+        self._auto_refresh_timer = QTimer(self)
+        self._auto_refresh_timer.setInterval(AUTO_REFRESH_INTERVAL_MS)
+        self._auto_refresh_timer.timeout.connect(self._on_auto_refresh)
+        self._auto_refresh_was_running = False
+
+        # 自动刷新的后台查询线程：同一时刻最多一个（在跑时跳过新的 tick）。请求序号
+        # 单调递增，任何"用户主动加载/整体重载/页面隐藏"都会推进它，使在途结果过期被丢弃
+        self._refresh_worker: Optional[HistoryRefreshWorker] = None
+        self._refresh_request_seq = 0
 
         # 初始化UI
         self._init_ui()
@@ -207,7 +192,7 @@ class HistoryPage(QScrollArea):
         title_layout.addStretch()
 
         self.refresh_button = PushButton("刷新", self, FluentIcon.SYNC)
-        self.refresh_button.clicked.connect(self._load_tasks)
+        self.refresh_button.clicked.connect(self._on_refresh_clicked)
         title_layout.addWidget(self.refresh_button)
 
         # 删除是低频且高风险的操作，收纳到「更多」菜单，避免与筛选控件
@@ -276,17 +261,17 @@ class HistoryPage(QScrollArea):
 
         main_layout.addWidget(select_card)
 
-        # 十字线（A1）：随图表数据一起在 _redraw_chart 中重新加入 PlotItem——
+        # 十字线：随图表数据一起在 _redraw_chart 中重新加入 PlotItem——
         # chart_widget.clear() 会清空 PlotItem 下全部 item，含本对象
         self.crosshair_line = pg.InfiniteLine(angle=90, movable=False)
         self.crosshair_line.setVisible(False)
 
-        # 真实时间轴（A4）：x 轴改用 DateAxisItem 显示实际日期时间刻度；绘图 x 数据
+        # 真实时间轴：x 轴改用 DateAxisItem 显示实际日期时间刻度；绘图 x 数据
         # 统一用 epoch float（dp.timestamp.timestamp()），仅用于绘图，严禁回流到
-        # SQL 查询参数（评审修订 B1，SQL 过滤参数全链路走 ISO 字符串）
-        self._value_axis = _MetricAxisItem(orientation='left')
+        # SQL 查询参数（SQL 过滤参数全链路走 ISO 字符串）
+        self._value_axis = MetricAxisItem(orientation='left')
         self._value_axis.enableAutoSIPrefix(False)
-        self._time_axis = _ContextDateAxisItem(orientation='bottom')
+        self._time_axis = ContextDateAxisItem(orientation='bottom')
         self.chart_widget = pg.PlotWidget(axisItems={
             'left': self._value_axis,
             'bottom': self._time_axis,
@@ -303,17 +288,14 @@ class HistoryPage(QScrollArea):
         self.chart_widget.setMinimumHeight(340)
         self.chart_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         # 渲染优化：分桶数据已保留尖峰，这里叠加 pyqtgraph 自身的峰值抽稀与视口裁剪，
-        # 双保险应对缩放/大量点渲染时的卡顿。
-        # 注：架构方案文本写的关键字是 method='peak'，但本项目实际安装的 pyqtgraph
-        # 0.14.0 中 PlotWidget.setDownsampling 转发到 PlotItem.setDownsampling，
-        # 其形参名是 mode 而非 method（PlotDataItem.setDownsampling 才是 method），
-        # 这里按本项目实际依赖版本的真实签名改用 mode='peak'，效果（峰值保留抽稀）等价。
+        # 双保险应对缩放/大量点渲染时的卡顿。pyqtgraph 0.14 中 PlotWidget.setDownsampling
+        # 转发到 PlotItem.setDownsampling，形参名是 mode（PlotDataItem 的才叫 method）。
         self.chart_widget.setDownsampling(auto=True, mode='peak')
         self.chart_widget.setClipToView(True)
-        # 捕获鼠标离开图表区域事件，清空十字线与悬停读数（A1）
+        # 捕获鼠标离开图表区域事件，清空十字线与悬停读数
         self.chart_widget.installEventFilter(self)
 
-        # 悬停十字线（A1）：SignalProxy 限流到 60Hz，避免每个原始鼠标移动事件都
+        # 悬停十字线：SignalProxy 限流到 60Hz，避免每个原始鼠标移动事件都
         # 触发一次吸附计算+重绘；需持有引用防止被 GC
         self._mouse_proxy = pg.SignalProxy(
             self.chart_widget.scene().sigMouseMoved, rateLimit=60, slot=self._on_mouse_moved)
@@ -399,7 +381,8 @@ class HistoryPage(QScrollArea):
         table_header = QHBoxLayout()
         table_header.addWidget(StrongBodyLabel("采样明细"))
         table_header.addStretch()
-        table_header.addWidget(CaptionLabel("最新数据优先"))
+        self.table_hint_label = CaptionLabel("最新数据优先")
+        table_header.addWidget(self.table_hint_label)
         table_layout.addLayout(table_header)
         table_layout.addWidget(self.data_table)
         table_outer_layout.addStretch()
@@ -412,29 +395,33 @@ class HistoryPage(QScrollArea):
         analysis_layout.setContentsMargins(0, 0, 0, 0)
         analysis_layout.setSpacing(12)
 
-        stats_card = CardWidget()
-        stats_layout = QHBoxLayout(stats_card)
-        stats_layout.setContentsMargins(16, 10, 16, 10)
-        stats_layout.setSpacing(0)
+        # 统计条：六格，窄窗口下自动换行（见 _update_stats_layout）
+        self.stats_card = CardWidget()
+        self.stats_layout = QGridLayout(self.stats_card)
+        self.stats_layout.setContentsMargins(16, 10, 16, 10)
+        self.stats_layout.setHorizontalSpacing(8)
+        self.stats_layout.setVerticalSpacing(10)
         self.stat_value_labels = {}
-        for index, key in enumerate(("当前", "最小", "最大", "平均")):
-            stat_widget = QWidget(stats_card)
+        self._stat_cells = []
+        for key in STAT_KEYS:
+            stat_widget = QWidget(self.stats_card)
             stat_layout = QVBoxLayout(stat_widget)
             stat_layout.setContentsMargins(12, 0, 12, 0)
             stat_layout.setSpacing(3)
-            stat_layout.addWidget(CaptionLabel(key))
+            caption = CaptionLabel(key)
+            caption.setToolTip(_STAT_TOOLTIPS[key])
+            stat_layout.addWidget(caption)
             value_label = StatValueLabel("--")
             value_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            # 长文本（如变化量 + 百分比）宁可被裁剪也不撑宽整行，完整内容见 tooltip
+            value_label.setMinimumWidth(1)
+            value_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
             stat_layout.addWidget(value_label)
-            stats_layout.addWidget(stat_widget, 1)
             self.stat_value_labels[key] = value_label
-            if index < 3:
-                stats_layout.addWidget(VerticalSeparator(stats_card))
-        analysis_layout.addWidget(stats_card)
-
-        # 兼容旧的 stats_label 文本 API，但不再把一大段统计文字渲染在界面。
-        self.stats_label = BodyLabel(self._EMPTY_STATS_TEXT, self.analysis_page)
-        self.stats_label.hide()
+            self._stat_cells.append(stat_widget)
+        self._stats_columns = None
+        self._update_stats_layout(self.viewport().width())
+        analysis_layout.addWidget(self.stats_card)
 
         view_header = QHBoxLayout()
         self.view_segmented = SegmentedWidget()
@@ -481,7 +468,7 @@ class HistoryPage(QScrollArea):
 
         self._update_filter_layout(self.viewport().width())
 
-        # 图表主题适配（A6）：构造时应用一次当前主题配色，并随全局主题切换实时重绘
+        # 图表主题适配：构造时应用一次当前主题配色，并随全局主题切换实时重绘
         self._apply_chart_theme()
         qconfig.themeChanged.connect(self._on_theme_changed)
 
@@ -505,6 +492,28 @@ class HistoryPage(QScrollArea):
             self.select_layout.addWidget(self.range_label, 1, 2)
             self.select_layout.addWidget(self.range_segmented, 1, 3)
 
+    @staticmethod
+    def _stats_column_count(available_width: int) -> int:
+        """统计条的列数：宽屏一行六格，中等宽度两行三列，窄窗口三行两列。"""
+        if available_width >= 1100:
+            return 6
+        if available_width >= 560:
+            return 3
+        return 2
+
+    def _update_stats_layout(self, available_width: int):
+        """按可用宽度重排统计条，避免长文本在窄窗口下互相挤压。"""
+        columns = self._stats_column_count(available_width)
+        if columns == self._stats_columns:
+            return
+        self._stats_columns = columns
+        for cell in self._stat_cells:
+            self.stats_layout.removeWidget(cell)
+        for index, cell in enumerate(self._stat_cells):
+            self.stats_layout.addWidget(cell, index // columns, index % columns)
+        for column in range(len(STAT_KEYS)):
+            self.stats_layout.setColumnStretch(column, 1 if column < columns else 0)
+
     def _toggle_raw_values(self, checked: bool):
         """按需显示原始值列，默认只保留用户最常用的时间与格式化值。"""
         self.data_table.setColumnHidden(2, not checked)
@@ -520,24 +529,63 @@ class HistoryPage(QScrollArea):
         self.empty_detail_label.setText(detail)
         self.content_stack.setCurrentWidget(self.empty_state_page)
 
+    def _invalidate_last_dt_cache(self):
+        """使最后时间戳缓存失效：下次计算时间范围锚点时重新查询 MAX(timestamp)。"""
+        self._last_dt_cache_task_id = None
+        self._last_dt_cache_value = None
+
+    def _get_manager(self) -> MonitorManager:
+        """监控管理器：优先用注入的，否则回退到单例（首次构造时绑定本页的 db）。"""
+        if self.manager is None:
+            self.manager = MonitorManager(db=self.db)
+        return self.manager
+
+    def _is_task_running(self, task_id: str) -> bool:
+        """所选任务当前是否仍有采集线程在运行（以 manager 为准，而非数据库状态列）。"""
+        task = self._get_manager().get_task(task_id)
+        return task is not None and task.isRunning()
+
+    def _on_refresh_clicked(self):
+        """刷新按钮：重新载入任务列表与当前任务数据（_load_tasks 会使最后时间戳缓存失效）。"""
+        self._load_tasks()
+
+    def select_task(self, task_id: str):
+        """选中指定任务并载入其数据（供主窗口从监控页"查看历史"跳转时调用）。
+
+        任务尚无采样数据时不在列表中：清空界面并给出提示后直接返回，
+        不再静默选中列表里的第一个任务。
+        """
+        self.current_task_id = task_id
+        self.current_metric = None
+        self._load_tasks()
+        if self.current_task_id != task_id:
+            InfoBar.info(
+                title="提示",
+                content="该任务暂无采样数据",
+                parent=self,
+                position=InfoBarPosition.TOP,
+                duration=2000
+            )
+
     def _load_tasks(self):
         """加载任务列表"""
+        # 新数据可能已经写入：任何整体重载都让最后时间戳缓存失效
+        self._invalidate_last_dt_cache()
+        self._cancel_pending_refresh()
+
         # 1. 保存当前选中的任务ID和指标（如果有）
         current_task_id = self.current_task_id
         current_metric = self.current_metric
 
-        # 2. 清空ComboBox
+        # 2. 清空ComboBox（blockSignals：清空期间不触发选择事件）
+        self.task_combo.blockSignals(True)
         self.task_combo.clear()
+        self.task_combo.blockSignals(False)
+        self._task_tooltips = {}
+        self.task_combo.setToolTip("")
 
-        # 获取所有任务（包括正在运行的和历史的）
-        all_tasks = self.db.get_all_tasks()
-
-        # 任务可见性与导出页统一为"有数据即显示"（不再按进程名过滤）
-        tasks = []
-        for task in all_tasks:
-            data_count = self.db.get_data_point_count(task.task_id)
-            if data_count > 0:
-                tasks.append(task)
+        # 单条查询取出"至少有一次采样"的任务（与导出页口径一致，不再逐任务 COUNT）
+        tasks = self.db.get_tasks_with_data()
 
         if not tasks:
             # 清空显示和当前任务ID、指标
@@ -555,18 +603,15 @@ class HistoryPage(QScrollArea):
         self.task_combo.setEnabled(True)
 
         # 3. 添加到下拉框（使用setItemData设置userData）
+        now = datetime.now()
         for task in tasks:
-            # 下拉框只承载任务身份；指标由下一行专门的选择器展示，避免把
-            # 进程、PID、指标和完整秒级时间拼成难以扫描的长句。
-            display_text = (
-                f"{task.process_name}  ·  PID {task.pid}  ·  "
-                f"{task.start_time.strftime('%m-%d %H:%M')}"
-            )
-            # 只传递文本，不传递第二个参数
-            self.task_combo.addItem(display_text)
-            # 使用setItemData单独设置userData
+            # 下拉项承载任务身份与上下文：进程 · PID · 开始时间 · 时长 · 备注；
+            # 指标由下一行专门的选择器展示
+            running = self._is_task_running(task.task_id)
+            self.task_combo.addItem(format_task_option_text(task, running, now))
             index = self.task_combo.count() - 1
             self.task_combo.setItemData(index, task.task_id)
+            self._task_tooltips[task.task_id] = format_task_tooltip(task, running, now)
 
         # 4. 尝试恢复之前选中的任务和指标并重新加载数据
         if current_task_id:
@@ -577,6 +622,8 @@ class HistoryPage(QScrollArea):
                     self.task_combo.setCurrentIndex(i)
                     self.task_combo.blockSignals(False)
                     self.current_task_id = current_task_id
+                    self.task_combo.setToolTip(
+                        self._task_tooltips.get(current_task_id, ""))
                     # 恢复任务状态并刷新删除按钮可用性（blockSignals跳过了_on_task_selected）
                     task_info = self.db.get_task(current_task_id)
                     self.current_task_status = task_info.status if task_info else None
@@ -587,7 +634,7 @@ class HistoryPage(QScrollArea):
                     self._load_task_data(current_task_id, self.current_metric)
                     return
 
-            # 之前的任务不在列表中了（可能被过滤/被删除），清空显示
+            # 之前的任务不在列表中了（可能被删除或尚无数据），清空显示
             self._clear_display(
                 "请选择监控任务",
                 "选定任务和指标后即可查看历史数据")
@@ -596,6 +643,13 @@ class HistoryPage(QScrollArea):
             self.current_metric = None
             self.current_task_status = None
             self._update_delete_button_state()
+            # 找不到目标任务：保持清空后的"请选择监控任务"状态直接返回，
+            # 不再静默选中列表里的第一个任务
+            self.task_combo.blockSignals(True)
+            self.task_combo.setCurrentIndex(-1)
+            self.task_combo.blockSignals(False)
+            self.task_combo.setToolTip("")
+            return
 
         # 5. 如果没有恢复之前的选择，且ComboBox不为空
         # 强制设置currentIndex以确保触发信号
@@ -617,6 +671,8 @@ class HistoryPage(QScrollArea):
             return
 
         self.current_task_id = task_id
+        self._auto_refresh_was_running = False
+        self.task_combo.setToolTip(self._task_tooltips.get(task_id, ""))
 
         # 记录任务状态，用于删除按钮的运行中保护
         task_info = self.db.get_task(task_id)
@@ -646,7 +702,7 @@ class HistoryPage(QScrollArea):
 
     def _on_time_range_changed(self, route_key: str):
         """
-        时间范围切换事件（A2）：重查图表+表格+统计摘要；只影响当前任务的展示，
+        时间范围切换事件：重查图表+表格+统计条；只影响当前任务的展示，
         不影响任务/指标下拉的选中状态（切任务/切指标时保持当前范围选择不变）
         """
         self.current_range_key = route_key
@@ -695,24 +751,35 @@ class HistoryPage(QScrollArea):
         self.metric_combo.setEnabled(False)
         self.metric_combo.blockSignals(False)
 
-    def _get_cached_last_dt(self, task_id: str) -> Optional[datetime]:
+    def _get_cached_last_dt(self, task_id: str, task_info=None) -> Optional[datetime]:
         """
-        按任务缓存 last_dt（评审修订 M3）：仅切任务时重新查询 MAX(timestamp)，
-        切范围/切指标复用缓存值，避免在现有 (task_id, metric_type) 索引不含
-        timestamp 的前提下重复触发一次全表 filter。
+        按任务缓存 last_dt：切范围/切指标复用缓存值；缓存在刷新、重载任务列表与
+        自动刷新时失效（_invalidate_last_dt_cache）。
+
+        Args:
+            task_id: 任务ID
+            task_info: 调用方已取到的 MonitorTask（可选，省一次 get_task）
         """
         if self._last_dt_cache_task_id != task_id:
-            self._last_dt_cache_value = self.db.get_last_point_timestamp(task_id)
+            # 优先读 tasks.last_sample_at（主键查询，随数据点写入同事务维护），
+            # 不再对大表执行 MAX(timestamp)；仅其为空（旧数据/维护缺失）时才回退旧查询
+            if task_info is None:
+                task_info = self.db.get_task(task_id)
+            last_dt = task_info.last_sample_at if task_info else None
+            if last_dt is None:
+                last_dt = self.db.get_last_point_timestamp(task_id)
+            self._last_dt_cache_value = last_dt
             self._last_dt_cache_task_id = task_id
         return self._last_dt_cache_value
 
-    def _compute_since_iso(self, task_id: str) -> Optional[str]:
+    def _compute_since_iso(self, task_id: str, task_info=None) -> Optional[str]:
         """
         把当前选中的时间范围换算成 SQL 过滤用的 ISO 字符串。
 
-        【评审修订 B1】SQL 过滤参数全链路用 ISO 字符串，与绘图用的 epoch float
-        严禁混用。锚点为该任务最后一个数据点的时间（get_last_point_timestamp），
-        而非当前时刻——停止已久的任务选"最近1小时"仍应能看到其最后一小时的数据。
+        SQL 过滤参数全链路用 ISO 字符串，与绘图用的 epoch float 严禁混用。锚点为
+        该任务最后一个数据点的时间（tasks.last_sample_at，为空才回退
+        get_last_point_timestamp），而非当前时刻——停止已久的任务选"最近1小时"
+        仍应能看到其最后一小时的数据。
 
         Returns:
             Optional[str]: 选中"全部"或该任务尚无数据点时返回 None（不过滤）
@@ -720,22 +787,28 @@ class HistoryPage(QScrollArea):
         range_seconds = TIME_RANGE_SECONDS.get(self.current_range_key)
         if range_seconds is None:
             return None
-        last_dt = self._get_cached_last_dt(task_id)
+        last_dt = self._get_cached_last_dt(task_id, task_info)
         if last_dt is None:
             return None
         since_dt = last_dt - timedelta(seconds=range_seconds)
         return since_dt.isoformat()
 
-    def _load_task_data(self, task_id: str, metric_type: str = None):
+    def _load_task_data(self, task_id: str, metric_type: str = None,
+                        keep_view: bool = False):
         """
-        加载任务指定指标的数据并显示（v1.2.0 批3 性能优化 + v1.3.0 批2 时间范围
-        筛选：表格与图表均按当前选中的时间范围过滤、限流查询，避免大数据量任务把
-        整张表拖进内存/渲染导致界面卡顿；导出页仍走全量数据）
+        加载任务指定指标的数据并显示：表格与图表均按当前选中的时间范围过滤、限流
+        查询，避免大数据量任务把整张表拖进内存/渲染导致界面卡顿；统计条统一取自
+        get_metric_stats（覆盖所选范围内全部数据）；导出页仍走全量数据。
 
         Args:
             task_id: 任务ID
             metric_type: 指标类型（首指标查询自动包含metric_type为NULL的旧数据）
+            keep_view: True 时保留用户当前的缩放/平移（自动刷新用）；False 时让图表
+                重新自适应范围，避免切指标后曲线跑出视野
         """
+        # 同步加载比在途的后台刷新更新：让在途结果过期，避免它回来覆盖本次显示
+        self._cancel_pending_refresh()
+
         # 获取任务信息
         task_info = self.db.get_task(task_id)
         if not task_info:
@@ -747,43 +820,74 @@ class HistoryPage(QScrollArea):
             )
             return
 
-        since_iso = self._compute_since_iso(task_id)
+        since_iso = self._compute_since_iso(task_id, task_info)
 
-        # 表格：所选范围内最近 TABLE_POINT_LIMIT 条，新语义下子查询已按时间升序返回，
-        # 无需再翻转
+        # 表格：所选范围内最近 TABLE_POINT_LIMIT 条，子查询已按时间升序返回
         table_points = self.db.get_task_data_points(
             task_id, metric_type=metric_type, limit=TABLE_POINT_LIMIT, since_iso=since_iso)
 
         if not table_points:
-            if self.current_range_key != DEFAULT_TIME_RANGE_KEY:
-                self._clear_display(
-                    "所选时间范围内暂无数据",
-                    "尝试切换到「全部」查看完整历史")
-            else:
-                self._clear_display(
-                    "该任务暂无数据",
-                    "产生新的采样数据后此处会自动更新")
+            self._show_no_data()
             return
+
+        # 统计：与图表/表格同一时间范围，口径统一（起点、当前、增速都来自它）
+        stats = (self.db.get_metric_stats(task_id, metric_type, since_iso=since_iso)
+                 if metric_type else None)
 
         # 图表：SQL 分桶降采样（每桶 MIN/MAX 两点，保留尖峰），按时间升序返回，
         # 同样按当前范围过滤
         chart_points = self.db.get_task_data_points_bucketed(
             task_id, metric_type=metric_type, max_buckets=CHART_MAX_BUCKETS, since_iso=since_iso)
 
-        # 更新图表
+        # 打点：先于绘图载入，_redraw_chart 会一并画出竖线
+        markers = self.db.get_markers(task_id, since_iso=since_iso)
+
+        self._apply_loaded_data(
+            metric_type, table_points, stats, chart_points, markers, keep_view)
+
+    def _show_no_data(self):
+        """所选范围内没有数据点：按当前所选范围判断提示文案（而不是与默认范围比较）。"""
+        if self.current_range_key != 'all':
+            self._clear_display(
+                "所选时间范围内暂无数据",
+                "尝试切换到「全部」查看完整历史")
+        else:
+            self._clear_display(
+                "该任务暂无数据",
+                "产生新的采样数据后此处会自动更新")
+
+    def _apply_loaded_data(self, metric_type, table_points, stats, chart_points,
+                           markers, keep_view: bool):
+        """把已查好的数据应用到界面（图表/表格/统计条/刷新间隔）。纯主线程渲染，不查库；
+        同步加载与后台自动刷新共用，保证两条路径的显示行为一致。"""
+        # 打点：先于绘图设置，_redraw_chart 会一并画出竖线
+        self._markers = markers
+
         self._update_chart(chart_points, metric_type)
-
-        # 更新表格
-        self._update_table(table_points, metric_type)
-
-        # 更新统计摘要行（A3）
-        self._update_stats(table_points, metric_type, since_iso)
+        self._update_table(
+            table_points, metric_type,
+            total=stats['count'] if stats else None)
+        self._update_stats(stats, metric_type)
+        if stats:
+            self._update_auto_refresh_interval(stats['count'])
+        if not keep_view:
+            self.chart_widget.enableAutoRange()
+            self._apply_min_y_span(metric_type)
         self.content_stack.setCurrentWidget(self.analysis_page)
+
+    def _apply_min_y_span(self, metric_type):
+        """数据几乎是平线时，纵轴跨度扩到下限（与迷你趋势图同一规则），
+        避免把几字节的抖动放大成满幅、刻度出现多位小数。跨度足够时保持自动范围。"""
+        if not self._chart_y:
+            return
+        low, high = compute_y_range(self._chart_y, metric_type)
+        if high - low > max(self._chart_y) - min(self._chart_y):
+            self.chart_widget.setYRange(low, high, padding=0.05)
 
     def _update_chart(self, data_points, metric_type):
         """
-        更新图表（A4 真实时间轴）：缓存 x（epoch float）/y 数组供悬停吸附与主题
-        重绘复用，再统一交给 _redraw_chart 完成实际绘制
+        更新图表：缓存 x（epoch float）/y 数组供悬停吸附与主题重绘复用，
+        再统一交给 _redraw_chart 完成实际绘制
 
         Args:
             data_points: 分桶降采样后的数据点列表（按 timestamp 升序）
@@ -792,7 +896,6 @@ class HistoryPage(QScrollArea):
         self._chart_metric_type = metric_type
         if data_points:
             # 绘图 x 数据统一用 epoch float，仅用于绘图，严禁回流到 SQL 查询参数
-            # （评审修订 B1）
             self._chart_x = [dp.timestamp.timestamp() for dp in data_points]
             self._chart_y = [dp.value for dp in data_points]
         else:
@@ -803,7 +906,10 @@ class HistoryPage(QScrollArea):
         self._chart_display_unit = (
             get_metric_display_unit(metric_type, reference_value)
             if metric_type else '')
-        self._value_axis.set_display_unit(self._chart_display_unit)
+        # 计数类指标强制整数刻度；字节类的刻度间距按显示单位选取
+        self._value_axis.set_display_unit(
+            self._chart_display_unit,
+            integer_only=bool(metric_type) and is_integer_metric(metric_type))
 
         self._redraw_chart()
 
@@ -818,10 +924,10 @@ class HistoryPage(QScrollArea):
 
     def _redraw_chart(self):
         """
-        按当前缓存的 _chart_x/_chart_y 数组重绘曲线。
+        按当前缓存的 _chart_x/_chart_y 数组重绘曲线与打点竖线。
 
         chart_widget.clear() 会清空 PlotItem 下全部 item（含十字线），因此每次
-        都要重新加入；主题切换（A6）时也复用缓存数组走这里重绘，不重新查库。
+        都要重新加入；主题切换时也复用缓存数组走这里重绘，不重新查库。
         """
         self.chart_widget.clear()
         self.chart_widget.addItem(self.crosshair_line, ignoreBounds=True)
@@ -835,9 +941,22 @@ class HistoryPage(QScrollArea):
         pen = pg.mkPen(color=colors['curve'], width=2)
         self.chart_widget.plot(self._chart_x, self._chart_y, pen=pen)
 
+        # 打点竖线：颜色随主题；ignoreBounds 保证它不参与自动范围计算
+        marker_pen = pg.mkPen(color=colors['marker'], width=1, style=Qt.DashLine)
+        for marker in self._markers:
+            line = pg.InfiniteLine(
+                pos=marker.timestamp.timestamp(), angle=90, movable=False,
+                pen=marker_pen, label=marker.label,
+                labelOpts={
+                    'position': 0.94, 'color': colors['marker'],
+                    'movable': False, 'rotateAxis': (1, 0),
+                })
+            line.setToolTip(marker.label)
+            self.chart_widget.addItem(line, ignoreBounds=True)
+
     @staticmethod
     def _nearest_index(x_array: list, x: float) -> int:
-        """在按升序排列的 x_array 中二分查找与 x 最接近的下标（悬停吸附用，A1）"""
+        """在按升序排列的 x_array 中二分查找与 x 最接近的下标（悬停吸附用）"""
         idx = bisect.bisect_left(x_array, x)
         if idx <= 0:
             return 0
@@ -849,7 +968,7 @@ class HistoryPage(QScrollArea):
 
     def _on_mouse_moved(self, evt):
         """
-        悬停十字线跟随鼠标并吸附到最近的绘制点（A1）。
+        悬停十字线跟随鼠标并吸附到最近的绘制点；读数里附带所处的打点区间。
 
         SignalProxy 限流到 60Hz 后回调，evt 是 SignalProxy 包装后的单元素元组。
         """
@@ -875,11 +994,17 @@ class HistoryPage(QScrollArea):
         formatted_value = format_metric_value(
             self._chart_metric_type, y_val,
             display_unit=self._chart_display_unit)
-        self.hover_label.setText(f"{time_str} · {formatted_value}")
+        text = f"{time_str} · {formatted_value}"
+        context = marker_context(
+            [m.timestamp.timestamp() for m in self._markers],
+            [m.label for m in self._markers], x_val)
+        if context:
+            text += f" · {context}"
+        self.hover_label.setText(text)
 
     def eventFilter(self, obj, event):
         """
-        鼠标离开图表区域时清空十字线与悬停读数（A1）。
+        鼠标离开图表区域时清空十字线与悬停读数。
 
         HistoryPage 本身是 QScrollArea：QAbstractScrollArea 内部会把 self 安装为
         其 viewport 的事件过滤器（Qt 内部机制，与本类下面 self.chart_widget.
@@ -893,58 +1018,42 @@ class HistoryPage(QScrollArea):
             self.hover_label.setText("")
         return super().eventFilter(obj, event)
 
-    def _update_stats(self, table_points, metric_type, since_iso):
+    def _update_stats(self, stats: Optional[dict], metric_type: Optional[str]):
         """
-        更新统计摘要行（A3）：当前 {last} ｜ 最小 {min} ｜ 最大 {max} ｜ 平均 {avg}
+        更新统计条：起点、当前、变化量、增速、最小、最大。
 
         Args:
-            table_points: 表格查询结果（按 timestamp 升序），末元素即"当前"
-                          （评审修订 M3：范围内最新值直接复用该结果，不单独查询）
+            stats: Database.get_metric_stats 的结果（覆盖所选范围内全部数据）；
+                None 时全部显示 "--"
             metric_type: 指标类型
-            since_iso: 当前范围过滤参数，透传给 get_metric_stats 保持与图表/表格
-                       口径一致
         """
-        if not table_points or not self.current_task_id or not metric_type:
-            self.stats_label.setText(self._EMPTY_STATS_TEXT)
-            self._set_stat_values("--", "--", "--", "--")
-            return
+        texts = build_stat_texts(metric_type, stats, self._chart_display_unit)
+        self._set_stat_values(texts)
 
-        current_text = format_metric_value(
-            metric_type, table_points[-1].value,
-            display_unit=self._chart_display_unit)
-        stats = self.db.get_metric_stats(self.current_task_id, metric_type, since_iso=since_iso)
-        if stats:
-            min_text = format_metric_value(
-                metric_type, stats['min'], display_unit=self._chart_display_unit)
-            max_text = format_metric_value(
-                metric_type, stats['max'], display_unit=self._chart_display_unit)
-            avg_text = format_metric_value(
-                metric_type, stats['avg'], display_unit=self._chart_display_unit)
-        else:
-            min_text = max_text = avg_text = "--"
+    def _set_stat_values(self, texts: dict):
+        """把各格文本写入统计条（完整文本同时放进 tooltip，防止被窄列裁剪）。"""
+        for key in STAT_KEYS:
+            text = texts.get(key, "--")
+            label = self.stat_value_labels[key]
+            label.setText(text)
+            label.setToolTip(text if text != "--" else "")
 
-        self.stats_label.setText(
-            f"当前 {current_text} ｜ 最小 {min_text} ｜ 最大 {max_text} ｜ 平均 {avg_text}")
-        self._set_stat_values(current_text, min_text, max_text, avg_text)
-
-    def _set_stat_values(self, current: str, minimum: str, maximum: str, average: str):
-        """更新四列统计带，保持各数值纵向对齐便于快速比较。"""
-        for key, value in zip(
-                ("当前", "最小", "最大", "平均"),
-                (current, minimum, maximum, average)):
-            self.stat_value_labels[key].setText(value)
-
-    def _update_table(self, data_points, metric_type):
+    def _update_table(self, data_points, metric_type, total: Optional[int] = None):
         """
         更新表格
 
         Args:
-            data_points: 数据点列表（limit 子查询新语义下已按 timestamp 升序返回；
+            data_points: 数据点列表（limit 子查询已按 timestamp 升序返回；
                          这里仍需 reversed() 翻转填充，使表格保持"倒序显示，最新的
-                         在前"的既有用户可见行为——方案原文"表格 reversed() 零改动"
-                         指的是保留这一步，之前误删已恢复，v1.2.0 批3 修正）
+                         在前"的既有用户可见行为，勿删）
             metric_type: 指标类型
+            total: 所选范围内的数据点总数（来自统计的 count）；None 时按已显示条数
         """
+        shown = len(data_points)
+        total = shown if total is None else max(total, shown)
+        self.table_hint_label.setText(
+            f"最新数据优先 · 显示最近 {shown:,} 条 / 共 {total:,} 条")
+
         # 大批量 setItem 前关闭界面更新与排序，避免逐行触发重排/重绘拖慢填表
         self.data_table.setUpdatesEnabled(False)
         self.data_table.setSortingEnabled(False)
@@ -954,8 +1063,7 @@ class HistoryPage(QScrollArea):
 
             # 倒序显示，最新的在前
             for i, dp in enumerate(reversed(data_points)):
-                # 时间（A4 真实时间轴：表格时间列改为含月日的绝对时间，替代原
-                # 仅 HH:MM:SS 展示，避免跨天数据歧义）
+                # 时间：含月日的绝对时间，避免跨天数据歧义
                 time_str = dp.timestamp.strftime(TABLE_TIME_FORMAT)
                 time_item = QTableWidgetItem(time_str)
                 time_item.setFont(self._detail_data_font)
@@ -989,11 +1097,12 @@ class HistoryPage(QScrollArea):
         self._chart_y = []
         self._chart_metric_type = None
         self._chart_display_unit = ''
+        self._markers = []
         self._value_axis.set_display_unit('')
         self._redraw_chart()
         self.data_table.setRowCount(0)
-        self.stats_label.setText(self._EMPTY_STATS_TEXT)
-        self._set_stat_values("--", "--", "--", "--")
+        self.table_hint_label.setText("最新数据优先")
+        self._update_stats(None, None)
         self._show_empty_state(empty_title, empty_detail)
 
     def _update_delete_button_state(self):
@@ -1018,7 +1127,7 @@ class HistoryPage(QScrollArea):
             self.delete_action.setToolTip("")
 
     def _on_delete_task_clicked(self):
-        """删除此任务数据按钮点击事件：确认对话框 -> delete_task -> 本页刷新"""
+        """删除此任务数据按钮点击事件：确认对话框 -> manager.delete_task_data -> 本页刷新"""
         if not self.current_task_id:
             return
 
@@ -1043,7 +1152,7 @@ class HistoryPage(QScrollArea):
         if not dialog.exec():
             return
 
-        if self.db.delete_task(self.current_task_id):
+        if self._get_manager().delete_task_data(self.current_task_id):
             InfoBar.success(
                 title="删除成功",
                 content="该任务的历史数据已删除",
@@ -1062,7 +1171,7 @@ class HistoryPage(QScrollArea):
             )
 
     def _save_chart_as_png(self):
-        """保存当前图表为 PNG 图片（A5）"""
+        """保存当前图表为 PNG 图片"""
         if not self.current_task_id or not self._chart_x:
             InfoBar.warning(
                 title="提示",
@@ -1107,7 +1216,7 @@ class HistoryPage(QScrollArea):
         )
 
     def _copy_chart_to_clipboard(self):
-        """复制当前图表为图片到剪贴板（A5）"""
+        """复制当前图表为图片到剪贴板"""
         if not self.current_task_id or not self._chart_x:
             InfoBar.warning(
                 title="提示",
@@ -1142,7 +1251,7 @@ class HistoryPage(QScrollArea):
 
     def _apply_chart_theme(self):
         """
-        应用图表配色（A6）：背景、坐标轴、十字线均按 chart_colors() 取色；曲线
+        应用图表配色：背景、坐标轴、十字线均按 chart_colors() 取色；曲线
         颜色随缓存的 x/y 数组一并在 _redraw_chart 中重绘。构造时调用一次，
         qconfig.themeChanged 时重新调用。
         """
@@ -1162,17 +1271,148 @@ class HistoryPage(QScrollArea):
         self._redraw_chart()
 
     def _on_theme_changed(self, theme):
-        """qconfig.themeChanged 回调：全局主题切换时重新取色重绘图表（A6）"""
+        """qconfig.themeChanged 回调：全局主题切换时重新取色重绘图表"""
         self._apply_chart_theme()
 
     def resizeEvent(self, event):
-        """页面宽度改变时更新筛选区的响应式排列。"""
+        """页面宽度改变时更新筛选区与统计条的响应式排列。"""
         super().resizeEvent(event)
         if getattr(self, 'select_layout', None) is not None:
             self._update_filter_layout(self.viewport().width())
+        if getattr(self, '_stat_cells', None):
+            self._update_stats_layout(self.viewport().width())
 
     def showEvent(self, event):
-        """页面显示事件"""
+        """页面显示事件：每次显示都刷新任务列表，并开始运行中任务的自动刷新计时"""
         super().showEvent(event)
-        # 每次显示时刷新任务列表
         self._load_tasks()
+        self._auto_refresh_timer.start()
+
+    def hideEvent(self, event):
+        """页面隐藏时停止自动刷新计时，避免后台页面白白查库"""
+        super().hideEvent(event)
+        self._auto_refresh_timer.stop()
+        # 不阻塞等待在途查询：只让它的结果过期，线程自行跑完后由 finished 释放
+        self._cancel_pending_refresh()
+
+    # ========== 运行中任务自动刷新 ==========
+
+    @staticmethod
+    def _auto_refresh_interval_for(count: int) -> int:
+        """按范围内数据点数返回自动刷新间隔（毫秒），分档见模块顶部常量。"""
+        if count < AUTO_REFRESH_TIER1_COUNT:
+            return AUTO_REFRESH_INTERVAL_MS
+        if count < AUTO_REFRESH_TIER2_COUNT:
+            return AUTO_REFRESH_INTERVAL_MID_MS
+        return AUTO_REFRESH_INTERVAL_SLOW_MS
+
+    def _update_auto_refresh_interval(self, count: int):
+        """依据当前统计的数据点数调整定时器间隔（仅在变化时设置，避免重置计时）。"""
+        interval = self._auto_refresh_interval_for(count)
+        if self._auto_refresh_timer.interval() != interval:
+            self._auto_refresh_timer.setInterval(interval)
+
+    def _should_skip_auto_refresh(self) -> bool:
+        """本次自动刷新是否应跳过（定时器继续）：
+        - 当前在"明细"视图（图表/统计不可见，刷新白耗主线程）；
+        - 鼠标正悬停在图表上（十字线可见，刷新会重绘并打断读数）；
+        - 主窗口已最小化。
+        """
+        if self.view_stack.currentIndex() != 0:
+            return True
+        if self.crosshair_line.isVisible():
+            return True
+        window = self.window()
+        if window is not None and window.isMinimized():
+            return True
+        return False
+
+    def _on_auto_refresh(self):
+        """
+        定时器回调：页面可见且所选任务仍在运行时，复用现有加载流程刷新数据
+        （保留用户的任务/指标/范围选择与图表缩放）；任务刚结束时整体重载一次，
+        让"运行中"标记、删除按钮与最终数据同步到位。明细视图、鼠标悬停图表、
+        窗口最小化时跳过本次刷新。
+        """
+        if not self.isVisible():
+            self._auto_refresh_timer.stop()
+            return
+        if not self.current_task_id:
+            return
+        if self._should_skip_auto_refresh():
+            return
+
+        if self._is_task_running(self.current_task_id):
+            self._auto_refresh_was_running = True
+            self._invalidate_last_dt_cache()
+            self._start_auto_refresh_worker()
+        elif self._auto_refresh_was_running:
+            self._auto_refresh_was_running = False
+            self._load_tasks()
+
+    # ========== 自动刷新：后台查询 + 主线程应用 ==========
+
+    def _cancel_pending_refresh(self):
+        """使在途的后台刷新结果过期（推进请求序号）；不等待线程，线程自行跑完。"""
+        self._refresh_request_seq += 1
+
+    def _start_auto_refresh_worker(self):
+        """
+        在后台线程执行自动刷新的全部查询。同一时刻最多一个 worker：上一个未结束时
+        跳过本次 tick（下一次 tick 再来）。结果带请求序号与 (任务, 指标, 范围) 标识，
+        回到主线程后若已过期则丢弃。
+        """
+        if self._refresh_worker is not None:
+            return
+        task_id = self.current_task_id
+        if not task_id:
+            return
+
+        self._refresh_request_seq += 1
+        worker = HistoryRefreshWorker(
+            self.db, self._refresh_request_seq, task_id, self.current_metric,
+            self.current_range_key, TIME_RANGE_SECONDS.get(self.current_range_key),
+            TABLE_POINT_LIMIT, CHART_MAX_BUCKETS)
+        worker.result_ready.connect(self._on_refresh_result)
+        # 先清引用、再 deleteLater（同一信号按连接顺序执行）：保证主窗口 closeEvent
+        # 读到的 _refresh_worker 要么仍有效、要么已是 None，不会拿到已删除的对象
+        worker.finished.connect(lambda w=worker: self._on_refresh_worker_finished(w))
+        worker.finished.connect(worker.deleteLater)
+        self._refresh_worker = worker
+        worker.start()
+
+    def _on_refresh_worker_finished(self, worker):
+        """线程结束：释放引用，允许下一次 tick 启动新的 worker。"""
+        if self._refresh_worker is worker:
+            self._refresh_worker = None
+
+    def _on_refresh_result(self, result: HistoryRefreshResult):
+        """
+        主线程槽：应用后台查询结果（保留用户当前缩放，keep_view=True）。
+        请求序号过期、或用户已切换任务/指标/范围时丢弃；此刻已进入应跳过刷新的状态
+        （明细视图/悬停图表/窗口最小化）时同样丢弃，等下一次 tick。
+        """
+        if result.request_id != self._refresh_request_seq:
+            return
+        if (result.task_id != self.current_task_id
+                or result.metric_type != self.current_metric
+                or result.range_key != self.current_range_key):
+            return
+        if result.error is not None:
+            logger.warning("历史页自动刷新失败，保持当前显示: %s", result.error)
+            return
+        if result.task_missing:
+            return
+        if self._should_skip_auto_refresh():
+            return
+
+        # 回填锚点缓存：与同步路径一致，后续切范围/指标可直接复用
+        self._last_dt_cache_task_id = result.task_id
+        self._last_dt_cache_value = result.last_dt
+
+        if not result.table_points:
+            self._show_no_data()
+            return
+        self._apply_loaded_data(
+            result.metric_type, result.table_points, result.stats,
+            result.chart_points, result.markers, keep_view=True)

@@ -71,7 +71,7 @@ def _get_user_version(path: str) -> int:
 
 
 def test_migration_v0_to_v1(db_path):
-    """迁移完成后：user_version=1、data_points 回填、tasks.metric_type 变 JSON 数组、生成备份"""
+    """迁移完成后：user_version 升到当前版本、data_points 回填、tasks.metric_type 变 JSON 数组、生成备份"""
     _create_v0_db(db_path)
     assert _get_user_version(db_path) == 0
 

@@ -40,7 +40,7 @@ def get_icon_path():
     """
     获取应用图标（app_green_icon.ico）的运行时查找路径
 
-    图标查找单点（v1.2.0 架构重构批4收敛，原分散在 main.py 内的三分支逻辑）：
+    图标查找单点（原分散在 main.py 内的三分支逻辑，现收敛于此）：
         - 打包环境（onedir）：图标随 _internal\\ 目录一起收进 datas，
           位于 exe 同级目录下（PyInstaller onedir 不再有 _MEIPASS 临时解压目录，
           onefile 时代的 sys._MEIPASS 分支保留仅作兼容，理论上不会命中）。
@@ -60,15 +60,23 @@ def get_icon_path():
         return os.path.join(BASE_DIR, 'build', 'app_green_icon.ico')
 
 
+# 覆盖数据目录的环境变量名
+DATA_DIR_ENV = "PROCESS_MONITOR_DATA_DIR"
+
+
 def get_data_dir():
     """
     获取数据目录
 
     Returns:
         str: 数据目录路径
+            - 设置了环境变量 PROCESS_MONITOR_DATA_DIR：使用该目录（便于测试/便携运行）
             - 开发环境：返回项目根目录下的data文件夹
             - 打包环境：返回用户本地应用数据目录，避免Program Files权限问题
     """
+    override = os.environ.get(DATA_DIR_ENV)
+    if override:
+        return os.path.abspath(override)
     if getattr(sys, 'frozen', False):
         local_appdata = os.environ.get('LOCALAPPDATA', os.path.expanduser('~'))
         return os.path.join(local_appdata, APP_NAME, "data")
@@ -91,16 +99,16 @@ MAX_MONITOR_TASKS = 5  # 最多同时监控5个进程
 DEFAULT_INTERVAL = 1.0  # 默认采集间隔（秒）；缺省值，运行时以设置页（app_config.cfg）为准
 
 # 数据保存配置
-# 固化为1，勿调大：v1.2.0 架构评审裁决——每周期立即落库，配合 flush 失败重试与 1000
+# 固化为1，勿调大：每周期立即落库，配合 flush 失败重试与 1000
 # 条缓冲上限保证"停止时数据不丢"的语义简单可靠；调大会引入"崩溃时丢一批未落库
 # 数据"的新风险，且与当前"实时显示历史数据"的产品预期冲突
 SAVE_BATCH_SIZE = 1
 
 # 数据保留天数（启动时自动清理已停止且过期的历史任务）
-# 默认 0 = 禁用自动清理（v1.2.0 架构评审裁决）：历史数据的删除应由用户在历史页显式点击
+# 默认 0 = 禁用自动清理：历史数据的删除应由用户在历史页显式点击
 # "删除此任务数据"完成，避免用户在不知情的情况下丢失数据；调大为正整数即可启用，
 # 启用时只清理 status='stopped' 且 结束时间早于"当前时间-该天数"的任务（含数据点）
-# 缺省值，运行时以设置页（app_config.cfg，v1.3.0 起用户可在设置页调整此项）为准
+# 缺省值，运行时以设置页（app_config.cfg）为准
 DATA_RETENTION_DAYS = 0
 
 # UI配置

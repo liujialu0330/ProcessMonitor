@@ -21,35 +21,48 @@ ProcessMonitor is a Windows 11 Fluent Design desktop app for keeping an eye on a
 
 ## ✨ Features
 
-### 🔍 Monitoring
-- **27 metrics, 4 categories** — memory (working set, private bytes, page faults, USS, ...), CPU (usage, user/kernel time, priority), system (threads, handles, context switches) and I/O (read/write bytes and counts)
-- **Multi-metric tasks** — check any combination of metrics for a single task; they're all sampled on the same clock and timestamp
-- **Up to 5 concurrent tasks** — monitor several processes side by side, with the current quota always shown (e.g. `3/5`)
-- **Configurable interval** — any integer from 1 to 3600 seconds, default 1s
-- **Process search** — filter the process list by typing part of its name or PID
-- **Pause & resume** — pause a running task without losing its history, and pick it back up anytime
-- **Process-first workflow** — the redesigned Fluent layout makes process search the primary entry point, summarizes the selected metrics, and presents task identity, state, live values, trends and actions in a clear hierarchy
-- **Mini trend sparkline** — every task card shows a 60-sample trend line for its primary metric at a glance
+### 🧭 Recommended workflow: hunting leaks
 
-### 📊 Data & Export
-- **Focused history workspace** — responsive two-row filters, a four-column stats strip, dedicated Trend/Details views, a 1-hour default range, and on-demand raw values and deletion actions
-- **Interactive history charts** — hover crosshair with a live time/value readout, quick time-range switch (10m / 1h / 6h / 24h / all), a real date/time axis, adaptive KB/MB/GB/TB display, reduced tick density, and one-click export to PNG or the clipboard
-- **Downsampled history charts** — large tasks are bucketed on the database side (up to 2,000 buckets, min/max per bucket) so peaks and valleys stay visible without shipping every raw point
-- **Fast history table** — shows the most recent 2,000 samples for smooth scrolling even on long-running tasks (exports are never truncated — always the full dataset)
-- **Wide-format CSV export** — a single continuous export flow with one row per sample, one column per metric, background execution and cancellation; the destination folder opens only when you ask for it
-- **Controlled cleanup** — delete a finished task from the History page's More menu, with confirmation and safeguards for running tasks
+1. On the Monitor page, pick the target process. The default "Leak check" preset (private bytes, handles, GDI objects, USER objects, threads) is pre-selected and your last choice is remembered; add a test note if you like, then start.
+2. Let the target warm up to a steady state, then click "Marker" on the task card and label it "baseline".
+3. After each round of the operation under test (e.g. open and close a window N times), add another marker describing what you just did.
+4. On the History page, look at the marker lines on the chart and at the stats strip's "Change" and "Growth rate" (per hour, least-squares slope). A value that climbs after every round and never falls back is the classic leak signature.
+
+### 🔍 Monitoring
+- **27 metrics, 4 categories** — memory (working set, private bytes, page faults, USS, ...), CPU (usage, user/kernel time, priority), system (threads, handles, GDI/USER objects, context switches) and I/O (read/write bytes and counts); every metric has a one-line description, shown as a tooltip in the metric picker
+- **Private bytes as the leak indicator** — the former "virtual memory", "commit size" and "private working set" metrics were identical on Windows and are merged into "private bytes", the primary metric for spotting memory leaks
+- **Honest gaps instead of fake zeros** — when a metric cannot be read, the task card shows "unavailable" with the reason and nothing is recorded for it. Without administrator rights only USS of higher-privilege processes is unreadable; GDI/USER objects of processes in other sessions (e.g. system services) show "not supported"
+- **Change since start and full-run trend** — each card shows every metric's change since the task began, and the sparkline covers "task start until now" (automatically thinned out on long runs)
+- **Markers and notes** — attach a test note to a task and drop labelled markers on a running task to record key actions; stopping a task asks for confirmation
+- **Careful task creation** — no process is pre-selected, creating a second task for the same PID asks for confirmation, and the process list can be searched by name or PID
+- **Multi-metric, multi-task** — any metric combination per task, sharing one interval and timestamp; up to 5 running tasks at once (the quota counts running tasks only); any integer interval from 1 to 3600 seconds, default 1s
+- **Pause & resume** — pause a task without losing history; resuming samples immediately
+- **Cards stay after a task ends** — a finished card offers "View history", "Monitor again" and "Close"; if the target process ends unexpectedly you get an in-app notice, plus a tray balloon when the window is in the background
+- **Steady sampling** — scheduled on a monotonic-clock deadline so it does not drift over time, does not backfill after the machine sleeps, and detects PID reuse so a new process is never mistaken for the original
+
+### 📊 History & Export
+- **Focused history workspace** — shows "All" data by default (leak analysis needs the whole run), with quick 10m / 1h / 6h / 24h ranges and separate Trend / Details views; the task dropdown shows duration, note and a "running" marker
+- **Stats strip** — start, current, change, growth rate (per hour), min and max
+- **Interactive history charts** — hover crosshair with readout, a real date/time axis and marker lines; Y-axis ticks are rounded in the display unit, count metrics use integer ticks, and a flat curve is not blown up into full-height noise; export to PNG or copy to the clipboard
+- **Auto-refresh for running tasks** — chart and stats follow the live data, with a refresh interval that adapts to the data volume
+- **Large-data friendly** — charts are bucketed on the database side (up to 2,000 buckets, min/max per bucket, so peaks and valleys survive); the detail table shows "latest 2,000 / N total" while exports are always complete
+- **Wide-format CSV export** — one row per sample, one column per metric, and a final "Marker" column; counts in the task info use thousands separators, switching task resets the default file name, and overwriting an existing file asks first; it writes a temporary file and replaces the target only on success, so a cancelled or failed export never leaves a half-written file; runs in the background and can be cancelled
+- **Controlled cleanup** — delete a finished task from the History page's More menu, with confirmation; database cleanup and compaction are unavailable while any task is running
 
 ### ⚙️ Settings & Personalization
 - **Theme** — light, dark, or follow the system, switches instantly
-- **Fluent typography** — a consistent Segoe UI / Microsoft YaHei UI type system, 24px page titles and monospaced data labels across every page
-- **Defaults & retention** — set the default sampling interval and a history retention policy (forever / 7 / 30 / 90 / 180 days)
-- **Database maintenance** — see current disk usage and clean up + compact the database in one click
-- **System tray** — optionally minimize to tray on close and keep monitoring in the background
+- **Consistent typography** — Segoe UI / Microsoft YaHei UI type stack, 24px page titles and monospaced data labels
+- **Defaults & retention** — default sampling interval and a history retention policy (forever / 7 / 30 / 90 / 180 days)
+- **Database maintenance** — see disk usage and clean up + compact in one click
+- **System tray and close behavior** — optionally minimize to tray on close and keep monitoring; closing the window while tasks are running asks "Stop and exit / Minimize to tray / Cancel" (skipped on logoff or shutdown)
+- **Single instance** — launching the app again activates the open window instead of starting a second copy
 
-### 🛡 Reliability
-- **Auto-update** — checks GitHub Releases on startup (or on demand) and downloads/launches the installer for you; the startup check now shows a non-modal notice instead of interrupting you
-- **Crash-resilient storage** — SQLite with WAL mode, automatic retry on failed writes, crash/error logging, and automatic recovery of orphaned "running" tasks after an unclean shutdown
-- **Automated test suite** — 101 test cases covering the data layer, schema migration, export, update checks, responsive monitor/history layouts, typography and metric formatting
+### 🛡 Reliability & Security
+- **Auto-update** — checks GitHub Releases on startup (or on demand) with a non-modal notice; downloads are restricted to official GitHub hosts and the installer's SHA-256 is verified, and if no checksum is published you are pointed to the release page for a manual download
+- **Crash-resilient storage** — SQLite with WAL mode, automatic retry on failed writes, crash/error logging (5MB x 5 rotation), and automatic recovery of orphaned "running" tasks after an unclean shutdown
+- **Safe database upgrades** — upgrades run in an explicit transaction and roll back on failure, restoring from the automatic backup so old data is never lost
+- **Never freezes on stop** — stopping a task or exiting the app does not block the UI, and all collected data is flushed to disk before exit
+- **Automated test suite** — 418 test cases covering the data layer, migration, collection and scheduling, export, update verification, page flows and UI contracts; tests use a temporary data directory and never touch real data
 - **Measured performance** — opening a 770k-row history task takes ~1.4s (down from 3.4s pre-v1.2.0; measured on the maintainer's dev machine)
 
 ## 📸 Screenshots
@@ -122,6 +135,7 @@ flowchart TD
 python -m pytest tests/
 ```
 
+- List the test cases with `pytest --collect-only -q`; tests use a temporary data directory by default, and the runtime data directory can be overridden with the `PROCESS_MONITOR_DATA_DIR` environment variable
 - CI runs the test suite on every push and pull request (see the CI badge above)
 - To build a Windows installer, see [build/README_打包说明.md](build/README_打包说明.md)
 

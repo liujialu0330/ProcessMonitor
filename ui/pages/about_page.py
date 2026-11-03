@@ -13,17 +13,21 @@ from PyQt5.QtWidgets import (
 )
 from qfluentwidgets import (
     CardWidget, PrimaryPushButton, FluentIcon,
-    StrongBodyLabel, BodyLabel, CaptionLabel,
+    StrongBodyLabel, BodyLabel,
     MessageBoxBase, SubtitleLabel, PushButton,
     InfoBar, InfoBarPosition, ProgressBar, TextEdit
 )
 
 import config
 from core.update_checker import (
-    UpdateChecker, UpdateDownloader,
+    UpdateChecker, UpdateDownloader, MSG_CANNOT_VERIFY,
     get_skipped_version, set_skipped_version
 )
 from ui.typography import DataCaptionLabel, PageTitleLabel
+
+
+# 缺少安装包校验信息时展示给用户的说明（core 层的 MSG_CANNOT_VERIFY 偏技术化）
+MSG_NO_DIGEST = "该版本未提供校验信息，请前往发布页手动下载"
 
 
 class UpdateAvailableDialog(MessageBoxBase):
@@ -79,10 +83,9 @@ class InstallConfirmDialog(MessageBoxBase):
 class AboutPage(QScrollArea):
     """关于页面"""
 
-    # 静默检查（启动3秒后自动检查）发现新版本时发出（v1.3.0 批4，C5，修复遗留
-    # P2-2："静默检查也弹模态对话框会打断用户"）：不再由本页面直接弹窗，改由
-    # 主窗口统一处理为非模态 InfoBar 提示；参数为 core.update_checker.
-    # parse_release_info 返回的 info 字典
+    # 静默检查（启动3秒后自动检查）发现新版本时发出：不由本页面直接弹模态对话框
+    # 打断用户，改由主窗口统一处理为非模态 InfoBar 提示；参数为
+    # core.update_checker.parse_release_info 返回的 info 字典
     update_available_silent = pyqtSignal(object)
 
     def __init__(self, parent=None):
@@ -94,6 +97,8 @@ class AboutPage(QScrollArea):
         self._checker = None
         self._downloader = None
         self._pending_info = None
+        # 发布页地址（html_url）：缺少校验信息时"打开发布页"按钮使用
+        self._release_url_hint = None
 
         self._init_ui()
 
@@ -166,6 +171,13 @@ class AboutPage(QScrollArea):
         self.status_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         update_layout.addWidget(self.status_label)
 
+        # 新版本缺少安装包校验信息时显示：无法自动下载，引导用户去发布页手动下载
+        self.release_button = PushButton("打开发布页", self, FluentIcon.LINK)
+        self.release_button.setMaximumWidth(160)
+        self.release_button.clicked.connect(self._open_release_page)
+        self.release_button.setVisible(False)
+        update_layout.addWidget(self.release_button, 0, Qt.AlignLeft)
+
         # 下载进度条（默认隐藏）
         self.progress_bar = ProgressBar()
         self.progress_bar.setVisible(False)
@@ -198,6 +210,8 @@ class AboutPage(QScrollArea):
             return
 
         self.check_button.setEnabled(False)
+        self.release_button.setVisible(False)
+        self._release_url_hint = None
         self.status_label.setText("正在检查更新…")
 
         self._checker = UpdateChecker(self)
@@ -222,15 +236,15 @@ class AboutPage(QScrollArea):
 
         self.status_label.setText(f"发现新版本 v{info['version']}")
         if silent:
-            # C5：静默检查不再直接弹模态对话框打断用户，改为发信号，由主窗口
-            # 用非模态 InfoBar 提示（手动检查路径不变，仍直接弹下方模态对话框）
+            # 静默检查不直接弹模态对话框打断用户，改为发信号，由主窗口用非模态
+            # InfoBar 提示（手动检查路径不变，仍直接弹下方模态对话框）
             self.update_available_silent.emit(info)
         else:
             self._show_update_dialog(info)
 
     def show_update_dialog_for(self, info: dict):
         """供主窗口在用户点击 InfoBar「查看」按钮后调用：弹出与手动检查路径
-        一致的确认对话框（C5，内部直接复用 _show_update_dialog，不重复实现）"""
+        一致的确认对话框（内部直接复用 _show_update_dialog，不重复实现）"""
         self._show_update_dialog(info)
 
     def _on_check_error(self, msg: str, silent: bool):
@@ -284,6 +298,11 @@ class AboutPage(QScrollArea):
             self.status_label.setText("未找到安装包，已打开发布页")
             return
 
+        if not info.get('asset_digest'):
+            # 缺少 SHA-256 摘要：下载线程会拒绝下载，这里直接给出可操作的说明
+            self._show_no_digest(info)
+            return
+
         self._pending_info = info
         self.status_label.setText("正在下载更新…")
         self.progress_bar.setValue(0)
@@ -291,7 +310,8 @@ class AboutPage(QScrollArea):
         self.check_button.setEnabled(False)
 
         self._downloader = UpdateDownloader(
-            info['asset_url'], info['asset_name'], info.get('asset_size', 0), self)
+            info['asset_url'], info['asset_name'], info.get('asset_size', 0), self,
+            digest=info.get('asset_digest'))
         self._downloader.download_progress.connect(self._on_download_progress)
         self._downloader.download_finished.connect(self._on_download_finished)
         self._downloader.error_occurred.connect(self._on_download_error)
@@ -319,7 +339,7 @@ class AboutPage(QScrollArea):
             except Exception as e:
                 self.status_label.setText(f"启动安装程序失败：{e}")
                 return
-            # 退出应用，交给安装向导。评审修订 B3：必须调用 quit_for_install()
+            # 退出应用，交给安装向导。必须调用 quit_for_install()
             # 而非普通 close()——否则"关闭窗口时最小化到托盘"开启时，安装向导
             # 已经启动，但主程序会被 closeEvent 的隐藏分支拦截、常驻托盘继续
             # 占用文件，导致覆盖安装因文件占用而失败。hasattr 防御：AboutPage
@@ -333,8 +353,44 @@ class AboutPage(QScrollArea):
         else:
             self.status_label.setText(f"安装包已保存：{path}")
 
+    def _release_page_url(self, info: dict = None) -> str:
+        """新版本发布页地址：优先用 release 自带的 html_url，缺失时用仓库发布列表。"""
+        info = info or {}
+        return (info.get('html_url') or self._release_url_hint
+                or f"https://github.com/{config.GITHUB_OWNER}/"
+                   f"{config.GITHUB_REPO}/releases")
+
+    def _open_release_page(self, info: dict = None):
+        """打开发布页（按钮点击时 info 为 False/None，使用已记录的地址）"""
+        webbrowser.open(self._release_page_url(info if isinstance(info, dict) else None))
+
+    def _show_no_digest(self, info: dict = None):
+        """该版本未提供安装包校验信息：不自动下载（无法确认安装包完整性），
+        说明原因并提供打开发布页的入口。"""
+        self.progress_bar.setVisible(False)
+        self.check_button.setEnabled(True)
+        self._release_url_hint = (info or {}).get('html_url') or self._release_url_hint
+        self.status_label.setText(MSG_NO_DIGEST)
+        self.release_button.setVisible(True)
+
+        info_bar = InfoBar.warning(
+            title="无法自动更新",
+            content=MSG_NO_DIGEST,
+            orient=Qt.Horizontal,
+            isClosable=True,
+            position=InfoBarPosition.TOP,
+            duration=8000,
+            parent=self
+        )
+        open_button = PushButton("打开发布页")
+        open_button.clicked.connect(self._open_release_page)
+        info_bar.addWidget(open_button)
+
     def _on_download_error(self, msg: str):
         """下载失败"""
+        if msg == MSG_CANNOT_VERIFY:
+            self._show_no_digest(self._pending_info)
+            return
         self.progress_bar.setVisible(False)
         self.check_button.setEnabled(True)
         self.status_label.setText("下载失败，可稍后重试")

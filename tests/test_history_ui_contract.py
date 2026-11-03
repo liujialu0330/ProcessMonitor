@@ -19,9 +19,10 @@ def test_history_page_uses_compact_analysis_contract(qapp, db):
     """统计、子视图和原始值列保持数据优先的默认形态。"""
     page = HistoryPage(db=db)
 
-    assert DEFAULT_TIME_RANGE_KEY == '1h'
-    assert page.current_range_key == '1h'
-    assert tuple(page.stat_value_labels) == ("当前", "最小", "最大", "平均")
+    assert DEFAULT_TIME_RANGE_KEY == 'all'
+    assert page.current_range_key == 'all'
+    assert tuple(page.stat_value_labels) == (
+        "起点", "当前", "变化", "增速", "最小", "最大")
     assert page.view_stack.currentIndex() == 0
     assert page.data_table.isColumnHidden(2) is True
 

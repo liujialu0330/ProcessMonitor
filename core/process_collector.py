@@ -2,9 +2,50 @@
 进程信息采集器
 负责从系统中采集进程的各项性能指标
 """
+import ctypes
+import logging
+import sys
+from ctypes import wintypes
 import psutil
-from typing import Optional, Dict, List, Tuple
+from typing import Any, Optional, Dict, List, Tuple
 from utils.metrics import MetricType
+
+logger = logging.getLogger(__name__)
+
+# ---------- GDI/USER 对象数（user32.GetGuiResources）----------
+GR_GDIOBJECTS = 0
+GR_USEROBJECTS = 1
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_ERROR_INVALID_PARAMETER = 87
+
+# 模块级惰性初始化的 Win32 函数，仅 Windows 平台使用
+_win32_funcs = None
+
+
+class MetricNotSupported(Exception):
+    """该指标对目标进程不适用（不是权限问题，以管理员运行也无法采集）。
+
+    异常消息即显示给用户的原因文案。
+    """
+
+
+def _init_win32():
+    """惰性加载并声明 Win32 函数原型（显式 argtypes/restype，避免64位句柄截断）。"""
+    global _win32_funcs
+    if _win32_funcs is not None:
+        return _win32_funcs
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    user32.GetGuiResources.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    user32.GetGuiResources.restype = wintypes.DWORD
+
+    _win32_funcs = (kernel32, user32)
+    return _win32_funcs
 
 
 class ProcessCollector:
@@ -20,6 +61,10 @@ class ProcessCollector:
         self.pid = pid
         self._process: Optional[psutil.Process] = None
         self._last_io_counters = None  # 用于计算IO增量
+        # 最近一次 collect_metrics 中无法采集的指标：{指标类型: 原因}
+        self.last_unavailable: Dict[str, str] = {}
+        # 已记录过异常日志的指标，避免持续失败时每个周期都刷日志
+        self._logged_failures = set()
 
     def is_process_running(self) -> bool:
         """
@@ -49,6 +94,46 @@ class ProcessCollector:
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             return None
 
+    def _get_gui_resource(self, flag: int) -> float:
+        """
+        读取进程的 GDI 或 USER 对象数（user32.GetGuiResources）
+
+        Args:
+            flag: GR_GDIOBJECTS(0) 或 GR_USEROBJECTS(1)
+
+        Returns:
+            float: 对象数
+
+        Raises:
+            psutil.NoSuchProcess: 进程已不存在
+            psutil.AccessDenied: 无权限打开进程，或调用失败
+            MetricNotSupported: 非 Windows，或进程不在当前会话（如 session 0 的系统服务）
+        """
+        if sys.platform != "win32":
+            raise MetricNotSupported("仅支持 Windows")
+
+        kernel32, user32 = _init_win32()
+        handle = kernel32.OpenProcess(
+            _PROCESS_QUERY_LIMITED_INFORMATION, False, self.pid)
+        if not handle:
+            if not psutil.pid_exists(self.pid):
+                raise psutil.NoSuchProcess(self.pid)
+            raise psutil.AccessDenied(self.pid)
+        try:
+            ctypes.set_last_error(0)
+            count = user32.GetGuiResources(handle, flag)
+            if count == 0:
+                error = ctypes.get_last_error()
+                if error == _ERROR_INVALID_PARAMETER:
+                    # 其他会话的进程（如 session 0 的系统服务）返回 0 且 LastError=87；
+                    # 这类进程不在当前桌面会话，提权也无法采集，不能提示"权限不足"
+                    raise MetricNotSupported("进程不在当前会话，不支持采集")
+                if error != 0:
+                    raise psutil.AccessDenied(self.pid)
+            return float(count)
+        finally:
+            kernel32.CloseHandle(handle)
+
     def _collect_one(self, metric_type: str) -> Optional[float]:
         """
         采集单个性能指标（内部方法，不捕获psutil异常，由调用方统一处理）
@@ -66,10 +151,6 @@ class ProcessCollector:
         if metric_type == MetricType.MEMORY_RSS:
             # 工作集内存（RSS），转换为KB
             return self._process.memory_info().rss / 1024
-
-        elif metric_type == MetricType.MEMORY_VMS:
-            # 虚拟内存大小，转换为KB
-            return self._process.memory_info().vms / 1024
 
         elif metric_type == MetricType.MEMORY_PERCENT:
             # 内存使用百分比
@@ -128,15 +209,12 @@ class ProcessCollector:
             return self._process.memory_info().peak_wset / 1024
 
         elif metric_type == MetricType.MEMORY_PRIVATE:
-            # 专用工作集，转换为KB
+            # 私有字节（Private Bytes，= PrivateUsage = 任务管理器"提交大小"），
+            # 转换为KB。psutil 的 vms/pagefile/private 数值相同，只采这一个
             return self._process.memory_info().private / 1024
 
-        elif metric_type == MetricType.MEMORY_PAGEFILE:
-            # 提交大小，转换为KB
-            return self._process.memory_info().pagefile / 1024
-
         elif metric_type == MetricType.MEMORY_PEAK_PAGEFILE:
-            # 提交大小峰值，转换为KB
+            # 私有字节峰值（PeakPagefileUsage），转换为KB
             return self._process.memory_info().peak_pagefile / 1024
 
         elif metric_type == MetricType.MEMORY_PAGED_POOL:
@@ -162,6 +240,13 @@ class ProcessCollector:
         elif metric_type == MetricType.MEMORY_USS:
             # 唯一集大小，转换为KB
             return self._process.memory_full_info().uss / 1024
+
+        # ========== GDI/USER 对象数 ==========
+        elif metric_type == MetricType.NUM_GDI_OBJECTS:
+            return self._get_gui_resource(GR_GDIOBJECTS)
+
+        elif metric_type == MetricType.NUM_USER_OBJECTS:
+            return self._get_gui_resource(GR_USEROBJECTS)
 
         # ========== CPU扩展指标 ==========
         elif metric_type == MetricType.CPU_USER_TIME:
@@ -212,28 +297,51 @@ class ProcessCollector:
 
         Returns:
             Optional[Dict[str, float]]: {指标类型: 指标值}字典；
-                进程不存在时返回None（调用方据此停止任务）
+                进程不存在（含 PID 已被另一个进程复用）时返回None（调用方据此停止任务）。
+                采集失败的指标不放入字典（不会记为0），原因记录在
+                self.last_unavailable（每次调用开头清空）。
         """
+        self.last_unavailable = {}
         try:
             if self._process is None:
                 self._process = psutil.Process(self.pid)
+
+            # PID 复用检测：is_running() 会比对进程创建时间，PID 被新进程占用时为 False，
+            # 否则会把另一个进程的数据记到本任务名下
+            try:
+                if not self._process.is_running():
+                    return None
+            except psutil.AccessDenied:
+                pass  # 无法确认时按"仍在运行"处理，不误停任务
 
             values: Dict[str, float] = {}
             with self._process.oneshot():
                 for metric_type in metric_types:
                     try:
                         value = self._collect_one(metric_type)
-                    except (psutil.AccessDenied, psutil.ZombieProcess):
-                        # 访问被拒绝或僵尸进程，进程可能仍存在但暂时无法访问
-                        # 单指标记0而不中断，避免误判为进程终止
+                    except psutil.AccessDenied:
+                        # 权限不足：跳过该指标（不记0），进程可能仍存在，不中断
+                        self.last_unavailable[metric_type] = "权限不足"
+                        continue
+                    except psutil.ZombieProcess:
                         # 注意：ZombieProcess是NoSuchProcess的子类，必须先于父类捕获
-                        value = 0.0
+                        self.last_unavailable[metric_type] = "进程正在退出"
+                        continue
                     except psutil.NoSuchProcess:
                         # 进程确实不存在，整体返回None停止任务
                         return None
+                    except MetricNotSupported as e:
+                        # 指标对该进程不适用（非权限问题），跳过且不提示提权
+                        self.last_unavailable[metric_type] = str(e)
+                        continue
                     except Exception:
-                        # 其他异常，进程可能仍存在，单指标记0继续
-                        value = 0.0
+                        # 其他异常，进程可能仍存在，跳过该指标继续
+                        if metric_type not in self._logged_failures:
+                            self._logged_failures.add(metric_type)
+                            logger.exception(
+                                "采集指标 %s 失败（PID %s）", metric_type, self.pid)
+                        self.last_unavailable[metric_type] = "采集失败"
+                        continue
 
                     if value is not None:
                         values[metric_type] = value
@@ -276,7 +384,7 @@ class ProcessCollector:
             # 其他异常，进程可能仍存在
             return 0.0
 
-    def get_process_info(self) -> Optional[Dict[str, any]]:
+    def get_process_info(self) -> Optional[Dict[str, Any]]:
         """
         获取进程的基本信息
 

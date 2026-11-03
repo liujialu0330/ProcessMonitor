@@ -3,18 +3,20 @@
 将监控任务的数据导出为CSV文件
 """
 import os
-from datetime import datetime
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QStandardPaths
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QScrollArea,
                              QFileDialog, QSizePolicy)
 from qfluentwidgets import (
     ComboBox, CardWidget, PrimaryPushButton, PushButton, FluentIcon,
     StrongBodyLabel, BodyLabel, CaptionLabel, LineEdit,
-    InfoBar, InfoBarPosition, HorizontalSeparator
+    InfoBar, InfoBarPosition, HorizontalSeparator, MessageBox
 )
 
 from core.export_worker import ExportWorker
 from data.database import Database
+from ui.formatting import (
+    default_export_filename, format_count, format_task_option_text
+)
 from ui.typography import DataCaptionLabel, PageTitleLabel
 from utils.metrics import get_metric_display_name
 
@@ -46,6 +48,11 @@ class ExportPage(QScrollArea):
 
         # 导出工作线程（持引用防GC；导出期间非None，closeEvent按shutdown_thread模式接入）
         self._export_worker = None
+
+        # 上次使用的保存目录：切换任务后默认文件名仍放在这里；首次默认"文档"目录
+        self._last_dir = (
+            QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation)
+            or os.path.expanduser('~'))
 
         # 初始化UI
         self._init_ui()
@@ -100,8 +107,8 @@ class ExportPage(QScrollArea):
 
         export_layout.addLayout(task_row_layout)
 
-        # 空状态占位（C3）：任务下拉为空时显示，同时禁用下拉框与浏览/导出按钮，
-        # 避免用户点击后触发既有"未选任务"提示与本占位重复打扰（评审修订 N6）
+        # 空状态占位：任务下拉为空时显示，同时禁用下拉框与浏览/导出按钮，
+        # 避免用户点击后触发既有"未选任务"提示与本占位重复打扰
         self.empty_state_label = BodyLabel(
             "暂无可导出的数据，请先创建监控任务")
         self.empty_state_label.setAlignment(Qt.AlignCenter)
@@ -183,7 +190,8 @@ class ExportPage(QScrollArea):
 
         export_layout.addLayout(path_layout)
 
-        format_hint = CaptionLabel("CSV · UTF-8 · 可用 Excel 打开")
+        format_hint = CaptionLabel(
+            "CSV · UTF-8 · 可用 Excel 打开 · 末列「打点」记录事件标记")
         export_layout.addWidget(format_hint)
 
         main_layout.addWidget(export_card)
@@ -198,7 +206,7 @@ class ExportPage(QScrollArea):
 
     def _set_empty_state(self, is_empty: bool) -> None:
         """
-        切换空状态占位说明与控件禁用（C3，评审修订 N6）
+        切换空状态占位说明与控件禁用
 
         任务下拉为空时显示占位说明并禁用下拉框、浏览按钮；导出按钮的可用性
         额外与"导出是否正在进行中"做 AND——不能在导出线程运行期间被这里误
@@ -228,40 +236,24 @@ class ExportPage(QScrollArea):
         # 清空下拉框
         self.task_combo.clear()
 
-        # 获取所有任务
-        all_tasks = self.db.get_all_tasks()
-
-        # 过滤掉数据点太少的任务
-        tasks = []
-        for task in all_tasks:
-            # 获取数据点数量
-            data_count = self.db.get_data_point_count(task.task_id)
-            # 至少要有1个数据点才能导出
-            if data_count > 0:
-                tasks.append(task)
+        # 单条查询取出至少有一次采样的任务（与历史页口径一致，不再逐任务 COUNT）
+        tasks = self.db.get_tasks_with_data()
 
         if not tasks:
             # 清空显示
             self._clear_task_info()
             self.current_task_id = None
             self.current_task = None
+            self.path_edit.clear()
             self._set_empty_state(True)
             return
 
         self._set_empty_state(False)
 
-        # 添加到下拉框
+        # 添加到下拉框：进程 · PID · 开始时间 · 时长 · 备注
         for task in tasks:
-            # 单指标保持原格式（显示指标名），多指标显示"N项指标"
-            if len(task.metric_types) == 1:
-                metric_text = get_metric_display_name(task.metric_types[0])
-            else:
-                metric_text = f"{len(task.metric_types)} 项指标"
-            display_text = (
-                f"{task.process_name} · PID {task.pid} · "
-                f"{metric_text} · "
-                f"{task.start_time.strftime('%Y-%m-%d %H:%M:%S')}"
-            )
+            display_text = format_task_option_text(
+                task, running=task.status == 'running', full_date=True)
             self.task_combo.addItem(display_text)
             # 设置任务ID作为userData
             index = self.task_combo.count() - 1
@@ -291,10 +283,16 @@ class ExportPage(QScrollArea):
         if not task_id:
             return
 
+        task_changed = task_id != self.current_task_id
         self.current_task_id = task_id
 
         # 加载任务信息
         self._load_task_info(task_id)
+
+        # 换了任务：保存路径重置为该任务的默认文件名，避免沿用上一个任务的文件名
+        # 而覆盖或误导；同一任务重新载入列表（如页面再次显示）时保留用户已选的路径
+        if task_changed and self.current_task is not None:
+            self._reset_save_path()
 
     def _load_task_info(self, task_id: str):
         """
@@ -341,7 +339,7 @@ class ExportPage(QScrollArea):
         data_count = self.db.get_data_point_count(task_id)
         sample_count = self.db.get_sample_count(task_id)
         self.data_count_label.setText(
-            f"{sample_count} 次采集 · {data_count} 条数据")
+            f"{format_count(sample_count)} 次采集 · {format_count(data_count)} 条数据")
 
         # 更新任务状态
         status_text = "运行中" if task.status == "running" else "已停止"
@@ -358,6 +356,30 @@ class ExportPage(QScrollArea):
         self.data_count_label.setText("—")
         self.status_label.setText("—")
 
+    def _default_save_path(self) -> str:
+        """当前任务的默认保存路径：上次使用的目录 + 进程名_PID_开始时间.csv"""
+        return os.path.join(self._last_dir, default_export_filename(self.current_task))
+
+    def _reset_save_path(self):
+        """把保存路径重置为当前任务的默认路径"""
+        self.path_edit.setText(self._default_save_path())
+
+    def _ask_save_path(self, default_path: str) -> str:
+        """弹出保存对话框，返回所选路径（取消返回空串）；抽成方法便于测试替换"""
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "选择保存位置", default_path, "CSV 文件 (*.csv)")
+        return file_path
+
+    def _confirm_overwrite(self, file_path: str) -> bool:
+        """目标文件已存在：确认是否覆盖；抽成方法便于测试替换"""
+        box = MessageBox(
+            "文件已存在",
+            f"{file_path}\n已存在，是否覆盖？",
+            self.window())
+        box.yesButton.setText("覆盖")
+        box.cancelButton.setText("取消")
+        return bool(box.exec())
+
     def _browse_save_path(self):
         """浏览保存路径"""
         if not self.current_task:
@@ -370,26 +392,11 @@ class ExportPage(QScrollArea):
             )
             return
 
-        # 生成默认文件名（单指标保持指标名，多指标显示"N项指标"）
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        if len(self.current_task.metric_types) == 1:
-            metric_name = get_metric_display_name(self.current_task.metric_types[0])
-        else:
-            metric_name = f"{len(self.current_task.metric_types)} 项指标"
-        # 移除文件名中的非法字符
-        process_name = self.current_task.process_name.replace('.exe', '')
-        default_filename = f"{process_name}_{metric_name}_{timestamp}.csv"
-
-        # 打开文件保存对话框
-        file_path, _ = QFileDialog.getSaveFileName(
-            self,
-            "选择保存位置",
-            default_filename,
-            "CSV 文件 (*.csv)"
-        )
-
+        file_path = self._ask_save_path(
+            self.path_edit.text().strip() or self._default_save_path())
         if file_path:
             self.path_edit.setText(file_path)
+            self._last_dir = os.path.dirname(file_path) or self._last_dir
 
     def _export_data(self):
         """
@@ -413,7 +420,7 @@ class ExportPage(QScrollArea):
             )
             return
 
-        # 未预先选路径时，直接在主操作中打开保存对话框，
+        # 路径为空（如手动清空）时，直接在主操作中打开保存对话框，
         # 使用户无需先点一次「选择位置」再点「导出」。
         save_path = self.path_edit.text().strip()
         if not save_path:
@@ -421,6 +428,10 @@ class ExportPage(QScrollArea):
             save_path = self.path_edit.text().strip()
             if not save_path:
                 return
+
+        # 目标已存在：确认覆盖（导出线程先写临时文件再原子替换，取消不会损坏原文件）
+        if os.path.exists(save_path) and not self._confirm_overwrite(save_path):
+            return
 
         # 轻量存在性检查（COUNT 查询，不拉取全部数据，避免为了校验而重复加载大数据集）
         if self.db.get_data_point_count(self.current_task_id) == 0:
@@ -441,25 +452,31 @@ class ExportPage(QScrollArea):
         self._export_worker.export_progress.connect(self._on_export_progress)
         self._export_worker.export_finished.connect(self._on_export_finished)
         self._export_worker.error_occurred.connect(self._on_export_error)
-        self._export_worker.start()
+        # 线程对象的释放挂在 QThread.finished 上：完成/失败信号是 run() 的最后一个
+        # 动作，但此时线程尚未真正结束，不能在这些信号的槽里 deleteLater
+        worker = self._export_worker
+        worker.finished.connect(lambda w=worker: self._on_export_thread_finished(w))
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
 
     def _on_export_progress(self, processed: int):
         """导出进度更新（已处理的数据点行数）"""
-        self.export_status_label.setText(f"正在导出… 已处理 {processed} 条数据")
+        self.export_status_label.setText(
+            f"正在导出… 已处理 {format_count(processed)} 条数据")
 
     def _on_export_finished(self, save_path: str, row_count: int, point_count: int):
         """导出完成"""
-        self.export_button.setEnabled(True)
         self.export_status_label.setText("")
+        self._last_dir = os.path.dirname(save_path) or self._last_dir
 
         info_bar = InfoBar.success(
             title="导出成功",
-            content=f"已导出 {row_count} 次采集（{point_count} 条数据）",
+            content=(f"已导出 {format_count(row_count)} 次采集"
+                     f"（{format_count(point_count)} 条数据）"),
             parent=self,
             position=InfoBarPosition.TOP,
             duration=8000
         )
-        self._release_export_worker()
 
         # 导出完成不再自动抢焦点打开资源管理器；保留显式快捷操作。
         self.open_folder_button = PushButton("打开文件夹")
@@ -469,7 +486,6 @@ class ExportPage(QScrollArea):
 
     def _on_export_error(self, msg: str):
         """导出失败"""
-        self.export_button.setEnabled(True)
         self.export_status_label.setText("")
         InfoBar.error(
             title="导出失败",
@@ -479,17 +495,15 @@ class ExportPage(QScrollArea):
             duration=3000
         )
 
-        self._release_export_worker()
-
-    def _release_export_worker(self):
+    def _on_export_thread_finished(self, worker):
         """
-        导出线程已结束（完成/失败）后释放引用：deleteLater() 交还给 Qt 的对象树，
-        并把 self._export_worker 置 None，避免每次导出都新建一个 ExportWorker 却
-        始终作为 self 的子对象常驻，多次导出后累积占用内存
+        导出线程真正结束（QThread.finished）：释放引用并恢复导出按钮。
+        deleteLater 由同一信号上的另一条连接负责；取消导出（窗口关闭）时不发
+        完成/失败信号，但 finished 仍会触发，因此按钮恢复放在这里最可靠。
         """
-        if self._export_worker is not None:
-            self._export_worker.deleteLater()
+        if self._export_worker is worker:
             self._export_worker = None
+        self._set_empty_state(self.task_combo.count() == 0)
 
     def _ask_open_folder(self, file_path: str):
         """

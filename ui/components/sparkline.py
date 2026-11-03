@@ -1,9 +1,13 @@
 """
 迷你趋势图组件（Sparkline）
-无坐标轴、无文字的极简折线图，用于任务卡片内联展示单个指标最近若干次采集的
-趋势走向（v1.3.0 批3 E）。
+无坐标轴、无文字的极简折线图，用于任务卡片内联展示首指标从任务开始至今的走势。
+
+长时间监控的点数会远超控件像素宽度，因此缓冲区超过上限时把相邻点成对合并
+（取平均）并让后续每个点覆盖两倍的采集次数：点数始终有界，而曲线覆盖的时间
+范围始终是"任务开始至今"，各点代表的时间跨度保持一致。
+纵轴按数据 min-max 自适应，但跨度有下限，避免微小抖动被画成满幅波动。
 """
-from collections import deque
+from typing import List, Optional, Sequence, Tuple
 
 from PyQt5.QtCore import Qt, QPointF
 from PyQt5.QtGui import QPainter, QPen, QColor, QPolygonF
@@ -11,47 +15,142 @@ from PyQt5.QtWidgets import QWidget, QSizePolicy
 
 from qfluentwidgets import isDarkTheme
 
+from utils.metrics import (
+    MetricType, canonical_metric_type, is_integer_metric, is_kb_metric
+)
+
 # 固定高度（像素），横向随父布局拉伸
 FIXED_HEIGHT = 36
 
-# 折线取色（评审修订 N5）：在 paintEvent 内动态调用 isDarkTheme()，不连接
-# qconfig.themeChanged——任务卡片随监控任务动态创建/销毁，这样实现不必在卡片
-# 销毁时手动断开主题信号连接，零信号残留。颜色自含常量，不依赖批2的
-# ui/chart_theme.py（该模块服务于历史页图表，两者取色场景独立）。
+# 缓冲区点数上限（必须为偶数，保证成对合并后没有落单点）
+DEFAULT_MAX_POINTS = 240
+
+# 纵轴最小跨度：字节类 max(当前值 1%, 64 KB)；计数类至少 4；百分比至少 1 个百分点
+MIN_SPAN_BYTES_KB = 64.0
+MIN_SPAN_BYTES_RATIO = 0.01
+MIN_SPAN_COUNT = 4.0
+MIN_SPAN_PERCENT = 1.0
+
+# 折线取色：在 paintEvent 内动态调用 isDarkTheme()，不连接 qconfig.themeChanged——
+# 任务卡片随监控任务动态创建/销毁，这样实现不必在卡片销毁时手动断开主题信号连接，
+# 零信号残留。颜色自含常量，不依赖历史页的 ui/chart_theme.py。
 _LIGHT_COLOR = QColor("#0A8F8F")
 _DARK_COLOR = QColor("#44D7D1")
 
 
-class SparklineWidget(QWidget):
-    """迷你趋势折线图：固定高度 36px，横向拉伸；纵向按当前缓冲区 min-max 自适应"""
+def merge_pairs(values: Sequence[float]) -> List[float]:
+    """相邻两点取平均成对合并（点数减半）。
 
-    def __init__(self, maxlen: int = 60, parent=None):
+    选平均而不是最大值：趋势图表达的是走势而非尖峰（尖峰在历史页图表里看），
+    取平均让缓慢上涨的曲线在多次合并后依然保持平滑单调。
+    元素个数为奇数时末尾落单的点原样保留。
+    """
+    merged = [(values[i] + values[i + 1]) / 2.0 for i in range(0, len(values) - 1, 2)]
+    if len(values) % 2:
+        merged.append(values[-1])
+    return merged
+
+
+class TrendDownsampler:
+    """等跨度抽稀缓冲区：始终覆盖"开始至今"，点数不超过 max_points。
+
+    每个已完成的点是 stride 次采集的平均值；达到上限时全体成对合并、stride 翻倍。
+    尚未攒满 stride 次的最新采集暂存为 pending，并以其平均值作为末尾点参与绘制，
+    因此最新一次采集的走势能立即反映到曲线末端。
+    """
+
+    def __init__(self, max_points: int = DEFAULT_MAX_POINTS):
+        # 取偶数，保证合并后没有落单点
+        self.max_points = max(2, max_points - max_points % 2)
+        self.stride = 1
+        self._points: List[float] = []
+        self._pending: List[float] = []
+
+    def append(self, value: float) -> None:
+        self._pending.append(value)
+        if len(self._pending) < self.stride:
+            return
+        self._points.append(sum(self._pending) / len(self._pending))
+        self._pending = []
+        if len(self._points) >= self.max_points:
+            self._points = merge_pairs(self._points)
+            self.stride *= 2
+
+    def clear(self) -> None:
+        self.stride = 1
+        self._points = []
+        self._pending = []
+
+    def series(self) -> List[float]:
+        """当前用于绘制的序列（含尚未攒满一个点的最新采集）。"""
+        if self._pending:
+            return self._points + [sum(self._pending) / len(self._pending)]
+        return list(self._points)
+
+
+def min_span(metric_type: Optional[str], reference: float) -> float:
+    """纵轴最小跨度（原始单位）：低于该跨度的起伏不应被拉伸成满幅波动。"""
+    if metric_type is None:
+        return 0.0
+    metric_type = canonical_metric_type(metric_type)
+    if is_kb_metric(metric_type):
+        return max(abs(reference) * MIN_SPAN_BYTES_RATIO, MIN_SPAN_BYTES_KB)
+    if is_integer_metric(metric_type):
+        return MIN_SPAN_COUNT
+    if metric_type in (MetricType.MEMORY_PERCENT, MetricType.CPU_PERCENT):
+        return MIN_SPAN_PERCENT
+    return abs(reference) * MIN_SPAN_BYTES_RATIO
+
+
+def compute_y_range(
+        values: Sequence[float], metric_type: Optional[str]) -> Tuple[float, float]:
+    """按数据 min-max 求纵轴范围；跨度小于下限时围绕数据中点扩展到下限。"""
+    low = min(values)
+    high = max(values)
+    required = min_span(metric_type, values[-1])
+    if high - low < required:
+        middle = (high + low) / 2.0
+        low = middle - required / 2.0
+        high = middle + required / 2.0
+    return low, high
+
+
+class SparklineWidget(QWidget):
+    """迷你趋势图：固定高度 36px，横向拉伸；覆盖任务开始至今的走势"""
+
+    def __init__(self, max_points: int = DEFAULT_MAX_POINTS,
+                 metric_type: Optional[str] = None, parent=None):
         """
         Args:
-            maxlen: 缓冲区最多保留的采集点数，超出后自动丢弃最旧的点
+            max_points: 缓冲区点数上限，达到后成对合并抽稀（见 TrendDownsampler）
+            metric_type: 趋势对应的指标，用于决定纵轴最小跨度；None 表示不设下限
             parent: 父窗口
         """
         super().__init__(parent)
-        self._maxlen = maxlen
-        self._values = deque(maxlen=maxlen)
+        self._metric_type = metric_type
+        self._sampler = TrendDownsampler(max_points)
 
         self.setFixedHeight(FIXED_HEIGHT)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
     def append(self, value: float) -> None:
         """追加一个采集点并触发重绘"""
-        self._values.append(value)
+        self._sampler.append(value)
         self.update()
 
     def clear(self) -> None:
         """清空缓冲区并触发重绘"""
-        self._values.clear()
+        self._sampler.clear()
         self.update()
+
+    def series(self) -> List[float]:
+        """当前绘制序列（测试与调试用）"""
+        return self._sampler.series()
 
     def paintEvent(self, event):
         """
-        QPainter 抗锯齿折线：纵向按当前缓冲区 min-max 自适应（min==max 画一条
-        水平中线）；0 个点不画任何内容，1 个点画一个圆点；无坐标轴、无文字。
+        QPainter 抗锯齿折线：纵向按 min-max 自适应并套用最小跨度（平线画在中线）；
+        0 个点不画任何内容，1 个点画一个圆点；无坐标轴、无文字。
 
         全部分支均已避开除零（step 的分母固定在 count>=2 分支内，恒 >=1；
         span==0 时单独走中线分支不做除法），widget 尚未布局（width/height 为0）
@@ -61,7 +160,8 @@ class SparklineWidget(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
 
-        count = len(self._values)
+        values = self._sampler.series()
+        count = len(values)
         width = self.width()
         height = self.height()
         color = _DARK_COLOR if isDarkTheme() else _LIGHT_COLOR
@@ -75,18 +175,17 @@ class SparklineWidget(QWidget):
             pen.setWidthF(1.5)
             painter.setPen(pen)
 
-            min_value = min(self._values)
-            max_value = max(self._values)
-            span = max_value - min_value
+            low, high = compute_y_range(values, self._metric_type)
+            span = high - low
             step = width / (count - 1)
 
             points = []
-            for i, value in enumerate(self._values):
+            for i, value in enumerate(values):
                 x = i * step
-                if span == 0:
+                if span <= 0:
                     y = height / 2
                 else:
-                    ratio = (value - min_value) / span
+                    ratio = (value - low) / span
                     y = height - ratio * height
                 points.append(QPointF(x, y))
 
