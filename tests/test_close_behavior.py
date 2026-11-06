@@ -115,23 +115,30 @@ def test_close_quits_when_tray_disabled(window, monkeypatch):
 
 
 def test_close_shutdown_order_through_coordinator(window, monkeypatch):
-    """真退出的固定顺序：stop_all_tasks → join_all(3000) → 登记表线程收尾 → 关库；
-    主窗口不再自己遍历任务线程"""
-    calls = []
+    """真退出的固定顺序：stop_all_tasks → 登记表线程统一取消 → join_all(3000) →
+    登记表线程等待 → 关库；两次等待拿到同一个截止时间；主窗口不再自己遍历任务线程"""
+    calls, deadlines = [], []
     monkeypatch.setattr(window.monitor_manager, 'stop_all_tasks',
                         lambda: calls.append('stop_all'))
     monkeypatch.setattr(window.monitor_manager, 'join_all',
-                        lambda timeout_ms: calls.append(('join_all', timeout_ms)) or True)
+                        lambda timeout_ms, deadline=None: (
+                            calls.append(('join_all', timeout_ms)),
+                            deadlines.append(deadline)) and True)
     monkeypatch.setattr(window.monitor_manager, 'get_all_tasks',
                         lambda: pytest.fail("主窗口不应直接取任务线程对象"))
+    monkeypatch.setattr(window.services.threads, 'cancel_all',
+                        lambda: calls.append('cancel_threads'))
     monkeypatch.setattr(window.services.threads, 'shutdown_all',
-                        lambda on_progress=None: calls.append('threads') or True)
+                        lambda on_progress=None, deadline=None: (
+                            calls.append('threads'), deadlines.append(deadline)) and True)
     monkeypatch.setattr(window.db, 'close', lambda: calls.append('db_close'))
     monkeypatch.setattr(QApplication, 'quit', lambda: calls.append('quit'))
 
     window.closeEvent(_fake_event())
 
-    assert calls == ['stop_all', ('join_all', 3000), 'threads', 'db_close', 'quit']
+    assert calls == ['stop_all', 'cancel_threads', ('join_all', 3000), 'threads',
+                     'db_close', 'quit']
+    assert deadlines[0] is not None and deadlines[0] == deadlines[1]
 
 
 class _RecordingCoordinator:
@@ -308,6 +315,101 @@ def test_tray_quit_request_goes_through_real_quit(window, monkeypatch):
     window.tray.quit_requested.emit()
     assert window._really_quit is True
     quit_mock.assert_called_once()
+
+
+# ========== 注销/关机（commitDataRequest） ==========
+
+def test_session_end_while_hidden_to_tray_runs_coordinator_once(window, monkeypatch):
+    """隐藏到托盘时注销/关机：Qt 的会话结束流程只关闭可见窗口，处理函数必须自己
+    close()，让隐藏态也进 closeEvent 走协调器；之后再来的关闭事件不重复收尾"""
+    _enable_close_to_tray(window)
+    window.tray = _FakeTray()
+    _RecordingCoordinator.instances = []
+    monkeypatch.setattr(main_window_module, 'ShutdownCoordinator', _RecordingCoordinator)
+    quit_mock = MagicMock()
+    monkeypatch.setattr(QApplication, 'quit', quit_mock)
+
+    window.close()                       # 关闭到托盘：只隐藏
+    assert window.isHidden() and _RecordingCoordinator.instances == []
+
+    window._on_commit_data_request(MagicMock())
+
+    [coordinator] = _RecordingCoordinator.instances
+    assert len(coordinator.runs) == 1
+    quit_mock.assert_called_once()
+    assert window.isHidden()
+
+    # Qt 随后的关闭流程（或任何重复关闭）不再收尾第二次
+    event = _fake_event()
+    window.closeEvent(event)
+    window._on_commit_data_request(MagicMock())
+    assert len(_RecordingCoordinator.instances) == 1 and len(coordinator.runs) == 1
+    event.accept.assert_called_once()
+    quit_mock.assert_called_once()
+
+
+def _session_end_cancelled(window, monkeypatch):
+    """会话结束信号到来但随后被取消、窗口没有真正关闭（close 被顶替为空操作）"""
+    with monkeypatch.context() as m:
+        m.setattr(window, 'close', lambda: None)
+        window._on_commit_data_request(MagicMock())
+    assert window._really_quit is True
+
+
+@pytest.mark.parametrize("restore", ["tray_menu", "show"])
+def test_cancelled_session_end_restores_close_confirmation(window, monkeypatch, restore):
+    """会话结束被取消后窗口重新显示：会话结束置的真退出标志被复位，之后有任务时
+    关窗仍弹三选确认，不会跳过确认直接全停"""
+    _start_running_task(window)
+    _session_end_cancelled(window, monkeypatch)
+
+    window.hide()
+    if restore == "tray_menu":
+        window._show_from_tray()
+    else:
+        window.show()
+    assert window._really_quit is False
+
+    _patch_ask(window, 'cancel')
+    quit_mock = MagicMock()
+    monkeypatch.setattr(QApplication, 'quit', quit_mock)
+    event = _fake_event()
+    window.closeEvent(event)
+
+    assert len(window.services.dialogs.calls_of('ask_close_action')) == 1
+    event.ignore.assert_called_once()
+    quit_mock.assert_not_called()
+    assert window.monitor_manager.has_running_tasks()
+
+
+def test_cancelled_session_end_still_hides_to_tray(window, monkeypatch):
+    """会话结束被取消后窗口重新显示：开启关闭到托盘时关窗仍只隐藏，不停任务"""
+    _enable_close_to_tray(window)
+    window.tray = _FakeTray()
+    _session_end_cancelled(window, monkeypatch)
+    window.hide()
+    window._show_from_tray()
+
+    stop_all = MagicMock()
+    monkeypatch.setattr(window.monitor_manager, 'stop_all_tasks', stop_all)
+    quit_mock = MagicMock()
+    monkeypatch.setattr(QApplication, 'quit', quit_mock)
+    event = _fake_event()
+    window.closeEvent(event)
+
+    assert window.isHidden()
+    event.ignore.assert_called_once()
+    stop_all.assert_not_called()
+    quit_mock.assert_not_called()
+
+
+def test_show_does_not_clear_tray_quit_flag(window):
+    """窗口显示只复位会话结束置的标志：托盘退出/立即安装置的真退出标志保持不变"""
+    window._really_quit = True
+    window.hide()
+    window.show()
+    window._show_from_tray()
+    assert window._really_quit is True
 
 
 def test_cleanup_exception_still_quits(window, monkeypatch):

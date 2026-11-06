@@ -696,6 +696,38 @@ def test_join_all_reports_timeout_and_still_joins_rest(manager):
     manager._tasks = {}
 
 
+class _SleepyJoinTask(_JoinTask):
+    """永不结束：wait 睡满给定超时后返回 False"""
+
+    def wait(self, timeout_ms=None):
+        self.log.append((self.name, timeout_ms))
+        time.sleep(timeout_ms / 1000.0)
+        return False
+
+
+def test_join_all_deadline_caps_each_wait_and_skips_expired(manager):
+    """总截止时间落实到每次等待：等待取单项超时与剩余时间的较小者，到期后其余
+    线程不再等待（不会把单项超时累加成远超总期限的等待）"""
+    log = []
+    manager._tasks = {name: _SleepyJoinTask(log, name) for name in ("a", "b", "c")}
+    t0 = time.monotonic()
+    assert manager.join_all(timeout_ms=3000, deadline=t0 + 0.2) is False
+    assert time.monotonic() - t0 < 1.0
+    [(name, waited)] = log
+    assert name == "a" and 0 < waited <= 200
+    manager._tasks = {}
+
+
+def test_join_all_expired_deadline_waits_nothing(manager):
+    log = []
+    manager._tasks = {"a": _JoinTask(log, "a"), "idle": _JoinTask(log, "idle", alive=False)}
+    assert manager.join_all(timeout_ms=3000, deadline=time.monotonic() - 1) is False
+    assert log == []
+    manager._tasks = {"idle": _JoinTask(log, "idle", alive=False)}
+    assert manager.join_all(timeout_ms=3000, deadline=time.monotonic() - 1) is True
+    manager._tasks = {}
+
+
 def test_join_all_real_stuck_thread_times_out(manager):
     """真实线程卡在收尾：join_all 按超时返回 False，放开后能正常结束"""
     gate = threading.Event()
