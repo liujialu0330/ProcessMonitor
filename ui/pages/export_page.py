@@ -3,7 +3,9 @@
 将监控任务的数据导出为CSV文件
 """
 import os
-from PyQt5.QtCore import Qt, QStandardPaths
+from datetime import datetime
+
+from PyQt5.QtCore import Qt, QStandardPaths, QTimer
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QScrollArea,
                              QFileDialog, QSizePolicy)
 from qfluentwidgets import (
@@ -19,6 +21,9 @@ from ui.formatting import (
 )
 from ui.typography import DataCaptionLabel, PageTitleLabel
 from utils.metrics import get_metric_display_name
+
+# 页面可见时刷新运行中任务的下拉时长与摘要的间隔（毫秒）；时长按分钟显示，30 秒足够
+RUNNING_TASK_REFRESH_INTERVAL_MS = 30_000
 
 
 class ExportPage(QScrollArea):
@@ -45,6 +50,14 @@ class ExportPage(QScrollArea):
 
         # 当前任务信息
         self.current_task = None
+
+        # 下拉列表里的任务对象（运行中任务的时长标签按定时器原地刷新）
+        self._task_by_id = {}
+
+        # 页面可见时定时刷新运行中任务的时长与摘要；页面隐藏时停止
+        self._running_refresh_timer = QTimer(self)
+        self._running_refresh_timer.setInterval(RUNNING_TASK_REFRESH_INTERVAL_MS)
+        self._running_refresh_timer.timeout.connect(self._refresh_running_tasks)
 
         # 导出工作线程（持引用防GC；导出期间非None，closeEvent按shutdown_thread模式接入）
         self._export_worker = None
@@ -235,6 +248,7 @@ class ExportPage(QScrollArea):
 
         # 清空下拉框
         self.task_combo.clear()
+        self._task_by_id = {}
 
         # 单条查询取出至少有一次采样的任务（与历史页口径一致，不再逐任务 COUNT）
         tasks = self.db.get_tasks_with_data()
@@ -258,6 +272,7 @@ class ExportPage(QScrollArea):
             # 设置任务ID作为userData
             index = self.task_combo.count() - 1
             self.task_combo.setItemData(index, task.task_id)
+            self._task_by_id[task.task_id] = task
 
         # 尝试恢复之前选中的任务
         if current_task_id:
@@ -531,3 +546,29 @@ class ExportPage(QScrollArea):
         super().showEvent(event)
         # 每次显示时刷新任务列表
         self._load_tasks()
+        self._running_refresh_timer.start()
+
+    def hideEvent(self, event):
+        """页面隐藏时停止定时刷新，避免后台页面白白查库"""
+        super().hideEvent(event)
+        self._running_refresh_timer.stop()
+
+    def _refresh_running_tasks(self):
+        """原地刷新运行中任务：下拉项时长随时间增长，任务结束后改为最终时长；
+        当前选中的是运行中任务时一并刷新摘要（采集次数、状态、结束时间）。
+        不重建列表，不影响当前选择与已选的保存路径。"""
+        now = datetime.now()
+        for index in range(self.task_combo.count()):
+            task_id = self.task_combo.itemData(index)
+            task = self._task_by_id.get(task_id)
+            if task is None or task.status != 'running':
+                continue
+            latest = self.db.get_task(task_id)
+            if latest is None:
+                # 任务已在别处被删除：保持原样，下次显示页面时整体重载
+                continue
+            self._task_by_id[task_id] = latest
+            self.task_combo.setItemText(index, format_task_option_text(
+                latest, running=latest.status == 'running', now=now, full_date=True))
+            if task_id == self.current_task_id:
+                self._load_task_info(task_id)

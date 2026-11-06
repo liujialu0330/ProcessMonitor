@@ -318,6 +318,37 @@ class MonitorPage(QScrollArea):
         if typed_text:
             self.process_combo.setText(typed_text)
 
+    def _selected_form_pid(self) -> Optional[int]:
+        """新建任务表单当前指向的 PID：PID 框有数字时以它为准，否则取下拉框精确选中的项。"""
+        pid_text = self.pid_input.text().strip()
+        if pid_text:
+            try:
+                return int(pid_text)
+            except ValueError:
+                return None
+        index = self.process_combo.currentIndex()
+        if index >= 0 and (self.process_combo.itemText(index)
+                           == self.process_combo.currentText()):
+            item_data = self.process_combo.itemData(index)
+            if item_data:
+                return item_data[0]
+        return None
+
+    def _forget_exited_process(self, pid: int) -> None:
+        """被测进程已退出时，若表单仍选着它（下拉项或 PID 框），清掉选择并刷新进程列表：
+        避免已不存在的 PID 一直留在表单里，用户再点"开始监控"才报"进程不存在"。"""
+        if self._selected_form_pid() != pid:
+            return
+        if ProcessCollector(pid).is_process_running():
+            return
+        self._syncing = True
+        try:
+            self.pid_input.clear()
+        finally:
+            self._syncing = False
+        self._pid_autofilled = False
+        self._refresh_process_list()
+
     def _on_pid_changed(self, text: str):
         """PID输入框内容变化"""
         if self._syncing:
@@ -567,6 +598,7 @@ class MonitorPage(QScrollArea):
         card = self.task_cards.get(task_id)
         if card is not None:
             card.set_finished(reason, datetime.now())
+            self._forget_exited_process(card.pid)
 
         # 释放 core 侧任务对象（此时线程只剩收尾，wait 极短）。task_stopped 是 QThread
         # 线程发出的信号、仍在该信号的槽调用栈内：这里是最后一个引用，同步移除会在
