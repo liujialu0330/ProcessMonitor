@@ -52,12 +52,18 @@ class MainWindow(FluentWindow):
         # 托盘驻留相关状态：必须在 _init_tray()/closeEvent 用到之前初始化完毕。
         # - _really_quit：托盘菜单"退出"、关于页"立即安装"与会话结束会置 True，
         #   closeEvent 据此跳过隐藏分支与关窗确认、直接走真退出路径。
+        # - _session_ending：本次 _really_quit 是否只由会话结束（注销/关机）置位。
+        #   会话结束可能被系统或其他程序取消，窗口随后重新显示时据此复位，避免之后
+        #   用户点 X 跳过托盘与确认直接全停；托盘退出/立即安装置的标志不复位。
+        # - _shutdown_started：真退出收尾已开始，之后再来的关闭事件不重复收尾。
         # - tray：托盘控制器，由 _init_tray() 创建；offscreen/CI 或精简系统下
         #   is_available() 为 False，closeEvent 的托盘隐藏分支与各类补充气泡逻辑都
         #   因此天然短路，退化为无托盘现状（不变式⑤）。
         # - _tray_tip_shown：首次隐藏到托盘时的提示气泡只弹一次。
         # 启动校正（孤儿任务、采样计数、过期清理）由组合根在构造本窗口之前完成。
         self._really_quit = False
+        self._session_ending = False
+        self._shutdown_started = False
         self.tray: Optional[TrayController] = None
         self._tray_tip_shown = False
         # 真退出收尾期间报告过的进度文案（按顺序；供日志与测试核对）
@@ -69,8 +75,8 @@ class MainWindow(FluentWindow):
         self._init_tray()
 
         # 注销/关机：系统会话结束时 closeEvent 的三选确认对话框会阻塞关机，
-        # 这里在会话结束前置真退出标志，跳过确认直接走真退出流程。
-        # DirectConnection：必须在 Qt 随后向窗口发送 QCloseEvent 之前同步执行。
+        # 这里在会话结束时置真退出标志并直接 close()，跳过确认走真退出流程。
+        # DirectConnection：必须在 Qt 随后关闭各窗口之前同步执行。
         app = QApplication.instance()
         if app is not None:
             app.commitDataRequest.connect(
@@ -223,9 +229,21 @@ class MainWindow(FluentWindow):
 
     def _show_from_tray(self) -> None:
         """托盘菜单"显示主界面"/单击或双击图标：从隐藏态还原窗口"""
+        self._clear_session_end_flag()
         self.showNormal()
         self.activateWindow()
         self.raise_()
+
+    def showEvent(self, event):
+        """窗口重新显示：此前的会话结束显然已被取消，复位它置的真退出标志"""
+        self._clear_session_end_flag()
+        super().showEvent(event)
+
+    def _clear_session_end_flag(self) -> None:
+        """只复位由会话结束置的 _really_quit；托盘退出/立即安装置的标志保持不变"""
+        if self._session_ending:
+            self._session_ending = False
+            self._really_quit = False
 
     def _quit_from_tray(self) -> None:
         """托盘菜单"退出"：置真退出标志后走正常关闭流程（与 quit_for_install
@@ -241,11 +259,17 @@ class MainWindow(FluentWindow):
         self.close()
 
     def _on_commit_data_request(self, session_manager=None) -> None:
-        """系统会话即将结束（注销/关机）：置真退出标志。
+        """系统会话即将结束（注销/关机）：置真退出标志并直接 close()。
 
-        随后 Qt 会向窗口发送关闭事件，closeEvent 据此跳过"隐藏到托盘"与
-        三选确认对话框，直接走清理并退出的真退出路径（退出不变式保持不变）。"""
-        self._really_quit = True
+        不能等 Qt 随后的关闭流程：它只关闭可见窗口，主窗口隐藏在托盘时收不到关闭
+        事件，收尾协调器就被绕过了（任务未 join、数据库未关）。这里主动 close()，
+        隐藏态也会进 closeEvent，跳过"隐藏到托盘"与三选确认，走真退出路径；收尾后
+        窗口已隐藏，Qt 后续的关闭流程不会重复（closeEvent 自身也只收尾一次）。"""
+        if not self._really_quit:
+            # 已由托盘退出/立即安装置位时不标记为会话结束，免得窗口重新显示时被复位
+            self._really_quit = True
+            self._session_ending = True
+        self.close()
 
     def _on_update_available_silent(self, info: dict) -> None:
         """静默检查更新发现新版本：不由 about_page 直接弹出模态对话框打断用户，
@@ -338,12 +362,18 @@ class MainWindow(FluentWindow):
         退出路径不变式（绝不破坏）：
         ① 默认配置（close_to_tray=False）且无运行中任务时直接走真退出；
         ② 托盘"退出"、关于页"立即安装"与会话结束都置 _really_quit=True，绕开
-           隐藏分支与关窗确认，走同一条真退出路径；
+           隐藏分支与关窗确认，走同一条真退出路径（会话结束直接 close()，托盘隐藏
+           时也进协调器；被取消后窗口重新显示即复位它置的标志）；
         ③ 隐藏到托盘不停止任务、不做任何清理；
         ④ 收尾中途抛异常，QApplication.quit() 仍必须执行（try/finally）；
         ⑤ offscreen/无托盘环境下托盘不可用，隐藏分支天然短路；
-        ⑥ 真退出的收尾只经 ShutdownCoordinator，总期限 30 秒，超时记日志。
+        ⑥ 真退出的收尾只经 ShutdownCoordinator，总期限 30 秒，超时记日志；
+           收尾只做一次，之后再来的关闭事件直接接受。
         """
+        if self._shutdown_started:
+            event.accept()
+            return
+
         if (not self._really_quit and self._tray_available()
                 and self.services.preferences.close_to_tray()):
             self._hide_to_tray(event)
@@ -363,6 +393,7 @@ class MainWindow(FluentWindow):
         # 真退出路径：QApplication.quit() 放 finally——setQuitOnLastWindowClosed(False)
         # 拆掉了"closeEvent 异常也能退出"的隐性保险丝，退出全靠这里显式调用 quit()；
         # 收尾中途抛异常又不放 finally，事件循环不会退出而窗口已隐藏，用户无从恢复。
+        self._shutdown_started = True
         try:
             self._run_shutdown()
             # 收尾完成才显式 accept；异常路径下 QCloseEvent 默认已是 accepted，

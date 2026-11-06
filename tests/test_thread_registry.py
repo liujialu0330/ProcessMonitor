@@ -99,6 +99,83 @@ def test_shutdown_all_without_running_threads_is_true(qapp):
     assert progress == []
 
 
+def test_never_started_thread_is_dropped(qapp):
+    """登记后从未启动的线程永远不会发 finished：cancel_all / shutdown_all 时清掉，
+    不再一直留在登记表里；已启动的线程不受影响"""
+    registry = ThreadRegistry()
+    idle, running = _GateThread(), _GateThread()
+    registry.register(idle, name="未启动", cancel=idle.cancel)
+    registry.register(running, name="运行中", cancel=running.cancel, timeout_ms=5000)
+    running.start()
+    assert running.started_evt.wait(5)
+
+    registry.cancel_all()
+    assert [e.name for e in registry.entries()] == ["运行中"]
+    assert idle.log == []                 # 未启动的线程不调取消回调
+    assert registry.shutdown_all() is True
+
+    registry2 = ThreadRegistry()
+    registry2.register(_GateThread(), name="未启动")
+    registry2.shutdown_all()
+    assert registry2.entries() == []
+
+
+def test_register_already_finished_thread_is_skipped(qapp):
+    """已结束的线程不会再发 finished，登记了就永远注销不掉：直接不登记"""
+    registry = ThreadRegistry()
+    t = _GateThread()
+    t.gate.set()
+    t.start()
+    assert t.wait(5000)
+    registry.register(t, name="已结束")
+    assert registry.entries() == []
+    assert poll_until(lambda: (_flush_deletes() or True) and sip.isdeleted(t), timeout=10)
+
+
+def test_cancel_all_cancels_running_once_without_waiting(qapp):
+    """cancel_all 只发取消、不等待；随后的 shutdown_all 不重复取消"""
+    log = []
+    registry = ThreadRegistry()
+    a, plain = _GateThread(log, "甲"), _GateThread(log, "丙")
+    for t in (a, plain):
+        t.start()
+        assert t.started_evt.wait(5)
+    registry.register(a, name="甲", cancel=a.cancel, timeout_ms=5000)
+    registry.register(plain, name="丙", timeout_ms=5000)
+    try:
+        registry.cancel_all()
+        assert log == [("cancel", "甲")]
+        assert plain.isRunning()
+        plain.gate.set()
+        assert registry.shutdown_all() is True
+        assert log == [("cancel", "甲")]
+    finally:
+        plain.gate.set()
+        plain.wait(5000)
+
+
+def test_shutdown_all_deadline_caps_total_wait(qapp, caplog):
+    """截止时间落实到每次等待：3 个各 5 秒超时的卡住线程，总等待不超过截止时间，
+    已到期的不再等待；返回 False 并记日志"""
+    import time
+    registry = ThreadRegistry()
+    stuck = [_GateThread(name=f"卡{i}") for i in range(3)]
+    for t in stuck:
+        t.start()
+        assert t.started_evt.wait(5)
+        registry.register(t, name=t.name, timeout_ms=5000)
+    try:
+        t0 = time.monotonic()
+        with caplog.at_level(logging.ERROR, logger="core.shutdown"):
+            assert registry.shutdown_all(deadline=t0 + 0.3) is False
+        assert time.monotonic() - t0 < 1.5
+        assert any("卡2" in r.getMessage() for r in caplog.records)
+    finally:
+        for t in stuck:
+            t.gate.set()
+            t.wait(5000)
+
+
 def test_shutdown_all_cancels_then_waits_in_registration_order(qapp, monkeypatch):
     import core.shutdown as shutdown_module
     log = []

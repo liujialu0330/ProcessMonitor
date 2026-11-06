@@ -3,6 +3,7 @@
 管理所有监控任务的创建、启动、停止等操作；由组合根构造并注入（不是单例）
 """
 import logging
+import time
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -318,7 +319,7 @@ class MonitorManager(QObject):
         for task in list(self._tasks.values()):
             task.stop()
 
-    def join_all(self, timeout_ms: int) -> bool:
+    def join_all(self, timeout_ms: int, *, deadline: Optional[float] = None) -> bool:
         """
         退出路径的 join：对仍在运行的任务线程逐个带超时等待（超时只记日志）。
         入口用 os._exit() 结束进程，若不等待，仍在收尾写库的线程会被中途掐死、
@@ -326,13 +327,25 @@ class MonitorManager(QObject):
 
         Args:
             timeout_ms: 每个线程的等待上限（毫秒）
+            deadline: 总截止时间（time.monotonic() 口径）。每次等待取 timeout_ms
+                与剩余时间的较小者，剩余 ≤0 时不再等待——否则多个卡住的线程会把
+                单项超时累加成远超总期限的等待。None 表示只按单项超时
 
         Returns:
-            bool: 全部线程都在超时前结束返回 True
+            bool: 全部线程都在超时（及截止时间）前结束返回 True
         """
         all_finished = True
         for task in list(self._tasks.values()):
-            if task.isRunning() and not shutdown_thread(task, timeout_ms=timeout_ms):
+            if not task.isRunning():
+                continue
+            wait_ms = timeout_ms
+            if deadline is not None:
+                wait_ms = min(timeout_ms, int((deadline - time.monotonic()) * 1000))
+            if wait_ms <= 0:
+                all_finished = False
+                logger.error("退出收尾已到总期限，不再等待监控任务线程: %r", task)
+                continue
+            if not shutdown_thread(task, timeout_ms=wait_ms):
                 all_finished = False
         return all_finished
 
