@@ -1,10 +1,13 @@
 """
-历史页：默认范围与空状态文案、缓存失效、运行中任务自动刷新、自适应范围、统计条、
-打点竖线、表格提示、任务下拉文案、经 manager 删除、删除确认框、错误提示停留时长。
+历史页组装：控件信号 → 视图模型命令的连线，以及视图模型信号驱动的关键可见状态
+（快照渲染、空状态、加载态、错误提示、任务下拉文案、删除确认、图表保存/复制、
+小窗口滚动）。选择语义、锚点、过期丢弃等业务规则见 tests/test_history_vm.py。
+
+视图模型注入同步查询执行器（SyncHistoryRunner）与立即执行的 defer，用户操作后
+结果当场可见；真实后台线程见 tests/test_history_page_async.py。
 """
 import uuid
 from datetime import datetime, timedelta
-from types import SimpleNamespace
 
 import pyqtgraph as pg
 import pytest
@@ -12,32 +15,43 @@ from pyqtgraph import exporters as pg_exporters
 from PyQt5.QtCore import Qt
 from PyQt5.QtTest import QTest
 
-from core.contracts import TaskStatus
 from core.monitor_manager import MonitorManager
+from data.errors import StorageError
 from data.models import DataPoint, MonitorTask
 from tests.doubles import FakeClock
 from tests.factories import make_history_page, make_services
-from ui.pages.history_page import AUTO_REFRESH_INTERVAL_MS
-from ui.services import ManagerTaskStatus, QtDialogs
+from tests.helpers import ManualDefer, ManualHistoryRunner, SyncHistoryRunner
+from ui.services import QtDialogs
 from utils.metrics import MetricType
 
 BASE = datetime(2026, 7, 16, 20, 0, 0)
+MEM = MetricType.MEMORY_PRIVATE
 
 
 def _seed_task(db, samples=10, note="", status="stopped", markers=(), name="demo.exe",
-               start=BASE, metric=MetricType.MEMORY_PRIVATE):
+               start=BASE, metric=MEM, metrics=None):
+    metrics = list(metrics or [metric])
     task = MonitorTask(
-        task_id=str(uuid.uuid4()), pid=4321, process_name=name, metric_types=[metric],
+        task_id=str(uuid.uuid4()), pid=4321, process_name=name, metric_types=metrics,
         interval=1.0, start_time=start,
         end_time=None if status == "running" else start + timedelta(seconds=samples),
         status=status, note=note)
     db.save_task(task)
     db.save_data_points([
-        DataPoint(task.task_id, start + timedelta(seconds=i), 1024.0 * (100 + i), metric)
-        for i in range(samples)])
+        DataPoint(task.task_id, start + timedelta(seconds=i), 1024.0 * (100 + i), m)
+        for i in range(samples) for m in metrics])
     for offset, label in markers:
         db.add_marker(task.task_id, start + timedelta(seconds=offset), label)
     return task
+
+
+def run_now(fn):
+    """defer 替身：加载请求立即发出（不等下一轮事件循环）。"""
+    fn()
+
+
+def _raise_storage(*a, **k):
+    raise StorageError("读取数据点失败: database disk image is malformed")
 
 
 @pytest.fixture
@@ -52,288 +66,330 @@ def services():
 
 
 @pytest.fixture
-def page(qapp, db, manager, services):
-    widget = make_history_page(db, manager, services)
+def runner(db):
+    return SyncHistoryRunner(db)
+
+
+@pytest.fixture
+def page(qapp, db, manager, services, runner):
+    widget = make_history_page(db, manager, services, worker_runner=runner, defer=run_now)
     widget.resize(1200, 800)
     yield widget
-    widget._auto_refresh_timer.stop()
+    widget.auto_refresh.stop()
     widget.close()
 
 
-# ---------- 默认范围与空状态 ----------
-
-def test_default_range_is_all_and_initial_empty_state(page):
-    assert page.current_range_key == 'all'
-    assert page.empty_title_label.text() == "暂无历史数据"
+def _empty_title(page):
+    return page.empty_state_card.title_label.text()
 
 
-def test_empty_state_wording_depends_on_selected_range(page, db, monkeypatch):
-    task = _seed_task(db, samples=3)
-    page.select_task(task.task_id)
-    monkeypatch.setattr(db.points, 'fetch', lambda *a, **k: [])
-
-    page.current_range_key = 'all'
-    page._load_task_data(task.task_id, MetricType.MEMORY_PRIVATE)
-    assert page.empty_title_label.text() == "该任务暂无数据"
-
-    page.current_range_key = '1h'
-    page._load_task_data(task.task_id, MetricType.MEMORY_PRIVATE)
-    assert page.empty_title_label.text() == "所选时间范围内暂无数据"
+def _marker_lines(page):
+    return [item for item in page.chart_view.chart_widget.getPlotItem().items
+            if isinstance(item, pg.InfiniteLine) and item is not page.chart_view.crosshair_line]
 
 
-def test_refresh_invalidates_last_timestamp_cache(page, db):
+# ---------- 初始状态与显示/隐藏 ----------
+
+def test_initial_state_is_empty_with_all_range(page):
+    assert page.vm.range_key == page.filter_bar.current_range() == 'all'
+    assert page.content_stack.currentWidget() is page.empty_state_card
+    assert _empty_title(page) == "暂无历史数据"
+    assert page.current_task_id is None and page.current_metric is None
+
+
+def test_show_reloads_and_drives_auto_refresh(page, db):
     task = _seed_task(db, samples=5)
-    page.select_task(task.task_id)
-    page.current_range_key = '1h'
-
-    first_anchor = page._get_cached_last_dt(task.task_id)
-    assert first_anchor == BASE + timedelta(seconds=4)
-
-    # 新数据写入后，不刷新时锚点仍是缓存值；点刷新后锚点跟上
-    db.save_data_points([DataPoint(
-        task.task_id, BASE + timedelta(seconds=60), 1.0, MetricType.MEMORY_PRIVATE)])
-    assert page._get_cached_last_dt(task.task_id) == first_anchor
-
-    page._on_refresh_clicked()
-
-    assert page._get_cached_last_dt(task.task_id) == BASE + timedelta(seconds=60)
-
-
-def test_cache_is_reused_between_range_switches(page, db, monkeypatch):
-    task = _seed_task(db, samples=5)
-    page.select_task(task.task_id)
-    calls = []
-    real = db.analytics.last_point_timestamp
-    monkeypatch.setattr(
-        db.analytics, 'last_point_timestamp', lambda tid: calls.append(tid) or real(tid))
-
-    page._on_time_range_changed('1h')
-    page._on_time_range_changed('6h')
-
-    assert len(calls) <= 1
-
-
-# ---------- 自动刷新 ----------
-
-def test_auto_refresh_timer_follows_visibility(page):
-    assert AUTO_REFRESH_INTERVAL_MS == 5000
-    assert page._auto_refresh_timer.interval() == 5000
-    assert not page._auto_refresh_timer.isActive()
+    assert not page.auto_refresh.is_active
 
     page.show()
-    assert page._auto_refresh_timer.isActive()
+    assert page.current_task_id == task.task_id
+    assert page.task_selector.current_id() == task.task_id
+    assert page.content_stack.currentWidget() is page.analysis_page
+    assert page.auto_refresh.is_active
+
     page.hide()
-    assert not page._auto_refresh_timer.isActive()
+    assert not page.auto_refresh.is_active
 
 
-def test_is_task_running_reads_manager_snapshot(qapp, db, manager, monkeypatch):
-    """生产装配（ManagerTaskStatus）下"是否运行中"只经 manager 的只读快照判断，
-    不取任务线程对象；停止收尾中仍算运行（收尾写完结束时间后才转已停止）"""
-    monkeypatch.setattr(manager, 'get_task', lambda tid: pytest.fail("界面不应取任务线程"))
-    snapshots = {
-        "run": SimpleNamespace(status=TaskStatus.RUNNING, is_stopping=False),
-        "stopping": SimpleNamespace(status=TaskStatus.RUNNING, is_stopping=True),
-        "pending": SimpleNamespace(status=TaskStatus.PENDING, is_stopping=False),
-        "done": SimpleNamespace(status=TaskStatus.STOPPED, is_stopping=False),
-    }
-    monkeypatch.setattr(manager, 'get_task_info', snapshots.get)
-    page = make_history_page(
-        db, manager, make_services(task_status=ManagerTaskStatus(manager)))
+# ---------- 控件信号 → 命令 ----------
+
+def test_user_picks_task_in_selector(page, db, runner):
+    old = _seed_task(db, samples=3, name="old.exe", start=BASE)
+    _seed_task(db, samples=3, name="new.exe", start=BASE + timedelta(hours=1))
+    page.vm.reload_tasks()
+    assert page.vm.selection_is_auto is True
+
+    page.task_selector.combo.setCurrentIndex(1)   # 等同用户在下拉里点选
+
+    assert page.current_task_id == old.task_id
+    assert page.vm.selection_is_auto is False
+    assert runner.requests[-1].task_id == old.task_id
+    assert "old.exe" in page.task_selector.combo.currentText()
+
+
+def test_metric_combo_selects_metric(page, db, runner):
+    task = _seed_task(db, samples=3, metrics=[MEM, MetricType.NUM_THREADS])
+    page.select_task(task.task_id)
+    assert page.filter_bar.current_metric() == MEM
+
+    page.filter_bar.metric_combo.setCurrentIndex(1)
+
+    assert page.current_metric == MetricType.NUM_THREADS
+    assert runner.requests[-1].metric == MetricType.NUM_THREADS
+    assert page.chart_view.metric_type == MetricType.NUM_THREADS
+
+
+def test_range_segment_sets_range(page, db, runner):
+    task = _seed_task(db, samples=3)
+    page.select_task(task.task_id)
+
+    page.filter_bar.range_segmented.setCurrentItem('1h')
+
+    assert page.vm.range_key == '1h'
+    assert runner.requests[-1].range_key == '1h'
+
+
+def test_refresh_button_reloads_task_list(page, db):
+    _seed_task(db, samples=3)
+    page.vm.reload_tasks()
+    assert page.task_selector.count() == 1
+
+    newer = _seed_task(db, samples=3, name="newer.exe", start=BASE + timedelta(hours=1))
+    page.filter_bar.refresh_button.click()
+
+    assert page.task_selector.count() == 2
+    assert page.current_task_id == newer.task_id   # 自动选中跟随最新
+
+
+def test_view_switch_and_raw_values(qapp, page):
+    assert page.view_stack.currentWidget() is page.chart_view
+    page.filter_bar.view_segmented.setCurrentItem('detail')
+    assert page.view_stack.currentWidget() is page.sample_table
+    page.filter_bar.view_segmented.setCurrentItem('trend')
+    assert page.view_stack.currentWidget() is page.chart_view
+
+    assert not page.sample_table.raw_values_visible()
+    page.filter_bar.raw_value_action.setChecked(True)
+    assert page.sample_table.raw_values_visible()
+
+
+def test_navigation_select_task_loads_once(qapp, db, manager, services):
+    """主窗口跳转 = 页面显示（重载）+ select_task：同一轮里只发一次查询，且查的是目标任务。"""
+    target = _seed_task(db, samples=3, name="old.exe", start=BASE)
+    _seed_task(db, samples=3, name="new.exe", start=BASE + timedelta(hours=1))
+    runner, defer = SyncHistoryRunner(db), ManualDefer()
+    page = make_history_page(db, manager, services, worker_runner=runner, defer=defer)
     try:
-        assert page._is_task_running("run") is True
-        assert page._is_task_running("stopping") is True
-        assert page._is_task_running("pending") is False
-        assert page._is_task_running("done") is False
-        assert page._is_task_running("unknown") is False
+        page.show()
+        page.select_task(target.task_id)
+        defer.run()
+        assert [r.task_id for r in runner.requests] == [target.task_id]
+        assert page.current_task_id == target.task_id
+        assert page.vm.selection_is_auto is False
     finally:
-        page._auto_refresh_timer.stop()
+        page.auto_refresh.stop()
         page.close()
 
 
-def test_auto_refresh_reloads_only_when_selected_task_is_running(
-        page, db, services, monkeypatch):
-    task = _seed_task(db, samples=5)
-    page.show()
-    page.select_task(task.task_id)
+# ---------- 快照渲染 ----------
 
-    loads = []
-    monkeypatch.setattr(
-        page, '_start_auto_refresh_worker', lambda *a, **k: loads.append((a, k)))
-
-    # 任务未在运行：不刷新
-    services.task_status.set_running(task.task_id, False)
-    page._on_auto_refresh()
-    assert loads == []
-
-    # 运行中：交给后台 worker 刷新（keep_view 语义在应用结果时保证）
-    services.task_status.set_running(task.task_id, True)
-    page._on_auto_refresh()
-    assert len(loads) == 1
-
-    # 刚结束：整体重载一次任务列表，之后不再重复
-    reloads = []
-    monkeypatch.setattr(page, '_load_tasks', lambda: reloads.append(1))
-    services.task_status.set_running(task.task_id, False)
-    page._on_auto_refresh()
-    page._on_auto_refresh()
-    assert reloads == [1]
-
-
-def test_auto_refresh_stops_when_page_not_visible(page):
-    page.show()
-    assert page._auto_refresh_timer.isActive()
-    page.hide()
-    page._auto_refresh_timer.start()   # 模拟隐藏后残留的一次触发
-    page._on_auto_refresh()
-    assert not page._auto_refresh_timer.isActive()
-
-
-# ---------- 自适应范围 ----------
-
-def test_reload_enables_auto_range_unless_keep_view(page, db, monkeypatch):
-    task = _seed_task(db, samples=5)
-    page.select_task(task.task_id)
-    calls = []
-    monkeypatch.setattr(page.chart_widget, 'enableAutoRange', lambda *a, **k: calls.append(1))
-
-    page._load_task_data(task.task_id, MetricType.MEMORY_PRIVATE)
-    assert calls == [1]
-
-    page._load_task_data(task.task_id, MetricType.MEMORY_PRIVATE, keep_view=True)
-    assert calls == [1]
-
-
-# ---------- 统计条 ----------
-
-def test_stats_strip_shows_six_cells_from_metric_stats(page, db):
-    task = _seed_task(db, samples=10)   # 100 MB -> 109 MB，每秒涨 1 MB
-    page.select_task(task.task_id)
-
-    texts = {key: label.text() for key, label in page.stat_value_labels.items()}
-    assert tuple(texts) == ("起点", "当前", "变化", "增速", "最小", "最大")
-    assert texts["起点"] == "100 MB"
-    assert texts["当前"] == "109 MB"
-    assert texts["变化"].startswith("+9 MB")
-    assert texts["增速"].endswith("/小时") and texts["增速"].startswith("+")
-    assert texts["最小"] == "100 MB" and texts["最大"] == "109 MB"
-
-
-def test_stats_strip_is_cleared_without_data(page):
-    page._clear_display()
-    assert {label.text() for label in page.stat_value_labels.values()} == {"--"}
-
-
-@pytest.mark.parametrize("width, columns", [(1400, 6), (800, 3), (400, 2)])
-def test_stats_strip_wraps_responsively(page, width, columns):
-    assert page._stats_column_count(width) == columns
-    page._update_stats_layout(width)
-    used_columns = {page.stats_layout.getItemPosition(i)[1]
-                    for i in range(page.stats_layout.count())}
-    assert max(used_columns) + 1 == columns
-
-
-# ---------- 打点竖线 ----------
-
-def test_markers_are_drawn_as_vertical_lines(page, db):
+def test_snapshot_renders_stats_table_chart_and_markers(page, db):
     task = _seed_task(db, samples=10, markers=[(2, "第1轮"), (6, "第2轮")])
     page.select_task(task.task_id)
 
-    lines = [item for item in page.chart_widget.getPlotItem().items
-             if isinstance(item, pg.InfiniteLine) and item is not page.crosshair_line]
-    assert len(lines) == 2
-    assert sorted(line.value() for line in lines) == [
+    texts = page.stats_strip.texts()
+    assert tuple(texts) == ("起点", "当前", "变化", "增速", "最小", "最大")
+    assert texts["起点"] == "100 MB" and texts["当前"] == "109 MB"
+    assert texts["变化"].startswith("+9 MB")
+    assert texts["增速"].startswith("+") and texts["增速"].endswith("/小时")
+    assert texts["最小"] == "100 MB" and texts["最大"] == "109 MB"
+
+    rows = page.sample_table.row_texts()
+    assert len(rows) == 10
+    assert rows[0][0] == (BASE + timedelta(seconds=9)).strftime('%m-%d %H:%M:%S')
+    assert rows[0][1] == "109 MB"
+    assert page.chart_view.axis_title() == "私有字节（MB）"
+    assert len(page.chart_view.x_values) == 10
+    assert sorted(line.value() for line in _marker_lines(page)) == [
         (BASE + timedelta(seconds=2)).timestamp(),
         (BASE + timedelta(seconds=6)).timestamp()]
 
 
-def test_no_marker_lines_for_task_without_markers(page, db):
+def test_table_hint_shows_shown_over_total(qapp, db, manager, services):
     task = _seed_task(db, samples=10)
+    page = make_history_page(db, manager, services, worker_runner=SyncHistoryRunner(db),
+                             defer=run_now, table_limit=4)
+    try:
+        page.select_task(task.task_id)
+        assert page.sample_table.table_hint_label.text() == (
+            "最新数据优先 · 显示最近 4 条 / 共 10 条")
+        assert page.sample_table.data_table.rowCount() == 4
+    finally:
+        page.close()
+
+
+def test_auto_refresh_keeps_view_user_action_resets_it(page, db, services, monkeypatch):
+    task = _seed_task(db, samples=5)
     page.select_task(task.task_id)
-    lines = [item for item in page.chart_widget.getPlotItem().items
-             if isinstance(item, pg.InfiniteLine) and item is not page.crosshair_line]
-    assert lines == []
+    resets = []
+    monkeypatch.setattr(page.chart_view, 'reset_view', lambda: resets.append(1))
+
+    services.task_status.set_running(task.task_id)
+    page.auto_refresh.tick()
+    assert resets == []
+
+    page.filter_bar.refresh_button.click()
+    assert resets == [1]
 
 
-# ---------- 表格提示 ----------
-
-def test_table_hint_shows_shown_over_total(page, db, monkeypatch):
-    task = _seed_task(db, samples=10)
-    monkeypatch.setattr('ui.pages.history_page.TABLE_POINT_LIMIT', 4)
+def test_snapshot_updates_auto_refresh_interval(page, db, monkeypatch):
+    task = _seed_task(db, samples=5)
+    real = db.analytics.legacy_stats
+    monkeypatch.setattr(
+        db.analytics, 'legacy_stats', lambda *a, **k: {**real(*a, **k), 'count': 300_000})
     page.select_task(task.task_id)
-
-    assert page.table_hint_label.text() == "最新数据优先 · 显示最近 4 条 / 共 10 条"
-    assert page.data_table.rowCount() == 4
+    assert page.auto_refresh.interval == 15000
 
 
-def test_table_hint_uses_thousands_separator(page):
-    points = [DataPoint("t", BASE + timedelta(seconds=i), 1.0, MetricType.NUM_THREADS)
-              for i in range(3)]
-    page._update_table(points, MetricType.NUM_THREADS, total=12345)
-    assert "共 12,345 条" in page.table_hint_label.text()
+def test_empty_state_clears_widgets(page, db):
+    task = _seed_task(db, samples=3)
+    page.select_task(task.task_id)
+    assert page.sample_table.row_texts()
+
+    page.vm.empty_state.emit("所选时间范围内暂无数据", "尝试切换到「全部」查看完整历史")
+
+    assert page.content_stack.currentWidget() is page.empty_state_card
+    assert _empty_title(page) == "所选时间范围内暂无数据"
+    assert page.sample_table.row_texts() == []
+    assert set(page.stats_strip.texts().values()) == {"--"}
+    assert not page.chart_view.has_data()
+
+
+# ---------- 加载态与错误 ----------
+
+def test_busy_disables_refresh_and_shows_bar_after_delay(qapp, db, manager, services):
+    task = _seed_task(db, samples=3)
+    runner = ManualHistoryRunner(db)
+    page = make_history_page(db, manager, services, worker_runner=runner, defer=run_now)
+    page.resize(1000, 700)
+    try:
+        page.show()
+        assert page.vm.is_busy
+        assert not page.filter_bar.refresh_button.isEnabled()
+        assert not page.busy_bar.isVisible()          # 快速查询不闪进度条
+        QTest.qWait(400)
+        assert page.busy_bar.isVisible()
+
+        runner.complete_all()
+        assert page.current_task_id == task.task_id
+        assert page.filter_bar.refresh_button.isEnabled()
+        assert not page.busy_bar.isVisible()
+    finally:
+        page.auto_refresh.stop()
+        page.close()
+
+
+def test_load_failure_shows_read_error_and_sticky_notice(page, db, services, monkeypatch):
+    task = _seed_task(db, samples=5)
+    page.select_task(task.task_id)
+    monkeypatch.setattr(db.points, 'fetch', _raise_storage)
+
+    page.filter_bar.refresh_button.click()
+
+    assert page.content_stack.currentWidget() is page.empty_state_card
+    assert _empty_title(page) == "读取数据失败"
+    error, = services.notifier.messages('error')
+    assert error.title == "读取数据失败" and "malformed" in error.content
+    assert error.effective_duration == -1   # 错误常驻，由用户关闭
+
+
+def test_task_list_failure_shows_read_error(page, db, services, monkeypatch):
+    _seed_task(db, samples=3)
+    monkeypatch.setattr(db.tasks, "list_with_data", _raise_storage)
+
+    page.vm.reload_tasks()
+
+    assert _empty_title(page) == "读取数据失败"
+    assert services.notifier.last().level == "error"
+    assert page.task_selector.count() == 0 and not page.task_selector.isEnabled()
 
 
 # ---------- 任务下拉 ----------
 
-def test_task_combo_text_and_single_query(page, db, manager, monkeypatch):
+def test_task_combo_text_tooltip_and_running_mark(page, db, services):
     long_note = "建模 200 次回归测试，连续运行过夜观察内存增长"
-    _seed_task(db, samples=30, note=long_note, name="MPrintExp.exe")
+    task = _seed_task(db, samples=30, note=long_note, name="MPrintExp.exe", status="running")
     _seed_task(db, samples=0, name="nodata.exe")   # 没有数据的任务不出现
-
-    counted = []
-    monkeypatch.setattr(
-        db, 'get_data_point_count', lambda *a, **k: counted.append(1) or 0)
-    page._load_tasks()
-
-    assert counted == [], "任务下拉不应再逐任务统计数据点"
-    assert page.task_combo.count() == 1
-    text = page.task_combo.itemText(0)
-    assert "MPrintExp.exe" in text and "PID 4321" in text and "07-16 20:00" in text
-    assert "…" in text and long_note not in text
-    assert long_note in page.task_combo.toolTip()
-
-
-def test_running_task_is_marked_in_combo(page, db, services):
-    task = _seed_task(db, samples=5, status="running")
     services.task_status.set_running(task.task_id)
-    page._load_tasks()
-    assert "运行中" in page.task_combo.itemText(0)
+
+    page.vm.reload_tasks()
+
+    assert page.task_selector.count() == 1
+    text = page.task_selector.item_text(0)
+    assert "MPrintExp.exe" in text and "PID 4321" in text and "07-16 20:00" in text
+    assert "运行中" in text
+    assert "…" in text and long_note not in text
+    assert long_note in page.task_selector.tooltip()
 
 
-def test_select_task_picks_given_task(page, db):
+def test_select_task_picks_given_task_and_missing_task_clears(page, db, services):
     first = _seed_task(db, samples=3, name="a.exe", start=BASE)
     second = _seed_task(db, samples=3, name="b.exe", start=BASE + timedelta(hours=1))
+    nodata = _seed_task(db, samples=0, name="nodata.exe")
 
     page.select_task(first.task_id)
     assert page.current_task_id == first.task_id
     page.select_task(second.task_id)
-    assert page.current_task_id == second.task_id
-    assert "b.exe" in page.task_combo.currentText()
+    assert "b.exe" in page.task_selector.combo.currentText()
+    assert services.notifier.notices == []
 
-    page.select_task("missing-task")
-    # 不在列表中（已删除或尚无数据）：清空选择并显示"请选择监控任务"，
-    # 不静默回落到首项；列表本身保持完整
-    assert page.current_task_id is None
-    assert page.current_metric is None
-    assert page.task_combo.currentIndex() == -1
-    assert page.task_combo.count() == 2
-    assert page.empty_title_label.text() == "请选择监控任务"
+    page.select_task(nodata.task_id)
+    # 不在列表中（尚无数据）：清空选择、提示，不静默回落到首项；列表本身保持完整
+    assert page.current_task_id is None and page.current_metric is None
+    assert page.task_selector.current_index() == -1
+    assert page.task_selector.count() == 2
+    assert _empty_title(page) == "请选择监控任务"
+    hint, = services.notifier.messages()
+    assert hint.level == "info" and "暂无采样数据" in hint.content
 
 
-# ---------- 删除经 manager ----------
+def test_running_task_duration_label_updates_in_place(page, db, services):
+    """页面开着时运行中任务的时长随定时刷新原地更新；结束后改为最终时长，不打断当前选择。"""
+    task = _seed_task(db, samples=3, status="running")
+    other = _seed_task(db, samples=3, start=BASE - timedelta(days=1))
+    services.task_status.set_running(task.task_id)
+    services.clock.set(BASE + timedelta(minutes=5))
+    page.select_task(other.task_id)
+    index = page.task_selector.options().index(
+        next(o for o in page.task_selector.options() if o.task_id == task.task_id))
+    assert "运行中 5分钟" in page.task_selector.item_text(index)
+
+    services.clock.set(BASE + timedelta(minutes=15))
+    page.auto_refresh.tick()
+    assert "运行中 15分钟" in page.task_selector.item_text(index)
+
+    db.update_task_status(task.task_id, "stopped", BASE + timedelta(minutes=20))
+    services.task_status.set_running(task.task_id, False)
+    services.clock.set(BASE + timedelta(hours=2))
+    page.auto_refresh.tick()
+    text = page.task_selector.item_text(index)
+    assert "运行中" not in text and "20分钟" in text
+    assert page.current_task_id == other.task_id
+
+
+# ---------- 删除 ----------
 
 def test_delete_goes_through_manager(page, db, manager, services, monkeypatch):
     task = _seed_task(db, samples=5)
     page.select_task(task.task_id)
-
     services.dialogs.push('confirm', True)
     deleted = []
     real = manager.delete_task_data
     monkeypatch.setattr(
         manager, 'delete_task_data', lambda tid: deleted.append(tid) or real(tid))
 
-    page._on_delete_task_clicked()
+    page.filter_bar.delete_action.trigger()
 
-    # 确认框挂在主窗口上、按钮文案为"删除/取消"
     confirm = services.dialogs.last_call('confirm')
     assert confirm['parent'] is page.window()
     assert confirm['title'] == "确认删除"
@@ -341,20 +397,17 @@ def test_delete_goes_through_manager(page, db, manager, services, monkeypatch):
     assert (confirm['confirm_text'], confirm['cancel_text']) == ("删除", "取消")
     assert deleted == [task.task_id]
     assert db.get_task(task.task_id) is None
-    assert page.current_task_id is None
-    assert page.task_combo.count() == 0
+    assert page.current_task_id is None and page.task_selector.count() == 0
     assert services.notifier.last().level == "success"
 
 
 def test_delete_cancelled_keeps_task(page, db, manager, services, monkeypatch):
-    """确认框里选了取消：不经 manager 删除，也不弹任何提示。"""
     task = _seed_task(db, samples=5)
     page.select_task(task.task_id)
     services.dialogs.push('confirm', False)
-    monkeypatch.setattr(
-        manager, 'delete_task_data', lambda tid: pytest.fail("取消后不应删除"))
+    monkeypatch.setattr(manager, 'delete_task_data', lambda tid: pytest.fail("取消后不应删除"))
 
-    page._on_delete_task_clicked()
+    page.filter_bar.delete_action.trigger()
 
     assert db.get_task(task.task_id) is not None
     assert services.notifier.notices == []
@@ -363,27 +416,33 @@ def test_delete_cancelled_keeps_task(page, db, manager, services, monkeypatch):
 def test_delete_failure_keeps_task(page, db, manager, services, monkeypatch):
     task = _seed_task(db, samples=5)
     page.select_task(task.task_id)
-
     services.dialogs.push('confirm', True)
     monkeypatch.setattr(manager, 'delete_task_data', lambda tid: False)
 
-    page._on_delete_task_clicked()
+    page.filter_bar.delete_action.trigger()
 
-    errors = services.notifier.messages('error')
-    assert len(errors) == 1
-    # 错误提示不能一闪即逝：不自动消失，由用户手动关闭
-    assert errors[0].effective_duration == -1
+    error, = services.notifier.messages('error')
+    assert error.effective_duration == -1
     assert db.get_task(task.task_id) is not None
 
 
+def test_delete_disabled_for_running_task(page, db, services):
+    task = _seed_task(db, samples=5, status="running")
+    services.task_status.set_running(task.task_id)
+    page.select_task(task.task_id)
+
+    assert not page.filter_bar.delete_action.isEnabled()
+    assert page.filter_bar.delete_action.toolTip() == "任务正在运行中，请先停止任务再删除"
+    page.filter_bar.delete_action.trigger()   # 禁用时 trigger 不得转发删除
+    assert services.dialogs.calls == []
+
+
 def test_delete_confirm_is_chinese_and_enter_does_not_delete(qapp, db, manager, monkeypatch):
-    """真实确认框（生产 QtDialogs 构造的对话框）：按钮为"删除/取消"，显示后焦点在
-    "取消"，回车不会删除"""
+    """真实确认框（生产 QtDialogs）：按钮"删除/取消"，焦点在"取消"，回车不会删除"""
     task = _seed_task(db, samples=5)
     seen = {}
 
     def _probe(box):
-        # 不进模态循环：显示后记录状态，再向焦点控件按回车，模拟用户顺手回车
         box.show()
         QTest.qWait(300)  # 等淡入动画结束，避免动画回调落到后续用例里
         seen.update(yes=box.yesButton.text(), cancel=box.cancelButton.text(),
@@ -391,69 +450,40 @@ def test_delete_confirm_is_chinese_and_enter_does_not_delete(qapp, db, manager, 
         accepted = []
         box.yesSignal.connect(lambda: accepted.append(True))
         QTest.keyClick(box.focusWidget(), Qt.Key_Return)
-        for _ in range(50):  # 等 100ms 淡出动画结束、对话框真正关闭
+        for _ in range(50):  # 等淡出动画结束、对话框真正关闭
             if not box.isVisible():
                 break
             QTest.qWait(20)
         seen['cancel_button'] = box.cancelButton
         return bool(accepted)
 
-    page = make_history_page(
-        db, manager, make_services(dialogs=QtDialogs(run_dialog=_probe)))
+    page = make_history_page(db, manager, make_services(dialogs=QtDialogs(run_dialog=_probe)),
+                             worker_runner=SyncHistoryRunner(db), defer=run_now)
     deleted = []
     monkeypatch.setattr(manager, 'delete_task_data', lambda tid: deleted.append(tid) or True)
     try:
         page.show()
         page.select_task(task.task_id)
 
-        page._on_delete_task_clicked()
+        page.filter_bar.delete_action.trigger()
 
-        assert seen['yes'] == "删除"
-        assert seen['cancel'] == "取消"
+        assert (seen['yes'], seen['cancel']) == ("删除", "取消")
         assert seen['focus'] is seen['cancel_button']
         assert deleted == []
-        assert db.get_task(task.task_id) is not None
     finally:
-        page._auto_refresh_timer.stop()
+        page.auto_refresh.stop()
         page.close()
 
 
-# ---------- 错误提示停留时长 ----------
-
-def test_load_task_failure_error_stays_until_closed(page, services):
-    page._load_task_data("不存在的任务")
-
-    errors = services.notifier.messages('error')
-    assert len(errors) == 1
-    assert errors[0].effective_duration == -1
-
-
-def test_save_chart_failure_error_stays_until_closed(page, db, services, monkeypatch, tmp_path):
-    task = _seed_task(db, samples=5)
-    page.select_task(task.task_id)
-    assert page._chart_x
-    services.dialogs.push('ask_save_path', str(tmp_path / "chart.png"))
-
-    def _boom(*args, **kwargs):
-        raise RuntimeError("导出失败")
-
-    monkeypatch.setattr(pg_exporters, 'ImageExporter', _boom)
-
-    page._save_chart_as_png()
-
-    errors = services.notifier.messages('error')
-    assert len(errors) == 1
-    assert errors[0].effective_duration == -1
-
+# ---------- 图表保存 / 复制 ----------
 
 def test_save_chart_default_name_uses_clock_and_cancel_is_silent(page, db, services):
-    """PNG 默认文件名的时间戳取自注入的时钟；保存框里取消则什么都不做、不提示。"""
     task = _seed_task(db, samples=5)
     page.select_task(task.task_id)
     services.clock.set(datetime(2026, 8, 1, 9, 30, 15))
     services.dialogs.push('ask_save_path', None)
 
-    page._save_chart_as_png()
+    page.chart_view.save_png_button.click()
 
     call = services.dialogs.last_call('ask_save_path')
     assert call['parent'] is page
@@ -468,179 +498,97 @@ def test_save_chart_success_writes_png(page, db, services, tmp_path):
     target = tmp_path / "chart.png"
     services.dialogs.push('ask_save_path', str(target))
 
-    page._save_chart_as_png()
+    page.chart_view.save_png_button.click()
 
     assert target.exists() and target.stat().st_size > 0
     notice = services.notifier.last()
     assert notice.level == "success" and str(target) in notice.content
 
 
+def test_save_chart_failure_error_stays(page, db, services, monkeypatch, tmp_path):
+    task = _seed_task(db, samples=5)
+    page.select_task(task.task_id)
+    services.dialogs.push('ask_save_path', str(tmp_path / "chart.png"))
+    monkeypatch.setattr(pg_exporters, 'ImageExporter',
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("导出失败")))
+
+    page.chart_view.save_png_button.click()
+
+    error, = services.notifier.messages('error')
+    assert error.effective_duration == -1
+
+
 def test_copy_chart_puts_pixmap_on_clipboard(page, db, services):
     task = _seed_task(db, samples=5)
     page.select_task(task.task_id)
 
-    page._copy_chart_image()
+    page.chart_view.copy_chart_button.click()
 
-    pixmap = services.dialogs.last_call('copy_pixmap')['pixmap']
-    assert not pixmap.isNull()
+    assert not services.dialogs.last_call('copy_pixmap')['pixmap'].isNull()
     assert services.notifier.last().level == "success"
 
 
+def test_copy_chart_failure_error_stays(page, db, services, monkeypatch):
+    task = _seed_task(db, samples=5)
+    page.select_task(task.task_id)
+    monkeypatch.setattr(page.chart_view, 'grab_pixmap',
+                        lambda: (_ for _ in ()).throw(RuntimeError("截图失败")))
+
+    page.chart_view.copy_chart_button.click()
+
+    error, = services.notifier.messages('error')
+    assert error.effective_duration == -1
+
+
 def test_chart_actions_without_data_only_warn(page, services):
-    """没有图表数据时保存/复制只给提示，不弹保存框、不碰剪贴板。"""
-    page._save_chart_as_png()
-    page._copy_chart_image()
+    page.chart_view.save_png_button.click()
+    page.chart_view.copy_chart_button.click()
 
     assert services.notifier.levels() == ["warning", "warning"]
     assert services.dialogs.calls == []
 
 
-def test_copy_chart_failure_error_stays_until_closed(page, db, services, monkeypatch):
-    task = _seed_task(db, samples=5)
-    page.select_task(task.task_id)
-    assert page._chart_x
-
-    def _boom(*args, **kwargs):
-        raise RuntimeError("截图失败")
-
-    monkeypatch.setattr(page.chart_widget, 'grab', _boom)
-
-    page._copy_chart_image()
-
-    errors = services.notifier.messages('error')
-    assert len(errors) == 1
-    assert errors[0].effective_duration == -1
-
+# ---------- 版式 ----------
 
 def test_small_window_scrolls_instead_of_clipping_chart(qapp, db, manager):
     """默认窗口尺寸下图表不能被压出卡片：内容放不下时页面应出现滚动条。"""
-    task = _seed_task(db, samples=20)
-    page = make_history_page(db, manager, make_services())
+    _seed_task(db, samples=20)
+    page = make_history_page(db, manager, make_services(),
+                             worker_runner=SyncHistoryRunner(db), defer=run_now)
     page.resize(930, 640)
     page.show()
     try:
-        page.select_task(task.task_id)
         qapp.processEvents()
-        chart = page.chart_widget
-        card = chart.parentWidget()
-        assert chart.geometry().bottom() <= card.rect().bottom()
-        content = page.widget()
-        if content.minimumSizeHint().height() > page.viewport().height():
+        assert page.content_stack.currentWidget() is page.analysis_page
+        chart = page.chart_view.chart_widget
+        assert chart.geometry().bottom() <= chart.parentWidget().rect().bottom()
+        if page.widget().minimumSizeHint().height() > page.viewport().height():
             assert page.verticalScrollBar().maximum() > 0
     finally:
-        page._auto_refresh_timer.stop()
+        page.auto_refresh.stop()
         page.close()
 
 
-def test_auto_selection_follows_newest_task_but_user_choice_is_kept(page, db):
-    """启动时默认选中的旧任务：出现更新的任务后切到最新；用户主动选过的任务保持不变。"""
-    old = _seed_task(db, samples=5, name="old.exe", start=BASE)
-    page._load_tasks()
-    assert page.current_task_id == old.task_id
-
-    newer = _seed_task(db, samples=5, name="newer.exe", start=BASE + timedelta(hours=1))
-    page._load_tasks()
-    assert page.current_task_id == newer.task_id
-
-    # 用户主动选回旧任务后，再出现新任务也不切走
-    old_index = next(i for i in range(page.task_combo.count())
-                     if page.task_combo.itemData(i) == old.task_id)
-    page.task_combo.setCurrentIndex(old_index)
-    assert page.current_task_id == old.task_id
-    _seed_task(db, samples=5, name="newest.exe", start=BASE + timedelta(hours=2))
-    page._load_tasks()
-    assert page.current_task_id == old.task_id
-
-
-def test_select_task_is_an_explicit_choice(page, db):
-    """从监控页"查看历史"跳转选中的任务，即便不是最新也不被自动切走。"""
-    old = _seed_task(db, samples=5, name="old.exe", start=BASE)
-    _seed_task(db, samples=5, name="newer.exe", start=BASE + timedelta(hours=1))
-    page._load_tasks()
-    page.select_task(old.task_id)
-    page._load_tasks()
-    assert page.current_task_id == old.task_id
-
-
-def test_running_task_duration_label_updates_in_place(page, db, services, monkeypatch):
-    """页面一直开着时，下拉里运行中任务的时长要跟着走；结束后改为最终时长。
-    原地改文字，不重载列表、不打断用户正在看的任务。"""
-    task = _seed_task(db, samples=3, status="running")
-    other = _seed_task(db, samples=3, start=BASE - timedelta(days=1))
-    clock = services.clock
-    services.task_status.set_running(task.task_id)
-    monkeypatch.setattr(page, '_start_auto_refresh_worker', lambda *a, **k: None)
-    clock.set(BASE + timedelta(minutes=5))
-
+@pytest.mark.parametrize("width, compact, columns", [
+    (1400, False, 6), (900, False, 3), (700, True, 3), (500, True, 2)])
+def test_resize_updates_filter_and_stats_layout(qapp, page, width, compact, columns):
+    """页面按视口宽度换算卡片内容宽度：筛选条 < 720 换行；统计条 ≥1100 六列、≥560 三列。"""
+    page.resize(width, 700)
     page.show()
-    page.select_task(other.task_id)
-    index = next(i for i in range(page.task_combo.count())
-                 if page.task_combo.itemData(i) == task.task_id)
-    assert "运行中 5分钟" in page.task_combo.itemText(index)
-
-    reloads = []
-    monkeypatch.setattr(page, '_load_tasks', lambda: reloads.append(1))
-    clock.set(BASE + timedelta(minutes=15))
-    page._on_auto_refresh()
-    assert "运行中 15分钟" in page.task_combo.itemText(index)
-
-    db.update_task_status(task.task_id, "stopped", BASE + timedelta(minutes=20))
-    services.task_status.set_running(task.task_id, False)
-    clock.set(BASE + timedelta(hours=2))
-    page._on_auto_refresh()
-    text = page.task_combo.itemText(index)
-    assert "运行中" not in text and "20分钟" in text
-    assert reloads == []
-    assert page.current_task_id == other.task_id
+    qapp.processEvents()
+    assert page.filter_bar.is_compact() is compact
+    assert page.stats_strip.columns() == columns
+    layout = page.filter_bar.select_layout
+    row, column, _rs, column_span = layout.getItemPosition(
+        layout.indexOf(page.filter_bar.range_segmented))
+    assert (row, column, column_span) == ((2, 1, 3) if compact else (1, 3, 1))
 
 
-# ---------- 读库失败（StorageError）与"暂无数据"区分 ----------
-
-def _raise_storage(*a, **k):
-    from data.errors import StorageError
-    raise StorageError("读取数据点失败: database disk image is malformed")
-
-
-@pytest.mark.parametrize("repo_attr, method", [
-    ("points", "fetch"),
-    ("analytics", "legacy_stats"),
-    ("analytics", "legacy_buckets"),
-    ("markers", "list"),
-    ("tasks", "get"),
-])
-def test_load_failure_shows_read_error_not_empty(page, db, services, monkeypatch,
-                                                 repo_attr, method):
-    task = _seed_task(db, samples=5, markers=[(1, "m")])
-    page.select_task(task.task_id)
-    assert page.content_stack.currentWidget() is page.analysis_page
-    notices_before = len(services.notifier.notices)
-
-    monkeypatch.setattr(getattr(db, repo_attr), method, _raise_storage)
-    page._load_task_data(task.task_id, MetricType.MEMORY_PRIVATE)
-
-    assert page.content_stack.currentWidget() is page.empty_state_page
-    assert page.empty_title_label.text() == "读取数据失败"
-    new = services.notifier.notices[notices_before:]
-    assert [(n.level, n.title) for n in new] == [("error", "读取数据失败")]
-    assert "malformed" in new[0].content
-
-
-def test_task_list_failure_shows_read_error(page, db, services, monkeypatch):
-    _seed_task(db, samples=3)
-    monkeypatch.setattr(db.tasks, "list_with_data", _raise_storage)
-
-    page._load_tasks()
-
-    assert page.empty_title_label.text() == "读取数据失败"
-    assert services.notifier.last().level == "error"
-    assert page.task_combo.count() == 0 and page.current_task_id is None
-
-
-def test_empty_range_still_shows_no_data_wording(page, db, services):
-    """真正没有数据时仍是"暂无数据"文案，且不弹错误"""
-    task = _seed_task(db, samples=3)
-    page.select_task(task.task_id)
-    page.current_range_key = 'all'
-    page._load_task_data(task.task_id, MetricType.NUM_THREADS)   # 该任务没有这个指标的数据
-    assert page.empty_title_label.text() == "该任务暂无数据"
-    assert services.notifier.messages("error") == []
+def test_page_holds_no_query_logic():
+    """页面只做组装：不直接查库、不屏蔽信号、不持有选择状态。"""
+    import inspect
+    import ui.pages.history_page as module
+    source = inspect.getsource(module)
+    for forbidden in ("blockSignals", "_selection_is_auto", "db.tasks", "db.points",
+                      "db.analytics", "db.markers", "get_task(", "run_history_query"):
+        assert forbidden not in source, forbidden

@@ -7,12 +7,13 @@ from datetime import datetime
 from typing import Dict, List, Optional
 
 from PyQt5.QtCore import Qt, pyqtSignal
-from PyQt5.QtGui import QColor
+from PyQt5.QtGui import QColor, QIcon
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                              QGridLayout, QSizePolicy)
 from qfluentwidgets import (
-    PushButton, CardWidget, FluentIcon, CaptionLabel, StrongBodyLabel
+    PushButton, CardWidget, FluentIcon, CaptionLabel, StrongBodyLabel, Theme, isDarkTheme
 )
+from qfluentwidgets.common.icon import FluentIconBase, SvgIconEngine, drawSvgIcon
 
 from core.contracts import StopReason, UnavailableReason
 from ui.components.sparkline import SparklineWidget
@@ -31,19 +32,48 @@ PAUSED_LABEL_DARK_COLOR = QColor("#FF9D42")
 # 卡片身份行里备注的最大显示字数（完整内容放 tooltip）
 NOTE_DISPLAY_CHARS = 40
 
+# 停止图标：16px 实心圆角方块（媒体播放器通行的"停止"）。FluentIcon 里没有合适的：
+# CANCEL 是撤销箭头、CLOSE 是关闭叉号，都会被误读成"取消/关掉卡片"
+_STOP_SVG = ('<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" '
+             'viewBox="0 0 16 16"><rect x="3" y="3" width="10" height="10" rx="1.5" '
+             'fill="{fill}"/></svg>')
+
+
+class StopIcon(FluentIconBase):
+    """自绘停止图标（不依赖图标文件，打包无需附带资源），颜色随主题切换。"""
+
+    @staticmethod
+    def _svg(theme: Theme, fill: str = None) -> str:
+        if fill is None:
+            dark = isDarkTheme() if theme == Theme.AUTO else theme == Theme.DARK
+            fill = "#ffffff" if dark else "#000000"
+        return _STOP_SVG.format(fill=fill)
+
+    def path(self, theme=Theme.AUTO) -> str:
+        # 没有图标文件；库只在 render/icon 里用到 path，二者都已覆盖
+        return ""
+
+    def icon(self, theme=Theme.AUTO, color: QColor = None) -> QIcon:
+        fill = QColor(color).name() if color else None
+        return QIcon(SvgIconEngine(self._svg(theme, fill)))
+
+    def render(self, painter, rect, theme=Theme.AUTO, indexes=None, **attributes):
+        drawSvgIcon(self._svg(theme, attributes.get('fill')).encode(), painter, rect)
+
 
 class TaskCard(CardWidget):
     """监控任务卡片组件"""
 
-    # 按钮信号一律只携带 task_id：TaskCard 不持有 manager，只 emit 信号，由
-    # MonitorPage 调用 manager 并在确认成功后回调 set_paused() 等方法更新显示
-    stop_clicked = pyqtSignal(str)
-    pause_clicked = pyqtSignal(str)
-    resume_clicked = pyqtSignal(str)
-    marker_clicked = pyqtSignal(str)
-    history_clicked = pyqtSignal(str)    # 已结束卡片："查看历史"
-    restart_clicked = pyqtSignal(str)    # 已结束卡片："重新监控"
-    close_clicked = pyqtSignal(str)      # 已结束卡片："关闭"（移除卡片）
+    # 按钮信号一律只携带 task_id：TaskCard 不持有 manager，只 emit 信号，经
+    # TaskBoard 转发给 MonitorPresenter，后者调用 manager 并在成功后回调
+    # set_paused() 等方法更新显示
+    stop_requested = pyqtSignal(str)
+    pause_requested = pyqtSignal(str)
+    resume_requested = pyqtSignal(str)
+    marker_requested = pyqtSignal(str)
+    history_requested = pyqtSignal(str)    # 已结束卡片："查看历史"
+    restart_requested = pyqtSignal(str)    # 已结束卡片："重新监控"
+    close_requested = pyqtSignal(str)      # 已结束卡片："关闭"（移除卡片）
 
     # 指标值网格每行列数
     VALUE_COLUMNS = 3
@@ -87,9 +117,6 @@ class TaskCard(CardWidget):
         # 暂停/结束状态；卡片创建时任务必为运行态
         self.is_paused = False
         self.is_finished = False
-
-        # 打点标签的递增序号（默认标签"标记 N"）
-        self.marker_seq = 1
 
         self._init_ui()
 
@@ -167,7 +194,7 @@ class TaskCard(CardWidget):
         self.marker_button = PushButton("打点", self, FluentIcon.TAG)
         self.marker_button.setToolTip("在当前时刻记录一个事件标记（如：开始第 3 轮建模）")
         self.marker_button.clicked.connect(
-            lambda: self.marker_clicked.emit(self.task_id))
+            lambda: self.marker_requested.emit(self.task_id))
         self.marker_button.setFixedWidth(88)
         running_layout.addWidget(self.marker_button)
 
@@ -178,9 +205,9 @@ class TaskCard(CardWidget):
 
         running_layout.addSpacing(20)
 
-        self.stop_button = PushButton("停止", self, FluentIcon.CANCEL)
+        self.stop_button = PushButton("停止", self, StopIcon())
         self.stop_button.setToolTip("停止后本任务不可续采")
-        self.stop_button.clicked.connect(lambda: self.stop_clicked.emit(self.task_id))
+        self.stop_button.clicked.connect(lambda: self.stop_requested.emit(self.task_id))
         self.stop_button.setFixedWidth(88)
         running_layout.addWidget(self.stop_button)
         header_layout.addWidget(self.running_actions, 0, Qt.AlignRight | Qt.AlignTop)
@@ -193,19 +220,19 @@ class TaskCard(CardWidget):
 
         self.history_button = PushButton("查看历史", self, FluentIcon.HISTORY)
         self.history_button.clicked.connect(
-            lambda: self.history_clicked.emit(self.task_id))
+            lambda: self.history_requested.emit(self.task_id))
         finished_layout.addWidget(self.history_button)
 
         self.restart_button = PushButton("重新监控", self, FluentIcon.PLAY)
         self.restart_button.setToolTip("按进程名查找进程，并以相同的指标、周期和备注新建任务")
         self.restart_button.clicked.connect(
-            lambda: self.restart_clicked.emit(self.task_id))
+            lambda: self.restart_requested.emit(self.task_id))
         finished_layout.addWidget(self.restart_button)
 
         self.close_button = PushButton("关闭", self, FluentIcon.CLOSE)
         self.close_button.setToolTip("从列表移除此卡片（历史数据仍保留）")
         self.close_button.clicked.connect(
-            lambda: self.close_clicked.emit(self.task_id))
+            lambda: self.close_requested.emit(self.task_id))
         finished_layout.addWidget(self.close_button)
         self.finished_actions.setVisible(False)
         header_layout.addWidget(self.finished_actions, 0, Qt.AlignRight | Qt.AlignTop)
@@ -344,14 +371,14 @@ class TaskCard(CardWidget):
         """
         暂停/恢复按钮点击：只负责按当前状态 emit 对应信号，不直接调用 manager。
 
-        按钮图标/文案与"已暂停"提示不在这里乐观更新——留给 MonitorPage 在确认
+        按钮图标/文案与"已暂停"提示不在这里乐观更新——留给 MonitorPresenter 在确认
         manager.pause_task/resume_task 调用成功后回调 set_paused()，避免任务
         已不在运行（如正在停止）导致调用失败时，卡片显示与真实状态不一致。
         """
         if self.is_paused:
-            self.resume_clicked.emit(self.task_id)
+            self.resume_requested.emit(self.task_id)
         else:
-            self.pause_clicked.emit(self.task_id)
+            self.pause_requested.emit(self.task_id)
 
     def set_paused(self, is_paused: bool) -> None:
         """
@@ -407,11 +434,3 @@ class TaskCard(CardWidget):
 
         self.running_actions.setVisible(False)
         self.finished_actions.setVisible(True)
-
-    def next_marker_label(self) -> str:
-        """下一个打点的默认标签（"标记 N"，N 随成功打点递增）。"""
-        return f"标记 {self.marker_seq}"
-
-    def note_marker_added(self) -> None:
-        """打点成功后递增默认标签序号。"""
-        self.marker_seq += 1

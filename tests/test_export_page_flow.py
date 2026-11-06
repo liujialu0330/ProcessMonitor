@@ -4,7 +4,9 @@
 
 页面经 tests/factories.make_export_page 构造：提示、对话框、时钟、任务运行状态
 都是替身（RecordingNotifier / ScriptedDialogs / FakeClock / FakeTaskStatus），
-不替换页面模块里的任何名字。
+不替换页面模块里的任何名字。操作尽量走公开接口：reload_tasks / refresh_running_tasks、
+按钮 click()、TaskSelector（用户点选经 _user_select）；只有导出线程信号槽的时序
+用例直接调用槽函数。
 """
 import csv
 import inspect
@@ -43,6 +45,11 @@ def _seed_task(db, samples=5, name="demo.exe", pid=4321, start=BASE, note="",
     for offset, label in markers:
         db.add_marker(task.task_id, start + timedelta(seconds=offset), label)
     return task
+
+
+def _user_select(page, index):
+    """模拟用户在任务下拉里点选第 index 项（对内部 ComboBox 设当前项与点选等价）。"""
+    page.task_selector.combo.setCurrentIndex(index)
 
 
 class _HookedDialogs(ScriptedDialogs):
@@ -93,14 +100,14 @@ def task_status(services):
 @pytest.fixture
 def page(qapp, db, manager, services, tmp_path):
     widget = make_export_page(db, manager, services)
-    widget._last_dir = str(tmp_path)
+    widget.last_dir = str(tmp_path)
     widget.resize(900, 700)
     yield widget
-    worker = widget._export_worker
+    worker = widget.export_worker
     if worker is not None:
         worker.cancel()
         worker.wait(5000)
-    widget._running_refresh_timer.stop()
+    widget.running_timer.stop()
     widget.close()
 
 
@@ -118,7 +125,7 @@ def test_constructor_requires_injected_dependencies():
 
 def test_default_save_path_is_last_dir_plus_task_filename(page, db, tmp_path):
     task = _seed_task(db)
-    page._load_tasks()
+    page.reload_tasks()
 
     assert page.current_task_id == task.task_id
     assert page.path_edit.text() == str(tmp_path / "demo_4321_20260716_205451.csv")
@@ -127,23 +134,23 @@ def test_default_save_path_is_last_dir_plus_task_filename(page, db, tmp_path):
 def test_save_path_resets_when_task_switches(page, db, tmp_path):
     first = _seed_task(db, name="a.exe", pid=1, start=BASE)
     second = _seed_task(db, name="b.exe", pid=2, start=BASE + timedelta(hours=1))
-    page._load_tasks()
-    ids = [page.task_combo.itemData(i) for i in range(page.task_combo.count())]
+    page.reload_tasks()
+    ids = [page.task_selector.task_id_at(i) for i in range(page.task_selector.count())]
     assert set(ids) == {first.task_id, second.task_id}
 
-    page.task_combo.setCurrentIndex(ids.index(first.task_id))
+    _user_select(page, ids.index(first.task_id))
     assert os.path.basename(page.path_edit.text()).startswith("a_1_")
-    page.task_combo.setCurrentIndex(ids.index(second.task_id))
+    _user_select(page, ids.index(second.task_id))
     assert os.path.basename(page.path_edit.text()).startswith("b_2_")
 
 
 def test_manual_path_is_kept_when_list_reloads_same_task(page, db, tmp_path):
     _seed_task(db)
-    page._load_tasks()
+    page.reload_tasks()
     custom = str(tmp_path / "我的导出.csv")
     page.path_edit.setText(custom)
 
-    page._load_tasks()   # 页面再次显示 -> 重新载入列表，任务没变
+    page.reload_tasks()   # 页面再次显示 -> 重新载入列表，任务没变
 
     assert page.path_edit.text() == custom
 
@@ -151,13 +158,13 @@ def test_manual_path_is_kept_when_list_reloads_same_task(page, db, tmp_path):
 def test_browse_remembers_directory_for_next_task(page, db, dialogs, tmp_path):
     first = _seed_task(db, name="a.exe", pid=1, start=BASE)
     _seed_task(db, name="b.exe", pid=2, start=BASE + timedelta(hours=1))
-    page._load_tasks()
+    page.reload_tasks()
     chosen_dir = tmp_path / "reports"
     chosen_dir.mkdir()
     default_before = page.path_edit.text()
     dialogs.push('ask_save_path', str(chosen_dir / "x.csv"))
 
-    page._browse_save_path()
+    page.browse_button.click()
     assert page.path_edit.text() == str(chosen_dir / "x.csv")
     call = dialogs.last_call('ask_save_path')
     assert call["parent"] is page
@@ -165,74 +172,74 @@ def test_browse_remembers_directory_for_next_task(page, db, dialogs, tmp_path):
     assert call["default_path"] == default_before
     assert call["name_filter"] == CSV_FILTER
 
-    other = [i for i in range(page.task_combo.count())
-             if page.task_combo.itemData(i) != page.current_task_id][0]
-    page.task_combo.setCurrentIndex(other)
+    other = [i for i in range(page.task_selector.count())
+             if page.task_selector.task_id_at(i) != page.current_task_id][0]
+    _user_select(page, other)
     assert os.path.dirname(page.path_edit.text()) == str(chosen_dir)
     assert first is not None
 
 
 def test_browse_cancel_keeps_path(page, db, dialogs):
     _seed_task(db)
-    page._load_tasks()
+    page.reload_tasks()
     before = page.path_edit.text()
     dialogs.push('ask_save_path', None)
-    page._browse_save_path()
+    page.browse_button.click()
     assert page.path_edit.text() == before
     assert len(dialogs.calls_of('ask_save_path')) == 1
 
 
 def test_overwrite_requires_confirmation(page, db, dialogs, tmp_path):
     _seed_task(db)
-    page._load_tasks()
+    page.reload_tasks()
     existing = tmp_path / "exists.csv"
     existing.write_text("原有内容", encoding='utf-8')
     page.path_edit.setText(str(existing))
 
     dialogs.push('confirm', False)
-    page._export_data()
-    assert page._export_worker is None
+    page.export_button.click()
+    assert page.export_worker is None
     assert existing.read_text(encoding='utf-8') == "原有内容"
 
     dialogs.push('confirm', True)
-    page._export_data()
+    page.export_button.click()
     asked = dialogs.calls_of('confirm')
     assert len(asked) == 2
     assert all(str(existing) in call["content"] for call in asked)
     assert asked[-1]["title"] == "文件已存在"
     assert asked[-1]["confirm_text"] == "覆盖"
     assert asked[-1]["parent"] is page.window()
-    assert page._export_worker is not None
+    assert page.export_worker is not None
 
 
 def test_no_overwrite_prompt_for_new_file(page, db, dialogs):
     _seed_task(db)
-    page._load_tasks()
-    page._export_data()
+    page.reload_tasks()
+    page.export_button.click()
     assert 'confirm' not in dialogs.methods_called()
-    assert page._export_worker is not None
+    assert page.export_worker is not None
 
 
 def test_export_with_empty_path_opens_save_dialog_first(page, db, dialogs, tmp_path):
     """路径被清空时点导出：直接弹保存对话框，选好后继续导出"""
     _seed_task(db)
-    page._load_tasks()
+    page.reload_tasks()
     page.path_edit.setText("")
     dialogs.push('ask_save_path', str(tmp_path / "chosen.csv"))
 
-    page._export_data()
+    page.export_button.click()
 
     assert page.path_edit.text() == str(tmp_path / "chosen.csv")
-    assert page._export_worker is not None
+    assert page.export_worker is not None
 
 
 def test_export_worker_reuses_page_db(page, db):
     """导出线程复用页面持有的 Database 实例，不按路径另建"""
     _seed_task(db)
-    page._load_tasks()
-    page._export_data()
-    assert page._export_worker is not None
-    assert page._export_worker.db is page.db
+    page.reload_tasks()
+    page.export_button.click()
+    assert page.export_worker is not None
+    assert page.export_worker.db is page.db
 
 
 # ---------- 错误提示 ----------
@@ -245,18 +252,21 @@ def test_error_infobars_stay_until_closed(page, db, notifier, monkeypatch):
     assert notice.effective_duration == -1
     assert notice.parent is page
 
+    # 列表里有、但读取任务详情失败（如刚被别处删除）：载入摘要时报错
+    _seed_task(db)
     monkeypatch.setattr(db, 'get_task', lambda task_id: None)
-    page._load_task_info("不存在的任务")
+    page.reload_tasks()
     notice = notifier.last()
-    assert notice.level == "error"
+    assert (notice.level, notice.title) == ("error", "任务加载失败")
     assert notice.effective_duration == -1
+    assert page.process_name_label.text() == "未选择任务"
 
 
 # ---------- 千分位与任务来源 ----------
 
 def test_task_info_uses_thousands_separators(page, db):
     task = _seed_task(db, samples=3)
-    page._load_tasks()
+    page.reload_tasks()
     assert page.current_task_id == task.task_id
 
     page._on_export_progress(1234567)
@@ -269,11 +279,11 @@ def test_task_list_comes_from_single_query(page, db, monkeypatch):
     counted = []
     monkeypatch.setattr(
         db, 'get_data_point_count', lambda *a, **k: counted.append(1) or 0)
-    page._load_tasks()
+    page.reload_tasks()
     # 只有选中任务的信息面板会统计一次，下拉列表本身不逐任务 COUNT
     assert len(counted) <= 1
-    assert page.task_combo.count() == 2
-    texts = [page.task_combo.itemText(i) for i in range(page.task_combo.count())]
+    assert page.task_selector.count() == 2
+    texts = [page.task_selector.item_text(i) for i in range(page.task_selector.count())]
     assert any("2026-07-16 20:54" in text for text in texts)
 
 
@@ -306,21 +316,21 @@ def test_open_folder_button_opens_export_dir_and_tolerates_failure(
 def test_result_slots_do_not_release_worker(page, db, tmp_path):
     page._export_worker = sentinel = object()
     page._on_export_finished(str(tmp_path / "x.csv"), 1, 1)
-    assert page._export_worker is sentinel
+    assert page.export_worker is sentinel
     page._on_export_error("失败")
-    assert page._export_worker is sentinel
+    assert page.export_worker is sentinel
     page._export_worker = None
 
 
 def test_export_end_to_end_releases_worker_on_thread_finished(
         page, db, notifier, tmp_path):
     _seed_task(db, samples=6, markers=[(2, "第1轮")])
-    page._load_tasks()
+    page.reload_tasks()
     target = tmp_path / "out.csv"
     page.path_edit.setText(str(target))
 
-    page._export_data()
-    worker = page._export_worker
+    page.export_button.click()
+    worker = page.export_worker
     assert worker is not None
     assert not page.export_button.isEnabled()
     # 登记到线程登记表：退出时先取消（删除半成品临时文件）再等 2 秒
@@ -330,7 +340,7 @@ def test_export_end_to_end_releases_worker_on_thread_finished(
 
     from PyQt5.QtWidgets import QApplication
     assert poll_until(lambda: (QApplication.processEvents() or True)
-                      and page._export_worker is None, timeout=15)
+                      and page.export_worker is None, timeout=15)
     assert page.export_button.isEnabled()
     assert notifier.last().level == "success"
     # 线程结束后由登记表自动注销
@@ -347,7 +357,7 @@ def test_export_end_to_end_releases_worker_on_thread_finished(
 def test_export_finished_refreshes_task_summary(page, db, tmp_path):
     """运行中任务导出期间仍在采集：导出完成后摘要的采集次数要同步更新。"""
     task = _seed_task(db, samples=3)
-    page._load_tasks()
+    page.reload_tasks()
     assert "3 次采集" in page.data_count_label.text()
 
     db.save_data_points([
@@ -369,8 +379,8 @@ def test_running_task_label_and_summary_refresh_while_visible(
     clock.set(BASE + timedelta(minutes=5))
 
     page.show()
-    assert page._running_refresh_timer.isActive()
-    assert "运行中 5分钟" in page.task_combo.itemText(0)
+    assert page.running_timer.is_active()
+    assert "运行中 5分钟" in page.task_selector.item_text(0)
     assert page.status_label.text() == "运行中"
     assert page.end_time_label.text() == "进行中"
     page.path_edit.setText(r"D:\导出\a.csv")
@@ -380,26 +390,26 @@ def test_running_task_label_and_summary_refresh_while_visible(
                   MetricType.NUM_THREADS)
         for i in range(2)])
     clock.set(BASE + timedelta(minutes=15))
-    page._refresh_running_tasks()
-    assert "运行中 15分钟" in page.task_combo.itemText(0)
+    page.refresh_running_tasks()
+    assert "运行中 15分钟" in page.task_selector.item_text(0)
     assert "5 次采集" in page.data_count_label.text()
 
     # 任务结束：采集线程退出、库里写入结束时间
     task_status.set_running(task.task_id, False)
     db.update_task_status(task.task_id, "stopped", BASE + timedelta(minutes=20))
-    page._refresh_running_tasks()
-    text = page.task_combo.itemText(0)
+    page.refresh_running_tasks()
+    text = page.task_selector.item_text(0)
     assert "运行中" not in text and "20分钟" in text
     assert page.status_label.text() == "已停止"
     assert page.path_edit.text() == r"D:\导出\a.csv"
 
     # 结束后再推进时钟：最终时长不再变化
     clock.advance(timedelta(hours=1))
-    page._refresh_running_tasks()
-    assert page.task_combo.itemText(0) == text
+    page.refresh_running_tasks()
+    assert page.task_selector.item_text(0) == text
 
     page.hide()
-    assert not page._running_refresh_timer.isActive()
+    assert not page.running_timer.is_active()
 
 
 def test_running_state_follows_task_status_not_db_column(page, db, clock, task_status):
@@ -408,18 +418,18 @@ def test_running_state_follows_task_status_not_db_column(page, db, clock, task_s
     orphan = _seed_task(db, samples=3, status="running")
     clock.set(BASE + timedelta(hours=2))
 
-    page._load_tasks()
+    page.reload_tasks()
 
     assert page.current_task_id == orphan.task_id
-    text = page.task_combo.itemText(0)
+    text = page.task_selector.item_text(0)
     assert "运行中" not in text and text.endswith("2秒")
     assert page.status_label.text() == "已停止"
     assert page.end_time_label.text() == (
         BASE + timedelta(seconds=2)).strftime('%Y-%m-%d %H:%M:%S')
 
     clock.advance(timedelta(hours=1))
-    page._refresh_running_tasks()
-    assert page.task_combo.itemText(0) == text
+    page.refresh_running_tasks()
+    assert page.task_selector.item_text(0) == text
 
 
 def test_stopping_task_still_counts_as_running(page, db, clock, task_status):
@@ -428,10 +438,40 @@ def test_stopping_task_still_counts_as_running(page, db, clock, task_status):
     task_status.set_running(task.task_id)
     clock.set(BASE + timedelta(minutes=7))
 
-    page._load_tasks()
+    page.reload_tasks()
 
-    assert "运行中 7分钟" in page.task_combo.itemText(0)
+    assert "运行中 7分钟" in page.task_selector.item_text(0)
     assert page.status_label.text() == "运行中"
+
+
+# ---------- 空状态 ----------
+
+def test_empty_state_card_replaces_export_card(page, db):
+    """没有可导出任务：空状态卡代替整张导出卡；有了任务后点页头"刷新"恢复。"""
+    page.reload_tasks()
+    assert page.empty_state_card.isVisibleTo(page)
+    assert not page.export_card.isVisibleTo(page)
+    assert page.task_selector.count() == 0 and page.current_task_id is None
+    assert page.path_edit.text() == ""
+
+    task = _seed_task(db)
+    page.refresh_button.click()
+    assert page.export_card.isVisibleTo(page)
+    assert not page.empty_state_card.isVisibleTo(page)
+    assert page.current_task_id == task.task_id
+
+
+def test_current_option_tooltip_follows_selection(page, db, clock):
+    """下拉框提示是当前任务的完整信息（与历史页同口径）。"""
+    from ui.formatting import format_task_tooltip
+    first = _seed_task(db, name="a.exe", pid=1, start=BASE, note="完整备注")
+    _seed_task(db, name="b.exe", pid=2, start=BASE + timedelta(hours=1))
+    page.reload_tasks()
+    ids = [option.task_id for option in page.task_selector.options()]
+    _user_select(page, ids.index(first.task_id))
+    assert page.task_selector.tooltip() == format_task_tooltip(
+        db.get_task(first.task_id), False, clock.now())
+    assert "完整备注" in page.task_selector.tooltip()
 
 
 # ---------- 与清理数据库互斥 ----------
@@ -440,17 +480,17 @@ def test_export_registers_with_manager_until_thread_finished(
         page, manager, db, tmp_path):
     """开始导出即登记（此时不能开始清理数据库），线程结束后注销"""
     _seed_task(db, samples=6)
-    page._load_tasks()
+    page.reload_tasks()
     page.path_edit.setText(str(tmp_path / "out.csv"))
 
-    page._export_data()
-    assert page._export_worker is not None
+    page.export_button.click()
+    assert page.export_worker is not None
     assert manager.has_running_exports() is True
     assert manager.begin_maintenance() is False
 
     from PyQt5.QtWidgets import QApplication
     assert poll_until(lambda: (QApplication.processEvents() or True)
-                      and page._export_worker is None, timeout=15)
+                      and page.export_worker is None, timeout=15)
     assert manager.has_running_exports() is False
     assert manager.begin_maintenance() is True
     manager.end_maintenance()
@@ -465,7 +505,7 @@ def test_export_unregisters_even_if_worker_reference_replaced(page, manager):
         page._on_export_thread_finished(old_worker)
 
         assert manager.has_running_exports() is False
-        assert page._export_worker is newer
+        assert page.export_worker is newer
     finally:
         page._export_worker = None
 
@@ -473,14 +513,14 @@ def test_export_unregisters_even_if_worker_reference_replaced(page, manager):
 def test_export_refused_during_maintenance(page, manager, db, notifier, dialogs):
     """清理数据库进行中：不弹保存对话框、不启动导出线程，并提示稍后再导出"""
     _seed_task(db)
-    page._load_tasks()
+    page.reload_tasks()
     page.path_edit.setText("")
     assert manager.begin_maintenance() is True
 
-    page._export_data()
+    page.export_button.click()
 
     assert dialogs.calls_of('ask_save_path') == []
-    assert page._export_worker is None
+    assert page.export_worker is None
     assert manager.has_running_exports() is False
     notice = notifier.last()
     assert notice.level == "warning"
@@ -492,17 +532,17 @@ def test_export_refused_if_maintenance_starts_during_overwrite_confirm(
         page, manager, db, notifier, dialogs, tmp_path):
     """覆盖确认框期间清理已开始：以登记结果为准，不启动导出线程"""
     _seed_task(db)
-    page._load_tasks()
+    page.reload_tasks()
     existing = tmp_path / "exists.csv"
     existing.write_text("原有内容", encoding='utf-8')
     page.path_edit.setText(str(existing))
     dialogs.push('confirm', True)
     dialogs.on_confirm = manager.begin_maintenance
 
-    page._export_data()
+    page.export_button.click()
 
     assert manager.is_maintenance_running() is True
-    assert page._export_worker is None
+    assert page.export_worker is None
     assert manager.has_running_exports() is False
     assert notifier.last().content == "正在清理数据库，请稍后再导出"
     assert page.export_button.isEnabled()
@@ -511,8 +551,8 @@ def test_export_refused_if_maintenance_starts_during_overwrite_confirm(
 
 def test_no_task_selected_warns_without_dialogs(page, notifier, dialogs):
     """尚未选择任务时点浏览/导出：只提示先选任务，不弹保存对话框"""
-    page._browse_save_path()
-    page._export_data()
+    page.browse_button.click()
+    page.export_button.click()
 
     assert [n.title for n in notifier.messages("warning")] == ["请选择任务"] * 2
     assert dialogs.methods_called() == []
