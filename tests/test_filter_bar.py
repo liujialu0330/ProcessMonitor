@@ -69,7 +69,8 @@ def test_range_defaults_to_all_and_set_range_is_silent(bar):
     assert DEFAULT_RANGE_KEY == 'all'
     assert bar.current_range() == 'all'
     assert [item.text() for item in bar.range_segmented.items.values()] == [
-        text for _key, text in RANGE_OPTIONS] == ['10分钟', '1小时', '6小时', '24小时', '全部']
+        text for _key, text in RANGE_OPTIONS] == [
+            '自基线', '10分钟', '1小时', '6小时', '24小时', '全部']
 
     bar.set_range('1h')
     assert bar.current_range() == '1h'
@@ -77,6 +78,24 @@ def test_range_defaults_to_all_and_set_range_is_silent(bar):
 
     bar.range_segmented.setCurrentItem('10m')   # 等同用户点击
     assert changed == ['10m']
+
+
+def test_baseline_range_disabled_until_available(bar):
+    """"自基线"在任务没有基线打点时禁用（tooltip 说明原因），有基线后可选"""
+    item = bar.range_segmented.items['baseline']
+    assert bar.baseline_available() is False and not item.isEnabled()
+    assert item.toolTip() == "该任务还没有基线打点"
+
+    bar.set_baseline_available(True)
+    assert bar.baseline_available() is True and item.isEnabled()
+    assert item.toolTip() == "只看基线打点之后的数据"
+
+    changed = _record(bar.range_changed)
+    bar.range_segmented.setCurrentItem('baseline')
+    assert changed == ['baseline'] and bar.current_range() == 'baseline'
+
+    bar.set_baseline_available(False)
+    assert not item.isEnabled()
 
 
 def test_view_switch(bar):

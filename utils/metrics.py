@@ -520,3 +520,44 @@ def format_metric_rate(metric_type: str, per_hour: float) -> str:
     if _text_is_zero(body):
         return "±0/小时"
     return ("+" if per_hour > 0 else "-") + body + "/小时"
+
+
+# ---------- 历史分析的显示类别（由 kind 派生，供统计条与图表选择口径） ----------
+# 水位量：正常显示数值、回归增速与趋势判定
+VALUE_CLASS_LEVEL = "level"
+# 累计量：图表画每秒速率，统计改为平均/峰值速率（CPU 累计时间同属此类）
+VALUE_CLASS_RATE = "rate"
+# 历史峰值：只增不减，不外推增速，统计"峰值抬升"次数与幅度
+VALUE_CLASS_PEAK = "peak"
+
+_RATE_CLASS_KINDS = frozenset({
+    MetricKind.CUMULATIVE_COUNT, MetricKind.CUMULATIVE_BYTES, MetricKind.SECONDS,
+})
+
+# 单进程对象数上限（Windows 默认配额），用于显示"已用 x%"
+OBJECT_COUNT_LIMIT = 10000
+_OBJECT_LIMITED_METRICS = frozenset({
+    MetricType.NUM_GDI_OBJECTS, MetricType.NUM_USER_OBJECTS,
+})
+
+
+def value_class(metric_type: Optional[str]) -> str:
+    """指标在历史分析里的显示类别：VALUE_CLASS_LEVEL / RATE / PEAK。
+
+    None 与未知键按水位量处理（与 is_cumulative_metric 对未知键返回 False 一致）。
+    """
+    kind = _kind_of(metric_type)
+    if kind is MetricKind.PEAK:
+        return VALUE_CLASS_PEAK
+    if kind in _RATE_CLASS_KINDS:
+        return VALUE_CLASS_RATE
+    return VALUE_CLASS_LEVEL
+
+
+def object_count_limit(metric_type: Optional[str]) -> Optional[int]:
+    """GDI/USER 对象数的单进程上限；其余指标返回 None。"""
+    if metric_type is None:
+        return None
+    if canonical_metric_type(metric_type) in _OBJECT_LIMITED_METRICS:
+        return OBJECT_COUNT_LIMIT
+    return None

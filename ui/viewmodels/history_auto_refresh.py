@@ -83,5 +83,6 @@ class HistoryAutoRefresh(QObject):
 
     @pyqtSlot(object)
     def _on_snapshot(self, snapshot: HistorySnapshot) -> None:
-        if snapshot.stats:
-            self.update_interval(snapshot.stats['count'])
+        # 按显示范围的总条数分档（统计可能只覆盖基线之后，不能代表图表的数据量）
+        if snapshot.total_count:
+            self.update_interval(snapshot.total_count)

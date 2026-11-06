@@ -7,7 +7,7 @@ import statistics
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, Callable, List, Optional, Sequence, Tuple
 
 Point = Tuple[datetime, float]
 
@@ -148,3 +148,52 @@ def baseline_delta(points: Sequence[Point], baseline_ts: datetime, n: int = 5, *
     if base is None:
         return None
     return pts[-1][1] - base
+
+
+@dataclass(frozen=True)
+class RoundDelta:
+    """
+    一轮的增量：相邻两个打点之间，右边界打点的标签即这一轮的名字。
+    start_value / end_value 是两端打点处的参考值（通常取打点之后若干样本的中位数），
+    任一端取不到值时 delta 为 None。
+    """
+    index: int
+    label: str
+    start: datetime
+    end: datetime
+    start_value: Optional[float]
+    end_value: Optional[float]
+    delta: Optional[float]
+
+
+def round_deltas(boundaries: Sequence[Boundary],
+                 value_at: Callable[[datetime], Optional[float]]) -> List[RoundDelta]:
+    """
+    逐轮增量：按时间排序的相邻边界两两成一轮（不补首末段：首个打点之前是预热、
+    最后一个打点之后是未完成的一轮）。value_at(ts) 给出边界处的参考值，
+    每个边界只调用一次。边界少于 2 个时返回空列表。
+    """
+    edges = sorted(boundaries, key=lambda b: b.timestamp)
+    if len(edges) < 2:
+        return []
+    values = [value_at(b.timestamp) for b in edges]
+    result: List[RoundDelta] = []
+    for i in range(len(edges) - 1):
+        left, right = values[i], values[i + 1]
+        delta = right - left if left is not None and right is not None else None
+        result.append(RoundDelta(
+            index=i, label=edges[i + 1].label,
+            start=edges[i].timestamp, end=edges[i + 1].timestamp,
+            start_value=left, end_value=right, delta=delta))
+    return result
+
+
+def mean_round_delta(intervals: Sequence[Any]) -> Optional[float]:
+    """
+    各轮增量的均值（"每轮 +X"）。intervals 为带 delta 属性的序列
+    （IntervalStats 或 RoundDelta）；delta 为 None 的轮次不计入，全部为 None 或为空时返回 None。
+    """
+    deltas = [item.delta for item in intervals if item.delta is not None]
+    if not deltas:
+        return None
+    return sum(deltas) / len(deltas)

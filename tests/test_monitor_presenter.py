@@ -1,17 +1,20 @@
 """
 监控页 Presenter：用假表单、假面板、假 manager 与服务替身覆盖全部业务流程——
 新建任务（指标、目标校验文案、重复 PID 确认）、停止确认、暂停/恢复、打点（点击时刻、
-默认标签递增、失败提示）、任务结束（卡片转已结束、表单清掉已退出进程、异常结束提示）、
+默认标签序列"基线 / 第 N 轮"、类型推断、失败提示）、卡片基线（5 个样本中位数、换基线、
+删基线）、任务结束（卡片转已结束、表单清掉已退出进程、异常结束提示）、
 指标不可用（管理员提示）、错误去重、上限提示、重新监控三种情况、关闭卡片与表单折叠。
 """
 from datetime import datetime, timedelta
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import pytest
 from PyQt5.QtCore import QObject, pyqtSignal
 from PyQt5.QtWidgets import QWidget
 
 from core.contracts import StopReason, TaskInfo, TaskStatus, UnavailableReason
+from core.monitor_manager import BASELINE_LABEL, BaselineSamples, round_label
+from data.models import Marker
 from tests.doubles import DEFAULT_FAKE_NOW, FakePreferences, FakeProcessQuery
 from tests.factories import make_services
 from ui.presenters.monitor_presenter import (
@@ -41,10 +44,15 @@ class FakeManager(QObject):
     error_occurred = pyqtSignal(str, str)
     metrics_unavailable = pyqtSignal(str, dict)
     task_limit_reached = pyqtSignal()
+    markers_changed = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
         self.infos: Dict[str, TaskInfo] = {}
+        # 内存版打点表：与真实 manager 的序列/基线规则一致（真实规则由
+        # test_monitor_manager_api 覆盖，这里只为驱动 Presenter）
+        self.markers: Dict[str, List[Marker]] = {}
+        self.seeds: Dict[str, BaselineSamples] = {}
         self.created: List[tuple] = []
         self.commands: List[tuple] = []
         self.running_pids = set()
@@ -97,21 +105,84 @@ class FakeManager(QObject):
         self.infos.pop(task_id, None)
         return True
 
-    def add_marker(self, task_id, label, timestamp=None):
-        self.commands.append(("marker", task_id, label, timestamp))
-        return timestamp if self.marker_ok else None
+    def add_marker(self, task_id, label, timestamp=None, kind='user'):
+        self.commands.append(("marker", task_id, label, timestamp, kind))
+        if not self.marker_ok:
+            return None
+        markers = self.markers.setdefault(task_id, [])
+        if kind == 'baseline':
+            markers[:] = [Marker(m.task_id, m.timestamp, m.label, m.id,
+                                 'user' if m.kind == 'baseline' else m.kind)
+                          for m in markers]
+        marker = Marker(task_id, timestamp, label.strip(),
+                        sum(len(v) for v in self.markers.values()) + 1, kind)
+        markers.append(marker)
+        self.markers_changed.emit(task_id)
+        return marker
+
+    def list_markers(self, task_id):
+        return list(self.markers.get(task_id, []))
+
+    def get_baseline(self, task_id, markers=None):
+        markers = self.list_markers(task_id) if markers is None else markers
+        return next((m for m in markers if m.kind == 'baseline'), None)
+
+    def next_marker_label(self, task_id):
+        markers = self.list_markers(task_id)
+        if self.get_baseline(task_id, markers) is None:
+            return BASELINE_LABEL
+        return round_label(sum(1 for m in markers if m.kind == 'user') + 1)
+
+    def baseline_samples(self, task_id, baseline=None):
+        return self.seeds.get(task_id, BaselineSamples(marker=baseline))
+
+    def delete_all_markers(self, task_id):
+        self.markers[task_id] = []
+        self.markers_changed.emit(task_id)
 
 
 class FakeCard:
+    """记录 Presenter 对卡片的调用。基线相关调用另存到 baseline / baseline_events，
+    时间推进（tick / set_started_at）与刻度（set_markers）也单独记，避免干扰
+    calls 的精确断言。"""
+
+    _RECORDED = ("update_values", "increment_count", "mark_unavailable",
+                 "set_paused", "set_stopping")
+
     def __init__(self, info: TaskInfo):
         self.info = info
         self.calls: List[tuple] = []
+        self.ticks: List[datetime] = []
+        self.started_at: Optional[datetime] = None
+        self.markers: List[Marker] = []
+        self.baseline: Optional[tuple] = None      # (时间, {指标: 值})
+        self.baseline_events: List[tuple] = []
 
     def __getattr__(self, name):
-        if name in ("update_values", "increment_count", "mark_unavailable",
-                    "set_paused", "set_stopping"):
+        if name in self._RECORDED:
             return lambda *args: self.calls.append((name,) + args)
         raise AttributeError(name)
+
+    def tick(self, now):
+        self.ticks.append(now)
+
+    def set_started_at(self, when):
+        self.started_at = when
+
+    def set_markers(self, markers):
+        self.markers = list(markers)
+
+    def set_baseline(self, timestamp, values=None):
+        self.baseline = (timestamp, dict(values or {}))
+        self.baseline_events.append(("set", timestamp))
+
+    def set_baseline_value(self, metric, value):
+        self.baseline[1][metric] = value
+        self.baseline_events.append(("value", metric, value))
+
+    def clear_baseline(self):
+        self.baseline = None
+        self.baseline_events.append(("clear",))
 
 
 class FakeBoard(QObject):
@@ -360,8 +431,33 @@ def test_data_updated_updates_card_values_and_count(presenter, manager, board):
     task_id = _add_task(manager)
     manager.data_updated.emit(task_id, {MetricType.MEMORY_PRIVATE: 1.0})
     manager.data_updated.emit("unknown", {})
+    # 收到数据的时刻经注入时钟传给卡片（"已运行"、"比开始时（N 分钟前）"）
     assert board.cards[task_id].calls == [
-        ("update_values", {MetricType.MEMORY_PRIVATE: 1.0}), ("increment_count",)]
+        ("update_values", {MetricType.MEMORY_PRIVATE: 1.0}, DEFAULT_FAKE_NOW),
+        ("increment_count",)]
+
+
+def test_task_started_sets_card_start_time_and_tick_refreshes_running_cards(
+        presenter, manager, board, services):
+    first = _add_task(manager)
+    second = _add_task(manager)
+    manager.task_started.emit(first)
+    assert board.cards[first].started_at == DEFAULT_FAKE_NOW
+
+    manager.task_stopped.emit(second, StopReason.USER)
+    services.clock.advance(5)
+    presenter.tick()
+
+    assert board.cards[first].ticks == [DEFAULT_FAKE_NOW + timedelta(seconds=5)]
+    assert board.cards[second].ticks == []   # 已结束的卡片时间定格，不再刷新
+
+
+def test_tick_timer_runs_only_while_some_card_is_running(presenter, manager):
+    assert not presenter._tick_timer.isActive()
+    task_id = _add_task(manager)
+    assert presenter._tick_timer.isActive()
+    manager.task_stopped.emit(task_id, StopReason.USER)
+    assert not presenter._tick_timer.isActive()
 
 
 def test_data_updated_never_queries_database():
@@ -408,7 +504,8 @@ def test_stop_requires_confirmation(presenter, manager, board, services):
     call = services.dialogs.last_call("confirm")
     assert call["title"] == "停止监控"
     assert call["confirm_text"] == "停止" and call["cancel_text"] == "取消"
-    assert "demo.exe（PID 1001）" in call["content"] and "不可续采" in call["content"]
+    assert "demo.exe（PID 1001）" in call["content"]
+    assert "停止后不能继续记录到这个任务；要继续请“重新监控”" in call["content"]
 
 
 def test_stop_returning_false_is_tolerated(presenter, manager, board, services):
@@ -444,45 +541,73 @@ def test_pause_resume_only_update_card_on_success(presenter, manager, board):
 # ---------------------------------------------------------------- 打点
 
 
-def test_marker_flow_with_incrementing_default_label(presenter, manager, board, services, host):
-    task_id = _add_task(manager)
-    # 第一次用默认标签，第二次取消，第三次自定义
-    services.dialogs.push("ask_marker_label", "标记 1", None, "第 3 轮")
+def _marker_commands(manager):
+    return [c[1:] for c in manager.commands if c[0] == "marker"]
 
-    for _ in range(3):
+
+def test_marker_flow_default_label_sequence(presenter, manager, board, services, host):
+    task_id = _add_task(manager, pid=1001, name="demo.exe")
+    # 第一次用默认"基线"，第二次取消，第三次默认"第 1 轮"，第四次自定义
+    services.dialogs.push("ask_marker_label", "基线", None, "第 1 轮", "第 3 轮建模")
+
+    for _ in range(4):
         board.marker_requested.emit(task_id)
 
     calls = services.dialogs.calls_of("ask_marker_label")
-    assert [c["default_label"] for c in calls] == ["标记 1", "标记 2", "标记 2"]
+    assert [c["default_label"] for c in calls] == ["基线", "第 1 轮", "第 1 轮", "第 2 轮"]
     assert all(c["parent"] is host.window() for c in calls)
-    assert [c[2] for c in manager.commands if c[0] == "marker"] == ["标记 1", "第 3 轮"]
-    assert presenter.next_marker_label(task_id) == "标记 3"
-    assert services.notifier.levels() == ["success", "success"]
-    assert "标记 1" in services.notifier.messages()[0].content
+    # 对话框显示进程名与 PID
+    assert all((c["process_name"], c["pid"]) == ("demo.exe", 1001) for c in calls)
+    assert [(c[1], c[3]) for c in _marker_commands(manager)] == [
+        ("基线", "baseline"), ("第 1 轮", "user"), ("第 3 轮建模", "user")]
+    assert presenter.next_marker_label(task_id) == "第 3 轮"
+    assert services.notifier.levels() == ["success", "success", "success"]
+    assert "基线" in services.notifier.messages()[0].content
+
+
+def test_renamed_first_marker_is_still_baseline(presenter, manager, board, services):
+    """默认名称是"基线"时用户改了名称，类型仍是基线；下一个默认名称是"第 1 轮"。"""
+    task_id = _add_task(manager)
+    services.dialogs.push("ask_marker_label", "预热完成")
+    board.marker_requested.emit(task_id)
+    assert _marker_commands(manager)[0][1:] == ("预热完成", DEFAULT_FAKE_NOW, "baseline")
+    assert presenter.next_marker_label(task_id) == "第 1 轮"
+
+
+def test_label_exactly_baseline_is_baseline_even_later(presenter, manager, board, services):
+    task_id = _add_task(manager)
+    services.dialogs.push("ask_marker_label", "基线", "基线")
+    board.marker_requested.emit(task_id)
+    board.marker_requested.emit(task_id)
+    assert [c[3] for c in _marker_commands(manager)] == ["baseline", "baseline"]
+
+
+def test_next_marker_label_unknown_task_is_none(presenter):
+    assert presenter.next_marker_label("ghost") is None
 
 
 def test_blank_marker_label_is_rejected(presenter, manager, board, services):
     task_id = _add_task(manager)
     services.dialogs.push("ask_marker_label", "   ")
     board.marker_requested.emit(task_id)
-    assert not [c for c in manager.commands if c[0] == "marker"]
-    assert services.notifier.last("warning").content == "打点标签不能为空"
+    assert not _marker_commands(manager)
+    assert services.notifier.last("warning").content == "打点名称不能为空"
 
 
 def test_marker_failure_is_reported(presenter, manager, board, services):
     task_id = _add_task(manager)
-    services.dialogs.push("ask_marker_label", "标记 1")
+    services.dialogs.push("ask_marker_label", "基线")
     manager.marker_ok = False
 
     board.marker_requested.emit(task_id)
 
     assert services.notifier.levels() == ["error"]
     assert services.notifier.last("error").effective_duration == -1
-    assert presenter.next_marker_label(task_id) == "标记 1"
+    assert presenter.next_marker_label(task_id) == "基线"
 
 
 def test_marker_time_is_click_time_not_confirm_time(presenter, manager, board, services):
-    """打点时间取点击"打点"的时刻：用户输入标签花了 12 秒，落库时间不能是确认时刻"""
+    """打点时间取点击"打点"的时刻：用户输入名称花了 12 秒，落库时间不能是确认时刻"""
     clicked = datetime(2026, 11, 6, 10, 0, 0)
     services.clock.set(clicked)
 
@@ -495,10 +620,102 @@ def test_marker_time_is_click_time_not_confirm_time(presenter, manager, board, s
 
     board.marker_requested.emit(task_id)
 
-    assert manager.commands[-1] == ("marker", task_id, "开始第 3 轮", clicked)
+    assert _marker_commands(manager)[-1] == (task_id, "开始第 3 轮", clicked, "baseline")
     assert services.dialogs.last_call("ask_marker_label")["timestamp"] == clicked
     assert services.clock.now() == clicked + timedelta(seconds=12)
     assert "10:00:00" in services.notifier.last("success").content
+
+
+# ---------------------------------------------------------------- 卡片基线
+
+
+def _emit_samples(manager, task_id, *values):
+    for private in values:
+        manager.data_updated.emit(task_id, {MetricType.MEMORY_PRIVATE: float(private),
+                                            MetricType.NUM_GDI_OBJECTS: private / 10})
+
+
+def test_baseline_value_is_median_of_five_samples_after_marker(
+        presenter, manager, board, services):
+    task_id = _add_task(manager)
+    card = board.cards[task_id]
+    _emit_samples(manager, task_id, 100, 100)          # 打基线之前的样本不计入
+    services.dialogs.push("ask_marker_label", "基线")
+    board.marker_requested.emit(task_id)
+
+    assert card.baseline == (DEFAULT_FAKE_NOW, {})      # 进入"基线采样中"
+    assert card.markers and card.markers[0].kind == "baseline"   # 迷你图刻度
+
+    _emit_samples(manager, task_id, 300, 900, 200, 100)
+    assert card.baseline[1] == {}                        # 不足 5 个样本
+    assert presenter.baseline_values(task_id) == {}
+
+    _emit_samples(manager, task_id, 400, 5000)           # 第 5 个凑满；第 6 个不再计入
+    private, gdi = MetricType.MEMORY_PRIVATE, MetricType.NUM_GDI_OBJECTS
+    assert card.baseline[1] == {private: 300.0, gdi: 30.0}
+    assert presenter.baseline_values(task_id) == {private: 300.0, gdi: 30.0}
+    assert [e[0] for e in card.baseline_events] == ["set", "value", "value"]
+
+
+def test_baseline_seeded_from_stored_samples(presenter, manager, board):
+    """分析页把较早的打点设为基线：先用库里已有的样本，settled 时不足 5 个也算"""
+    task_id = _add_task(manager)
+    old = Marker(task_id, DEFAULT_FAKE_NOW - timedelta(hours=1), "第 2 轮", 7, "baseline")
+    manager.markers[task_id] = [old]
+    manager.seeds[task_id] = BaselineSamples(
+        marker=old, samples={MetricType.MEMORY_PRIVATE: [10.0, 30.0, 20.0]}, settled=True)
+
+    manager.markers_changed.emit(task_id)
+
+    card = board.cards[task_id]
+    assert card.baseline == (old.timestamp, {MetricType.MEMORY_PRIVATE: 20.0})
+    # settled：之后的实时样本不再混进基线
+    _emit_samples(manager, task_id, 999, 999, 999)
+    assert presenter.baseline_values(task_id) == {MetricType.MEMORY_PRIVATE: 20.0}
+
+
+def test_recent_baseline_seed_is_topped_up_by_live_samples(presenter, manager, board):
+    task_id = _add_task(manager)
+    marker = Marker(task_id, DEFAULT_FAKE_NOW, "基线", 3, "baseline")
+    manager.markers[task_id] = [marker]
+    manager.seeds[task_id] = BaselineSamples(
+        marker=marker, samples={MetricType.MEMORY_PRIVATE: [1.0, 2.0, 3.0]}, settled=False)
+    manager.markers_changed.emit(task_id)
+    assert board.cards[task_id].baseline[1] == {}
+
+    _emit_samples(manager, task_id, 4, 5)
+    assert board.cards[task_id].baseline[1][MetricType.MEMORY_PRIVATE] == 3.0
+
+
+def test_unchanged_baseline_is_not_reset_by_other_marker_changes(
+        presenter, manager, board, services):
+    task_id = _add_task(manager)
+    services.dialogs.push("ask_marker_label", "基线", "第 1 轮")
+    board.marker_requested.emit(task_id)
+    _emit_samples(manager, task_id, 1, 2, 3, 4, 5)
+    board.marker_requested.emit(task_id)     # 普通打点：基线不变，不重新采样
+
+    card = board.cards[task_id]
+    assert [e[0] for e in card.baseline_events].count("set") == 1
+    assert card.baseline[1][MetricType.MEMORY_PRIVATE] == 3.0
+    assert [m.label for m in card.markers] == ["基线", "第 1 轮"]
+
+
+def test_deleting_baseline_returns_card_to_since_start(presenter, manager, board, services):
+    task_id = _add_task(manager)
+    services.dialogs.push("ask_marker_label", "基线")
+    board.marker_requested.emit(task_id)
+
+    manager.delete_all_markers(task_id)
+
+    card = board.cards[task_id]
+    assert card.baseline is None and card.baseline_events[-1] == ("clear",)
+    assert presenter.baseline_values(task_id) is None
+    assert presenter.next_marker_label(task_id) == "基线"
+
+
+def test_markers_changed_for_unknown_task_is_ignored(presenter, manager):
+    manager.markers_changed.emit("ghost")
 
 
 def test_marker_ignored_for_finished_task(presenter, manager, board, services):

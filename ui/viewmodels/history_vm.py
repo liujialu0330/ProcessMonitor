@@ -11,6 +11,8 @@
   LatestRequestGate 判过期。同一事件循环轮次内的多次加载请求合并成一次查询
   （如导航跳转时"页面显示时重载 + 选中目标任务"），页面据 busy 显示加载态。
   任务列表本身（单条 SQL）仍在主线程读取。
+
+打点变化（manager.markers_changed）时静默重查当前任务：基线、编号与统计口径都随打点变。
 """
 import logging
 from typing import Callable, Dict, List, Optional, Set
@@ -19,8 +21,8 @@ from PyQt5.QtCore import QObject, QTimer, pyqtSignal, pyqtSlot
 
 from core.contracts import TaskStatus
 from core.history_query import (
-    CHART_MAX_BUCKETS, DEFAULT_RANGE_KEY, TABLE_POINT_LIMIT, TIME_RANGE_SECONDS,
-    HistoryRequest, HistorySnapshot, build_request,
+    BASELINE_RANGE_KEY, CHART_MAX_BUCKETS, DEFAULT_RANGE_KEY, RANGE_KEYS,
+    TABLE_POINT_LIMIT, HistoryRequest, HistorySnapshot, build_request,
 )
 from core.history_refresh_worker import HistoryRefreshWorker
 from core.workers.base import LatestRequestGate
@@ -106,6 +108,9 @@ class HistoryViewModel(QObject):
     - empty_state(str, str)：(标题, 提示)，页面切到空状态并清空图表/表格/统计
     - busy(bool)：用户操作触发的加载开始/结束（定时刷新不置忙）
     - error(str, str)：(标题, 内容)，需要提示用户的错误；定时刷新的连续读库失败只发一次
+    - baseline_changed(bool)：当前任务是否有基线打点（"自基线"范围是否可选）
+    - range_reset(str)：视图模型自行改了时间范围（选着"自基线"而基线已不存在时回到
+      "全部"），页面据此同步筛选条
     """
 
     tasks_changed = pyqtSignal(list, set, object)
@@ -116,6 +121,8 @@ class HistoryViewModel(QObject):
     empty_state = pyqtSignal(str, str)
     busy = pyqtSignal(bool)
     error = pyqtSignal(str, str)
+    baseline_changed = pyqtSignal(bool)
+    range_reset = pyqtSignal(str)
 
     def __init__(self, db, manager, services, *,
                  worker_runner: Optional[HistoryRunner] = None,
@@ -155,6 +162,8 @@ class HistoryViewModel(QObject):
         self.is_busy: bool = False
         # 最近一次显示出来的快照；空状态下为 None
         self.last_snapshot: Optional[HistorySnapshot] = None
+        # 当前任务是否有基线打点（最近一次查询结果）
+        self.has_baseline: bool = False
 
         # ---- 内部状态 ----
         # 载入列表时仍在运行的任务：定时刷新它们的时长文案，结束时回库取结束时间
@@ -172,6 +181,13 @@ class HistoryViewModel(QObject):
         self._refresh_error_notified = False
         # 定时刷新是否应跳过（如用户正在看明细/悬停图表），由 HistoryAutoRefresh 设置
         self._refresh_guard: Callable[[], bool] = lambda: False
+        # 打点变化触发的静默重查：结果不受"跳过定时刷新"的判断影响
+        self._forced_seqs: Set[int] = set()
+
+        # 打点增删改后重查（manager 尚无该信号时不连接，兼容旧 manager 与测试替身）
+        markers_changed = getattr(manager, 'markers_changed', None)
+        if markers_changed is not None:
+            markers_changed.connect(self.on_markers_changed)
 
     # ========== 只读属性 ==========
 
@@ -301,7 +317,7 @@ class HistoryViewModel(QObject):
 
     def set_range(self, range_key: str) -> None:
         """切换时间范围；切任务/切指标时保持不变。"""
-        if range_key not in TIME_RANGE_SECONDS:
+        if range_key not in RANGE_KEYS:
             raise ValueError(f"未知的时间范围：{range_key!r}")
         if range_key == self.range_key:
             return
@@ -346,6 +362,20 @@ class HistoryViewModel(QObject):
             self._was_running = False
             self.reload_tasks()
 
+    @pyqtSlot(str)
+    def on_markers_changed(self, task_id: str) -> None:
+        """
+        打点增删改（manager.markers_changed）：是当前任务就重查一次。
+        用户加载在途时并入那次加载（重新发出，忙状态由新结果撤掉）；否则静默重查，
+        保留缩放、不置忙，结果不因"用户正在看图"而被丢弃。
+        """
+        if not task_id or task_id != self.current_task_id:
+            return
+        if self.is_busy:
+            self._request_load()
+            return
+        self._start_query(auto_refresh=True, forced=True)
+
     def cancel_pending(self) -> None:
         """让在途与已排队的查询全部作废（不等待线程，线程自行跑完后结果被丢弃）。"""
         self._dispatch_scheduled = False
@@ -380,6 +410,7 @@ class HistoryViewModel(QObject):
         self.current_metric = None
         self.metrics_changed.emit([])
         self.selection_changed.emit(None, None, False)
+        self._set_has_baseline(False)
 
     def _current_is_running(self) -> bool:
         task = self.current_task
@@ -436,7 +467,7 @@ class HistoryViewModel(QObject):
             return
         self._start_query(auto_refresh=False)
 
-    def _start_query(self, auto_refresh: bool) -> None:
+    def _start_query(self, auto_refresh: bool, forced: bool = False) -> None:
         task_id = self.current_task_id
         request = build_request(
             task_id, self.current_metric, self.range_key,
@@ -444,22 +475,26 @@ class HistoryViewModel(QObject):
             table_limit=self._table_limit, max_buckets=self._max_buckets,
             seq=self._gate.next_seq(), auto_refresh=auto_refresh)
         self._inflight.add(request.request_seq)
+        if forced:
+            self._forced_seqs.add(request.request_seq)
         self._runner(request, self._on_snapshot)
 
     @pyqtSlot(object)
     def _on_snapshot(self, snapshot: HistorySnapshot) -> None:
         request = snapshot.request
         self._inflight.discard(request.request_seq)
+        forced = request.request_seq in self._forced_seqs
+        self._forced_seqs.discard(request.request_seq)
         if not self._gate.is_current(request.request_seq):
             return
         try:
-            self._apply_snapshot(snapshot)
+            self._apply_snapshot(snapshot, forced)
         finally:
             # 先让页面画出结果/空状态再撤加载态；槽里若又发起了新加载（序号已变）则不撤
             if not request.auto_refresh and self._gate.is_current(request.request_seq):
                 self._set_busy(False)
 
-    def _apply_snapshot(self, snapshot: HistorySnapshot) -> None:
+    def _apply_snapshot(self, snapshot: HistorySnapshot, forced: bool = False) -> None:
         request = snapshot.request
         auto = request.auto_refresh
         if (request.task_id != self.current_task_id
@@ -486,11 +521,17 @@ class HistoryViewModel(QObject):
                 self.error.emit(*ERROR_TASK_MISSING)
             return
         # 结果回来时已进入应跳过刷新的状态：丢弃，等下一次定时刷新
-        if auto and self._refresh_guard():
+        if auto and not forced and self._refresh_guard():
             return
 
         self._anchor_task_id = request.task_id
         self._anchor_value = snapshot.task_last_at
+
+        self._set_has_baseline(snapshot.baseline is not None)
+        if request.range_key == BASELINE_RANGE_KEY and snapshot.baseline is None:
+            # 基线已被删除："自基线"不可选，回到"全部"（此次结果的起点本就不过滤）
+            self.range_key = DEFAULT_RANGE_KEY
+            self.range_reset.emit(DEFAULT_RANGE_KEY)
 
         if not snapshot.points:
             self._show_empty(*(EMPTY_NO_DATA_IN_RANGE if self.range_key != 'all'
@@ -500,6 +541,11 @@ class HistoryViewModel(QObject):
         self.snapshot_ready.emit(snapshot)
 
     # ========== 输出 ==========
+
+    def _set_has_baseline(self, value: bool) -> None:
+        self.has_baseline = value
+        # 每次都发：页面切任务后筛选条需要按新任务重设（重复值无副作用）
+        self.baseline_changed.emit(value)
 
     def _show_empty(self, title: str, detail: str) -> None:
         self.last_snapshot = None

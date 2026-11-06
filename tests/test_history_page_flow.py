@@ -6,6 +6,7 @@
 视图模型注入同步查询执行器（SyncHistoryRunner）与立即执行的 defer，用户操作后
 结果当场可见；真实后台线程见 tests/test_history_page_async.py。
 """
+import dataclasses
 import uuid
 from datetime import datetime, timedelta
 
@@ -194,25 +195,79 @@ def test_navigation_select_task_loads_once(qapp, db, manager, services):
 # ---------- 快照渲染 ----------
 
 def test_snapshot_renders_stats_table_chart_and_markers(page, db):
+    """两个用户打点围出一轮：增长格显示"每轮增长"（打点后 5 点中位数 104 → 107.5 MB）；
+    只有 9 秒数据，判定为数据不足；打点竖线横排编号。"""
     task = _seed_task(db, samples=10, markers=[(2, "第1轮"), (6, "第2轮")])
     page.select_task(task.task_id)
 
     texts = page.stats_strip.texts()
-    assert tuple(texts) == ("起点", "当前", "变化", "增速", "最小", "最大")
-    assert texts["起点"] == "100 MB" and texts["当前"] == "109 MB"
-    assert texts["变化"].startswith("+9 MB")
-    assert texts["增速"].startswith("+") and texts["增速"].endswith("/小时")
-    assert texts["最小"] == "100 MB" and texts["最大"] == "109 MB"
+    assert texts == {"开始值": "100 MB", "当前值": "109 MB", "变化量": "+9 MB (+9.0%)",
+                     "每轮增长": "+3.5 MB", "最小": "100 MB", "最大": "109 MB"}
+    assert page.stats_strip.pill_text() == "数据不足"
 
     rows = page.sample_table.row_texts()
     assert len(rows) == 10
     assert rows[0][0] == (BASE + timedelta(seconds=9)).strftime('%m-%d %H:%M:%S')
-    assert rows[0][1] == "109 MB"
+    assert rows[0][1] == "109 MB" and rows[0][2] == "+1 MB" and rows[0][3] == "--"
     assert page.chart_view.axis_title() == "私有字节（MB）"
     assert len(page.chart_view.x_values) == 10
     assert sorted(line.value() for line in _marker_lines(page)) == [
         (BASE + timedelta(seconds=2)).timestamp(),
         (BASE + timedelta(seconds=6)).timestamp()]
+    assert [badge for _k, badge, _line in page.chart_view.marker_items()] == ["①", "②"]
+
+
+def test_short_data_rate_cell_is_dimmed(page, db):
+    task = _seed_task(db, samples=10)
+    page.select_task(task.task_id)
+    assert page.stats_strip.texts()["每分钟增长"] == "数据不足（已采 9秒）"
+    assert page.stats_strip.dimmed_titles() == ["每分钟增长"]
+
+
+def test_baseline_enables_range_and_drives_stats(page, db):
+    """有基线：筛选条"自基线"可选、统计条首格为基线值、明细"较基线"有值；
+    选"自基线"后图表与明细从基线起；基线被删后回到"全部"。"""
+    task = _seed_task(db, samples=10)
+    marker_id = db.markers.add(task.task_id, BASE + timedelta(seconds=3), "基线", 'baseline')
+    page.select_task(task.task_id)
+
+    assert page.filter_bar.baseline_available() is True
+    texts = page.stats_strip.texts()
+    assert texts["基线值"] == "105 MB" and texts["变化量"] == "+4 MB (+3.8%)"
+    assert page.sample_table.row_texts()[0][3] == "+4 MB"
+    assert [badge for _k, badge, _line in page.chart_view.marker_items()] == ["基"]
+
+    page.filter_bar.range_segmented.setCurrentItem('baseline')
+    assert page.vm.range_key == 'baseline'
+    assert len(page.sample_table.row_texts()) == 7
+    assert page.chart_view.x_values[0] == (BASE + timedelta(seconds=3)).timestamp()
+
+    db.markers.delete(marker_id)
+    page.filter_bar.refresh_button.click()
+    assert page.vm.range_key == page.filter_bar.current_range() == 'all'
+    assert page.filter_bar.baseline_available() is False
+    assert page.stats_strip.texts()["开始值"] == "100 MB"
+
+
+def test_selecting_task_without_baseline_disables_range(page, db):
+    with_baseline = _seed_task(db, samples=5, name="a.exe")
+    db.markers.add(with_baseline.task_id, BASE, "基线", 'baseline')
+    plain = _seed_task(db, samples=5, name="b.exe", start=BASE - timedelta(days=1))
+    page.select_task(with_baseline.task_id)
+    assert page.filter_bar.baseline_available() is True
+    page.select_task(plain.task_id)
+    assert page.filter_bar.baseline_available() is False
+
+
+def test_cumulative_metric_renders_rate_chart_with_level_table(page, db):
+    """累计类：图表画每秒速率，统计条与明细仍是累计值（单位按累计值选）"""
+    task = _seed_task(db, samples=40, metric=MetricType.IO_READ_BYTES)
+    page.select_task(task.task_id)
+    assert page.chart_view.is_rate is True
+    assert page.chart_view.axis_title() == "每秒IO读取字节（MB）"
+    texts = page.stats_strip.texts()
+    assert texts["当前值"] == "139 MB" and texts["平均速率"] == "1 MB/秒"
+    assert page.sample_table.row_texts()[0][1] == "139 MB"
 
 
 def test_table_hint_shows_shown_over_total(qapp, db, manager, services):
@@ -222,7 +277,7 @@ def test_table_hint_shows_shown_over_total(qapp, db, manager, services):
     try:
         page.select_task(task.task_id)
         assert page.sample_table.table_hint_label.text() == (
-            "最新数据优先 · 显示最近 4 条 / 共 10 条")
+            "共 10 条（倒序） · 仅显示最近 4 条")
         assert page.sample_table.data_table.rowCount() == 4
     finally:
         page.close()
@@ -244,9 +299,10 @@ def test_auto_refresh_keeps_view_user_action_resets_it(page, db, services, monke
 
 def test_snapshot_updates_auto_refresh_interval(page, db, monkeypatch):
     task = _seed_task(db, samples=5)
-    real = db.analytics.legacy_stats
+    real = db.analytics.aggregates
     monkeypatch.setattr(
-        db.analytics, 'legacy_stats', lambda *a, **k: {**real(*a, **k), 'count': 300_000})
+        db.analytics, 'aggregates',
+        lambda *a, **k: dataclasses.replace(real(*a, **k), count=300_000))
     page.select_task(task.task_id)
     assert page.auto_refresh.interval == 15000
 

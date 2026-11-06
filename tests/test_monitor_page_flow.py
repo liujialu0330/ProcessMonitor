@@ -230,10 +230,12 @@ def test_data_updated_shows_values_delta_and_count(page, manager):
     manager.data_updated.emit(task_id, {private: 3072.0, gdi: 103.0})
 
     assert card.value_labels[private].text() == "3 MB"
-    assert card.delta_labels[private].text() == "较开始 +2 MB"
-    assert card.delta_labels[gdi].text() == "较开始 +3 个"
-    assert card.trend_delta_label.text() == "较开始 +2 MB"
-    assert card.count == 2 and card.count_label.text() == "已记录：2 次采集"
+    # 无基线：比开始时（相对时间取注入时钟，替身时钟不走，故为 0 秒前）
+    assert card.delta_labels[private].text() == "比开始时（0 秒前）+2 MB"
+    assert card.delta_labels[gdi].text() == "比开始时（0 秒前）+3 个"
+    assert card.trend_delta_label.text() == "比开始时（0 秒前）+2 MB"
+    assert card.count == 2
+    assert card.count_label.text() == "已运行 0 秒 · 每 1 秒 · 2 次采集"
 
 
 def test_metrics_unavailable_marks_card(page, manager, services):
@@ -274,15 +276,28 @@ def test_pause_button_toggles_card(page, manager, monkeypatch):
 
 def test_marker_button_writes_marker_via_manager(page, manager, db, services):
     task_id = _add_card(manager)
-    services.dialogs.push("ask_marker_label", "第 1 轮")
+    services.dialogs.push("ask_marker_label", "预热完成", "第 1 轮")
+    card = page.board.cards()[task_id]
 
-    page.board.cards()[task_id].marker_button.click()
+    card.marker_button.click()
+    card.marker_button.click()
 
     markers = db.get_markers(task_id)
-    assert [m.label for m in markers] == ["第 1 轮"]
+    # 首个打点默认"基线"：改了名称仍是基线；之后默认"第 1 轮"
+    assert [(m.label, m.kind) for m in markers] == [("预热完成", "baseline"),
+                                                     ("第 1 轮", "user")]
     assert markers[0].timestamp == DEFAULT_FAKE_NOW
-    assert services.dialogs.last_call("ask_marker_label")["default_label"] == "标记 1"
+    calls = services.dialogs.calls_of("ask_marker_label")
+    assert [c["default_label"] for c in calls] == ["基线", "第 1 轮"]
+    assert (calls[0]["process_name"], calls[0]["pid"]) == ("demo.exe", os.getpid())
     assert services.notifier.last().level == "success"
+    # 卡片进入"较基线"模式，基线值要等基线之后的 5 个样本
+    assert card.baseline is not None
+    assert card.delta_labels[MetricType.MEMORY_PRIVATE].text() == "基线采样中"
+    for value in (1024.0, 2048.0, 3072.0, 4096.0, 5120.0):
+        manager.data_updated.emit(task_id, {MetricType.MEMORY_PRIVATE: value})
+    manager.data_updated.emit(task_id, {MetricType.MEMORY_PRIVATE: 6144.0})
+    assert card.delta_labels[MetricType.MEMORY_PRIVATE].text() == "较基线 +3 MB"
 
 
 # ---------- 任务结束 ----------
@@ -321,6 +336,21 @@ def test_abnormal_stop_signals_main_window(page, manager, services):
     assert received and "进程已终止" in received[0] and "demo.exe" in received[0]
     assert services.notifier.last().parent is page
     assert "进程已终止" in page.board.cards()[task_id].finished_detail_label.text()
+
+
+def test_pause_and_resume_write_system_markers_and_card_ticks(page, manager, db):
+    """经真实 manager 暂停/恢复：写入系统打点，markers_changed 驱动卡片刷新刻度"""
+    task_id = _add_card(manager)
+    card = page.board.cards()[task_id]
+    # 不起采集线程：直接把任务置为运行态，暂停/恢复只改状态并写系统打点
+    from core.monitor_task import WorkerState
+    assert manager.get_task(task_id)._transition((WorkerState.WAITING,), WorkerState.RUNNING)
+
+    card.pause_button.click()
+    card.pause_button.click()
+
+    assert [m.kind for m in db.get_markers(task_id)] == ["pause", "resume"]
+    assert card.status_label.text() == "● 运行中"
 
 
 def test_history_button_emits_page_signal(page, manager):

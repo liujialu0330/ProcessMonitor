@@ -6,7 +6,8 @@
    范围——两条路径都经视图模型、都用生产装配的后台线程查询：
    - 发给仓储的 since（datetime）/ limit / 分桶上限完全相同；
    - 交给页面渲染的快照（明细点、统计、分桶点、打点、锚点）逐项相等；
-   - 渲染后的表格内容、表格提示、统计条文本、曲线点、打点竖线、纵轴标题完全相同；
+   - 渲染后的表格内容、表格提示、统计条文本（标题与值）、曲线点、打点竖线与编号徽标、
+     纵轴标题完全相同；
    - 范围内无数据时两条路径显示同一空状态文案。
 2. 选择语义：select_task 显式选中后不被新任务切走；自动选中时新任务出现会一路
    跟到最新；自动选中的任务被删除时回落到最新任务（而用户显式选中的任务消失时清空）。
@@ -129,8 +130,12 @@ def _record_db_queries(db, monkeypatch):
 
     wrap(db.points, 'fetch', 'table',
          lambda a, k: (a[0].since, a[0].limit))
-    wrap(db.analytics, 'legacy_stats', 'stats',
+    wrap(db.analytics, 'aggregates', 'stats',
          lambda a, k: (k.get('since'), None))
+    wrap(db.analytics, 'value_near', 'value_near',
+         lambda a, k: (a[2], None))
+    wrap(db.analytics, 'gaps', 'gaps',
+         lambda a, k: (k.get('since'), a[1]))
     wrap(db.analytics, 'legacy_buckets', 'buckets',
          lambda a, k: (k.get('since'), a[2]))
     wrap(db.markers, 'list', 'markers',
@@ -150,7 +155,8 @@ def _view(page):
     chart = page.chart_view
     plot_items = chart.chart_widget.getPlotItem().items
     marker_lines = sorted(
-        (item.value(), item.label.toPlainText() if item.label else None)
+        (item.value(), item.label.toPlainText() if getattr(item, 'label', None) else None,
+         item.toolTip())
         for item in plot_items
         if isinstance(item, pg.InfiniteLine) and item is not chart.crosshair_line)
     curve_points = [len(item.getData()[0]) for item in plot_items
@@ -165,6 +171,10 @@ def _view(page):
         rows=page.sample_table.row_texts(),
         hint=page.sample_table.table_hint_label.text(),
         stats=page.stats_strip.texts(),
+        stat_notes=page.stats_strip.notes(),
+        pill=page.stats_strip.pill_text(),
+        dimmed=page.stats_strip.dimmed_titles(),
+        baseline_range=page.filter_bar.baseline_available(),
         chart_x=list(chart.x_values), chart_y=list(chart.y_values),
         curve_points=curve_points,
         markers=marker_lines,
@@ -210,28 +220,58 @@ def _auto_refresh(page):
 
 
 # (指标, 范围, 期望 since 相对 BASE 的分钟数（None=不过滤）, 表格行数, 统计 count,
-#  分桶后曲线点数, 打点数, 统计条文本)
+#  分桶后曲线点数, 打点数, 统计条文本（标题 → 值）)
+# 打点数恒为 2：快照带任务全部打点（编号与基线参考不随范围变化），图表自行裁剪视口。
+# 增长格：水位量做线性回归，跨度 < 1 小时按 /分、否则 /小时，± 为 95% 置信区间；
+# 跨度不足 max(10 分钟, 30 × 周期 60 秒) = 30 分钟或点数 < 30 时置灰"数据不足"；
+# 统计范围内有 ≥ 2 个用户打点时改为"每轮增长"（打点后 5 个样本中位数之差的均值）。
 _LAST = BASE + timedelta(minutes=120)
 QUERY_CASES = [
-    # 全部：121 点，表格截到最近 50 条；61 点以上分桶 20 桶 × (MIN, MAX) = 40 点
+    # 全部：121 点，表格截到最近 50 条；61 点以上分桶 20 桶 × (MIN, MAX) = 40 点。
+    # 两个用户打点围出一轮：30 分钟后 5 点中位数 116 MB → 115 分钟后 158.5 MB，+42.5 MB
     (MEM, 'all', None, 50, 121, 40, 2,
-     {"起点": "150 MB", "当前": "160 MB", "变化": "+10 MB (+6.7%)",
-      "增速": "+29.92 MB/小时", "最小": "100.5 MB", "最大": "209.5 MB"}),
-    # 10 分钟：锚点 120 分钟 → since 110 分钟（含端点）共 11 点，点数少于桶数不抽稀
-    (MEM, '10m', 110, 11, 11, 11, 1,
-     {"起点": "155 MB", "当前": "160 MB", "变化": "+5 MB (+3.2%)",
-      "增速": "+139.09 MB/小时", "最小": "155 MB", "最大": "209.5 MB"}),
-    (MEM, '1h', 60, 50, 61, 40, 1,
-     {"起点": "130 MB", "当前": "160 MB", "变化": "+30 MB (+23.1%)",
-      "增速": "+32.22 MB/小时", "最小": "130 MB", "最大": "209.5 MB"}),
+     {"开始值": "150 MB", "当前值": "160 MB", "变化量": "+10 MB (+6.7%)",
+      "每轮增长": "+42.5 MB", "最小": "100.5 MB", "最大": "209.5 MB"}),
+    # 10 分钟：锚点 120 分钟 → since 110 分钟（含端点）共 11 点，点数少于桶数不抽稀；
+    # 只有 11 点、跨度 10 分钟，增速门槛不过
+    (MEM, '10m', 110, 11, 11, 11, 2,
+     {"开始值": "155 MB", "当前值": "160 MB", "变化量": "+5 MB (+3.2%)",
+      "每分钟增长": "数据不足（已采 10分钟）", "最小": "155 MB", "最大": "209.5 MB"}),
+    (MEM, '1h', 60, 50, 61, 40, 2,
+     {"开始值": "130 MB", "当前值": "160 MB", "变化量": "+30 MB (+23.1%)",
+      "每小时增长": "+32.2 ±10.7 MB/小时", "最小": "130 MB", "最大": "209.5 MB"}),
     (THREADS, 'all', None, 50, 61, 40, 2,
-     {"起点": "20 个", "当前": "24 个", "变化": "+4 个 (+20.0%)",
-      "增速": "+0.3 个/小时", "最小": "20 个", "最大": "26 个"}),
+     {"开始值": "20 个", "当前值": "24 个", "变化量": "+4 个 (+20.0%)",
+      "每小时增长": "+0.3 ±1.72 个/小时", "最小": "20 个", "最大": "26 个"}),
     # 线程数最后一点在 60 分钟；1 小时范围（since 60 分钟）只含这一点，增速无法计算
-    (THREADS, '1h', 60, 1, 1, 1, 1,
-     {"起点": "24 个", "当前": "24 个", "变化": "±0",
-      "增速": "--", "最小": "24 个", "最大": "24 个"}),
+    (THREADS, '1h', 60, 1, 1, 1, 2,
+     {"开始值": "24 个", "当前值": "24 个", "变化量": "±0",
+      "每分钟增长": "数据不足（已采 0秒）", "最小": "24 个", "最大": "24 个"}),
 ]
+# 各用例的判定胶囊、置灰格与增长格说明（与 QUERY_CASES 一一对应）
+QUERY_JUDGEMENTS = {
+    (MEM, 'all'): ("波动", [], "1 轮均值"),
+    (MEM, '10m'): ("数据不足", ["每分钟增长"], ""),
+    (MEM, '1h'): ("波动", [], "基于 1小时0分 / 61 点"),
+    (THREADS, 'all'): ("平稳", [], "基于 1小时0分 / 61 点"),
+    (THREADS, '1h'): ("数据不足", ["每分钟增长"], ""),
+}
+# 打点竖线：(位置, 徽标, tooltip)
+MARKER_LINES = [
+    ((BASE + timedelta(minutes=30)).timestamp(), "①", "① 第1轮 · 07-16 08:30:00"),
+    ((BASE + timedelta(minutes=115)).timestamp(), "②", "② 第2轮 · 07-16 09:55:00"),
+]
+
+
+def _expected_calls(metric, since):
+    """一次有数据的加载发给仓储的查询（顺序固定）：打点（全部）→ 明细 → 统计范围聚合 →
+    各轮打点处的值（仅私有字节"全部"有两个用户打点落在统计范围内）→ 空洞 → 分桶。"""
+    calls = [('markers', None, None), ('table', since, TABLE_LIMIT), ('stats', since, None)]
+    if metric == MEM and since is None:
+        calls += [('value_near', BASE + timedelta(minutes=30), None),
+                  ('value_near', BASE + timedelta(minutes=115), None)]
+    calls += [('gaps', since, 60.0), ('buckets', since, MAX_BUCKETS)]
+    return calls
 
 
 @pytest.mark.parametrize(
@@ -273,18 +313,14 @@ def test_manual_load_and_auto_refresh_are_identical(
     # 1) 查询参数：同一 since、同一 limit / 分桶上限、同样的查询集合与顺序
     expected_since = (None if since_minutes is None
                       else BASE + timedelta(minutes=since_minutes))
-    expected_calls = [
-        ('table', expected_since, TABLE_LIMIT),
-        ('stats', expected_since, None),
-        ('buckets', expected_since, MAX_BUCKETS),
-        ('markers', expected_since, None),
-    ]
+    expected_calls = _expected_calls(metric, expected_since)
     assert manual_calls == expected_calls
     assert auto_calls == expected_calls
     assert manual.request.since == auto.request.since == expected_since
 
     # 2) 查询结果：逐项相等（DataPoint/Marker 是 dataclass，按值比较）
-    for key in ('points', 'stats', 'buckets', 'markers'):
+    for key in ('points', 'stats', 'buckets', 'markers', 'judgement', 'rate', 'gaps',
+                'rounds', 'baseline', 'total_count', 'stats_since'):
         assert getattr(manual, key) == getattr(auto, key), f"{key} 两条路径不一致"
     assert manual.request.metric == auto.request.metric == metric
     assert len(manual.points) == rows
@@ -305,18 +341,25 @@ def test_manual_load_and_auto_refresh_are_identical(
     assert len(manual_view['rows']) == rows
     # 明细表倒序：第一行是范围内最新一条
     assert manual_view['rows'][0][0] == manual.points[-1].timestamp.strftime('%m-%d %H:%M:%S')
-    assert manual_view['hint'] == f"最新数据优先 · 显示最近 {rows:,} 条 / 共 {count:,} 条"
+    truncated = f" · 仅显示最近 {rows:,} 条" if count > rows else ""
+    assert manual_view['hint'] == f"共 {count:,} 条（倒序）{truncated}"
     assert manual_view['stats'] == stat_texts
     assert manual_view['curve_points'] == [buckets]
     assert len(manual_view['chart_x']) == buckets
     assert len(manual_view['markers']) == len(manual_view['marker_data']) == markers
+    assert manual_view['markers'] == MARKER_LINES
+    pill, dimmed, rate_note = QUERY_JUDGEMENTS[(metric, range_key)]
+    assert manual_view['pill'] == pill
+    assert manual_view['dimmed'] == dimmed
+    assert list(manual_view['stat_notes'].values())[3] == rate_note
+    assert manual_view['baseline_range'] is False
 
 
 def test_out_of_range_metric_shows_same_empty_state_on_both_paths(page, db, monkeypatch):
     """
     锚点取任务整体最后采样（120 分钟），线程数最后一点在 60 分钟：选"10分钟"时该指标
     范围内无数据。两条路径都应显示"所选时间范围内暂无数据"，且都只查到明细为止
-    （不再查统计/分桶/打点）。
+    （打点先查——"自基线"范围的起点依赖它；不再查统计/空洞/分桶）。
     """
     task = _seed_query_dataset(db)
     _prepare(page, task, THREADS, '10m')
@@ -337,12 +380,115 @@ def test_out_of_range_metric_shows_same_empty_state_on_both_paths(page, db, monk
     auto_view = _view(page)
 
     assert snapshots == []
-    assert manual_calls == [('table', expected_since, TABLE_LIMIT)]
-    assert isinstance(manual_calls[0][1], datetime)
+    assert manual_calls == [('markers', None, None), ('table', expected_since, TABLE_LIMIT)]
+    assert isinstance(manual_calls[1][1], datetime)
     assert auto_calls == manual_calls
     assert manual_view['content'] == auto_view['content'] == 'empty'
     assert manual_view['empty_title'] == auto_view['empty_title'] == "所选时间范围内暂无数据"
     assert manual_view['empty_detail'] == auto_view['empty_detail'] == "尝试切换到「全部」查看完整历史"
+
+
+# ---------- 基线、空洞与系统打点 ----------
+
+GAP_FROM, GAP_TO = 70, 85   # 70..84 分钟无采样（暂停 15 分钟）
+
+
+def _seed_baseline_dataset(db):
+    """
+    带基线与空洞的数据集（每分钟一次采样，私有字节）：
+    - 0..19 分钟预热段陡升 100 + 2i MB；20 分钟起平稳线性上涨 140 + 0.5(i-20) MB；
+    - 70..84 分钟无采样（69 → 85 分钟间隔 16 分钟 > 2.5 × 60 秒，构成空洞）；
+    - 打点：20 分钟基线、50 分钟「第1轮」、100 分钟「第2轮」，69:30 暂停、84:30 恢复。
+    """
+    task = _make_task(db, name="baseline.exe", metrics=(MEM,))
+    db.save_data_points([
+        DataPoint(task.task_id, BASE + timedelta(minutes=i),
+                  1024.0 * (100 + 2 * i if i < 20 else 140 + 0.5 * (i - 20)), MEM)
+        for i in range(121) if not GAP_FROM <= i < GAP_TO])
+    for minutes, label, kind in ((20, "基线", 'baseline'), (50, "第1轮", 'user'),
+                                 (100, "第2轮", 'user'), (69.5, "暂停", 'pause'),
+                                 (84.5, "恢复", 'resume')):
+        db.markers.add(task.task_id, BASE + timedelta(minutes=minutes), label, kind)
+    return task
+
+
+# 统计只用基线（20 分钟）之后的 86 个点：基线值 = 20..24 分钟中位数 141 MB；
+# 两轮：141 → 156 → 181 MB，每轮 +15、+25，均值 +20 MB；10 分钟范围只有 11 点，
+# 增速门槛不过，但基线值仍作参考、变化量相对基线
+BASELINE_CASES = [
+    ('baseline', 20, 86,
+     {"基线值": "141 MB", "当前值": "190 MB", "变化量": "+49 MB (+34.8%)",
+      "每轮增长": "+20 MB", "最小": "140 MB", "最大": "190 MB"},
+     "基线 08:20:00 起 · 1小时40分 · 86 点", "持续上涨", ["无数据 16分钟"]),
+    ('all', None, 106,
+     {"基线值": "141 MB", "当前值": "190 MB", "变化量": "+49 MB (+34.8%)",
+      "每轮增长": "+20 MB", "最小": "140 MB", "最大": "190 MB"},
+     "基线 08:20:00 起 · 1小时40分 · 86 点", "持续上涨", ["无数据 16分钟"]),
+    ('10m', 110, 11,
+     {"基线值": "141 MB", "当前值": "190 MB", "变化量": "+49 MB (+34.8%)",
+      "每分钟增长": "数据不足（已采 10分钟）", "最小": "185 MB", "最大": "190 MB"},
+     "10分钟 · 11 点", "数据不足", []),
+]
+BASELINE_MARKER_LINES = [
+    ((BASE + timedelta(minutes=20)).timestamp(), "基", "基 基线 · 07-16 08:20:00"),
+    ((BASE + timedelta(minutes=50)).timestamp(), "①", "① 第1轮 · 07-16 08:50:00"),
+    ((BASE + timedelta(minutes=69.5)).timestamp(), None, "暂停 · 07-16 09:09:30"),
+    ((BASE + timedelta(minutes=84.5)).timestamp(), None, "恢复 · 07-16 09:24:30"),
+    ((BASE + timedelta(minutes=100)).timestamp(), "②", "② 第2轮 · 07-16 09:40:00"),
+]
+
+
+@pytest.mark.parametrize(
+    "range_key, since_minutes, total, stat_texts, basis, pill, gap_texts", BASELINE_CASES,
+    ids=[case[0] for case in BASELINE_CASES])
+def test_baseline_and_gaps_identical_on_both_paths(
+        page, db, range_key, since_minutes, total, stat_texts, basis, pill, gap_texts):
+    """
+    存在基线时：统计只用基线之后的数据、首格为基线值；"自基线"范围从基线起显示；
+    空洞处曲线断开并画阴影；暂停/恢复画为不编号的系统打点。两条路径渲染逐项相同。
+    """
+    task = _seed_baseline_dataset(db)
+    _prepare(page, task, MEM, range_key)
+    snapshots = _record_snapshots(page)
+
+    _manual_load(page)
+    manual_view = _view(page)
+    manual_chart = (page.chart_view.connect_array(),
+                    [text for _region, text in page.chart_view.gap_items()],
+                    page.stats_strip.basis())
+    _clear_widgets(page)
+    _auto_refresh(page)
+    auto_view = _view(page)
+    auto_chart = (page.chart_view.connect_array(),
+                  [text for _region, text in page.chart_view.gap_items()],
+                  page.stats_strip.basis())
+
+    manual, auto = snapshots
+    assert manual_view == auto_view
+    assert manual_chart == auto_chart
+    for key in ('points', 'stats', 'buckets', 'markers', 'judgement', 'rate', 'gaps',
+                'rounds', 'baseline', 'total_count', 'stats_since'):
+        assert getattr(manual, key) == getattr(auto, key), f"{key} 两条路径不一致"
+
+    expected_since = None if since_minutes is None else BASE + timedelta(minutes=since_minutes)
+    baseline_at = BASE + timedelta(minutes=20)
+    assert manual.request.since == expected_since
+    assert manual.stats_since == max(expected_since or baseline_at, baseline_at)
+    assert manual.total_count == total
+    assert manual.baseline.value == 1024.0 * 141 and manual.baseline.sample_count == 5
+
+    assert manual_view['stats'] == stat_texts
+    assert manual_view['pill'] == pill
+    assert manual_view['baseline_range'] is True
+    assert manual_view['markers'] == BASELINE_MARKER_LINES
+    connect, gaps, strip_basis = manual_chart
+    assert strip_basis == basis
+    assert gaps == gap_texts
+    # 曲线只在空洞处断开一次（无空洞时全连）
+    assert connect.count(False) == len(gap_texts)
+    assert manual_view['hint'].startswith(f"共 {total:,} 条（倒序）")
+    # 明细"较基线"列相对基线值 141 MB
+    assert manual_view['rows'][0][3] == "+49 MB"
 
 
 # ---------- 选择语义 ----------

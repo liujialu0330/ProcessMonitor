@@ -1,7 +1,7 @@
 """
 历史数据页面
 
-只做组装与连线：筛选条（内嵌任务选择器）、统计条、趋势图 / 采样明细、空状态卡，
+只做组装与连线：筛选条（内嵌任务选择器）、统计条、趋势图 / 采集明细、空状态卡，
 加上视图模型（HistoryViewModel：选择语义、异步查询、空状态与错误）和自动刷新调度
 （HistoryAutoRefresh）。控件信号转成视图模型命令，视图模型信号转成控件更新；
 查库、选择规则、过期判断都不在这里。需要对话框与提示的交互（删除确认、保存/复制
@@ -21,7 +21,7 @@ from ui.viewmodels.history_auto_refresh import HistoryAutoRefresh
 from ui.viewmodels.history_vm import (
     EMPTY_NO_TASKS, HistoryRunner, HistoryViewModel)
 from ui.widgets.empty_state import EmptyStateCard
-from ui.widgets.history.chart_view import ChartView
+from ui.widgets.history.chart_view import ChartView, chart_display_unit
 from ui.widgets.history.common import VIEWPORT_TO_CONTENT_OFFSET
 from ui.widgets.history.filter_bar import VIEW_TREND, FilterBar
 from ui.widgets.history.sample_table import SampleTable
@@ -145,6 +145,8 @@ class HistoryPage(PageScaffold):
         vm.snapshot_ready.connect(self._on_snapshot)
         vm.empty_state.connect(self._on_empty_state)
         vm.busy.connect(self._on_busy)
+        vm.baseline_changed.connect(bar.set_baseline_available)
+        vm.range_reset.connect(bar.set_range)
         vm.error.connect(lambda title, content: self.services.notifier.error(
             self, title, content))
 
@@ -217,16 +219,17 @@ class HistoryPage(PageScaffold):
         self.filter_bar.set_delete_enabled(self.vm.can_delete, self.vm.delete_hint)
 
     def _on_snapshot(self, snapshot: HistorySnapshot) -> None:
-        request, stats = snapshot.request, snapshot.stats
-        # 先画图：统计条与明细沿用图表按数据选出的显示单位
-        self.chart_view.set_series(
-            snapshot.buckets, request.metric, snapshot.markers,
-            keep_view=request.auto_refresh)
-        unit = self.chart_view.display_unit
-        self.stats_strip.set_values(stats, request.metric, unit)
+        request = snapshot.request
+        # 先画图：统计条与明细沿用图表按数据选出的显示单位（累计类画的是速率，
+        # 统计条与明细仍是累计值，单位按分桶点另选）
+        self.chart_view.set_snapshot(snapshot, keep_view=request.auto_refresh)
+        unit = (chart_display_unit(request.metric, [p.value for p in snapshot.buckets])
+                if self.chart_view.is_rate else self.chart_view.display_unit)
+        self.stats_strip.set_snapshot(snapshot, unit)
+        baseline = snapshot.baseline
         self.sample_table.set_points(
-            snapshot.points, request.metric,
-            stats['count'] if stats else None, unit)
+            snapshot.points, request.metric, snapshot.total_count or None, unit,
+            baseline_value=baseline.value if baseline is not None else None)
         self.content_stack.setCurrentWidget(self.analysis_page)
 
     def _on_empty_state(self, title: str, hint: str) -> None:

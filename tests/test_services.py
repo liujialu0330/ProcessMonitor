@@ -206,21 +206,36 @@ def test_ask_marker_label_returns_stripped_label_and_shows_click_time(host):
 
     def _fill(dialog, seen):
         seen['time'] = dialog.time_label.text()
+        seen['target'] = dialog.target_label.text()
         seen['default'] = dialog.label_edit.text()
         dialog.label_edit.setText("  第 3 轮建模  ")
         dialog.yesButton.click()
 
     runner = _ClickRunner(_fill)
-    label = QtDialogs(run_dialog=runner).ask_marker_label(host, "标记 2", clicked_at)
+    label = QtDialogs(run_dialog=runner).ask_marker_label(
+        host, "第 2 轮", clicked_at, process_name="demo.exe", pid=1234)
 
     assert label == "第 3 轮建模"
-    assert runner.seen['default'] == "标记 2"
-    assert "09:08:07" in runner.seen['time']
+    assert runner.seen['default'] == "第 2 轮"
+    assert runner.seen['time'] == "已在 09:08:07 记录，可修改名称"
+    assert runner.seen['target'] == "demo.exe · PID 1234"
+
+
+def test_ask_marker_label_keeps_old_positional_signature(host):
+    """不传 process_name / pid 的旧调用方式仍可用"""
+    def _fill(dialog, seen):
+        seen['target_hidden'] = dialog.target_label.isHidden()
+        dialog.yesButton.click()
+
+    runner = _ClickRunner(_fill)
+    label = QtDialogs(run_dialog=runner).ask_marker_label(
+        host, "基线", datetime(2026, 3, 4, 9, 8, 7))
+    assert label == "基线" and runner.seen['target_hidden'] is True
 
 
 def test_ask_marker_label_returns_none_on_cancel(host):
     dialogs = QtDialogs(run_dialog=_ClickRunner(_click("cancelButton")))
-    assert dialogs.ask_marker_label(host, "标记 1", datetime.now()) is None
+    assert dialogs.ask_marker_label(host, "基线", datetime.now()) is None
 
 
 def test_choose_metrics_returns_selection_or_none(host):

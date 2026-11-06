@@ -133,3 +133,63 @@ def test_stop_while_paused_terminates_promptly(make_task):
     assert task.isRunning() is False
     assert duration < 1.0
     assert reasons == [StopReason.USER]
+
+
+# ---------- 暂停/恢复系统打点 ----------
+
+def _system_markers(db, task):
+    return [(m.label, m.kind) for m in db.markers.list(task.task_id)]
+
+
+def test_pause_and_resume_write_system_markers(make_task, db):
+    """暂停/恢复成功切换时各写一条系统打点（kind=pause/resume），时间取调用时刻"""
+    from datetime import datetime
+
+    task = make_task(interval=0.1)
+    updates = _count_updates(task)
+    task.start()
+    assert poll_until(lambda: len(updates) >= 1)
+
+    before = datetime.now()
+    assert task.pause() is True
+    assert task.resume() is True
+    after = datetime.now()
+
+    markers = db.markers.list(task.task_id)
+    assert [(m.label, m.kind) for m in markers] == [("暂停", "pause"), ("恢复", "resume")]
+    assert all(before <= m.timestamp <= after for m in markers)
+
+
+def test_system_marker_uses_given_click_time(make_task, db):
+    from datetime import datetime
+
+    task = make_task(interval=0.1)
+    task.start()
+    clicked = datetime(2026, 11, 6, 10, 0, 0)
+    assert task.pause(clicked) is True
+    assert [m.timestamp for m in db.markers.list(task.task_id)] == [clicked]
+
+
+def test_rejected_pause_or_resume_writes_no_marker(make_task, db):
+    """状态没有切换（未启动、重复暂停、未暂停就恢复）时不写打点"""
+    task = make_task(interval=0.1)
+    assert task.pause() is False            # 未启动
+    task.start()
+    assert task.resume() is False           # 运行中直接恢复
+    assert task.pause() is True
+    assert task.pause() is False            # 重复暂停
+    assert _system_markers(db, task) == [("暂停", "pause")]
+
+
+def test_system_marker_write_failure_does_not_block_pause(make_task, db, monkeypatch):
+    """写库失败只记日志：暂停/恢复本身照常成功"""
+    from data.errors import StorageError
+
+    def boom(*args, **kwargs):
+        raise StorageError("database is locked")
+
+    task = make_task(interval=0.1)
+    task.start()
+    monkeypatch.setattr(db.markers, "add", boom)
+    assert task.pause() is True and task.is_paused()
+    assert task.resume() is True and not task.is_paused()

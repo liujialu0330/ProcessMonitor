@@ -21,8 +21,13 @@ from qfluentwidgets import (
 from ui.widgets.history.common import (
     CARD_PADDING_H, VIEWPORT_TO_CONTENT_OFFSET, content_width_of)
 
+# "自基线"范围：任务没有基线打点时禁用
+BASELINE_RANGE_KEY = 'baseline'
+BASELINE_RANGE_DISABLED_TIP = "该任务还没有基线打点"
+BASELINE_RANGE_TIP = "只看基线打点之后的数据"
 # 时间范围选项（routeKey, 显示文本）；秒数等查询语义由页面/查询层定义
 RANGE_OPTIONS: Tuple[Tuple[str, str], ...] = (
+    (BASELINE_RANGE_KEY, '自基线'),
     ('10m', '10分钟'),
     ('1h', '1小时'),
     ('6h', '6小时'),
@@ -100,6 +105,7 @@ class FilterBar(CardWidget):
             self.range_segmented.addItem(routeKey=route_key, text=text)
         self.range_segmented.setCurrentItem(DEFAULT_RANGE_KEY)
         self.range_segmented.currentItemChanged.connect(self.range_changed)
+        self.set_baseline_available(False)
 
         # 命令组：趋势/明细、刷新、更多（低频且高风险的删除收纳进菜单）
         self.command_bar = QWidget(self)
@@ -221,6 +227,15 @@ class FilterBar(CardWidget):
 
     def current_range(self) -> str:
         return self.range_segmented.currentRouteKey()
+
+    def set_baseline_available(self, available: bool) -> None:
+        """"自基线"范围是否可选（任务有基线打点时可选）。"""
+        item = self.range_segmented.items[BASELINE_RANGE_KEY]
+        item.setEnabled(available)
+        item.setToolTip(BASELINE_RANGE_TIP if available else BASELINE_RANGE_DISABLED_TIP)
+
+    def baseline_available(self) -> bool:
+        return self.range_segmented.items[BASELINE_RANGE_KEY].isEnabled()
 
     def set_view(self, key: str) -> None:
         """选中趋势/明细（不发 view_changed）。"""

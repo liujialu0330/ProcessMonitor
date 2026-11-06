@@ -44,6 +44,8 @@ def test_create_card_from_snapshot(board):
     assert board.card("t1") is card
     assert (card.process_name, card.pid, card.interval, card.note) == (
         "demo.exe", 1001, 2.0, "过夜测试")
+    # 身份行带上快照里的 PID 与采集间隔
+    assert card.meta_label.text() == "· PID 1001 · 每 2 秒"
     assert card.metric_types == [MetricType.MEMORY_PRIVATE, MetricType.NUM_GDI_OBJECTS]
     assert not board.empty_state.isVisible()
     assert list(board.cards()) == ["t1"]
@@ -77,6 +79,7 @@ def test_remove_card_restores_empty_state(board):
 
 @pytest.mark.parametrize("button, signal", [
     ("marker_button", "marker_requested"),
+    ("analysis_button", "history_requested"),
     ("pause_button", "pause_requested"),
     ("stop_button", "stop_requested"),
 ])

@@ -1,29 +1,39 @@
 """
-历史趋势图卡片：真实时间轴曲线、打点竖线、悬停十字线与读数、主题配色、导出图片。
+历史趋势图卡片：真实时间轴曲线、空洞断开与阴影、打点编号竖线、悬停十字线与读数、
+主题配色、导出图片。
+
+- 空洞（相邻采样间隔 > 2.5 × 周期）：曲线在空洞处断开（pyqtgraph connect 数组），
+  空洞区间画灰色阴影并标注"无数据 12分钟"；
+- 打点：用户打点画注意色虚线、顶部横排编号徽标 ①②③，基线画注意色实线、徽标"基"，
+  标签放在 tooltip 与悬停读数里；暂停/恢复是系统打点，画在底部的浅色短竖线、不编号；
+- 累计类指标由调用方传入每秒速率序列（rate=True），纵轴标题为"每秒 X"。
 
 绘图 x 数据统一用 epoch float（timestamp.timestamp()），仅用于绘图与悬停吸附，
 严禁回流作为 SQL 查询参数（查询参数全链路走 datetime / ISO 字符串）。
 """
 import bisect
 from datetime import datetime
-from typing import Callable, List, Optional, Sequence
+from typing import Callable, List, Optional, Sequence, Tuple
 
+import numpy as np
 import pyqtgraph as pg
 from pyqtgraph import exporters
 from PyQt5.QtCore import QEvent, Qt, pyqtSignal
-from PyQt5.QtGui import QPixmap
+from PyQt5.QtGui import QColor, QPixmap
 from PyQt5.QtWidgets import QHBoxLayout, QSizePolicy, QVBoxLayout
 from qfluentwidgets import CardWidget, FluentIcon, TransparentToolButton, qconfig
 
+from core.analysis.series import connect_mask
 from ui.chart_theme import chart_colors
 from ui.components.chart_axes import ContextDateAxisItem, MetricAxisItem
 from ui.components.sparkline import compute_y_range
-from ui.formatting import marker_context
+from ui.formatting import (
+    BADGE_BASELINE, format_duration, format_per_second, marker_badge, marker_context)
 from ui.typography import DataCaptionLabel, TypeScale, data_font, ui_font
 from ui.widgets.history.common import CARD_PADDING_H, DETAIL_TIME_FORMAT
 from utils.metrics import (
-    format_metric_value, get_metric_display_name, get_metric_display_unit,
-    is_integer_metric)
+    VALUE_CLASS_RATE, format_metric_value, get_metric_display_name,
+    get_metric_display_unit, is_integer_metric)
 
 # 保留约 360px 的有效读图高度，同时允许高窗口自动拉伸
 CHART_MIN_HEIGHT = 340
@@ -40,12 +50,29 @@ CONTENT_SPACING = 8
 DEFAULT_VALUE_AXIS_TITLE = '值'
 TIME_AXIS_TITLE = '时间'
 
+# 打点类型（与 data.models.MARKER_KINDS 一致）
+MARKER_USER = 'user'
+MARKER_BASELINE = 'baseline'
+SYSTEM_MARKER_KINDS = ('pause', 'resume')
+SYSTEM_MARKER_TEXTS = {'pause': '暂停', 'resume': '恢复'}
+# 徽标在竖线上的纵向位置（0 底、1 顶）；系统打点短竖线占绘图区高度的比例
+BADGE_POSITION = 0.94
+SYSTEM_MARKER_SPAN = 0.08
+# 空洞阴影的不透明度（0–255）与说明文字的纵向位置
+GAP_SHADE_ALPHA = 36
+GAP_LABEL_POSITION = 0.85
+# 系统打点短竖线的不透明度
+SYSTEM_MARKER_ALPHA = 140
 
-def value_axis_title(metric_type: Optional[str], display_unit: str) -> str:
-    """纵轴标题：指标名（显示单位）；无指标时为 "值"。"""
+
+def value_axis_title(metric_type: Optional[str], display_unit: str,
+                     rate: bool = False) -> str:
+    """纵轴标题：指标名（显示单位）；速率序列为"每秒指标名（单位）"；无指标时为 "值"。"""
     if not metric_type:
         return DEFAULT_VALUE_AXIS_TITLE
     name = get_metric_display_name(metric_type)
+    if rate:
+        name = f"每秒{name}"
     return f"{name}（{display_unit}）" if display_unit else name
 
 
@@ -55,6 +82,28 @@ def chart_display_unit(metric_type: Optional[str], values: Sequence[float]) -> s
         return ''
     reference_value = max((abs(value) for value in values), default=0.0)
     return get_metric_display_unit(metric_type, reference_value)
+
+
+def gap_label_text(start: datetime, end: datetime) -> str:
+    """空洞阴影上的说明，如 "无数据 12分钟"。"""
+    return f"无数据 {format_duration((end - start).total_seconds())}"
+
+
+def marker_badges(markers: Sequence) -> List[Optional[str]]:
+    """与 markers 等长的徽标：用户打点按时间顺序编号 ①②③，基线为"基"，
+    系统打点（暂停/恢复）为 None。markers 须按时间升序。"""
+    badges: List[Optional[str]] = []
+    number = 0
+    for marker in markers:
+        kind = getattr(marker, 'kind', MARKER_USER)
+        if kind == MARKER_BASELINE:
+            badges.append(BADGE_BASELINE)
+        elif kind in SYSTEM_MARKER_KINDS:
+            badges.append(None)
+        else:
+            number += 1
+            badges.append(marker_badge(number))
+    return badges
 
 
 def nearest_index(x_array: Sequence[float], x: float) -> int:
@@ -87,8 +136,15 @@ class ChartView(CardWidget):
         self._y: List[float] = []
         self._metric_type: Optional[str] = None
         self._display_unit = ''
-        # 当前范围内的打点（按时间升序）：图上画竖线，悬停读数据此提示所处区间
+        # 打点（按时间升序，含基线与暂停/恢复）：图上画竖线，悬停读数据此提示所处区间
         self._markers: list = []
+        # 空洞 (前一点, 后一点)，epoch 秒；曲线在此断开并画阴影
+        self._gaps: List[Tuple[float, float]] = []
+        # 当前曲线是否为每秒速率序列（累计类指标）
+        self._rate = False
+        # 本次重绘画出的打点竖线 [(kind, 徽标或 None, 竖线)] 与空洞阴影 [(区域, 说明)]
+        self._marker_items: list = []
+        self._gap_items: list = []
 
         self._pressed = False
         self._interacting = False
@@ -116,7 +172,8 @@ class ChartView(CardWidget):
         self.chart_widget.setMinimumHeight(CHART_MIN_HEIGHT)
         self.chart_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         # 分桶数据已保留尖峰，这里叠加 pyqtgraph 的峰值抽稀与视口裁剪应对缩放卡顿。
-        # pyqtgraph 0.14 中 PlotWidget.setDownsampling 转发到 PlotItem，形参名是 mode
+        # pyqtgraph 0.14 中 PlotWidget.setDownsampling 转发到 PlotItem，形参名是 mode；
+        # 两者都能正确处理 connect 数组（空洞断开）
         self.chart_widget.setDownsampling(auto=True, mode='peak')
         self.chart_widget.setClipToView(True)
 
@@ -177,6 +234,28 @@ class ChartView(CardWidget):
     def markers(self) -> list:
         return self._markers
 
+    @property
+    def gaps(self) -> List[Tuple[float, float]]:
+        """当前空洞（epoch 秒）。"""
+        return self._gaps
+
+    @property
+    def is_rate(self) -> bool:
+        """当前曲线是否为每秒速率序列。"""
+        return self._rate
+
+    def marker_items(self) -> list:
+        """本次绘制的打点竖线：[(kind, 徽标或 None, InfiniteLine)]，按时间升序。"""
+        return list(self._marker_items)
+
+    def gap_items(self) -> list:
+        """本次绘制的空洞阴影：[(LinearRegionItem, 说明文本)]。"""
+        return list(self._gap_items)
+
+    def connect_array(self) -> List[bool]:
+        """当前曲线的连线掩码（第 i 项为 False 表示第 i 点与下一点之间断开）。"""
+        return connect_mask(self._x, self._gaps)
+
     def has_data(self) -> bool:
         return bool(self._x)
 
@@ -186,20 +265,33 @@ class ChartView(CardWidget):
 
     # ---------- 数据 ----------
 
+    def set_snapshot(self, snapshot, keep_view: bool = False) -> None:
+        """按历史查询快照绘制：累计类画每秒速率序列，其余画分桶点；带打点与空洞。"""
+        rate = snapshot.value_class == VALUE_CLASS_RATE
+        self.set_series(
+            snapshot.rate_series if rate else snapshot.buckets, snapshot.request.metric,
+            snapshot.markers, keep_view=keep_view, gaps=snapshot.gaps, rate=rate)
+
     def set_series(self, points: Sequence, metric_type: Optional[str],
-                   markers: Optional[Sequence] = None, keep_view: bool = False) -> None:
+                   markers: Optional[Sequence] = None, keep_view: bool = False, *,
+                   gaps: Optional[Sequence] = None, rate: bool = False) -> None:
         """
         设置曲线数据并重绘。
 
         Args:
             points: 分桶降采样后的数据点（需有 timestamp / value，按时间升序）
             metric_type: 指标类型
-            markers: 打点列表（需有 timestamp / label，按时间升序）；None 表示保持现有打点
+            markers: 打点列表（需有 timestamp / label，可有 kind，按时间升序）；
+                None 表示保持现有打点
             keep_view: True 保留用户当前缩放/平移（自动刷新用）；False 重新自适应范围
+            gaps: 空洞 [(前一点 datetime, 后一点 datetime)]；None 表示没有空洞
+            rate: points 是否为每秒速率序列（纵轴标题与读数带"每秒"）
         """
         if markers is not None:
             self._markers = list(markers)
         self._metric_type = metric_type
+        self._rate = rate
+        self._gaps = [(a.timestamp(), b.timestamp()) for a, b in (gaps or ())]
         if points:
             self._x = [dp.timestamp.timestamp() for dp in points]
             self._y = [dp.value for dp in points]
@@ -208,13 +300,14 @@ class ChartView(CardWidget):
             self._y = []
 
         self._display_unit = chart_display_unit(metric_type, self._y)
-        # 计数类指标强制整数刻度；字节类的刻度间距按显示单位选取
+        # 计数类指标强制整数刻度（速率是小数，不强制）；字节类的刻度间距按显示单位选取
         self.value_axis.set_display_unit(
             self._display_unit,
-            integer_only=bool(metric_type) and is_integer_metric(metric_type))
+            integer_only=bool(metric_type) and not rate and is_integer_metric(metric_type))
 
         self._redraw()
-        self.chart_widget.setLabel('left', value_axis_title(metric_type, self._display_unit))
+        self.chart_widget.setLabel(
+            'left', value_axis_title(metric_type, self._display_unit, rate))
         self.chart_widget.setLabel('bottom', TIME_AXIS_TITLE)
 
         if not keep_view:
@@ -226,12 +319,14 @@ class ChartView(CardWidget):
         self._redraw()
 
     def clear(self) -> None:
-        """清空曲线、打点与单位；纵轴标题保持上一次的文本。"""
+        """清空曲线、打点、空洞与单位；纵轴标题保持上一次的文本。"""
         self._x = []
         self._y = []
         self._metric_type = None
         self._display_unit = ''
         self._markers = []
+        self._gaps = []
+        self._rate = False
         self.value_axis.set_display_unit('')
         self._redraw()
 
@@ -242,16 +337,19 @@ class ChartView(CardWidget):
 
     def _apply_min_y_span(self) -> None:
         """数据几乎是平线时，纵轴跨度扩到下限（与迷你趋势图同一规则），
-        避免把几字节的抖动放大成满幅、刻度出现多位小数。跨度足够时保持自动范围。"""
+        避免把几字节的抖动放大成满幅、刻度出现多位小数。跨度足够时保持自动范围。
+        速率序列不套用指标的跨度下限（下限是按水位量定的）。"""
         if not self._y:
             return
-        low, high = compute_y_range(self._y, self._metric_type)
+        low, high = compute_y_range(self._y, None if self._rate else self._metric_type)
         if high - low > max(self._y) - min(self._y):
             self.chart_widget.setYRange(low, high, padding=0.05)
 
     def _redraw(self) -> None:
-        """按缓存的 x/y 重绘曲线与打点竖线（主题切换也走这里，不重新查库）。"""
+        """按缓存数据重绘曲线、空洞阴影与打点竖线（主题切换也走这里，不重新查库）。"""
         self.chart_widget.clear()
+        self._marker_items = []
+        self._gap_items = []
         self.chart_widget.addItem(self.crosshair_line, ignoreBounds=True)
         self.hide_hover()
 
@@ -259,34 +357,78 @@ class ChartView(CardWidget):
             return
 
         colors = chart_colors()
+        self._draw_gaps(colors)
         pen = pg.mkPen(color=colors['curve'], width=2)
-        self.chart_widget.plot(self._x, self._y, pen=pen)
+        extra = {'connect': np.array(self.connect_array(), dtype=bool)} if self._gaps else {}
+        self.chart_widget.plot(self._x, self._y, pen=pen, **extra)
+        self._draw_markers(colors)
 
-        # 打点竖线：颜色随主题；ignoreBounds 保证它不参与自动范围计算
-        marker_pen = pg.mkPen(color=colors['marker'], width=1, style=Qt.DashLine)
-        for marker in self._markers:
-            line = pg.InfiniteLine(
-                pos=marker.timestamp.timestamp(), angle=90, movable=False,
-                pen=marker_pen, label=marker.label,
-                labelOpts={
-                    'position': 0.94, 'color': colors['marker'],
-                    'movable': False, 'rotateAxis': (1, 0),
-                })
-            line.setToolTip(marker.label)
+    def _draw_gaps(self, colors: dict) -> None:
+        """空洞：灰色阴影 + "无数据 N" 说明；ignoreBounds 不参与自动范围。"""
+        shade = QColor(colors['axis'])
+        shade.setAlpha(GAP_SHADE_ALPHA)
+        for start, end in self._gaps:
+            region = pg.LinearRegionItem(
+                values=(start, end), orientation='vertical', movable=False,
+                brush=pg.mkBrush(shade), pen=pg.mkPen(None))
+            region.setZValue(-10)
+            text = gap_label_text(datetime.fromtimestamp(start), datetime.fromtimestamp(end))
+            label = pg.InfLineLabel(
+                region.lines[0], text=text, position=GAP_LABEL_POSITION,
+                anchors=[(0, 0.5), (0, 0.5)], color=colors['text'])
+            label.setToolTip(text)
+            region.setToolTip(text)
+            self.chart_widget.addItem(region, ignoreBounds=True)
+            self._gap_items.append((region, text))
+
+    def _draw_markers(self, colors: dict) -> None:
+        """打点竖线：用户打点虚线 + 编号徽标，基线实线 + "基"，暂停/恢复底部浅色短线。"""
+        marker_color = colors['marker']
+        user_pen = pg.mkPen(color=marker_color, width=1, style=Qt.DashLine)
+        baseline_pen = pg.mkPen(color=marker_color, width=2)
+        system_color = QColor(colors['crosshair'])
+        system_color.setAlpha(SYSTEM_MARKER_ALPHA)
+        system_pen = pg.mkPen(color=system_color, width=2)
+        for marker, badge in zip(self._markers, marker_badges(self._markers)):
+            kind = getattr(marker, 'kind', MARKER_USER)
+            pos = marker.timestamp.timestamp()
+            time_text = marker.timestamp.strftime(DETAIL_TIME_FORMAT)
+            if badge is None:
+                tooltip = f"{SYSTEM_MARKER_TEXTS.get(kind, kind)} · {time_text}"
+                line = pg.InfiniteLine(pos=pos, angle=90, movable=False, pen=system_pen,
+                                       span=(0, SYSTEM_MARKER_SPAN))
+            else:
+                tooltip = f"{badge} {marker.label} · {time_text}"
+                line = pg.InfiniteLine(
+                    pos=pos, angle=90, movable=False,
+                    pen=baseline_pen if kind == MARKER_BASELINE else user_pen,
+                    label=badge, labelOpts={
+                        'position': BADGE_POSITION, 'color': marker_color,
+                        'movable': False,
+                    })
+                line.label.setToolTip(tooltip)
+            line.setToolTip(tooltip)
             self.chart_widget.addItem(line, ignoreBounds=True)
+            self._marker_items.append((kind, badge, line))
 
     # ---------- 悬停十字线 ----------
 
     def hover_text(self, index: int) -> str:
-        """第 index 个绘制点的悬停读数：时间 · 值 · 所处打点区间（若有）。"""
+        """第 index 个绘制点的悬停读数：时间 · 值 · 所处打点区间（若有，带编号徽标）。"""
         x_val = self._x[index]
         time_str = datetime.fromtimestamp(x_val).strftime(DETAIL_TIME_FORMAT)
-        formatted_value = format_metric_value(
-            self._metric_type, self._y[index], display_unit=self._display_unit)
+        if self._rate:
+            formatted_value = format_per_second(self._metric_type, self._y[index])
+        else:
+            formatted_value = format_metric_value(
+                self._metric_type, self._y[index], display_unit=self._display_unit)
         text = f"{time_str} · {formatted_value}"
+        # 区间说明只看用户打点与基线（暂停/恢复不是一轮操作的边界）
+        labelled = [(m, badge) for m, badge in zip(self._markers, marker_badges(self._markers))
+                    if badge is not None]
         context = marker_context(
-            [m.timestamp.timestamp() for m in self._markers],
-            [m.label for m in self._markers], x_val)
+            [m.timestamp.timestamp() for m, _ in labelled],
+            [f"{badge} {m.label}" for m, badge in labelled], x_val)
         if context:
             text += f" · {context}"
         return text
