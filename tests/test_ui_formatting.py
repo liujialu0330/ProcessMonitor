@@ -13,7 +13,7 @@ from ui.formatting import (
     sanitize_filename, stop_reason_text, task_duration_seconds, task_status_text,
     truncate_text, unavailable_reason_text
 )
-from utils.metrics import MetricType
+from utils.metrics import RATE_NOT_APPLICABLE, MetricType
 
 # 已停止任务的时长不看 now；随便给一个远离起止时间的时刻，证明确实没被用到
 FAR_NOW = datetime(2030, 1, 1)
@@ -157,6 +157,16 @@ def test_build_stat_texts_zero_baseline_has_no_percent():
              'last': 5.0, 'slope_per_hour': 3.0}
     texts = build_stat_texts(MetricType.NUM_HANDLES, stats)
     assert texts["变化"] == "+5 个"
+
+
+def test_build_stat_texts_cumulative_metric_rate_not_applicable():
+    """累计类指标（IO 字节等）单调不减：变化量照常显示，增速不外推"""
+    stats = {'count': 10, 'min': 1024.0, 'max': 3072.0, 'avg': 2048.0,
+             'first': 1024.0, 'last': 3072.0, 'slope_per_hour': 4096.0}
+    texts = build_stat_texts(MetricType.IO_READ_BYTES, stats, "MB")
+    assert texts["变化"] == "+2 MB (+200.0%)"
+    assert texts["增速"] == RATE_NOT_APPLICABLE
+    assert texts["当前"] == "3 MB"
 
 
 def test_marker_context_locates_interval():

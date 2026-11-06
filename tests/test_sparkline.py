@@ -13,10 +13,10 @@ import io
 import pytest
 
 from ui.components.sparkline import (
-    MIN_SPAN_BYTES_KB, MIN_SPAN_COUNT, SparklineWidget, TrendDownsampler,
-    compute_y_range, merge_pairs, min_span
+    MIN_SPAN_BYTES_KB, MIN_SPAN_COUNT, MIN_SPAN_PERCENT, SparklineWidget,
+    TrendDownsampler, compute_y_range, merge_pairs, min_span
 )
-from utils.metrics import MetricType
+from utils.metrics import MetricType, min_span_for
 
 
 def test_merge_pairs_averages_adjacent_values():
@@ -64,12 +64,21 @@ def test_downsampler_shows_pending_latest_sample():
 
 
 def test_min_span_rules_by_metric_kind():
-    """字节类 max(当前值1%, 64KB)；计数类至少 4"""
+    """字节类 max(当前值1%, 64KB)；计数类至少 4；百分比至少 1 个百分点"""
     assert min_span(MetricType.MEMORY_PRIVATE, 1000.0) == MIN_SPAN_BYTES_KB
     big = 100 * 1024 * 1024.0  # 100 GB（KB 单位）
     assert min_span(MetricType.MEMORY_PRIVATE, big) == pytest.approx(big * 0.01)
     assert min_span(MetricType.NUM_GDI_OBJECTS, 5000.0) == MIN_SPAN_COUNT
+    assert min_span(MetricType.CPU_PERCENT, 50.0) == MIN_SPAN_PERCENT
     assert min_span(None, 5.0) == 0.0
+
+
+def test_min_span_delegates_to_metric_registry():
+    """迷你图不再自带指标分类表，规则统一由 utils.metrics.min_span_for 按 kind 派生"""
+    for metric in (MetricType.MEMORY_PERCENT, MetricType.IO_READ_BYTES,
+                   MetricType.CPU_SYSTEM_TIME, MetricType.NUM_HANDLES, "unknown"):
+        for reference in (0.0, 80.0, 1e6):
+            assert min_span(metric, reference) == min_span_for(metric, reference)
 
 
 def test_compute_y_range_expands_tiny_jitter_to_minimum_span():

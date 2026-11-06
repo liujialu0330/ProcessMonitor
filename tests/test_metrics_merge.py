@@ -6,7 +6,7 @@ import pytest
 
 from utils.metrics import (
     AVAILABLE_METRICS, DEPRECATED_METRICS, LEGACY_METRIC_ALIASES,
-    METRIC_DESCRIPTIONS, METRIC_DISPLAY_NAMES, METRIC_UNITS, MetricType,
+    METRIC_DESCRIPTIONS, METRIC_DISPLAY_NAMES, METRIC_UNITS, REGISTRY, MetricType,
     all_metric_types, canonical_metric_type, format_metric_value,
     get_metric_display_name, get_metric_display_unit, get_metric_unit,
 )
@@ -85,10 +85,11 @@ def test_involuntary_ctx_switches_deprecated_but_still_displayable():
 
 
 def test_registry_tables_cover_available_plus_deprecated():
-    """显示名/单位/说明三张表的键 = 可选指标 ∪ 已废弃指标，两者不相交"""
+    """显示名/单位/说明三张表的键 = 可选指标 ∪ 已废弃指标 = 注册表键，两者不相交"""
     available = set(all_metric_types())
     assert not (available & DEPRECATED_METRICS)
     expected = available | DEPRECATED_METRICS
+    assert set(REGISTRY) == expected
     assert set(METRIC_DISPLAY_NAMES) == expected
     assert set(METRIC_UNITS) == expected
     assert set(METRIC_DESCRIPTIONS) == expected
