@@ -1,21 +1,24 @@
 """
 监控任务模块
-单个监控任务的实现，继承QThread在后台运行
+单个监控任务的实现（MonitorWorker），继承QThread在后台运行，维护显式状态 WorkerState
 """
 import logging
 import threading
 import time
 import uuid
 from datetime import datetime
-from typing import Dict, Optional, List
+from enum import Enum
+from typing import TYPE_CHECKING, Dict, Optional, List
 from PyQt5.QtCore import QThread, pyqtSignal
 
 from core.contracts import StopReason, TaskStatus, UnavailableReason
 from core.process_collector import ProcessCollector
-from data.models import MonitorTask as TaskModel, DataPoint
-from data.database import Database
+from data.models import TaskRecord, DataPoint
 from utils.metrics import MetricType
 import config
+
+if TYPE_CHECKING:
+    from data.database import Database
 
 logger = logging.getLogger(__name__)
 
@@ -27,9 +30,34 @@ CONSECUTIVE_FAILURE_NOTIFY_THRESHOLD = 3
 FLUSH_FAILURE_LOG_INTERVAL = 100
 
 
-class MonitorTask(QThread):
+class WorkerState(Enum):
+    """监控线程的显式状态。
+
+    迁移（其余组合一律拒绝，保持原状态）：
+        WAITING  --start()-->  RUNNING
+        WAITING  --stop()-->   STOPPED   （从未启动，没有线程需要收尾）
+        RUNNING  --pause()-->  PAUSED
+        PAUSED   --resume()--> RUNNING
+        RUNNING/PAUSED --stop() 或主循环自行结束--> STOPPING
+        STOPPING --收尾落库完成--> STOPPED
+    STOPPED 是终态：线程对象不可复用，重新监控必须新建任务。
     """
-    监控任务类
+    WAITING = "waiting"      # 已创建，未启动
+    RUNNING = "running"      # 采集中
+    PAUSED = "paused"        # 已暂停（线程仍在，等待恢复或停止）
+    STOPPING = "stopping"    # 已请求停止或已退出主循环，正在收尾（flush/写状态）
+    STOPPED = "stopped"      # 收尾已完成，不会再写库
+
+
+# 已请求运行且未请求停止：is_running() 的口径（暂停中也算）
+ACTIVE_STATES = frozenset({WorkerState.RUNNING, WorkerState.PAUSED})
+# 线程仍可能写库：运行计数与维护互斥的口径（含停止收尾中）
+LIVE_STATES = frozenset({WorkerState.RUNNING, WorkerState.PAUSED, WorkerState.STOPPING})
+
+
+class MonitorWorker(QThread):
+    """
+    监控线程
     在独立线程中定期采集进程性能指标
     """
 
@@ -41,7 +69,7 @@ class MonitorTask(QThread):
     metrics_unavailable = pyqtSignal(str, dict)
 
     def __init__(self, pid: int, process_name: str, metric_types: List[str],
-                 interval: float = None, task_id: str = None, db: Database = None,
+                 interval: float = None, task_id: str = None, db: "Database" = None,
                  note: str = '', create_time: Optional[float] = None):
         """
         初始化监控任务
@@ -52,12 +80,15 @@ class MonitorTask(QThread):
             metric_types: 监控指标类型列表
             interval: 采集间隔（秒），默认使用配置文件中的值
             task_id: 任务ID，默认自动生成
-            db: 数据库实例（可选，默认回退新建 Database()；生产路径由 MonitorManager 注入）
+            db: 数据库实例（必填，由 MonitorManager 注入同一实例；保留在原位置以兼容
+                位置参数调用，缺省或为 None 时抛 TypeError，不再自建连接）
             note: 任务备注（随任务行一并落库）
             create_time: 用户所选进程的创建时间（来自进程列表）。线程启动时与该 PID
                 当前进程比对，不一致说明 PID 已被别的进程复用；为 None（如手动输入
                 PID）时跳过比对
         """
+        if db is None:
+            raise TypeError("MonitorWorker 需要注入 db（不再自建数据库连接）")
         super().__init__()
 
         # 任务信息
@@ -69,9 +100,10 @@ class MonitorTask(QThread):
         self.note = note or ''
         self.expected_create_time = create_time
 
-        # 任务状态
-        self._running = False
-        self._paused = False
+        # 显式状态：GUI 线程（start/stop/pause/resume）与工作线程（主循环、收尾）
+        # 都会读写，一律经 _state_lock
+        self._state_lock = threading.Lock()
+        self._state = WorkerState.WAITING
 
         # 调度唤醒事件：stop()/pause()/resume() 置位，让等待中的工作线程立即醒来
         self._wake = threading.Event()
@@ -92,11 +124,11 @@ class MonitorTask(QThread):
         # 已通知过 UI 的不可用指标（每个指标每个任务只通知一次，避免每周期刷屏）
         self._unavailable_notified = set()
 
-        # 数据库（生产路径应由 MonitorManager 注入，回退仅为兼容兜底）
-        self.db = db if db is not None else Database()
+        # 数据库（与 MonitorManager 持有同一实例）
+        self.db = db
 
         # 任务模型
-        self.task_model = TaskModel(
+        self.task_model = TaskRecord(
             task_id=self.task_id,
             pid=self.pid,
             process_name=self.process_name,
@@ -109,12 +141,32 @@ class MonitorTask(QThread):
             create_time=create_time,   # 随任务行落库，供事后识别 PID 复用
         )
 
+    # ========== 状态 ==========
+
+    @property
+    def state(self) -> WorkerState:
+        """当前状态（线程安全）"""
+        with self._state_lock:
+            return self._state
+
+    def _transition(self, allowed_from, target: WorkerState) -> bool:
+        """当前状态在 allowed_from 中时迁移到 target 并返回 True，否则不动返回 False"""
+        with self._state_lock:
+            if self._state not in allowed_from:
+                return False
+            self._state = target
+            return True
+
     def start(self, priority=QThread.InheritPriority):
         """
-        启动线程（重写 QThread.start）：先置运行标志再调用 super().start()，
-        避免线程尚未真正执行到 run() 内部置位语句前 stop() 被提前调用导致状态错乱。
+        启动线程（重写 QThread.start）：先迁移到 RUNNING 再调用 super().start()，
+        避免线程尚未执行到 run() 前 stop() 被提前调用导致状态错乱。
+        只有 WAITING 能启动：已停止的线程对象不可复用。
         """
-        self._running = True
+        if not self._transition((WorkerState.WAITING,), WorkerState.RUNNING):
+            logger.warning("task_id=%s 状态为 %s，忽略重复启动",
+                           self.task_id, self.state.value)
+            return
         self._wake.clear()
         super().start(priority)
 
@@ -124,7 +176,12 @@ class MonitorTask(QThread):
 
         主体放进 try/finally：无论正常结束、主动停止还是意外异常，收尾 _teardown
         都恰好执行一次，且始终在工作线程内（保证"task_stopped 晚于落库完成"）。
+        测试可在当前线程直接调用 run()：WAITING 视同已 start()。
         """
+        self._transition((WorkerState.WAITING,), WorkerState.RUNNING)
+        if self.state is WorkerState.STOPPED:
+            # 启动前已被停止（WAITING -> STOPPED）：没有任何东西需要收尾
+            return
         stop_reason = StopReason.USER
         try:
             stop_reason = self._run_loop()
@@ -134,8 +191,14 @@ class MonitorTask(QThread):
             logger.error(error_msg, exc_info=True)
             self.error_occurred.emit(self.task_id, error_msg)
         finally:
-            self._running = False
-            self._teardown(stop_reason)
+            # 主循环自行结束（进程退出、异常）时也先进入 STOPPING：收尾还要写库，
+            # 运行计数与维护互斥必须继续把它算在内
+            self._transition(ACTIVE_STATES, WorkerState.STOPPING)
+            try:
+                self._teardown(stop_reason)
+            finally:
+                # _teardown 正常会在 emit 前置 STOPPED；这里兜底它被替换或中途异常的情况
+                self._transition(LIVE_STATES, WorkerState.STOPPED)
 
     def _run_loop(self) -> StopReason:
         """
@@ -182,26 +245,27 @@ class MonitorTask(QThread):
         next_deadline = time.monotonic()
         if cpu_primed:
             next_deadline += self.interval
-        while self._running:
+        while True:
+            state = self.state
+            if state not in ACTIVE_STATES:
+                break
             # 暂停：无超时等待，直到 resume()/stop() 唤醒；恢复后立即采一次
-            if self._paused:
+            if state is WorkerState.PAUSED:
                 self._wake.wait()
                 self._wake.clear()
                 next_deadline = time.monotonic()
                 continue
 
-            # 等到本周期截止时间；被唤醒后重新检查标志（调用方先置标志再 set 事件，
-            # 故 clear 之后读到的标志一定是最新的）
-            while self._running and not self._paused:
+            # 等到本周期截止时间；被唤醒后重新检查状态（调用方先改状态再 set 事件，
+            # 故 clear 之后读到的状态一定是最新的）
+            while self.state is WorkerState.RUNNING:
                 remaining = next_deadline - time.monotonic()
                 if remaining <= 0:
                     break
                 self._wake.wait(remaining)
                 self._wake.clear()
-            if not self._running:
-                break
-            if self._paused:
-                continue
+            if self.state is not WorkerState.RUNNING:
+                continue   # 暂停或停止：回到循环顶部按新状态处理
 
             # 落后超过一个周期（如系统休眠唤醒、采集被严重拖慢）：重置为当前时间，不补采
             now = time.monotonic()
@@ -264,35 +328,45 @@ class MonitorTask(QThread):
                        self.task_id, fresh)
         self.metrics_unavailable.emit(self.task_id, fresh)
 
-    def stop(self):
+    def stop(self) -> bool:
         """
-        停止监控任务：只置运行标志，让 run() 主循环自然退出。
+        请求停止：RUNNING/PAUSED 迁移到 STOPPING，让 run() 主循环自然退出；
+        从未启动（WAITING）直接迁移到 STOPPED。
         收尾工作（flush/写状态/emit）全部在 run() 内部完成，因此本方法近乎立即
-        返回，不得劣化。置标志后 set 事件，唤醒正在等待的工作线程（含暂停态）。
+        返回，不得劣化。改状态后 set 事件，唤醒正在等待的工作线程（含暂停态）。
+
+        Returns:
+            bool: 本次调用是否改变了状态（重复停止返回 False）
         """
-        self._running = False
+        changed = (self._transition(ACTIVE_STATES, WorkerState.STOPPING)
+                   or self._transition((WorkerState.WAITING,), WorkerState.STOPPED))
         self._wake.set()
+        return changed
 
-    def pause(self):
-        """暂停监控（唤醒当前等待，工作线程转入暂停等待）"""
-        self._paused = True
+    def pause(self) -> bool:
+        """暂停监控（仅 RUNNING 可暂停；唤醒当前等待，工作线程转入暂停等待）"""
+        if not self._transition((WorkerState.RUNNING,), WorkerState.PAUSED):
+            return False
         self._wake.set()
+        return True
 
-    def resume(self):
-        """恢复监控（唤醒暂停等待，工作线程立即采集一次）"""
-        self._paused = False
+    def resume(self) -> bool:
+        """恢复监控（仅 PAUSED 可恢复；唤醒暂停等待，工作线程立即采集一次）"""
+        if not self._transition((WorkerState.PAUSED,), WorkerState.RUNNING):
+            return False
         self._wake.set()
+        return True
 
     def is_running(self) -> bool:
-        """任务是否正在运行（只读 _running，不与 isRunning() 做或运算，
-        否则 stop() 置的 False 会被冲回 True，导致 wait() 挂起）"""
-        return self._running
+        """已请求运行且未请求停止（暂停中也算）。只由状态派生，不与 isRunning()
+        做或运算：否则停止收尾期间会被冲回 True，等它变 False 的调用方会挂起"""
+        return self.state in ACTIVE_STATES
 
     def is_paused(self) -> bool:
         """任务是否已暂停"""
-        return self._paused
+        return self.state is WorkerState.PAUSED
 
-    def get_task_info(self) -> TaskModel:
+    def get_task_info(self) -> TaskRecord:
         """获取任务信息"""
         return self.task_model
 
@@ -324,7 +398,9 @@ class MonitorTask(QThread):
             logger.error("task_id=%s 写入停止状态失败", self.task_id, exc_info=True)
         logger.info("任务停止: task_id=%s 原因=%s", self.task_id, reason.value)
 
-        # 发送停止信号
+        # 先置 STOPPED 再发信号：界面收到 task_stopped 时运行计数已不含本任务
+        # （此后线程不再写库，维护互斥也随之放行）
+        self._transition(LIVE_STATES, WorkerState.STOPPED)
         self.task_stopped.emit(self.task_id, reason)
 
     def _ensure_task_row(self) -> bool:
@@ -389,12 +465,17 @@ class MonitorTask(QThread):
                          self.task_id, len(self._data_buffer))
 
 
+# 旧名兼容：保留一个版本，新代码请用 MonitorWorker
+MonitorTask = MonitorWorker
+
+
 # 单元测试
 if __name__ == "__main__":
     import sys
     import os
     import tempfile
     from PyQt5.QtWidgets import QApplication
+    from data.database import Database
 
     # 冒烟测试使用临时目录数据库，不写项目 data\monitor.db（显式注入 db 参数，不再
     # 改写 config.DB_PATH）
@@ -410,7 +491,7 @@ if __name__ == "__main__":
     print(f"测试监控当前进程: PID={current_pid}")
 
     # 创建监控任务（多指标，显式注入临时数据库）
-    task = MonitorTask(
+    task = MonitorWorker(
         pid=current_pid,
         process_name="python.exe",
         metric_types=["memory_rss", "cpu_percent", "num_threads"],

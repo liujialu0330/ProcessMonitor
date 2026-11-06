@@ -28,6 +28,28 @@ def wait_stable(getter, quiet: float = 0.4, timeout: float = 10.0) -> bool:
     return False
 
 
+def stop_and_join(manager, timeout_ms: int = 5000) -> bool:
+    """停止 manager 的全部任务并带超时等待线程结束（stop_all_tasks 本身不再等待）。
+    用例收尾与需要"任务已全部收尾落库"的断言前调用。"""
+    manager.stop_all_tasks()
+    return manager.join_all(timeout_ms=timeout_ms)
+
+
+def process_events_until(condition, timeout: float = 5.0) -> bool:
+    """一边处理 Qt 事件一边等 condition() 为真（队列信号与 deleteLater 需要事件循环）"""
+    from PyQt5.QtCore import QCoreApplication, QEvent
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        QCoreApplication.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+        if condition():
+            return True
+        time.sleep(0.01)
+    QCoreApplication.processEvents()
+    return bool(condition())
+
+
 def record_stop_reasons(task) -> list:
     """直连记录 task_stopped 的停止原因（StopReason），在发射线程内同步追加，
     适用于 MonitorTask 与 MonitorManager"""

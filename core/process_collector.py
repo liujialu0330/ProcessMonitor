@@ -8,6 +8,7 @@ import sys
 from ctypes import wintypes
 import psutil
 from typing import Any, Optional, Dict, List, Tuple
+from core import process_catalog
 from core.contracts import UnavailableReason
 from utils.metrics import MetricType
 
@@ -424,56 +425,17 @@ class ProcessCollector:
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             return None
 
+    # 下面两个静态方法是旧接口：进程查询已移到 core.process_catalog，这里只做委托
+
     @staticmethod
     def get_all_processes() -> List[Tuple[int, str, Optional[float]]]:
-        """
-        获取系统中所有正在运行的进程列表
-
-        带上创建时间：列表可能已过期，从选中到真正开始采集之间 PID 可能被别的进程
-        复用，监控任务据此确认采到的仍是所选的那个进程。
-
-        Returns:
-            List[Tuple[int, str, Optional[float]]]: (pid, name, create_time)元组的列表；
-                create_time 读取失败时为None（调用方据此跳过身份比对）
-        """
-        processes = []
-        for proc in psutil.process_iter(['pid', 'name', 'create_time']):
-            try:
-                pid = proc.info['pid']
-                name = proc.info['name']
-                # 过滤掉进程名为空或None的进程
-                if name and name.strip():
-                    processes.append((pid, name, proc.info.get('create_time')))
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
-
-        # 按进程名排序
-        processes.sort(key=lambda x: x[1].lower())
-        return processes
+        """(pid, name, create_time) 列表，按进程名排序；见 process_catalog.list_processes"""
+        return process_catalog.list_processes()
 
     @staticmethod
     def find_process_by_name(name: str) -> List[Tuple[int, str]]:
-        """
-        根据进程名查找进程
-
-        Args:
-            name: 进程名（支持部分匹配）
-
-        Returns:
-            List[Tuple[int, str]]: 匹配的(pid, name)元组列表
-        """
-        processes = []
-        name_lower = name.lower()
-
-        for proc in psutil.process_iter(['pid', 'name']):
-            try:
-                if name_lower in proc.info['name'].lower():
-                    processes.append((proc.info['pid'], proc.info['name']))
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
-
-        processes.sort(key=lambda x: x[1].lower())
-        return processes
+        """按进程名部分匹配查找 (pid, name)；见 process_catalog.search_by_name"""
+        return process_catalog.search_by_name(name)
 
 
 # 单元测试代码（可选）

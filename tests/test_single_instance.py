@@ -10,8 +10,10 @@ from PyQt5.QtNetwork import QLocalServer
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QWidget
 
-import main
-from main import SingleInstanceGuard, activate_main_window, single_instance_name
+import app.single_instance as single_instance_module
+from app.single_instance import (
+    SingleInstanceGuard, activate_main_window, single_instance_name,
+)
 from tests.helpers import poll_until
 
 
@@ -39,7 +41,7 @@ def _notify_from_other_process(name: str) -> subprocess.Popen:
         'import sys',
         'from PyQt5.QtWidgets import QApplication',
         'app = QApplication([])',
-        'from main import SingleInstanceGuard',
+        'from app.single_instance import SingleInstanceGuard',
         f'sys.exit(0 if SingleInstanceGuard({name!r}).notify_existing_instance() else 1)',
     ])
     env = dict(os.environ, QT_QPA_PLATFORM='offscreen', PYTHONIOENCODING='utf-8')
@@ -85,13 +87,13 @@ def test_listen_failure_degrades_gracefully(qapp, unique_name, monkeypatch, capl
     import logging
     monkeypatch.setattr(QLocalServer, 'listen', lambda self, name: False)
     guard = SingleInstanceGuard(unique_name)
-    with caplog.at_level(logging.WARNING, logger="main"):
+    with caplog.at_level(logging.WARNING, logger="app.single_instance"):
         assert guard.listen() is False     # 不抛异常，允许继续启动
     assert any("单实例监听失败" in r.getMessage() for r in caplog.records)
 
 
 def test_server_name_contains_sanitized_username(monkeypatch):
-    monkeypatch.setattr(main.getpass, 'getuser', lambda: 'Zhang San/x')
+    monkeypatch.setattr(single_instance_module.getpass, 'getuser', lambda: 'Zhang San/x')
     name = single_instance_name()
     assert name == "ProcessMonitor_Zhang_San_x"  # 空格与斜杠均被替换为下划线
 
@@ -99,7 +101,7 @@ def test_server_name_contains_sanitized_username(monkeypatch):
 def test_server_name_falls_back_when_getuser_fails(monkeypatch):
     def _fail():
         raise OSError("no user")
-    monkeypatch.setattr(main.getpass, 'getuser', _fail)
+    monkeypatch.setattr(single_instance_module.getpass, 'getuser', _fail)
     monkeypatch.setenv('USERNAME', 'fallback')
     assert single_instance_name() == "ProcessMonitor_fallback"
 
@@ -116,3 +118,17 @@ def test_activate_main_window_restores_hidden_and_minimized(qapp):
     assert not (window.windowState() & Qt.WindowMinimized)
     assert window.isVisible() is True
     window.close()
+
+
+def test_main_module_is_thin_entry():
+    """入口文件只剩 run() 调用：导入 main 不得连带导入 ui/core/data（日志须先于它们初始化）"""
+    import subprocess
+    code = os.linesep.join([
+        'import sys, main',
+        'heavy = [m for m in sys.modules if m.split(".")[0] in ("ui", "core", "data")]',
+        'sys.exit(1 if heavy else 0)',
+    ])
+    proc = subprocess.run([sys.executable, '-c', code], cwd=PROJECT_ROOT,
+                          env=dict(os.environ, QT_QPA_PLATFORM='offscreen'),
+                          capture_output=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr.decode('utf-8', 'replace')

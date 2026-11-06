@@ -1,5 +1,5 @@
 """
-MonitorTask 暂停/恢复行为验证
+MonitorWorker 暂停/恢复行为验证
 
 真实起 QThread 监控当前测试进程，验证 pause() 让主循环跳过采集（不再 emit
 data_updated）、resume() 立即恢复采集、以及暂停态下 stop() 无需先 resume 即可
@@ -13,22 +13,23 @@ import pytest
 from PyQt5.QtCore import Qt
 
 from core.contracts import StopReason
-from core.monitor_task import MonitorTask
+from core.monitor_task import MonitorWorker
 from tests.helpers import poll_until, record_stop_reasons, wait_stable
 
 
 @pytest.fixture
-def make_task(tmp_path, qapp):
-    """构造真实 MonitorTask（数据库由根 conftest 隔离到临时目录），用例结束后
-    兜底清理，防止某个断言失败导致线程遗留"""
+def make_task(db, qapp):
+    """构造真实 MonitorWorker（显式注入临时库），用例结束后兜底清理，防止某个断言
+    失败导致线程遗留"""
     created = []
 
     def _factory(pid=None, interval=0.1, metric_types=None):
-        t = MonitorTask(
+        t = MonitorWorker(
             pid=pid or os.getpid(),
             process_name="pytest-target",
             metric_types=metric_types or ["memory_rss"],
             interval=interval,
+            db=db,
         )
         created.append(t)
         return t

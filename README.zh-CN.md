@@ -115,7 +115,7 @@ flowchart TD
         TS[应用级排版系统] --> MW
     end
     subgraph Core["核心业务层 (core/)"]
-        MM[监控管理器 MonitorManager] --> MT[监控任务 MonitorTask QThread]
+        MM[监控管理器 MonitorManager] --> MT[监控线程 MonitorWorker QThread]
         MT --> PC[进程采集器 ProcessCollector / psutil]
         EW[导出线程 ExportWorker QThread]
     end

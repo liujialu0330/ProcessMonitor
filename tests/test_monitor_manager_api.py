@@ -1,7 +1,8 @@
 """
-MonitorManager 新接口与线程释放语义：
-stop_task 非阻塞、remove_task 按 isRunning 等待、start_task 拒绝已结束任务、
-stop_all_tasks 先全部置标志再逐个 join、维护锁、标记、delete_task_data、运行计数、note
+MonitorManager 接口与线程释放语义：
+去单例（普通注入）、stop_task / remove_task / stop_all_tasks 都不阻塞、线程 finished 后
+manager 自行移除并释放对象、start_task 只接受未启动任务、计数只看 WorkerState、
+join_all 带超时、维护锁、标记、delete_task_data、note
 """
 import os
 import threading
@@ -9,20 +10,23 @@ import time
 from datetime import datetime
 
 import pytest
-from PyQt5.QtCore import Qt
 
 import dataclasses
 
 from core.contracts import StopReason, TaskInfo, TaskStatus
 from core.monitor_manager import MonitorManager
-from core.monitor_task import MonitorTask
+from core.monitor_task import MonitorTask, MonitorWorker, WorkerState
 from data.database import Database
-from tests.helpers import poll_until, record_stop_reasons
+from tests.helpers import (
+    poll_until, process_events_until, record_stop_reasons, stop_and_join,
+)
 
 
 @pytest.fixture
 def manager(db, qapp):
-    return MonitorManager(db=db)
+    mgr = MonitorManager(db=db)
+    yield mgr
+    stop_and_join(mgr)
 
 
 class _SlowCollector:
@@ -85,23 +89,73 @@ def test_stop_task_returns_while_thread_still_running(manager):
     assert task.wait(5000) is True
 
 
-def test_remove_task_waits_while_thread_running_even_if_flag_cleared(manager):
-    """_running 已为 False 但线程仍在运行（停止收尾中）：remove_task 必须 wait 到线程结束"""
+def test_remove_task_does_not_wait_and_finished_callback_removes(manager, qapp):
+    """线程卡在收尾中：remove_task 立即返回 True、不 wait；任务留在 manager 里直到
+    线程 finished，再由 manager 自己移除、释放对象并发出一次 task_removed"""
+    removed = []
+    manager.task_removed.connect(removed.append)
     gate = threading.Event()
     collector = _SlowCollector(gate)
     task_id, task = _start_task_with_collector(manager, collector)
     assert collector.entered.wait(5)
-    manager.stop_task(task_id)
-    assert task.is_running() is False and task.isRunning() is True
 
-    threading.Timer(0.3, gate.set).start()
     t0 = time.perf_counter()
     assert manager.remove_task(task_id) is True
-    elapsed = time.perf_counter() - t0
+    assert time.perf_counter() - t0 < 0.2, "remove_task 不应等待线程"
+    assert task.state is WorkerState.STOPPING and task.isRunning() is True
+    assert manager.get_task(task_id) is task
+    qapp.processEvents()
+    assert removed == []
 
-    assert task.isFinished() is True, "remove_task 返回时线程必须已结束"
-    assert elapsed >= 0.2
+    gate.set()
+    assert task.wait(5000) is True
+    assert process_events_until(lambda: manager.get_task(task_id) is None)
+    assert removed == [task_id]
+
+
+def test_finished_worker_is_removed_and_deleted_without_remove_call(manager, qapp):
+    """无人调用 remove_task：线程结束（finished）后 manager 自行移除并 deleteLater"""
+    from PyQt5 import sip
+
+    removed = []
+    manager.task_removed.connect(removed.append)
+    task_id, task = _start_task_with_collector(manager, _SlowCollector())
+    manager.stop_task(task_id)
+    assert task.wait(5000) is True
+    assert manager.get_task(task_id) is task   # finished 经队列送达前仍在
+
+    assert process_events_until(lambda: sip.isdeleted(task))
     assert manager.get_task(task_id) is None
+    assert manager.get_task_count() == 0
+    assert removed == [task_id]
+
+
+def test_remove_task_not_started_removes_immediately(manager):
+    """未启动的任务没有线程可等：立即移除，且对象已置 STOPPED 不会再被启动"""
+    removed = []
+    manager.task_removed.connect(removed.append)
+    task_id = manager.create_task(os.getpid(), "p.exe", ["memory_rss"], 1.0)
+    task = manager.get_task(task_id)
+
+    assert manager.remove_task(task_id) is True
+    assert manager.get_task(task_id) is None
+    assert removed == [task_id]
+    assert task.state is WorkerState.STOPPED
+    assert manager.remove_task(task_id) is False
+
+
+def test_remove_task_after_finished_before_callback(manager):
+    """线程已结束但 finished 尚未送达：remove_task 直接移除，之后的回调不会重复发信号"""
+    removed = []
+    manager.task_removed.connect(removed.append)
+    task_id, task = _start_task_with_collector(manager, _SlowCollector())
+    manager.stop_task(task_id)
+    assert task.wait(5000) is True
+
+    assert manager.remove_task(task_id) is True
+    assert manager.get_task(task_id) is None
+    manager._on_worker_finished()
+    assert removed == [task_id]
 
 
 def test_remove_task_unknown_returns_false(manager):
@@ -135,7 +189,26 @@ def test_start_task_rejects_running_and_unknown(manager):
     task_id, task = _start_task_with_collector(manager, _SlowCollector())
     assert manager.start_task(task_id) is False
     assert manager.start_task("nope") is False
-    manager.stop_all_tasks()
+
+
+# ========== 去单例 ==========
+
+def test_manager_is_not_a_singleton(tmp_path, qapp):
+    """每次构造都是独立实例，各自持有注入的数据库与任务表"""
+    db_a = Database(str(tmp_path / "a.db"))
+    db_b = Database(str(tmp_path / "b.db"))
+    a, b = MonitorManager(db=db_a), MonitorManager(db=db_b)
+
+    assert a is not b
+    assert (a.db, b.db) == (db_a, db_b)
+    a.create_task(os.getpid(), "x.exe", ["memory_rss"], 1.0)
+    assert (a.get_task_count(), b.get_task_count()) == (1, 0)
+    assert not hasattr(MonitorManager, '_instance')
+
+
+def test_manager_requires_db():
+    with pytest.raises(TypeError):
+        MonitorManager()
 
 
 # ========== stop_all_tasks ==========
@@ -158,28 +231,43 @@ class _FakeTask:
         return True
 
 
-def test_stop_all_tasks_flags_all_before_joining(manager):
+def test_stop_all_tasks_only_requests_stop_without_waiting(manager):
+    """退出路径的等待交给 join_all（带超时）：stop_all_tasks 只改状态并唤醒"""
     log = []
     manager._tasks = {n: _FakeTask(n, log) for n in ("a", "b", "c")}
     manager._tasks["idle"] = _FakeTask("idle", log, running=False)
 
     manager.stop_all_tasks()
 
-    assert [e[:2] for e in log] == [
-        ("stop", "a"), ("stop", "b"), ("stop", "c"),
-        ("wait", "a"), ("wait", "b"), ("wait", "c"),
-    ]
-    # 无超时 join：wait 不带参数
-    assert all(e[2] == () for e in log if e[0] == "wait")
+    assert log == [("stop", "a"), ("stop", "b"), ("stop", "c"), ("stop", "idle")]
+    manager._tasks = {}
 
 
-def test_stop_all_tasks_real_tasks_all_finished(manager):
+def test_stop_all_tasks_returns_while_thread_stuck(manager):
+    gate = threading.Event()
+    collector = _SlowCollector(gate)
+    task_id, task = _start_task_with_collector(manager, collector)
+    assert collector.entered.wait(5)
+
+    t0 = time.perf_counter()
+    manager.stop_all_tasks()
+    assert time.perf_counter() - t0 < 0.2
+    assert task.state is WorkerState.STOPPING and task.isRunning()
+    gate.set()
+    assert manager.join_all(timeout_ms=5000) is True
+
+
+def test_stop_all_then_join_all_real_tasks_all_finished(manager):
     ids = [_start_task_with_collector(manager, _SlowCollector())[0] for _ in range(3)]
+    pending = manager.create_task(os.getpid(), "p.exe", ["memory_rss"], 1.0)
     tasks = [manager.get_task(i) for i in ids]
 
     manager.stop_all_tasks()
+    assert manager.join_all(timeout_ms=5000) is True
 
     assert all(t.isFinished() for t in tasks)
+    assert all(t.state is WorkerState.STOPPED for t in tasks)
+    assert manager.get_task(pending).state is WorkerState.STOPPED   # 未启动的也不能再启动
     assert manager.running_task_count() == 0
 
 
@@ -205,6 +293,36 @@ def test_running_task_count_and_has_running_tasks(manager):
     task.wait(5000)
     assert manager.running_task_count() == 0
     assert pending is not None
+
+
+class _StateOnlyTask:
+    """只有 state 可信、isRunning 故意给反值：验证计数不看 QThread 状态"""
+
+    def __init__(self, state, pid=1):
+        self.state = state
+        self.pid = pid
+
+    def isRunning(self):
+        return self.state is WorkerState.STOPPED
+
+
+@pytest.mark.parametrize("state, live, active", [
+    (WorkerState.WAITING, False, False),
+    (WorkerState.RUNNING, True, True),
+    (WorkerState.PAUSED, True, True),
+    (WorkerState.STOPPING, True, False),
+    (WorkerState.STOPPED, False, False),
+])
+def test_counts_follow_worker_state_only(manager, state, live, active):
+    manager._tasks = {"t": _StateOnlyTask(state)}
+    try:
+        assert manager.running_task_count() == int(live)
+        assert manager.has_running_tasks() is live
+        assert manager.is_task_active("t") is active
+        assert manager.has_running_task_for_pid(1) is active
+        assert manager.is_task_paused("t") is (state is WorkerState.PAUSED)
+    finally:
+        manager._tasks = {}
 
 
 def test_maintenance_lock_blocks_create_and_emits_error(manager):
@@ -241,7 +359,7 @@ def test_begin_maintenance_refused_when_tasks_running(manager):
     assert manager.begin_maintenance() is False
     assert manager.is_maintenance_running() is False
 
-    manager.stop_all_tasks()
+    stop_and_join(manager)
     assert manager.begin_maintenance() is True
     manager.end_maintenance()
 
@@ -319,7 +437,7 @@ def test_create_time_is_written_to_task_row(manager):
         manager, _Collector(), create_time=create_time)
     assert poll_until(lambda: manager.db.get_task(task_id) is not None)
     assert manager.db.get_task(task_id).create_time == create_time
-    manager.stop_all_tasks()
+    stop_and_join(manager)
     # 停止收尾再次保存任务行，create_time 不丢
     assert manager.db.get_task(task_id).create_time == create_time
 
@@ -327,7 +445,7 @@ def test_create_time_is_written_to_task_row(manager):
     manager.get_task(plain).collector = _SlowCollector()
     manager.start_task(plain)
     assert poll_until(lambda: manager.db.get_task(plain) is not None)
-    manager.stop_all_tasks()
+    stop_and_join(manager)
     assert manager.db.get_task(plain).create_time is None
 
 
@@ -346,7 +464,7 @@ def test_delete_task_data_refused_while_running(manager):
     assert manager.delete_task_data(task_id) is False
     assert manager.db.get_task(task_id) is not None
 
-    manager.stop_all_tasks()
+    stop_and_join(manager)
     assert manager.delete_task_data(task_id) is True
     assert manager.db.get_task(task_id) is None
     assert manager.db.get_data_point_count(task_id) == 0
@@ -376,9 +494,11 @@ def test_create_task_note_is_persisted(manager):
 
 
 def test_monitor_task_constructor_keeps_keyword_compat(db):
-    """旧的关键字/位置调用方式仍然可用（note 在末尾）"""
+    """旧的关键字/位置调用方式仍然可用（note 在末尾）；旧名 MonitorTask 是 MonitorWorker 的别名"""
+    assert MonitorTask is MonitorWorker
     t = MonitorTask(1, "a.exe", ["memory_rss"], 1.0, "tid-1", db)
     assert (t.task_id, t.db, t.note) == ("tid-1", db, '')
+    assert t.state is WorkerState.WAITING
 
 
 # ========== 维护与导出互斥 ==========
@@ -549,9 +669,6 @@ class _JoinTask:
         pass
 
     def wait(self, timeout_ms=None):
-        if timeout_ms is None:   # 用例结束时 conftest 的 stop_all_tasks 无超时收尾
-            self._alive = False
-            return True
         self.log.append((self.name, timeout_ms))
         if self.hang:
             return False
@@ -568,6 +685,7 @@ def test_join_all_waits_running_tasks_with_timeout(manager):
     }
     assert manager.join_all(timeout_ms=3000) is True
     assert log == [("a", 3000), ("b", 3000)]   # 已结束的线程不等
+    manager._tasks = {}
 
 
 def test_join_all_reports_timeout_and_still_joins_rest(manager):
@@ -575,6 +693,7 @@ def test_join_all_reports_timeout_and_still_joins_rest(manager):
     manager._tasks = {"stuck": _JoinTask(log, "stuck", hang=True), "ok": _JoinTask(log, "ok")}
     assert manager.join_all(timeout_ms=50) is False
     assert log == [("stuck", 50), ("ok", 50)]   # 一个超时不影响后面的线程
+    manager._tasks = {}
 
 
 def test_join_all_real_stuck_thread_times_out(manager):

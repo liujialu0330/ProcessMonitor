@@ -320,14 +320,21 @@ def test_export_end_to_end_releases_worker_on_thread_finished(
     page.path_edit.setText(str(target))
 
     page._export_data()
-    assert page._export_worker is not None
+    worker = page._export_worker
+    assert worker is not None
     assert not page.export_button.isEnabled()
+    # 登记到线程登记表：退出时先取消（删除半成品临时文件）再等 2 秒
+    entries = page.services.threads.entries()
+    assert [(e.name, e.thread, e.cancel, e.timeout_ms) for e in entries] == [
+        ("导出数据", worker, worker.cancel, 2000)]
 
     from PyQt5.QtWidgets import QApplication
     assert poll_until(lambda: (QApplication.processEvents() or True)
                       and page._export_worker is None, timeout=15)
     assert page.export_button.isEnabled()
     assert notifier.last().level == "success"
+    # 线程结束后由登记表自动注销
+    assert page.services.threads.entries() == []
 
     # 导出文件末列为「打点」
     with open(target, newline='', encoding='utf-8-sig') as f:

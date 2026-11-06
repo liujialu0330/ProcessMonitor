@@ -66,7 +66,7 @@ DATA_DIR_ENV = "PROCESS_MONITOR_DATA_DIR"
 
 def get_data_dir():
     """
-    获取数据目录
+    获取数据目录（兼容接口，规则见 app.paths.AppPaths.resolve）
 
     Returns:
         str: 数据目录路径
@@ -74,25 +74,28 @@ def get_data_dir():
             - 开发环境：返回项目根目录下的data文件夹
             - 打包环境：返回用户本地应用数据目录，避免Program Files权限问题
     """
-    override = os.environ.get(DATA_DIR_ENV)
-    if override:
-        return os.path.abspath(override)
-    if getattr(sys, 'frozen', False):
-        local_appdata = os.environ.get('LOCALAPPDATA', os.path.expanduser('~'))
-        return os.path.join(local_appdata, APP_NAME, "data")
-    else:
-        return os.path.join(BASE_DIR, "data")
+    from app.paths import AppPaths
+    return AppPaths.resolve().data_dir
 
 
-# 数据库配置
-DATA_DIR = get_data_dir()
-DB_PATH = os.path.join(DATA_DIR, "monitor.db")
+# 由数据目录派生的兼容路径常量：不在导入期计算（导入本模块不得有创建目录等副作用，
+# 也不能把导入那一刻的环境变量固化下来），每次访问时按 AppPaths.resolve() 现算。
+# 新代码请直接用组合根注入的 AppPaths。
+_DERIVED_PATHS = {
+    'DATA_DIR': 'data_dir',
+    'DB_PATH': 'db_path',
+    'LOG_DIR': 'log_dir',
+    'UPDATE_PREFS_PATH': 'prefs_path',
+}
 
-# 更新偏好文件（记录跳过的版本等）
-UPDATE_PREFS_PATH = os.path.join(DATA_DIR, "update_prefs.json")
 
-# 确保数据目录存在
-os.makedirs(DATA_DIR, exist_ok=True)
+def __getattr__(name):
+    attr = _DERIVED_PATHS.get(name)
+    if attr is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from app.paths import AppPaths
+    return getattr(AppPaths.resolve(), attr)
+
 
 # 监控配置
 MAX_MONITOR_TASKS = 5  # 最多同时监控5个进程

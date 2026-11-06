@@ -302,6 +302,13 @@ def test_fake_preferences():
     prefs.tray = False
     assert prefs.close_to_tray() is False
 
+    # 取值范围默认与生产配置一致，可改写
+    import app_config
+    assert prefs.interval_range() == app_config.interval_range()
+    assert prefs.retention_options() == app_config.retention_options()
+    prefs.retention_options().append(999)   # 返回副本
+    assert 999 not in prefs.retention_options()
+
 
 # ---------- make_services ----------
 
@@ -314,8 +321,13 @@ def test_make_services_defaults_to_doubles():
     assert isinstance(services.process_query, FakeProcessQuery)
     assert isinstance(services.task_status, FakeTaskStatus)
     assert isinstance(services.preferences, FakePreferences)
+    # 线程登记表用真实对象（QObject，离屏可用），初始为空
+    from core.shutdown import ThreadRegistry
+    assert isinstance(services.threads, ThreadRegistry)
+    assert services.threads.entries() == []
     # 每次组装都是新实例，用例之间不共享记录
     assert make_services().notifier is not services.notifier
+    assert make_services().threads is not services.threads
 
 
 def test_make_services_overrides_by_field_name():

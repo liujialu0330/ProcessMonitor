@@ -1,7 +1,9 @@
 """
 测试用的服务集合与页面工厂
 
-make_services(**overrides) 组装一份全替身的 UiServices，可按名字替换其中任意一项。
+make_services(**overrides) 组装一份全替身的 UiServices，可按名字替换其中任意一项；
+线程登记表（threads）用真实的 ThreadRegistry（QObject，离屏可用），测试可从
+services.threads.entries() 断言页面登记了哪些后台线程。
 
 页面工厂按"页面构造函数必填注入"之后的签名编写：
     MonitorPage / HistoryPage / ExportPage / SettingPage(db, manager, services, parent=None)
@@ -15,6 +17,7 @@ manager（ManagerTaskStatus），使页面看到的"是否在运行"与 manager 
 from dataclasses import replace
 from typing import Any, Optional
 
+from core.shutdown import ThreadRegistry
 from tests.doubles import (
     FakeClock, FakePreferences, FakeProcessQuery, FakeTaskStatus,
     RecordingNotifier, ScriptedDialogs,
@@ -31,6 +34,7 @@ def make_services(**overrides: Any) -> UiServices:
         process_query=FakeProcessQuery(),
         task_status=FakeTaskStatus(),
         preferences=FakePreferences(),
+        threads=ThreadRegistry(),
     )
     return replace(services, **overrides) if overrides else services
 

@@ -53,6 +53,8 @@
 - 导出进行中不能清理压缩数据库，清理进行中不能开始导出，二者不再互相抢锁
 - 清理数据库失败不再显示成功：清理或压缩出错时提示“清理失败”及原因，而不是“数据库清理完成”；压缩后不再残留接近整库大小的 `-wal` 文件
 - 读取失败显示“读取数据失败”而非“暂无数据”：历史页读库出错时给出错误提示，不再误显示为没有数据；运行中任务的自动刷新读库出错时保留当前显示并提示一次
+- 退出时后台线程收尾有 30 秒总期限并记录日志，不再可能无限等待；收尾期间窗口先隐藏，托盘图标悬停文字显示进度
+- 清理数据库与开始监控/导出的互斥改为界面线程先占锁，消除确认清理后、后台线程真正开始前任务或导出趁机开始的竞争
 
 #### 内部
 - 旧数据库迁移到 v2 时，把旧任务的 `memory_vms` / `memory_pagefile` 并入 `memory_private` 并对同一时间戳的重复数据点去重（迁移前备份为 `.bak_v1`）；旧指标键即使迁移未成功也显示为“私有字节”
@@ -60,13 +62,18 @@
 - 文档同步：PRD、代码架构说明（精简重写）、README 与更新日志
 - `ExportWorker` 改为注入页面持有的 `Database` 实例，线程内不再另建数据库对象
 - `MonitorManager` 新增导出登记（`begin_export` / `end_export` / `has_running_exports`），`begin_maintenance` 在导出进行中时拒绝，设置页按原因分别提示
-- 退出时改由各页面的 `background_threads()` 登记需要收尾的线程，主窗口统一收尾，不再按私有属性名 `getattr`
+- 线程基类与登记表：导出、历史刷新、清理、更新检查与下载统一继承 `core/workers/base.py` 的 `BackgroundTask`（`result` / `failed` / `progress` 信号、`CancelToken` 取消、`LatestRequestGate` 最新请求获胜）；页面启动线程时登记到 `ThreadRegistry`，线程结束自动注销并释放，退出时由 `ShutdownCoordinator` 按“停任务 → 等待任务 → 结束登记线程 → 关闭数据库”统一收尾
+- 监控任务线程改名 `MonitorWorker`（旧名 `MonitorTask` 保留为别名）并维护显式状态机（等待/运行/暂停/停止中/已停止）；线程结束后由管理器自行移除，`remove_task` 与 `stop_all_tasks` 不再阻塞等待；`db` 改为必须注入，删除最后的 `Database()` 兜底
 - 废弃“非自愿上下文切换”（`num_ctx_switches_involuntary`）：Windows 上 psutil 恒为 0，不再可选，旧数据仍可显示与导出；可选指标 27 → 26（系统资源 6 → 5）
 - 新增 `core/contracts.py`：任务状态、停止原因、指标不可用原因改用枚举跨层传递，中文文案集中到 `ui/formatting.py`，不再以中文字面量作为 core 与界面之间的协议
 - `MonitorManager` 对界面只提供只读快照 `TaskInfo` 与状态查询（`is_task_active` / `has_running_task_for_pid` 等），退出时的兜底限时 join 并入 `join_all`；界面不再持有任务线程对象
 - `ui/formatting.py` 的时长与任务下拉文案函数改为必须由调用方传入当前时刻，不再自取系统时间
 - 新增界面服务层 `ui/services/`（提示、对话框与系统交互、时钟、进程查询、任务运行状态、用户偏好），页面与主窗口不再直接调用 InfoBar、对话框类、`os.startfile`、浏览器与系统时间；测试注入替身即可断言提示与预设用户选择
-- 页面与主窗口的依赖改为构造时必填注入（`db`、`manager`、`services`），删除页面内自建数据库/管理器的兜底；入口 `main.py` 显式组装唯一的数据库、监控管理器与服务集合
+- 页面与主窗口的依赖改为构造时必填注入（`db`、`manager`、`services`），删除页面内自建数据库/管理器的兜底
+- 组合根 `app/bootstrap.py`：`main.py` 只调用 `run()`，启动顺序固定为路径 → 日志 → QApplication → 单实例 → 配置/主题 → 显式迁移 → 数据库 → 监控管理器 → 启动校正 → 线程登记表与界面服务 → 主窗口；路径统一由 `app/paths.py` 的 `AppPaths` 解析，`config.py` 导入时不再有副作用；`ui` / `core` / `data` / `utils` 不再依赖 `app` 包
+- `MonitorManager` 去单例，改为由组合根构造注入的普通对象；进程查询收敛到 `core/process_catalog.py`，数据库维护（启动校正、清理压缩与维护锁）收敛到 `core/maintenance_service.py`；采集周期范围与保留天数选项只在 `app_config` 定义一份
+- 托盘拆分为 `ui/tray.py` 的 `TrayController`，主窗口只连接“显示主界面”“退出”两个信号
+- “跳过此版本”并入配置文件 `config.json`：旧版 `update_prefs.json` 首次启动时自动导入后删除
 - 数据层拆分：连接工厂、表结构与迁移移入 `data/db/`，各表读写拆为 `data/repos/` 下的任务、数据点、打点、分析仓储与 `data/maintenance.py`；仓储失败统一抛 `StorageError`、时间参数只收 `datetime`；`Database` 改为门面，旧方法签名与返回值不变（`vacuum` 改为失败时抛出）；历史页、导出、设置页清理改用仓储接口以区分“读取失败”与“没有数据”；新增按时间分桶（不跨空洞，空洞阈值 2.5 倍采集周期）、聚合、空洞、基线取值等分析查询
 - 数据库升级到 v4：`tasks` 新增 `create_time`（被监控进程的创建时间，随任务行落库），`task_markers` 新增 `kind`（用户/基线/暂停/恢复打点）
 - 数据库常驻一个空闲连接：避免每次写入后 `-wal` 被删除重建，单次写入耗时由约 13.65 ms 降到约 1.55 ms

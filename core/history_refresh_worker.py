@@ -15,7 +15,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import List, Optional, Tuple
 
-from PyQt5.QtCore import QThread, pyqtSignal
+from PyQt5.QtCore import pyqtSignal
+
+from core.workers.base import BackgroundTask, CancelToken
 
 from data.errors import StorageError
 from data.models import DataPoint, Marker
@@ -74,7 +76,7 @@ def query_history_refresh(db, request_id: int, task_id: str,
                           table_limit: int, max_buckets: int) -> HistoryRefreshResult:
     """
     执行自动刷新所需的全部只读查询（与 HistoryPage._load_task_data 的同步路径同口径）。
-    存储失败抛 StorageError，由 HistoryRefreshWorker.run 转成结果的 error 字段。
+    存储失败抛 StorageError，由 HistoryRefreshWorker 转成结果的 error 字段。
 
     Args:
         db: Database 实例（用其仓储属性 tasks/points/analytics/markers）
@@ -108,13 +110,15 @@ def query_history_refresh(db, request_id: int, task_id: str,
     return result
 
 
-class HistoryRefreshWorker(QThread):
+class HistoryRefreshWorker(BackgroundTask):
     """
-    历史页自动刷新后台线程（持引用防 GC，用法参照 core/export_worker.py）。
+    历史页自动刷新后台线程。
 
-    信号约定：result_ready 是 run() 的最后一个动作；UI 侧应把 QThread.finished 接到
-    deleteLater，而不是在 result_ready 的槽里释放线程对象。查询无取消机制（只读、
-    不改库），退出时由主窗口带超时 join 兜底。
+    信号约定：result_ready 是 run() 的最后一个动作，成功与失败都经它返回（失败时
+    结果的 error 非空），同时也发基类的 result/failed。请求序号存于 request_seq，
+    页面用 LatestRequestGate 判断结果是否过期。查询只读、不改库，取消只是让结果
+    不再发出；退出时由线程登记表带超时 join 兜底。线程对象的释放由登记表挂在
+    QThread.finished 上。
     """
 
     # 结果信号：携带 HistoryRefreshResult（成功与失败都经此返回，失败时 error 非空）
@@ -124,9 +128,8 @@ class HistoryRefreshWorker(QThread):
                  metric_type: Optional[str], range_key: str,
                  range_seconds: Optional[int],
                  table_limit: int, max_buckets: int, parent=None):
-        super().__init__(parent)
+        super().__init__(parent, request_seq=request_id)
         self._db = db
-        self._request_id = request_id
         self._task_id = task_id
         self._metric_type = metric_type
         self._range_key = range_key
@@ -134,17 +137,21 @@ class HistoryRefreshWorker(QThread):
         self._table_limit = table_limit
         self._max_buckets = max_buckets
 
-    def run(self):
-        try:
-            result = query_history_refresh(
-                self._db, self._request_id, self._task_id, self._metric_type,
-                self._range_key, self._range_seconds,
-                self._table_limit, self._max_buckets)
-        except Exception as e:
-            logger.error("历史页自动刷新查询失败", exc_info=True)
-            result = HistoryRefreshResult(
-                request_id=self._request_id, task_id=self._task_id,
-                metric_type=self._metric_type, range_key=self._range_key,
-                error=str(e) or type(e).__name__,
-                storage_error=isinstance(e, StorageError))
-        self.result_ready.emit(result)
+    def execute(self, token: CancelToken) -> HistoryRefreshResult:
+        return query_history_refresh(
+            self._db, self.request_seq, self._task_id, self._metric_type,
+            self._range_key, self._range_seconds,
+            self._table_limit, self._max_buckets)
+
+    def handle_result(self, value: HistoryRefreshResult) -> None:
+        super().handle_result(value)
+        self.result_ready.emit(value)
+
+    def handle_failure(self, exc: Exception) -> None:
+        logger.error("历史页自动刷新查询失败", exc_info=exc)
+        message = self.failure_message(exc)
+        self.failed.emit(message)
+        self.result_ready.emit(HistoryRefreshResult(
+            request_id=self.request_seq, task_id=self._task_id,
+            metric_type=self._metric_type, range_key=self._range_key,
+            error=message, storage_error=isinstance(exc, StorageError)))

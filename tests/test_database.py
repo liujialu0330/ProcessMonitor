@@ -2,6 +2,7 @@
 Database 基础存取用例
 平移自 data/database.py 原 `__main__` 冒烟块，改为 tmp_path 临时库注入
 """
+import os
 import uuid
 from datetime import datetime, timedelta
 
@@ -504,3 +505,61 @@ def test_vacuum_runs_and_shrinks_or_noop(db):
     size_after = db.get_db_size_bytes()
 
     assert size_after <= size_before
+
+
+# ========== migrate=False：迁移由组合根显式调用 ==========
+
+def test_migrate_false_skips_migration(tmp_path, monkeypatch):
+    """migrate=False 时构造函数不跑迁移、不建库文件，提示标志全为 False"""
+    from data import database as database_module
+    from data.database import Database
+
+    calls = []
+    monkeypatch.setattr(database_module.MigrationRunner, 'migrate',
+                        lambda self: calls.append(self) or None)
+    path = str(tmp_path / "nomigrate.db")
+    db = Database(path, migrate=False)
+    assert calls == []
+    assert db.migration_report is None
+    assert (db.migration_failed, db.data_reset, db.backup_aborted) == (False, False, False)
+    assert not os.path.exists(path)
+
+
+def test_migrate_false_with_explicit_runner(tmp_path):
+    """先显式跑 MigrationRunner 再以 migrate=False 构造：库可正常读写，报告原样挂上"""
+    from data.database import Database
+    from data.db.connection import ConnectionFactory
+    from data.db.migrations.runner import MigrationOutcome, MigrationRunner
+
+    path = str(tmp_path / "explicit.db")
+    report = MigrationRunner(ConnectionFactory(path, keep_alive=False)).migrate()
+    assert report.outcome is MigrationOutcome.UP_TO_DATE and report.created
+
+    db = Database(path, migrate=False, migration_report=report)
+    assert db.migration_report is report
+    task = _make_task()
+    assert db.save_task(task) is True
+    assert db.get_task(task.task_id).task_id == task.task_id
+    db.close()
+
+
+def test_apply_migration_report_maps_flags(tmp_path):
+    """apply_migration_report 把结果映射为三个互斥标志"""
+    from data.database import Database
+    from data.db.migrations.runner import MigrationOutcome, MigrationReport
+
+    db = Database(str(tmp_path / "flags.db"), migrate=False)
+    expected = {
+        MigrationOutcome.UP_TO_DATE: (False, False, False),
+        MigrationOutcome.MIGRATED: (False, False, False),
+        MigrationOutcome.BACKUP_ABORTED: (False, False, True),
+        MigrationOutcome.FAILED_RESTORED: (True, False, False),
+        MigrationOutcome.FAILED_KEPT: (True, False, False),
+        MigrationOutcome.RESET: (False, True, False),
+    }
+    assert set(expected) == set(MigrationOutcome)
+    for outcome, flags in expected.items():
+        report = MigrationReport(outcome, 3, 3)
+        db.apply_migration_report(report)
+        assert db.migration_report is report
+        assert (db.migration_failed, db.data_reset, db.backup_aborted) == flags, outcome

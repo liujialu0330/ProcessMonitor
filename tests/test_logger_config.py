@@ -79,8 +79,21 @@ def test_setup_logging_uses_explicit_dir(tmp_path, monkeypatch):
 
 
 def test_default_log_dir_is_sibling_of_data_dir(tmp_path, monkeypatch):
-    """未设置环境变量时保持既有布局：logs 与 data 同级"""
+    """未设置环境变量时保持既有布局：logs 与 data 同级（开发环境为项目根下的 logs 目录）"""
+    import sys
+    import config
     monkeypatch.delenv("PROCESS_MONITOR_DATA_DIR", raising=False)
-    fake_data = str(tmp_path / "app" / "data")
-    monkeypatch.setattr(logger_module.config, 'get_data_dir', lambda: fake_data)
-    assert logger_module.get_log_dir() == str(tmp_path / "app" / "logs")
+    monkeypatch.setattr(sys, 'frozen', False, raising=False)
+    assert logger_module.get_log_dir() == os.path.join(config.BASE_DIR, "logs")
+
+    # 打包环境：LOCALAPPDATA 下 <APP_NAME>/logs，与 data 同级
+    monkeypatch.setattr(sys, 'frozen', True, raising=False)
+    monkeypatch.setenv('LOCALAPPDATA', str(tmp_path))
+    assert logger_module.get_log_dir() == os.path.join(str(tmp_path), config.APP_NAME, "logs")
+
+
+def test_get_log_dir_delegates_to_app_paths(tmp_path, monkeypatch):
+    """日志目录规则只在 AppPaths 定义一份"""
+    from app.paths import AppPaths
+    monkeypatch.setenv("PROCESS_MONITOR_DATA_DIR", str(tmp_path / "d"))
+    assert logger_module.get_log_dir() == AppPaths.resolve().log_dir == str(tmp_path / "d" / "logs")

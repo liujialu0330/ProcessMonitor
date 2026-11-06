@@ -1,13 +1,14 @@
 """
 用户偏好读取（MonitorPreferences）
 
-页面需要的用户偏好（上次选择的指标、默认采集周期、保留天数、关窗到托盘）统一
+页面需要的用户偏好（上次选择的指标、默认采集周期、保留天数、关窗到托盘）及其
+取值范围（采集周期范围、保留天数可选值）统一
 经由注入的 MonitorPreferences 读取：测试可以给出固定偏好，不必改动全局 cfg 单例。
 
 设置页上直接绑定 ConfigItem 的设置卡片不经过本服务：那是 qfluentwidgets 设置卡
 的既有用法，卡片本身负责读写与落盘。
 """
-from typing import Iterable, List, Protocol, runtime_checkable
+from typing import Iterable, List, Protocol, Tuple, runtime_checkable
 
 import app_config
 from app_config import cfg
@@ -37,6 +38,14 @@ class MonitorPreferences(Protocol):
         """关闭主窗口时是否最小化到系统托盘。"""
         ...
 
+    def interval_range(self) -> Tuple[int, int]:
+        """采集周期（秒）的合法范围 (最小, 最大)：取值范围只在 app_config 定义一份。"""
+        ...
+
+    def retention_options(self) -> List[int]:
+        """历史数据保留天数的可选值（0 = 永久保留），顺序即设置页选项顺序。"""
+        ...
+
 
 class ConfigPreferences:
     """生产实现：读写 app_config 的全局 cfg 单例。"""
@@ -60,3 +69,11 @@ class ConfigPreferences:
     def close_to_tray(self) -> bool:
         """关窗时是否最小化到托盘。"""
         return bool(cfg.get(cfg.close_to_tray))
+
+    def interval_range(self) -> Tuple[int, int]:
+        """采集周期范围：委托 app_config.interval_range（来自 ConfigItem 校验器）。"""
+        return app_config.interval_range()
+
+    def retention_options(self) -> List[int]:
+        """保留天数可选值：委托 app_config.retention_options（来自 ConfigItem 校验器）。"""
+        return app_config.retention_options()
