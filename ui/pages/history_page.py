@@ -126,6 +126,9 @@ class HistoryPage(QScrollArea):
         self._selection_is_auto = False
         self.current_metric = None
         self.current_task_status = None
+        # 下拉列表里的任务对象与载入时的运行状态：运行中任务的时长标签按定时器原地刷新
+        self._task_by_id = {}
+        self._task_running = {}
 
         # 时间范围选择：默认"全部"，切任务/切指标时保持不变，只有用户主动
         # 切换 SegmentedWidget 才会改变
@@ -587,6 +590,8 @@ class HistoryPage(QScrollArea):
         self.task_combo.clear()
         self.task_combo.blockSignals(False)
         self._task_tooltips = {}
+        self._task_by_id = {}
+        self._task_running = {}
         self.task_combo.setToolTip("")
 
         # 单条查询取出"至少有一次采样"的任务（与导出页口径一致，不再逐任务 COUNT）
@@ -617,6 +622,8 @@ class HistoryPage(QScrollArea):
             index = self.task_combo.count() - 1
             self.task_combo.setItemData(index, task.task_id)
             self._task_tooltips[task.task_id] = format_task_tooltip(task, running, now)
+            self._task_by_id[task.task_id] = task
+            self._task_running[task.task_id] = running
 
         # 4. 尝试恢复之前选中的任务和指标并重新加载数据。
         # 之前只是默认选中、且列表最前面（最新）的任务已经换了：改为选中最新任务
@@ -668,6 +675,25 @@ class HistoryPage(QScrollArea):
             self.task_combo.setCurrentIndex(-1)
             self.task_combo.setCurrentIndex(0)
             self._selection_is_auto = True
+
+    def _refresh_task_option_texts(self):
+        """原地刷新下拉项的时长标签：运行中任务的时长随时间增长；任务刚结束时
+        从数据库取回结束时间，标签改为最终时长。不重建列表，不影响当前选择与图表。"""
+        now = datetime.now()
+        for index in range(self.task_combo.count()):
+            task_id = self.task_combo.itemData(index)
+            task = self._task_by_id.get(task_id)
+            if task is None or not self._task_running.get(task_id):
+                continue
+            running = self._is_task_running(task_id)
+            if not running:
+                task = self.db.get_task(task_id) or task
+                self._task_by_id[task_id] = task
+                self._task_running[task_id] = False
+            self.task_combo.setItemText(index, format_task_option_text(task, running, now))
+            self._task_tooltips[task_id] = format_task_tooltip(task, running, now)
+            if task_id == self.current_task_id:
+                self.task_combo.setToolTip(self._task_tooltips[task_id])
 
     def _on_task_selected(self, index: int):
         """任务选择事件"""
@@ -1349,6 +1375,7 @@ class HistoryPage(QScrollArea):
         if not self.isVisible():
             self._auto_refresh_timer.stop()
             return
+        self._refresh_task_option_texts()
         if not self.current_task_id:
             return
         if self._should_skip_auto_refresh():

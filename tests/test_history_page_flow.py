@@ -378,3 +378,45 @@ def test_select_task_is_an_explicit_choice(page, db):
     page.select_task(old.task_id)
     page._load_tasks()
     assert page.current_task_id == old.task_id
+
+
+class _Clock(datetime):
+    """可控的当前时间：替换页面模块里的 datetime"""
+    current = BASE
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls.current
+
+
+def test_running_task_duration_label_updates_in_place(page, db, monkeypatch):
+    """页面一直开着时，下拉里运行中任务的时长要跟着走；结束后改为最终时长。
+    原地改文字，不重载列表、不打断用户正在看的任务。"""
+    task = _seed_task(db, samples=3, status="running")
+    other = _seed_task(db, samples=3, start=BASE - timedelta(days=1))
+    running = {task.task_id}
+    monkeypatch.setattr(page, '_is_task_running', lambda tid: tid in running)
+    monkeypatch.setattr(page, '_start_auto_refresh_worker', lambda *a, **k: None)
+    monkeypatch.setattr(history_module, 'datetime', _Clock)
+    _Clock.current = BASE + timedelta(minutes=5)
+
+    page.show()
+    page.select_task(other.task_id)
+    index = next(i for i in range(page.task_combo.count())
+                 if page.task_combo.itemData(i) == task.task_id)
+    assert "运行中 5分钟" in page.task_combo.itemText(index)
+
+    reloads = []
+    monkeypatch.setattr(page, '_load_tasks', lambda: reloads.append(1))
+    _Clock.current = BASE + timedelta(minutes=15)
+    page._on_auto_refresh()
+    assert "运行中 15分钟" in page.task_combo.itemText(index)
+
+    db.update_task_status(task.task_id, "stopped", BASE + timedelta(minutes=20))
+    running.clear()
+    _Clock.current = BASE + timedelta(hours=2)
+    page._on_auto_refresh()
+    text = page.task_combo.itemText(index)
+    assert "运行中" not in text and "20分钟" in text
+    assert reloads == []
+    assert page.current_task_id == other.task_id

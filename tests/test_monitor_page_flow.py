@@ -521,3 +521,40 @@ def test_find_pids_by_name_excludes_own_process(page, monkeypatch):
     monkeypatch.setattr(ProcessCollector, "get_all_processes", staticmethod(
         lambda: [(os.getpid(), "python.exe")]))
     assert page._find_pids_by_name("python.exe") == []
+
+
+def test_exited_process_is_cleared_from_form(page, manager, infobar, monkeypatch):
+    """被测进程退出后，表单里不能一直留着已不存在的 PID（再点开始才报"进程不存在"）。"""
+    task_id, _ = _add_card(page, manager, pid=1002)
+    page.process_combo.setCurrentIndex(1)
+    assert page.pid_input.text() == "1002"
+
+    monkeypatch.setattr(ProcessCollector, "is_process_running", lambda self: False)
+    monkeypatch.setattr(ProcessCollector, "get_all_processes", staticmethod(
+        lambda: [(1001, "alpha.exe"), (1003, "MPrintExp.exe")]))
+    page._on_task_stopped(task_id, "进程已终止")
+
+    assert page.pid_input.text() == ""
+    assert page.process_combo.currentIndex() == -1
+    assert page.process_combo.text() == ""
+    assert all(page.process_combo.itemData(i)[0] != 1002
+               for i in range(page.process_combo.count()))
+
+
+def test_form_is_kept_when_selection_is_another_or_still_alive(page, manager, infobar, monkeypatch):
+    task_id, _ = _add_card(page, manager, pid=1002)
+    other_id, _ = _add_card(page, manager, pid=1002)
+
+    # 表单选的是别的进程：不动
+    page.process_combo.setCurrentIndex(0)
+    monkeypatch.setattr(ProcessCollector, "is_process_running", lambda self: False)
+    page._on_task_stopped(task_id, "进程已终止")
+    assert page.pid_input.text() == "1001"
+    assert page.process_combo.currentIndex() == 0
+
+    # 选的就是它，但进程还活着（如用户手动停止）：不动
+    page.process_combo.setCurrentIndex(1)
+    monkeypatch.setattr(ProcessCollector, "is_process_running", lambda self: True)
+    page._on_task_stopped(other_id, "用户停止")
+    assert page.pid_input.text() == "1002"
+    assert page.process_combo.currentIndex() == 1

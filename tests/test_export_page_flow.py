@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import ui.formatting as formatting_module
 import ui.pages.export_page as export_module
 from data.models import DataPoint, MonitorTask
 from tests.helpers import poll_until
@@ -20,11 +21,12 @@ BASE = datetime(2026, 7, 16, 20, 54, 51)
 
 
 def _seed_task(db, samples=5, name="demo.exe", pid=4321, start=BASE, note="",
-               markers=()):
+               markers=(), status="stopped"):
     task = MonitorTask(
         task_id=str(uuid.uuid4()), pid=pid, process_name=name,
         metric_types=[MetricType.NUM_THREADS], interval=1.0, start_time=start,
-        end_time=start + timedelta(seconds=samples), status="stopped", note=note)
+        end_time=None if status == "running" else start + timedelta(seconds=samples),
+        status=status, note=note)
     db.save_task(task)
     db.save_data_points([
         DataPoint(task.task_id, start + timedelta(seconds=i), float(10 + i),
@@ -228,3 +230,45 @@ def test_export_finished_refreshes_task_summary(page, db, silent_infobar, tmp_pa
         for i in range(2)])
     page._on_export_finished(str(tmp_path / "x.csv"), 5, 5)
     assert "5 次采集" in page.data_count_label.text()
+
+
+class _Clock(datetime):
+    """可控的当前时间：替换页面与格式化模块里的 datetime"""
+    current = BASE
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls.current
+
+
+def test_running_task_label_and_summary_refresh_while_visible(page, db, monkeypatch):
+    """页面一直开着时，运行中任务的下拉时长与摘要要定时刷新；任务结束后显示最终状态，
+    且不重置用户已选的保存路径。"""
+    task = _seed_task(db, samples=3, status="running")
+    monkeypatch.setattr(export_module, 'datetime', _Clock)
+    monkeypatch.setattr(formatting_module, 'datetime', _Clock)
+    _Clock.current = BASE + timedelta(minutes=5)
+
+    page.show()
+    assert page._running_refresh_timer.isActive()
+    assert "运行中 5分钟" in page.task_combo.itemText(0)
+    page.path_edit.setText(r"D:\导出\a.csv")
+
+    db.save_data_points([
+        DataPoint(task.task_id, BASE + timedelta(seconds=10 + i), 1.0,
+                  MetricType.NUM_THREADS)
+        for i in range(2)])
+    _Clock.current = BASE + timedelta(minutes=15)
+    page._refresh_running_tasks()
+    assert "运行中 15分钟" in page.task_combo.itemText(0)
+    assert "5 次采集" in page.data_count_label.text()
+
+    db.update_task_status(task.task_id, "stopped", BASE + timedelta(minutes=20))
+    page._refresh_running_tasks()
+    text = page.task_combo.itemText(0)
+    assert "运行中" not in text and "20分钟" in text
+    assert page.status_label.text() == "已停止"
+    assert page.path_edit.text() == r"D:\导出\a.csv"
+
+    page.hide()
+    assert not page._running_refresh_timer.isActive()
