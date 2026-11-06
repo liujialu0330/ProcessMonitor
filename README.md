@@ -115,7 +115,7 @@ flowchart TD
         TS[Typography System] --> MW
     end
     subgraph Core["Core Layer (core/)"]
-        MM[MonitorManager] --> MT[MonitorTask QThread]
+        MM[MonitorManager] --> MT[MonitorWorker QThread]
         MT --> PC[ProcessCollector / psutil]
         EW[ExportWorker QThread]
     end

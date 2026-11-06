@@ -1,7 +1,7 @@
 """
 pytest 全局 fixture
-统一 sys.path（把项目根加进 sys.path）、数据目录隔离、tmp_path 数据库注入、
-QApplication 会话级实例、MonitorManager 单例重置
+统一 sys.path（把项目根加进 sys.path）、数据目录隔离（只设环境变量，不覆写任何
+路径常量）、tmp_path 数据库注入、QApplication 会话级实例、迁移记录与应用配置复位
 """
 import os
 import sys
@@ -18,7 +18,7 @@ if PROJECT_ROOT not in sys.path:
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
 import config  # noqa: E402
-from core.monitor_manager import MonitorManager  # noqa: E402
+from app.paths import AppPaths  # noqa: E402
 from data.database import Database  # noqa: E402
 from data.db.migrations.runner import reset_guard_for_tests  # noqa: E402
 import app_config  # noqa: E402
@@ -41,36 +41,19 @@ def _isolate_data_dir(tmp_path_factory, monkeypatch):
     """
     把数据目录隔离到临时目录，任何用例都不得触碰开发机的 data 目录。
 
-    各模块访问路径的方式：Database 与 update_checker 在调用时才读取
-    config.DB_PATH / config.UPDATE_PREFS_PATH；setting_page 读取 config.DATA_DIR；
-    app_config.CONFIG_PATH 是导入时从 config.DATA_DIR 拷贝出的常量，必须单独覆写。
-    这些入口都在此统一指向临时目录。
+    只设置环境变量 PROCESS_MONITOR_DATA_DIR：路径统一由 app.paths.AppPaths.resolve()
+    在使用时解析（config 的兼容路径常量、app_config.CONFIG_PATH、日志目录都是访问时
+    现算），不再逐个覆写模块常量。返回本用例的 AppPaths，需要显式注入的用例可直接用。
     """
     data_dir = str(tmp_path_factory.mktemp("appdata"))
-    monkeypatch.setattr(config, 'DATA_DIR', data_dir)
-    monkeypatch.setattr(config, 'DB_PATH', os.path.join(data_dir, 'monitor.db'))
-    monkeypatch.setattr(
-        config, 'UPDATE_PREFS_PATH', os.path.join(data_dir, 'update_prefs.json'))
-    monkeypatch.setattr(
-        app_config, 'CONFIG_PATH', os.path.join(data_dir, 'config.json'))
+    monkeypatch.setenv(config.DATA_DIR_ENV, data_dir)
+    return AppPaths.resolve()
 
 
-@pytest.fixture(autouse=True)
-def _reset_monitor_manager_singleton():
-    """
-    重置 MonitorManager 单例（所有用例前后）。
-
-    MonitorManager 是进程级单例（_instance 类属性，仅首次构造时传入的 db 生效），
-    不重置会让后续用例复用上一个用例残留的旧实例（及其绑定的旧 db、旧任务字典）。
-    teardown 顺序固定：先对旧实例 stop_all_tasks() 收尾残留 QThread，再置
-    _instance = None。_initialized 是实例级属性，随旧实例一起丢弃。
-    """
-    MonitorManager._instance = None
-    yield
-    old_instance = MonitorManager._instance
-    if old_instance is not None:
-        old_instance.stop_all_tasks()
-    MonitorManager._instance = None
+@pytest.fixture
+def app_paths(_isolate_data_dir):
+    """本用例隔离后的应用路径（数据目录为临时目录，尚未创建日志目录）"""
+    return _isolate_data_dir
 
 
 @pytest.fixture
@@ -123,6 +106,7 @@ def _reset_app_config():
         item_cfg.default_interval.value = item_cfg.default_interval.defaultValue
         item_cfg.retention_days.value = item_cfg.retention_days.defaultValue
         item_cfg.close_to_tray.value = item_cfg.close_to_tray.defaultValue
+        item_cfg.skipped_version.value = item_cfg.skipped_version.defaultValue
         # 主题复位为本应用语义上的默认值 AUTO（跟随系统），而非 qfluentwidgets
         # 库自带的类默认值 Theme.LIGHT——与 load_app_config() 首启行为保持一致
         item_cfg.themeMode.value = Theme.AUTO

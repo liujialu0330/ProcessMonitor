@@ -29,6 +29,7 @@ from app_config import cfg
 from core.monitor_manager import MonitorManager
 from tests.doubles import ScriptedDialogs
 from ui.main_window import MainWindow
+from core.shutdown import ThreadRegistry
 from ui.services import production_services
 from utils.metrics import MetricType
 
@@ -62,7 +63,8 @@ def test_gui_smoke_full_lifecycle(qapp, e2e_db, tmp_path):
     # 对话框，用例中途失败时若仍有任务在跑，收尾的 close() 不能被它阻塞
     manager = MonitorManager(db=e2e_db)
     dialogs = ScriptedDialogs(ask_close_action='quit')
-    services = dataclasses.replace(production_services(manager), dialogs=dialogs)
+    services = dataclasses.replace(
+        production_services(manager, ThreadRegistry()), dialogs=dialogs)
 
     window = MainWindow(e2e_db, manager, services)
     # 覆写为 no-op：防止 3 秒后 QTimer 触发真实联网检查更新；MainWindow 内部 QTimer

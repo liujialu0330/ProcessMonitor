@@ -17,6 +17,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Un
 
 from PyQt5.QtCore import QObject, pyqtSignal
 
+import app_config
 from ui.services.notifier import NOTICE_LEVELS, resolve_duration
 from utils.metrics import LEAK_CHECK_PRESET
 
@@ -334,6 +335,16 @@ class FakeProcessQuery:
     def self_pid(self) -> int:
         return self._self_pid
 
+    def find_pids_by_name(self, name: str,
+                          exclude_self: bool = True) -> List[Tuple[int, Optional[float]]]:
+        self.calls.append(('find_pids_by_name', None))
+        wanted = name.lower()
+        return [(pid, create_time)
+                for pid, entry_name, create_time in sorted(
+                    self.processes, key=lambda entry: entry[1].lower())
+                if entry_name.lower() == wanted
+                and not (exclude_self and pid == self._self_pid)]
+
     def kill(self, pid: int) -> None:
         """模拟进程退出：从进程表移除，并从显式 alive 集合中移除。"""
         self.processes = [entry for entry in self.processes if entry[0] != pid]
@@ -371,7 +382,8 @@ class FakeTaskStatus:
 class FakePreferences:
     """固定用户偏好替身。
 
-    构造后可直接改属性 interval / retention / tray 模拟用户改了设置；
+    构造后可直接改属性 interval / retention / tray 模拟用户改了设置，
+    interval_bounds / retention_choices 是取值范围（默认同 app_config）；
     remember_last_metrics 原样记下（不做归一化），历次调用记在 remembered 中。
     """
 
@@ -383,6 +395,9 @@ class FakePreferences:
         self.interval = default_interval
         self.retention = retention_days
         self.tray = close_to_tray
+        # 取值范围默认与生产配置一致；测试可改写以验证页面确实从这里取
+        self.interval_bounds: Tuple[int, int] = app_config.interval_range()
+        self.retention_choices: List[int] = app_config.retention_options()
         self.remembered: List[List[str]] = []
 
     def last_metrics(self) -> List[str]:
@@ -401,3 +416,9 @@ class FakePreferences:
 
     def close_to_tray(self) -> bool:
         return self.tray
+
+    def interval_range(self) -> Tuple[int, int]:
+        return self.interval_bounds
+
+    def retention_options(self) -> List[int]:
+        return list(self.retention_choices)

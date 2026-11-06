@@ -160,7 +160,7 @@ def test_refresh_query_runs_off_main_thread(shown, db):
 
 def _result(page, **overrides):
     base = dict(
-        request_id=page._refresh_request_seq, task_id=page.current_task_id,
+        request_id=page._refresh_gate.current, task_id=page.current_task_id,
         metric_type=page.current_metric, range_key=page.current_range_key,
         last_dt=BASE, table_points=[DataPoint(page.current_task_id, BASE, 1.0, METRIC)],
         stats=None, chart_points=[DataPoint(page.current_task_id, BASE, 1.0, METRIC)])
@@ -172,7 +172,7 @@ def test_stale_results_are_discarded(shown, monkeypatch):
     page = shown
     applied = _spy_apply(page, monkeypatch)
 
-    page._on_refresh_result(_result(page, request_id=page._refresh_request_seq - 1))
+    page._on_refresh_result(_result(page, request_id=page._refresh_gate.current - 1))
     page._on_refresh_result(_result(page, task_id="other-task"))
     page._on_refresh_result(_result(page, metric_type=MetricType.CPU_PERCENT))
     page._on_refresh_result(_result(page, range_key="10m"))
@@ -288,9 +288,27 @@ def test_shutdown_thread_joins_refresh_worker_with_timeout(shown, db):
     assert _wait(lambda: page._refresh_worker is None)
 
 
+def test_refresh_worker_registered_with_thread_registry(shown, db, services):
+    """在途刷新线程登记到 services.threads（只读查询不可取消、3 秒超时）；
+    结束后自动注销"""
+    page = shown
+    entered, _calls = _block_table_query(page, db)
+    page._on_auto_refresh()
+    assert entered.wait(10)
+
+    worker = page._refresh_worker
+    entries = services.threads.entries()
+    assert [(e.name, e.thread, e.cancel, e.timeout_ms) for e in entries] == [
+        ("历史自动刷新", worker, None, 3000)]
+
+    page._gate.set()
+    assert _wait(lambda: page._refresh_worker is None and services.threads.entries() == [])
+
+
 def test_main_window_close_joins_history_refresh_worker(qapp, tmp_path, monkeypatch):
-    """关窗真退出时，历史页经 background_threads() 登记的在途刷新线程被带超时
-    join：closeEvent 返回时线程已结束（不 join 的话它还要再跑几百毫秒）"""
+    """关窗真退出时，登记在 services.threads 里的在途刷新线程被带超时 join：
+    closeEvent 返回时线程已结束（不 join 的话它还要再跑几百毫秒）。
+    依赖主窗口 closeEvent 经 ShutdownCoordinator 收尾登记表。"""
     import time
     from unittest.mock import MagicMock
     from PyQt5.QtCore import QThread
@@ -311,18 +329,14 @@ def test_main_window_close_joins_history_refresh_worker(qapp, tmp_path, monkeypa
     win.about_page.check_update = lambda *args, **kwargs: None
     monkeypatch.setattr(QApplication, 'quit', MagicMock())
     worker = _SlowRefresh()
-    win.history_page._refresh_worker = worker
+    win.services.threads.register(worker, name="历史自动刷新", timeout_ms=3000)
     try:
-        entries = win.history_page.background_threads()
-        assert [(e.thread, e.cancel_fn, e.timeout_ms) for e in entries] ==             [(worker, None, 3000)]
-
         worker.start()
         assert worker.started_evt.wait(5)
         win.closeEvent(MagicMock())
         assert worker.isFinished()
     finally:
         worker.wait(5000)
-        win.history_page._refresh_worker = None
         manager.stop_all_tasks()
 
 

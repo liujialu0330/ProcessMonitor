@@ -242,3 +242,50 @@ def test_parse_sha256_digest():
     assert parse_sha256_digest("  sha256:" + hex64.upper() + " ") == hex64
     for bad in (None, "", "sha256:", "sha1:" + "a" * 40, hex64, "sha256:" + "a" * 63):
         assert parse_sha256_digest(bad) is None
+
+
+# ========== 基类信号（BackgroundTask） ==========
+
+def test_downloader_generic_signals_mirror_named_ones(qapp, monkeypatch, work_dirs):
+    """成功时 result 与 download_finished 同值、progress 与 download_progress 同步；
+    失败时 failed 与 error_occurred 同文案"""
+    content = b'g' * 3000
+    monkeypatch.setattr(update_checker_module, '_open_download',
+                        lambda *a, **k: _FakeResponse(content, 3000))
+    d = UpdateDownloader(GOOD_URL, "pkg.exe", digest=_digest(content))
+    finished, result, named_progress, progress = [], [], [], []
+    d.download_finished.connect(finished.append)
+    d.result.connect(result.append)
+    d.download_progress.connect(named_progress.append)
+    d.progress.connect(progress.append)
+
+    d.run()
+
+    assert len(finished) == 1 and result == finished
+    assert progress == named_progress and progress[-1] == 100
+
+    d2 = UpdateDownloader(GOOD_URL, "pkg.exe", digest=None)
+    errors, failed = [], []
+    d2.error_occurred.connect(errors.append)
+    d2.failed.connect(failed.append)
+    d2.run()
+    assert errors == failed == [MSG_CANNOT_VERIFY]
+
+
+def test_cancel_during_download_emits_nothing(qapp, monkeypatch, work_dirs):
+    """下载途中取消：删除残留目录，既不发完成也不发失败"""
+    content = b'h' * 10240
+    monkeypatch.setattr(update_checker_module, '_open_download',
+                        lambda *a, **k: _FakeResponse(content, 10240))
+    d = UpdateDownloader(GOOD_URL, "pkg.exe", digest=_digest(content))
+    signals = []
+    d.download_progress.connect(lambda p: d.cancel())   # 第一块写完即取消
+    d.error_occurred.connect(signals.append)
+    d.failed.connect(signals.append)
+    d.download_finished.connect(signals.append)
+    d.result.connect(signals.append)
+
+    d.run()
+
+    assert signals == []
+    assert not os.path.exists(work_dirs[0])

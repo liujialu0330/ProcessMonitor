@@ -1,6 +1,6 @@
 """
 日志基建模块
-统一配置应用日志（RotatingFileHandler），main.py 入口最早处调用 setup_logging()。
+统一配置应用日志（RotatingFileHandler），app.bootstrap.run() 最早处调用 setup_logging()。
 """
 import logging
 import logging.handlers
@@ -19,7 +19,8 @@ _configured = False
 
 def get_log_dir() -> str:
     """
-    获取日志目录（由 config.get_data_dir() 推导，不再自行判断打包/开发环境）
+    获取日志目录（经 config.LOG_DIR 委托 app.paths.AppPaths.resolve，规则只在那里定义
+    一份；工具层不直接依赖 app 组装层）
 
     Returns:
         str: 日志目录路径
@@ -28,16 +29,13 @@ def get_log_dir() -> str:
             - 默认：与数据目录同级的 logs\\（打包为 %LOCALAPPDATA%\\<APP_NAME>\\logs，
               开发环境为项目根目录下的 logs\\，已加入 .gitignore）
     """
-    data_dir = config.get_data_dir()
-    if os.environ.get(config.DATA_DIR_ENV):
-        return os.path.join(data_dir, "logs")
-    return os.path.join(os.path.dirname(data_dir), "logs")
+    return config.LOG_DIR
 
 
 def setup_logging(log_dir: Optional[str] = None) -> str:
     """
     初始化应用日志：RotatingFileHandler 挂到 root logger，各模块用
-    `logging.getLogger(__name__)` 即可复用。应在 main.py 入口最早处调用一次。
+    `logging.getLogger(__name__)` 即可复用。应在 app.bootstrap.run() 最早处调用一次。
 
     Args:
         log_dir: 日志目录；为 None 时按 get_log_dir() 推导

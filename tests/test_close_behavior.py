@@ -7,24 +7,32 @@
 ② 托盘"退出"（_really_quit）与 About 页"立即安装"（quit_for_install）都绕开
    隐藏分支，走同一条真退出路径；
 ③ 隐藏到托盘不停止任务、不做任何清理；
-④ 清理步骤中途抛异常时 QApplication.quit() 仍必须执行（try/finally）。
+④ 清理步骤中途抛异常时 QApplication.quit() 仍必须执行（try/finally）；
+⑤ 无托盘环境下隐藏分支天然短路；
+⑥ 真退出的收尾只经 ShutdownCoordinator（停任务 → 带超时 join → 登记表线程 →
+   关库），先隐藏窗口再收尾，进度经 on_progress 报告。
 
 构造真实 MainWindow（tmp 库与真实 MonitorManager 注入，服务用替身；模式对齐
-tests/e2e/test_gui_smoke.py）而非 mock 整个窗口：closeEvent 的清理路径直接引用
-self.monitor_manager/self.about_page/self.export_page/self.setting_page 等真实
-属性，只有真实对象才能验证到实际调用链路。"关闭到托盘"偏好由 FakePreferences
-给出，关窗三选一由 ScriptedDialogs 预设。MonitorManager 单例由根 conftest 的
-autouse fixture 重置。
+tests/e2e/test_gui_smoke.py）而非 mock 整个窗口，只有真实对象才能验证到实际
+调用链路。"关闭到托盘"偏好由 FakePreferences 给出，关窗三选一由 ScriptedDialogs
+预设；托盘用 _FakeTray 顶替 TrayController（offscreen 下真实托盘不可用）。
 """
+import threading
 from unittest.mock import MagicMock
 
 import pytest
+from PyQt5.QtCore import QThread
 from PyQt5.QtWidgets import QApplication
 
+import ui.main_window as main_window_module
+from core.shutdown import (
+    PROGRESS_SAVING, PROGRESS_STOPPING_TASKS, PROGRESS_STOPPING_THREADS,
+)
 from core.monitor_manager import MonitorManager
 from data.database import Database
 from tests.doubles import FakePreferences, RecordingNotifier, ScriptedDialogs
 from tests.factories import make_main_window, make_services
+from tests.helpers import stop_and_join
 from ui.components.dialogs import CloseActionDialog
 from ui.services import ManagerTaskStatus
 from utils.metrics import MetricType
@@ -49,7 +57,7 @@ def window(tmp_path, qapp):
     win.about_page.check_update = lambda *args, **kwargs: None
     win.show()
     yield win
-    win.monitor_manager.stop_all_tasks()
+    stop_and_join(win.monitor_manager)
 
 
 def _enable_close_to_tray(window):
@@ -57,17 +65,27 @@ def _enable_close_to_tray(window):
     window.services.preferences.tray = True
 
 
-class _FakeTrayIcon:
-    """closeEvent 隐藏分支所需的最小伪托盘对象：只需 showMessage 可调用即可，
-    不依赖真实系统托盘（offscreen/CI 下 QSystemTrayIcon.isSystemTrayAvailable()
-    恒为 False，MainWindow._init_tray() 不会真正创建托盘图标，故用例里直接
-    赋值伪对象来模拟"托盘可用"的场景）"""
+class _FakeTray:
+    """顶替 TrayController 的"托盘可用"替身（offscreen/CI 下真实托盘不可用，
+    MainWindow 的 TrayController.is_available() 恒为 False）"""
 
     def __init__(self):
+        self.icon = object()
         self.messages = []
+        self.tooltips = []
+        self.hidden = False
 
-    def showMessage(self, title, msg, *args, **kwargs):
-        self.messages.append((title, msg))
+    def is_available(self):
+        return True
+
+    def show_message(self, title, content, kind='info'):
+        self.messages.append((title, content))
+
+    def set_tooltip(self, text):
+        self.tooltips.append(text)
+
+    def hide(self):
+        self.hidden = True
 
 
 def _fake_event():
@@ -96,8 +114,8 @@ def test_close_quits_when_tray_disabled(window, monkeypatch):
     event.ignore.assert_not_called()
 
 
-def test_close_joins_tasks_through_manager_after_stop_all(window, monkeypatch):
-    """真退出：先 stop_all_tasks（无超时 join），再经 manager.join_all 带超时兜底；
+def test_close_shutdown_order_through_coordinator(window, monkeypatch):
+    """真退出的固定顺序：stop_all_tasks → join_all(3000) → 登记表线程收尾 → 关库；
     主窗口不再自己遍历任务线程"""
     calls = []
     monkeypatch.setattr(window.monitor_manager, 'stop_all_tasks',
@@ -106,18 +124,98 @@ def test_close_joins_tasks_through_manager_after_stop_all(window, monkeypatch):
                         lambda timeout_ms: calls.append(('join_all', timeout_ms)) or True)
     monkeypatch.setattr(window.monitor_manager, 'get_all_tasks',
                         lambda: pytest.fail("主窗口不应直接取任务线程对象"))
-    monkeypatch.setattr(QApplication, 'quit', MagicMock())
+    monkeypatch.setattr(window.services.threads, 'shutdown_all',
+                        lambda on_progress=None: calls.append('threads') or True)
+    monkeypatch.setattr(window.db, 'close', lambda: calls.append('db_close'))
+    monkeypatch.setattr(QApplication, 'quit', lambda: calls.append('quit'))
 
     window.closeEvent(_fake_event())
 
-    assert calls == ['stop_all', ('join_all', 3000)]
+    assert calls == ['stop_all', ('join_all', 3000), 'threads', 'db_close', 'quit']
+
+
+class _RecordingCoordinator:
+    """顶替 ShutdownCoordinator：记录构造参数与 run 调用时窗口是否已隐藏"""
+    instances = []
+
+    def __init__(self, manager, registry, **kwargs):
+        self.manager, self.registry, self.kwargs = manager, registry, kwargs
+        self.runs = []
+        _RecordingCoordinator.instances.append(self)
+
+    def run(self, on_progress=None):
+        self.runs.append(on_progress)
+        on_progress("测试进度")
+        return True
+
+
+def test_close_runs_coordinator_with_window_dependencies(window, monkeypatch):
+    """closeEvent 只调协调器：注入 manager、页面共用的线程登记表与数据库；
+    运行前先隐藏窗口（即时反馈），进度经 _on_shutdown_progress 记录"""
+    _RecordingCoordinator.instances = []
+    hidden_at_run = []
+    monkeypatch.setattr(main_window_module, 'ShutdownCoordinator', _RecordingCoordinator)
+    monkeypatch.setattr(_RecordingCoordinator, 'run',
+                        lambda self, on_progress=None: (
+                            hidden_at_run.append(window.isHidden()),
+                            self.runs.append(on_progress),
+                            on_progress("测试进度"))[-1] or True)
+    quit_mock = MagicMock()
+    monkeypatch.setattr(QApplication, 'quit', quit_mock)
+    event = _fake_event()
+
+    window.closeEvent(event)
+
+    [coordinator] = _RecordingCoordinator.instances
+    assert coordinator.manager is window.monitor_manager
+    assert coordinator.registry is window.services.threads
+    assert coordinator.kwargs == {'db': window.db}
+    assert coordinator.runs == [window._on_shutdown_progress]
+    assert hidden_at_run == [True]
+    assert window.shutdown_progress == ["测试进度"]
+    event.accept.assert_called_once()
+    quit_mock.assert_called_once()
+
+
+def test_close_reports_real_progress_in_order(window, monkeypatch):
+    """真实协调器：停任务、结束后台线程、保存三段进度按顺序报告，并显示在托盘悬停文字上"""
+    window.tray = _FakeTray()
+    monkeypatch.setattr(QApplication, 'quit', MagicMock())
+    thread = _SlowThread(0.2)
+    window.services.threads.register(thread, name="慢线程", timeout_ms=3000)
+    thread.start()
+    assert thread.started_evt.wait(5)
+
+    window.closeEvent(_fake_event())
+
+    assert window.shutdown_progress == [
+        PROGRESS_STOPPING_TASKS, PROGRESS_STOPPING_THREADS, PROGRESS_SAVING]
+    assert window.tray.tooltips[-1].endswith(PROGRESS_SAVING)
+    assert thread.isFinished()
+    assert window.tray.hidden is True
+
+
+def test_close_logs_when_shutdown_exceeds_budget(window, monkeypatch, caplog):
+    """收尾未在期限内完成：只记日志，照常 accept 并退出（不再无限等待）"""
+    monkeypatch.setattr(main_window_module, 'ShutdownCoordinator', _RecordingCoordinator)
+    monkeypatch.setattr(_RecordingCoordinator, 'run', lambda self, on_progress=None: False)
+    quit_mock = MagicMock()
+    monkeypatch.setattr(QApplication, 'quit', quit_mock)
+    event = _fake_event()
+
+    with caplog.at_level('ERROR', logger='ui.main_window'):
+        window.closeEvent(event)
+
+    assert any("退出收尾未在期限内全部完成" in r.getMessage() for r in caplog.records)
+    event.accept.assert_called_once()
+    quit_mock.assert_called_once()
 
 
 def test_close_hides_when_tray_enabled(window, monkeypatch):
-    """不变式③：托盘启用（close_to_tray=True 且 tray_icon 可用）时关闭改为
+    """不变式③：托盘启用（close_to_tray=True 且托盘可用）时关闭改为
     隐藏窗口，不停止任务、不做任何清理，event 被 ignore 而非 accept"""
     _enable_close_to_tray(window)
-    window.tray_icon = _FakeTrayIcon()
+    window.tray = _FakeTray()
 
     stop_all = MagicMock()
     monkeypatch.setattr(window.monitor_manager, 'stop_all_tasks', stop_all)
@@ -135,20 +233,20 @@ def test_close_hides_when_tray_enabled(window, monkeypatch):
     event.ignore.assert_called_once()
     event.accept.assert_not_called()
     assert window._tray_tip_shown is True
-    assert window.tray_icon.messages, "首次隐藏到托盘应弹一次提示气泡"
+    assert window.tray.messages, "首次隐藏到托盘应弹一次提示气泡"
 
     # 首次提示只弹一次：再关闭一次（先还原可见性，模拟用户从托盘还原后再关）
     # 不应重复追加气泡
     window.show()
     window.closeEvent(_fake_event())
-    assert len(window.tray_icon.messages) == 1
+    assert len(window.tray.messages) == 1
 
 
 def test_really_quit_bypasses_tray(window, monkeypatch):
     """不变式②（前半）：_really_quit=True 时即使 close_to_tray=True 也绕开
     隐藏分支，走完整清理 -> quit 的真退出路径"""
     _enable_close_to_tray(window)
-    window.tray_icon = _FakeTrayIcon()
+    window.tray = _FakeTray()
     window._really_quit = True
 
     stop_all = MagicMock(wraps=window.monitor_manager.stop_all_tasks)
@@ -171,7 +269,7 @@ def test_quit_for_install_bypasses_tray(window, monkeypatch):
     对应 About 页"立即安装"场景：即使托盘开关开启，也不能让安装向导启动后
     主程序仍常驻托盘占用文件"""
     _enable_close_to_tray(window)
-    window.tray_icon = _FakeTrayIcon()
+    window.tray = _FakeTray()
     quit_mock = MagicMock()
     monkeypatch.setattr(QApplication, 'quit', quit_mock)
 
@@ -184,23 +282,65 @@ def test_quit_for_install_bypasses_tray(window, monkeypatch):
     assert window.isHidden() is True  # 真退出路径下 close() 使窗口被隐藏/关闭
 
 
+def test_about_page_install_request_goes_through_quit_for_install(window, monkeypatch):
+    """关于页只发 install_requested，主窗口连接到 quit_for_install（不靠 hasattr 反向调用）"""
+    _enable_close_to_tray(window)
+    window.tray = _FakeTray()
+    quit_mock = MagicMock()
+    monkeypatch.setattr(QApplication, 'quit', quit_mock)
+
+    window.about_page.install_requested.emit()
+
+    assert window._really_quit is True
+    quit_mock.assert_called_once()
+
+
+def test_tray_quit_request_goes_through_real_quit(window, monkeypatch):
+    """托盘控制器的 quit_requested 连到真退出；show_requested 还原窗口"""
+    _enable_close_to_tray(window)
+    quit_mock = MagicMock()
+    monkeypatch.setattr(QApplication, 'quit', quit_mock)
+
+    window.hide()
+    window.tray.show_requested.emit()
+    assert window.isHidden() is False
+
+    window.tray.quit_requested.emit()
+    assert window._really_quit is True
+    quit_mock.assert_called_once()
+
+
 def test_cleanup_exception_still_quits(window, monkeypatch):
-    """不变式④：清理步骤中途抛异常，QApplication.quit() 仍
+    """不变式④：收尾中途抛异常，QApplication.quit() 仍
     必须在 finally 中被调用——否则 setQuitOnLastWindowClosed(False) 拆掉了
     "closeEvent 异常也能退出"的隐性保险丝后，异常会导致事件循环永不退出且
     窗口已被清理/隐藏，用户无法通过任何界面操作恢复"""
     quit_mock = MagicMock()
-    # 用局部 context 打补丁：window fixture 的 teardown 还要真实调用 stop_all_tasks
+    monkeypatch.setattr(main_window_module, 'ShutdownCoordinator', _RecordingCoordinator)
+    monkeypatch.setattr(_RecordingCoordinator, 'run', MagicMock(
+        side_effect=RuntimeError("模拟清理异常")))
+    monkeypatch.setattr(QApplication, 'quit', quit_mock)
+    window.tray = _FakeTray()
+
+    event = _fake_event()
+    with pytest.raises(RuntimeError, match="模拟清理异常"):
+        window.closeEvent(event)
+
+    quit_mock.assert_called_once()
+    assert window.tray.hidden is True   # finally 里先隐藏托盘图标
+
+
+def test_task_stop_failure_inside_coordinator_still_quits(window, monkeypatch):
+    """停任务抛异常由协调器吞掉并记日志：后续步骤照走，正常 accept 并退出"""
+    quit_mock = MagicMock()
+    monkeypatch.setattr(QApplication, 'quit', quit_mock)
     with monkeypatch.context() as m:
-        m.setattr(
-            window.monitor_manager, 'stop_all_tasks',
-            MagicMock(side_effect=RuntimeError("模拟清理异常")))
-        m.setattr(QApplication, 'quit', quit_mock)
-
+        m.setattr(window.monitor_manager, 'stop_all_tasks',
+                  MagicMock(side_effect=RuntimeError("模拟清理异常")))
         event = _fake_event()
-        with pytest.raises(RuntimeError, match="模拟清理异常"):
-            window.closeEvent(event)
+        window.closeEvent(event)
 
+    event.accept.assert_called_once()
     quit_mock.assert_called_once()
 
 
@@ -258,11 +398,12 @@ def test_close_with_running_task_quit_stops_and_quits(window, monkeypatch):
     quit_mock.assert_called_once()
     event.accept.assert_called_once()
     assert window.monitor_manager.running_task_count() == 0
+    assert all(task.isFinished() for task in window.monitor_manager.get_all_tasks())
 
 
 def test_close_with_running_task_tray_hides_without_stopping(window, monkeypatch):
     """选"最小化到托盘"（托盘可用）：隐藏窗口，不停止任务、不退出"""
-    window.tray_icon = _FakeTrayIcon()
+    window.tray = _FakeTray()
     _start_running_task(window)
     _patch_ask(window, 'tray')
     stop_all = MagicMock()
@@ -319,9 +460,17 @@ def test_ask_close_action_passes_count_and_tray_availability(window):
     first = dialogs.calls_of('ask_close_action')[0]
     assert first == {"parent": window, "running_count": 0, "can_tray": False}  # offscreen 无托盘
 
-    window.tray_icon = _FakeTrayIcon()
+    window.tray = _FakeTray()
     window._ask_close_action()
     assert dialogs.last_call('ask_close_action')["can_tray"] is True
+
+
+def test_tray_icon_compat_property(window):
+    """兼容属性 tray_icon：指向控制器的托盘图标，托盘不可用（offscreen）时为 None"""
+    assert window.tray is not None and window.tray.is_available() is False
+    assert window.tray_icon is None
+    window.tray = _FakeTray()
+    assert window.tray_icon is window.tray.icon
 
 
 def test_close_action_dialog_tray_button_only_when_tray_available(qapp):
@@ -387,131 +536,64 @@ def test_close_action_dialog_default_is_never_destructive(qapp, can_tray):
 
 def test_abnormal_end_bubble_only_when_window_not_in_front(window):
     """异常结束提醒：无托盘时短路；有托盘且窗口隐藏时弹气泡；窗口在前台不重复提醒"""
-    window._on_task_ended_abnormally("标题", "内容")   # tray_icon 为 None，不应抛错
+    window._on_task_ended_abnormally("标题", "内容")   # 托盘不可用，不应抛错
 
-    window.tray_icon = _FakeTrayIcon()
+    window.tray = _FakeTray()
     window.hide()
     window._on_task_ended_abnormally("任务已结束", "demo.exe 进程已终止")
-    assert window.tray_icon.messages == [("任务已结束", "demo.exe 进程已终止")]
+    assert window.tray.messages == [("任务已结束", "demo.exe 进程已终止")]
 
-    window.tray_icon.messages.clear()
+    window.tray.messages.clear()
     window.show()
     window.isActiveWindow = lambda: True
     window._on_task_ended_abnormally("任务已结束", "x")
-    assert window.tray_icon.messages == []
+    assert window.tray.messages == []
 
 
-# ========== 退出时按页面登记收尾后台线程 ==========
+# ========== 退出时经线程登记表收尾后台线程 ==========
 
-class _FakeThread:
-    """记录取消与等待调用的假线程：isRunning 在被 wait 之前恒为 True"""
+class _SlowThread(QThread):
+    """可取消的慢线程：取消后提前结束，否则睡满 duration 秒"""
 
-    def __init__(self, log, name):
-        self.log = log
-        self.name = name
-        self.waited_ms = None
+    def __init__(self, duration):
+        super().__init__()
+        self.duration = duration
+        self.started_evt = threading.Event()
+        self.cancel_evt = threading.Event()
+        self.log = []
 
-    def isRunning(self):
-        return self.waited_ms is None
+    def run(self):
+        self.started_evt.set()
+        self.cancel_evt.wait(self.duration)
 
     def cancel(self):
-        self.log.append(("cancel", self.name))
-
-    def wait(self, timeout_ms):
-        self.log.append(("wait", self.name))
-        self.waited_ms = timeout_ms
-        return True
+        self.log.append(("cancel", self.isRunning()))
+        self.cancel_evt.set()
 
 
-def test_close_shuts_down_every_page_background_thread(window, monkeypatch):
-    """各页面现有的后台线程在真退出时都被收尾，取消语义与超时保持原值：
-    下载 2000 可取消、检查更新 1000、导出 2000 可取消、清理 5000 不取消、
-    历史自动刷新 3000"""
+def test_close_shuts_down_registered_threads(window, monkeypatch):
+    """页面登记到 services.threads 的在途线程在真退出时都被收尾：有取消回调的
+    先取消，closeEvent 返回时线程都已结束"""
     monkeypatch.setattr(QApplication, 'quit', MagicMock())
-    log = []
-    fakes = {name: _FakeThread(log, name) for name in
-             ("download", "check", "export", "cleanup", "refresh")}
-    window.about_page._downloader = fakes["download"]
-    window.about_page._checker = fakes["check"]
-    window.export_page._export_worker = fakes["export"]
-    window.setting_page._cleanup_worker = fakes["cleanup"]
-    window.history_page._refresh_worker = fakes["refresh"]
-    try:
-        window.closeEvent(_fake_event())
-    finally:
-        window.about_page._downloader = None
-        window.about_page._checker = None
-        window.export_page._export_worker = None
-        window.setting_page._cleanup_worker = None
-        window.history_page._refresh_worker = None
-
-    assert {name: fake.waited_ms for name, fake in fakes.items()} == {
-        "download": 2000, "check": 1000, "export": 2000,
-        "cleanup": 5000, "refresh": 3000}
-    cancelled = [name for action, name in log if action == "cancel"]
-    assert cancelled == ["download", "export"]
-    # 取消必须先于等待
-    assert log.index(("cancel", "download")) < log.index(("wait", "download"))
-    assert log.index(("cancel", "export")) < log.index(("wait", "export"))
-
-
-def test_close_uses_public_background_threads_not_private_names(window, monkeypatch):
-    """主窗口只认页面的 background_threads()：页面内部线程属性改名（这里私有属性
-    全为 None，线程只经公开方法给出）也不会漏收"""
-    from ui.thread_shutdown import BackgroundThread
-
-    monkeypatch.setattr(QApplication, 'quit', MagicMock())
-    log = []
-    owners = window._thread_owner_pages()
-    assert set(owners) == {window.about_page, window.export_page,
-                           window.setting_page, window.history_page}
-    fakes = []
-    for index, page in enumerate(owners):
-        fake = _FakeThread(log, f"renamed_{index}")
-        fakes.append(fake)
-        monkeypatch.setattr(
-            page, 'background_threads',
-            lambda fake=fake: [BackgroundThread(fake.name, fake,
-                                                cancel_fn=fake.cancel,
-                                                timeout_ms=1234)])
+    cancellable = _SlowThread(10.0)
+    plain = _SlowThread(0.3)
+    window.services.threads.register(cancellable, name="下载", cancel=cancellable.cancel,
+                                     timeout_ms=3000)
+    window.services.threads.register(plain, name="历史刷新", timeout_ms=3000)
+    for thread in (cancellable, plain):
+        thread.start()
+        assert thread.started_evt.wait(5)
 
     window.closeEvent(_fake_event())
 
-    assert [fake.waited_ms for fake in fakes] == [1234] * len(owners)
-    assert [name for action, name in log if action == "cancel"] == \
-        [fake.name for fake in fakes]
+    assert cancellable.log == [("cancel", True)]
+    assert cancellable.isFinished() and plain.isFinished()
 
 
-def test_close_continues_when_one_page_fails_to_list_threads(window, monkeypatch):
-    """某一页取线程列表抛异常时，其余页面的线程照样收尾，quit 照常执行"""
-    from ui.thread_shutdown import BackgroundThread
-
-    quit_mock = MagicMock()
-    monkeypatch.setattr(QApplication, 'quit', quit_mock)
-    log = []
-    fake = _FakeThread(log, "history")
-    monkeypatch.setattr(
-        window.about_page, 'background_threads',
-        MagicMock(side_effect=RuntimeError("模拟页面异常")))
-    monkeypatch.setattr(
-        window.history_page, 'background_threads',
-        lambda: [BackgroundThread("history", fake, timeout_ms=3000)])
-
-    event = _fake_event()
-    window.closeEvent(event)
-
-    assert fake.waited_ms == 3000
-    quit_mock.assert_called_once()
-    event.accept.assert_called_once()
-
-
-def test_page_background_threads_are_none_when_idle(window):
-    """空闲时各页面登记项的线程为 None，收尾时直接跳过"""
-    for page in window._thread_owner_pages():
-        entries = page.background_threads()
-        assert entries
-        assert all(entry.thread is None for entry in entries)
-        assert all(entry.cancel_fn is None for entry in entries)
+def test_main_window_has_no_per_page_thread_shutdown(window):
+    """收线程只走登记表：主窗口不再逐页调用 background_threads()"""
+    assert not hasattr(window, '_shutdown_page_threads')
+    assert not hasattr(window, '_thread_owner_pages')
 
 
 def test_migration_failed_tip_holds_for_both_failure_cases(window):
@@ -555,18 +637,20 @@ def test_silent_update_notice_offers_view_button(window, monkeypatch):
     assert shown == [info]
 
 
-def test_startup_cleanup_uses_retention_from_preferences(tmp_path, qapp, monkeypatch):
-    """启动自动清理的保留天数取自注入的偏好服务"""
-    db = Database(str(tmp_path / "retention.db"))
-    seen = []
-    monkeypatch.setattr(db, 'cleanup_old_tasks', lambda days: seen.append(days) or 0)
+def test_main_window_does_not_run_startup_maintenance(tmp_path, qapp, monkeypatch):
+    """启动校正（孤儿任务、采样计数、过期清理）归组合根的 MaintenanceService
+    （见 tests/test_bootstrap.py、tests/test_maintenance_service.py），主窗口构造时不再调用"""
+    db = Database(str(tmp_path / "startup.db"))
+    for name in ('reconcile_orphan_tasks', 'reconcile_sample_counts', 'cleanup_old_tasks'):
+        monkeypatch.setattr(db, name, MagicMock(
+            side_effect=AssertionError(f"主窗口不应调用 {name}")))
     manager = MonitorManager(db=db)
     services = make_services(preferences=FakePreferences(retention_days=7),
                              task_status=ManagerTaskStatus(manager))
     win = make_main_window(db, manager, services)
     win.about_page.check_update = lambda *args, **kwargs: None
-
-    assert seen == [7]
+    monkeypatch.setattr(QApplication, 'quit', MagicMock())
+    win.close()
 
 
 def test_main_window_requires_injected_dependencies(qapp):

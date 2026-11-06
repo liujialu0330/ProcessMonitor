@@ -1,5 +1,5 @@
 """
-MonitorTask 调度与健壮性：
+MonitorWorker 调度与健壮性：
 Event + 单调时钟截止时间调度（无累积漂移、落后不补采）、run() 的 try/finally 只收尾一次、
 任务行补写、flush 失败日志节流、PID 复用检测
 """
@@ -15,7 +15,7 @@ from PyQt5.QtCore import Qt
 
 from core.contracts import StopReason
 from core.monitor_task import (
-    FLUSH_FAILURE_LOG_INTERVAL, MonitorTask,
+    FLUSH_FAILURE_LOG_INTERVAL, MonitorWorker,
 )
 from core.process_collector import ProcessCollector
 from data.models import DataPoint
@@ -50,7 +50,7 @@ def make_task(db, qapp):
 
     def _factory(collector, interval=0.1, task_db=None, metric_types=None,
                  create_time=None):
-        t = MonitorTask(pid=os.getpid(), process_name="fake.exe",
+        t = MonitorWorker(pid=os.getpid(), process_name="fake.exe",
                         metric_types=metric_types or ["memory_rss"], interval=interval,
                         db=task_db if task_db is not None else db,
                         create_time=create_time)
@@ -183,7 +183,6 @@ def test_collect_returning_none_stops_as_process_terminated(make_task):
     task = make_task(collector, interval=0.05)
     stopped = []
     task.task_stopped.connect(lambda tid, r: stopped.append(r), Qt.DirectConnection)
-    task._running = True   # 同线程直接 run()，等价于 start() 置位运行标志
 
     task.run()
 
@@ -316,7 +315,6 @@ def test_task_stops_when_pid_reused(make_task, monkeypatch):
     collector.collect_metrics(["memory_rss"])   # 让 _process 存在
     monkeypatch.setattr(collector._process, 'is_running', lambda: False)
     monkeypatch.setattr(collector, 'is_process_running', lambda: True)
-    task._running = True   # 同线程直接 run()，等价于 start() 置位运行标志
 
     task.run()
 
@@ -399,7 +397,6 @@ def test_create_time_mismatch_stops_before_collecting(make_task, db):
     collector = _IdentityCollector(actual_create_time=2000.0)
     task = make_task(collector, interval=0.05, create_time=1000.0)
     stopped, errors = _run_inline(task)
-    task._running = True   # 同线程直接 run()，等价于 start() 置位运行标志
 
     task.run()
 

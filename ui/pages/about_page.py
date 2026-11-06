@@ -4,6 +4,7 @@
 """
 import os
 import sys
+from typing import Optional
 
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QPixmap
@@ -17,13 +18,10 @@ from qfluentwidgets import (
     ProgressBar, TextEdit
 )
 
+import app_config
 import config
-from core.update_checker import (
-    UpdateChecker, UpdateDownloader, MSG_CANNOT_VERIFY,
-    get_skipped_version, set_skipped_version
-)
+from core.update_checker import UpdateChecker, UpdateDownloader, MSG_CANNOT_VERIFY
 from ui.services import UiServices
-from ui.thread_shutdown import BackgroundThread
 from ui.typography import DataCaptionLabel, PageTitleLabel
 
 
@@ -88,6 +86,9 @@ class AboutPage(QScrollArea):
     # 打断用户，改由主窗口统一处理为非模态提示；参数为
     # core.update_checker.parse_release_info 返回的 info 字典
     update_available_silent = pyqtSignal(object)
+    # 安装程序已成功启动、用户确认"立即安装"：主窗口据此走真退出路径
+    # （quit_for_install），本页面不反向调用窗口方法
+    install_requested = pyqtSignal()
 
     def __init__(self, services: UiServices, parent=None):
         """初始化页面
@@ -100,9 +101,10 @@ class AboutPage(QScrollArea):
         self.setObjectName("aboutPage")
         self.services = services
 
-        # 更新相关状态
-        self._checker = None
-        self._downloader = None
+        # 更新相关状态：线程运行期间非 None，线程结束时清空（对象的释放与退出收尾由
+        # services.threads 登记表负责）
+        self._checker: Optional[UpdateChecker] = None
+        self._downloader: Optional[UpdateDownloader] = None
         self._pending_info = None
         # 发布页地址（html_url）：缺少校验信息时"打开发布页"按钮使用
         self._release_url_hint = None
@@ -203,19 +205,15 @@ class AboutPage(QScrollArea):
 
     # ========== 更新流程 ==========
 
-    def background_threads(self) -> list:
-        """退出时需要收尾的后台线程（由主窗口统一 shutdown）。
+    def _on_checker_finished(self, worker) -> None:
+        """检查线程真正结束：释放引用（对象由登记表 deleteLater）"""
+        if self._checker is worker:
+            self._checker = None
 
-        下载线程先置取消标志再等待；更新检查线程无取消机制，仅等待。
-        """
-        downloader = self._downloader
-        return [
-            BackgroundThread(
-                "更新下载", downloader,
-                cancel_fn=downloader.cancel if downloader is not None else None,
-                timeout_ms=2000),
-            BackgroundThread("检查更新", self._checker, timeout_ms=1000),
-        ]
+    def _on_downloader_finished(self, worker) -> None:
+        """下载线程真正结束：释放引用（对象由登记表 deleteLater）"""
+        if self._downloader is worker:
+            self._downloader = None
 
     def check_update(self, silent: bool = False):
         """
@@ -235,12 +233,16 @@ class AboutPage(QScrollArea):
         self._release_url_hint = None
         self.status_label.setText("正在检查更新…")
 
-        self._checker = UpdateChecker(self)
-        self._checker.check_finished.connect(
+        checker = UpdateChecker()
+        self._checker = checker
+        checker.check_finished.connect(
             lambda info: self._on_check_finished(info, silent))
-        self._checker.error_occurred.connect(
+        checker.error_occurred.connect(
             lambda msg: self._on_check_error(msg, silent))
-        self._checker.start()
+        checker.finished.connect(lambda w=checker: self._on_checker_finished(w))
+        # 网络请求自带超时、无取消检查点：退出时只短暂等待
+        self.services.threads.register(checker, name="检查更新", timeout_ms=1000)
+        checker.start()
 
     def _on_check_finished(self, info: dict, silent: bool):
         """检查完成"""
@@ -251,7 +253,7 @@ class AboutPage(QScrollArea):
             return
 
         # 静默检查时尊重"跳过此版本"
-        if silent and info['version'] == get_skipped_version():
+        if silent and info['version'] == app_config.get_skipped_version():
             self.status_label.setText(f"已跳过版本 v{info['version']}")
             return
 
@@ -284,7 +286,7 @@ class AboutPage(QScrollArea):
         if dialog.exec():
             self._start_update(info)
         elif dialog.skip_requested:
-            set_skipped_version(info['version'])
+            app_config.set_skipped_version(info['version'])
             self.status_label.setText(f"已跳过版本 v{info['version']}")
 
     def _start_update(self, info: dict):
@@ -316,13 +318,18 @@ class AboutPage(QScrollArea):
         self.progress_bar.setVisible(True)
         self.check_button.setEnabled(False)
 
-        self._downloader = UpdateDownloader(
-            info['asset_url'], info['asset_name'], info.get('asset_size', 0), self,
+        downloader = UpdateDownloader(
+            info['asset_url'], info['asset_name'], info.get('asset_size', 0),
             digest=info.get('asset_digest'))
-        self._downloader.download_progress.connect(self._on_download_progress)
-        self._downloader.download_finished.connect(self._on_download_finished)
-        self._downloader.error_occurred.connect(self._on_download_error)
-        self._downloader.start()
+        self._downloader = downloader
+        downloader.download_progress.connect(self._on_download_progress)
+        downloader.download_finished.connect(self._on_download_finished)
+        downloader.error_occurred.connect(self._on_download_error)
+        downloader.finished.connect(lambda w=downloader: self._on_downloader_finished(w))
+        # 退出时先取消（下载线程自行删除残留）再等待
+        self.services.threads.register(
+            downloader, name="更新下载", cancel=downloader.cancel, timeout_ms=2000)
+        downloader.start()
 
     def _on_download_progress(self, percent: int):
         """下载进度更新"""
@@ -346,17 +353,11 @@ class AboutPage(QScrollArea):
             except OSError as e:
                 self.status_label.setText(f"启动安装程序失败：{e}")
                 return
-            # 退出应用，交给安装向导。必须调用 quit_for_install()
-            # 而非普通 close()——否则"关闭窗口时最小化到托盘"开启时，安装向导
-            # 已经启动，但主程序会被 closeEvent 的隐藏分支拦截、常驻托盘继续
-            # 占用文件，导致覆盖安装因文件占用而失败。hasattr 防御：AboutPage
-            # 可能被独立构造用于测试（此时 self.window() 是页面自身，没有
-            # quit_for_install 方法），仍需能正常关闭。
-            window = self.window()
-            if hasattr(window, 'quit_for_install'):
-                window.quit_for_install()
-            else:
-                window.close()
+            # 退出应用，交给安装向导：主窗口连接本信号后走真退出路径
+            # （quit_for_install），而非普通 close()——否则"关闭窗口时最小化到托盘"
+            # 开启时，主程序会被 closeEvent 的隐藏分支拦截、常驻托盘继续占用文件，
+            # 导致覆盖安装因文件占用而失败。
+            self.install_requested.emit()
         else:
             self.status_label.setText(f"安装包已保存：{path}")
 

@@ -4,9 +4,9 @@
 """
 import logging
 import os
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QWidget
 from qfluentwidgets import (
     ScrollArea, ExpandLayout, SettingCardGroup, OptionsSettingCard,
@@ -15,10 +15,14 @@ from qfluentwidgets import (
 )
 
 from app_config import cfg
+from core.maintenance_service import (
+    BUSY_EXPORT_RUNNING, BUSY_MAINTENANCE_RUNNING, BUSY_TASKS_RUNNING,
+    MaintenanceBusy, MaintenanceService,
+)
+from core.workers.cleanup_worker import CleanupWorker
 from data.database import Database
 from ui.components.spinbox_setting_card import SpinBoxSettingCard
 from ui.services import UiServices
-from ui.thread_shutdown import BackgroundThread
 from ui.typography import PageTitleLabel
 import config
 
@@ -26,6 +30,11 @@ if TYPE_CHECKING:
     from core.monitor_manager import MonitorManager
 
 logger = logging.getLogger(__name__)
+
+
+def _retention_text(days: int) -> str:
+    """保留天数选项的显示文案（0 = 永久保留）"""
+    return "永久保留" if days <= 0 else f"{days} 天"
 
 
 def _format_bytes(num_bytes: int) -> str:
@@ -38,35 +47,14 @@ def _format_bytes(num_bytes: int) -> str:
     return f"{value:.1f} TB"
 
 
-class _CleanupWorker(QThread):
-    """"清理并压缩数据库"后台线程：按保留天数删除过期任务（retention_days>0 时）
-    再执行 VACUUM，避免大库操作阻塞 UI 线程。
-
-    直接用 db.maintenance（失败抛 StorageError），成功发 finished_ok，任何失败都发
-    failed——不再像旧实现那样压缩失败也提示"完成"。两个信号恰好发一个，且是 run()
-    的最后动作，StateToolTip 不会卡在"进行中"。线程对象的释放与维护状态的退出都挂在
-    QThread.finished 上（见 SettingPage._on_cleanup_thread_finished）。
-    """
-
-    finished_ok = pyqtSignal(int)  # 参数：被删除的任务数（未执行清理时为0）
-    failed = pyqtSignal(str)       # 参数：失败原因
-
-    def __init__(self, db, retention_days: int, parent=None):
-        super().__init__(parent)
-        self.db = db
-        self.retention_days = retention_days
-
-    def run(self):
-        deleted = 0
-        try:
-            if self.retention_days > 0:
-                deleted = self.db.maintenance.cleanup_older_than(self.retention_days)
-            self.db.maintenance.vacuum()
-        except Exception as e:
-            logger.error("清理并压缩数据库失败", exc_info=True)
-            self.failed.emit(str(e) or type(e).__name__)
-            return
-        self.finished_ok.emit(deleted)
+# 清理被拒绝的原因（MaintenanceBusy.reason）→ 提示文案
+_BUSY_REASON_TEXTS = {
+    BUSY_TASKS_RUNNING: "有监控任务正在运行，请先停止全部任务再清理数据库",
+    # 导出线程长时间读库，与压缩数据库互相抢锁
+    BUSY_EXPORT_RUNNING: "正在导出数据，请等导出完成后再清理数据库",
+    BUSY_MAINTENANCE_RUNNING: "数据库正在清理中，请稍候",
+}
+_BUSY_FALLBACK_TEXT = "数据库正忙，请稍后再清理"
 
 
 class _CnSwitchSettingCard(SwitchSettingCard):
@@ -85,7 +73,8 @@ class SettingPage(ScrollArea):
     """设置页面"""
 
     def __init__(self, db: Database, manager: "MonitorManager",
-                 services: UiServices, parent=None):
+                 services: UiServices, parent=None, *,
+                 maintenance: Optional[MaintenanceService] = None):
         """初始化页面
 
         设置卡片直接绑定 cfg 的 ConfigItem（卡片自身负责读写与落盘）；
@@ -93,18 +82,23 @@ class SettingPage(ScrollArea):
 
         Args:
             db: 数据库实例："数据管理"卡片查询占用大小与执行清理压缩
-            manager: 监控管理器：清理前进入维护状态（begin_maintenance，有运行中
-                任务或导出时拒绝）、结束后退出（end_maintenance）。本页面不直接
-                操作任务，遵守分层
-            services: 界面服务（提示、确认框、打开文件夹、用户偏好）
+            manager: 监控管理器：只读查询是否有运行中任务/导出（清理按钮可用状态、
+                点击时的预检）。维护锁经 MaintenanceService 的 begin()/end() 占用与
+                释放，本页面不直接操作任务与维护状态，遵守分层
+            services: 界面服务（提示、确认框、打开文件夹、用户偏好、线程登记表）
             parent: 父窗口
+            maintenance: 数据库维护服务；未给出时按 db 与 manager 组装一个（它只是
+                二者之上的无状态薄层）
         """
         super().__init__(parent)
         self.setObjectName("settingPage")
         self.db = db
         self.manager = manager
         self.services = services
-        self._cleanup_worker: _CleanupWorker = None
+        if maintenance is None:
+            maintenance = MaintenanceService(db, manager)
+        self.maintenance = maintenance
+        self._cleanup_worker: Optional[CleanupWorker] = None
         self._state_tooltip: StateToolTip = None
 
         # 承载各设置分组的滚动内容容器
@@ -144,15 +138,17 @@ class SettingPage(ScrollArea):
     def _init_data_group(self):
         """数据分组：历史数据保留策略 + 数据管理（清理压缩、打开数据目录）"""
         self.data_group = SettingCardGroup("数据", self.scroll_widget)
+        # 选项文案与 ConfigItem 校验器的可选值逐一对应：可选值只在应用配置里定义一份
+        retention_texts = [_retention_text(days)
+                           for days in self.services.preferences.retention_options()]
         self.retention_card = OptionsSettingCard(
             cfg.retention_days, FIF.DELETE, "历史数据保留",
             "启动时清理超过保留期限的已停止任务",
-            texts=["永久保留", "7 天", "30 天", "90 天", "180 天"],
-            parent=self.data_group)
+            texts=retention_texts, parent=self.data_group)
         self.data_group.addSettingCard(self.retention_card)
 
         # 清理并压缩数据库：content 显示当前占用；运行中有任务时按钮禁用，
-        # 真正的把关在点击时的 begin_maintenance（见 _on_cleanup_clicked）
+        # 真正的把关在确认后、启动线程前的 MaintenanceService.begin()
         self.cleanup_card = PushSettingCard(
             "立即清理", FIF.BROOM, "清理并压缩数据库", "当前占用 —",
             parent=self.data_group)
@@ -245,14 +241,6 @@ class SettingPage(ScrollArea):
 
     # ========== 数据管理 ==========
 
-    def background_threads(self) -> list:
-        """退出时需要收尾的后台线程（由主窗口统一 shutdown）。
-
-        清理线程无取消机制、只等待：VACUUM 中途被打断会让数据库处于中间态，
-        所以给较长的超时让它尽量跑完。
-        """
-        return [BackgroundThread("清理数据库", self._cleanup_worker, timeout_ms=5000)]
-
     def _is_cleanup_running(self) -> bool:
         """清理线程是否仍在运行"""
         return self._cleanup_worker is not None and self._cleanup_worker.isRunning()
@@ -286,29 +274,66 @@ class SettingPage(ScrollArea):
         return self.services.dialogs.confirm(
             self.window(), "清理并压缩数据库", content, "清理")
 
+    def _busy_reason(self) -> Optional[str]:
+        """点击时的只读预检：当前是否会被维护锁拒绝（与 MaintenanceBusy.reason 同口径）"""
+        if self.manager.has_running_tasks():
+            return BUSY_TASKS_RUNNING
+        if self.manager.has_running_exports():
+            return BUSY_EXPORT_RUNNING
+        return None
+
+    def _warn_busy(self, reason: str) -> None:
+        """清理被拒绝：按原因提示"""
+        self.services.notifier.warning(
+            self.window(), "无法清理",
+            _BUSY_REASON_TEXTS.get(reason, _BUSY_FALLBACK_TEXT), duration=4000)
+        self._refresh_data_management_state()
+
     def _on_cleanup_clicked(self) -> None:
-        """"清理并压缩数据库"卡片点击：先进入维护状态（有运行中任务时拒绝并提示），
-        再按当前保留策略确认，确认后在后台线程执行清理+压缩，StateToolTip 反馈
-        进行中/完成。维护状态在线程结束（QThread.finished）时退出。"""
+        """"清理并压缩数据库"卡片点击：先预检（有运行中任务或导出时直接提示，不弹
+        确认），再按当前保留策略确认。确认后在界面线程占用维护锁（确认期间若有任务
+        或导出开始，这里被拒并按原因提示，不启动线程），占锁成功才在后台线程执行
+        清理+压缩，StateToolTip 反馈进行中/完成；线程结束（无论成败）后释放维护锁。
+
+        占锁放在界面线程：开始监控/开始导出的判断也在界面线程，二者串行，不存在
+        "确认之后、后台线程真正占锁之前"任务或导出趁机开始的窗口。"""
         if self._is_cleanup_running():
             return
 
-        # 先占维护锁再弹确认：确认期间不会有新任务被创建/启动
-        if not self.manager.begin_maintenance():
-            if self.manager.has_running_tasks():
-                content = "有监控任务正在运行，请先停止全部任务再清理数据库"
-            else:
-                # 导出线程长时间读库，与压缩数据库互相抢锁
-                content = "正在导出数据，请等导出完成后再清理数据库"
-            self.services.notifier.warning(
-                self.window(), "无法清理", content, duration=4000)
-            self._refresh_data_management_state()
+        reason = self._busy_reason()
+        if reason is not None:
+            self._warn_busy(reason)
             return
 
         days = self.services.preferences.retention_days()
         if not self._confirm_cleanup(days):
-            self.manager.end_maintenance()
             return
+
+        try:
+            self.maintenance.begin()
+        except MaintenanceBusy as busy:
+            logger.info("清理数据库被拒绝: %s", busy.reason)
+            self._warn_busy(busy.reason)
+            return
+
+        try:
+            worker = CleanupWorker(self.maintenance, days, already_locked=True)
+            worker.result.connect(self._on_cleanup_finished)
+            worker.busy.connect(self._on_cleanup_busy)
+            worker.failed.connect(self._on_cleanup_failed)
+            # 释放引用与维护锁挂在 QThread.finished 上（结果信号是 run() 的最后一个
+            # 动作，但此时线程尚未真正结束）；线程对象的 deleteLater 由登记表负责。
+            # VACUUM 中途打断会让数据库停在中间态，因此不给取消回调，退出时给较长的
+            # 等待超时
+            worker.finished.connect(lambda w=worker: self._on_cleanup_thread_finished(w))
+            self.services.threads.register(worker, name="清理数据库", timeout_ms=5000)
+            self._cleanup_worker = worker
+            worker.start()
+        except Exception:
+            # 线程没能启动就不会有 finished，锁必须在这里释放
+            self._cleanup_worker = None
+            self.maintenance.end()
+            raise
 
         self.cleanup_card.button.setEnabled(False)
         self._state_tooltip = StateToolTip(
@@ -316,17 +341,14 @@ class SettingPage(ScrollArea):
         self._state_tooltip.move(self._state_tooltip.getSuitablePos())
         self._state_tooltip.show()
 
-        worker = _CleanupWorker(self.db, days, self)
-        self._cleanup_worker = worker
-        worker.finished_ok.connect(self._on_cleanup_finished)
-        worker.failed.connect(self._on_cleanup_failed)
-        # 线程对象的释放与维护状态的退出都挂在 QThread.finished 上：finished_ok 是
-        # run() 的最后一个动作，但此时线程尚未真正结束
-        worker.finished.connect(lambda w=worker: self._on_cleanup_thread_finished(w))
-        worker.finished.connect(worker.deleteLater)
-        worker.start()
+    def _close_state_tooltip(self) -> None:
+        """关闭"进行中"提示（不显示"完成"）"""
+        if self._state_tooltip is not None:
+            self._state_tooltip.close()
+            self._state_tooltip.deleteLater()
+            self._state_tooltip = None
 
-    def _on_cleanup_finished(self, deleted: int) -> None:
+    def _on_cleanup_finished(self, result) -> None:
         """清理线程完成：StateToolTip 收尾，刷新占用显示"""
         if self._state_tooltip is not None:
             self._state_tooltip.setContent("数据库清理完成")
@@ -334,20 +356,22 @@ class SettingPage(ScrollArea):
             self._state_tooltip = None
         self._refresh_data_management_state()
 
+    def _on_cleanup_busy(self, reason: str) -> None:
+        """维护服务拒绝清理（只在线程自行占锁时可能发生；两段式下已在界面线程拦截）：
+        关闭进行中提示并说明原因"""
+        self._close_state_tooltip()
+        self._warn_busy(reason)
+
     def _on_cleanup_failed(self, reason: str) -> None:
         """清理线程失败：StateToolTip 关闭（不显示"完成"），弹出"清理失败"错误提示"""
-        if self._state_tooltip is not None:
-            self._state_tooltip.close()
-            self._state_tooltip.deleteLater()
-            self._state_tooltip = None
+        self._close_state_tooltip()
         self.services.notifier.error(
             self.window(), "清理失败", f"清理并压缩数据库失败：{reason}")
         self._refresh_data_management_state()
 
     def _on_cleanup_thread_finished(self, worker) -> None:
-        """清理线程真正结束：退出维护状态、释放引用并刷新按钮可用状态。
-        deleteLater 由同一信号上的另一条连接负责。"""
+        """清理线程真正结束（无论成功、失败）：释放维护锁与引用，刷新按钮可用状态。"""
+        self.maintenance.end()
         if self._cleanup_worker is worker:
             self._cleanup_worker = None
-        self.manager.end_maintenance()
         self._refresh_data_management_state()

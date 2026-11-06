@@ -1,14 +1,11 @@
 """
 MonitorTask._flush_buffer 失败重试用例
-用假 db（可控 save_data_points 返回值）驱动，不接触真实 sqlite/进程采集；
-构造 MonitorTask 前须把 config.DB_PATH 指向 tmp_path，避免 __init__ 内部
-`self.db = Database()` 触碰项目真实 data\\monitor.db（随后立即用假 db 顶替）
+用假 db（可控 save_data_points 返回值）经构造参数注入，不接触真实 sqlite/进程采集
 """
 from datetime import datetime
 
 import pytest
 
-import config
 from core.monitor_task import MonitorTask, MAX_BUFFER_SIZE, CONSECUTIVE_FAILURE_NOTIFY_THRESHOLD
 from data.models import DataPoint
 
@@ -38,12 +35,10 @@ class _FakeDB:
 
 
 @pytest.fixture
-def task(tmp_path, monkeypatch, qapp):
-    """构造一个不会真正启动线程的 MonitorTask，db 替换为 _FakeDB"""
-    monkeypatch.setattr(config, 'DB_PATH', str(tmp_path / "flush_retry.db"))
-    t = MonitorTask(pid=999999, process_name="fake.exe", metric_types=["memory_rss"], interval=1.0)
-    t.db = _FakeDB()
-    return t
+def task(qapp):
+    """构造一个不会真正启动线程的 MonitorTask，显式注入 _FakeDB"""
+    return MonitorTask(pid=999999, process_name="fake.exe", metric_types=["memory_rss"],
+                       interval=1.0, db=_FakeDB())
 
 
 def _make_points(task_obj, n=1, value=1.0):

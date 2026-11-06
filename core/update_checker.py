@@ -14,9 +14,10 @@ import urllib.parse
 import urllib.request
 from typing import Optional
 
-from PyQt5.QtCore import QThread, pyqtSignal
+from PyQt5.QtCore import pyqtSignal
 
 import config
+from core.workers.base import BackgroundTask, CancelToken, TaskError
 
 logger = logging.getLogger(__name__)
 
@@ -117,9 +118,13 @@ def compare_version(a: str, b: str) -> int:
     return 0
 
 
-def parse_release_info(data: dict) -> dict:
+def parse_release_info(data: dict, current_version: Optional[str] = None) -> dict:
     """
     解析 GitHub Release API 返回的 JSON
+
+    Args:
+        data: Release API 的 JSON 对象
+        current_version: 与之比较的本地版本号；None 时取 config.APP_VERSION（测试可显式传入）
 
     Returns:
         dict: {
@@ -152,7 +157,8 @@ def parse_release_info(data: dict) -> dict:
 
     return {
         'version': version,
-        'has_update': compare_version(version, config.APP_VERSION) > 0,
+        'has_update': compare_version(
+            version, config.APP_VERSION if current_version is None else current_version) > 0,
         'notes': (data.get('body') or '').strip(),
         'html_url': data.get('html_url') or '',
         'asset_url': asset_url,
@@ -162,77 +168,49 @@ def parse_release_info(data: dict) -> dict:
     }
 
 
-def load_update_prefs() -> dict:
-    """读取更新偏好（跳过的版本等），异常时返回空配置"""
-    try:
-        with open(config.UPDATE_PREFS_PATH, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            if isinstance(data, dict):
-                return data
-    except FileNotFoundError:
-        pass  # 尚无偏好文件属正常情况
-    except Exception:
-        logger.warning("读取更新偏好失败: %s", config.UPDATE_PREFS_PATH, exc_info=True)
-    return {}
-
-
-def save_update_prefs(prefs: dict):
-    """保存更新偏好，异常时静默忽略"""
-    try:
-        with open(config.UPDATE_PREFS_PATH, 'w', encoding='utf-8') as f:
-            json.dump(prefs, f, ensure_ascii=False, indent=2)
-    except Exception:
-        logger.warning("保存更新偏好失败: %s", config.UPDATE_PREFS_PATH, exc_info=True)
-
-
-def get_skipped_version() -> str:
-    """获取用户选择跳过的版本号"""
-    return str(load_update_prefs().get('skipped_version') or '')
-
-
-def set_skipped_version(version: str):
-    """记录用户选择跳过的版本号"""
-    prefs = load_update_prefs()
-    prefs['skipped_version'] = version
-    save_update_prefs(prefs)
-
-
-class UpdateChecker(QThread):
-    """检查更新的后台线程"""
+class UpdateChecker(BackgroundTask):
+    """检查更新的后台线程（无取消检查点：网络请求自带超时，退出时带超时 join）"""
 
     # 检查完成信号，携带 parse_release_info 的结果
     check_finished = pyqtSignal(dict)
     # 检查失败信号，携带错误描述
     error_occurred = pyqtSignal(str)
 
-    def run(self):
+    def execute(self, token: CancelToken) -> dict:
+        request = urllib.request.Request(GITHUB_API_LATEST, headers=REQUEST_HEADERS)
         try:
-            request = urllib.request.Request(
-                GITHUB_API_LATEST, headers=REQUEST_HEADERS
-            )
             with urllib.request.urlopen(request, timeout=CHECK_TIMEOUT) as resp:
                 data = json.loads(resp.read().decode('utf-8'))
-            self.check_finished.emit(parse_release_info(data))
         except urllib.error.HTTPError as e:
             if e.code == 404:
-                # 仓库尚无任何 release
-                self.error_occurred.emit("仓库暂无发布版本")
-            else:
-                logger.error("检查更新失败（HTTP %s）", e.code, exc_info=True)
-                self.error_occurred.emit(f"检查更新失败（HTTP {e.code}）")
-        except Exception as e:
-            logger.error("检查更新失败", exc_info=True)
-            self.error_occurred.emit(f"检查更新失败：{e}")
+                # 仓库尚无任何 release：正常情况，不记堆栈
+                raise TaskError("仓库暂无发布版本") from e
+            logger.error("检查更新失败（HTTP %s）", e.code, exc_info=True)
+            raise TaskError(f"检查更新失败（HTTP {e.code}）") from e
+        return parse_release_info(data)
+
+    def failure_message(self, exc: Exception) -> str:
+        if isinstance(exc, TaskError):
+            return str(exc)
+        return f"检查更新失败：{exc}"
+
+    def handle_result(self, value: dict) -> None:
+        super().handle_result(value)
+        self.check_finished.emit(value)
+
+    def handle_failure(self, exc: Exception) -> None:
+        super().handle_failure(exc)
+        self.error_occurred.emit(self.failure_message(exc))
 
 
-class UpdateDownloader(QThread):
+class UpdateDownloader(BackgroundTask):
     """
     下载安装包的后台线程。
 
     安全约束：下载地址必须通过 https + 域名白名单；必须提供 asset 的 SHA-256
     摘要（digest），下载完成后逐字节校验，不一致视为失败并删除文件；缺少摘要时
     不下载，经 error_occurred 提示用户去发布页手动下载。文件落在 mkdtemp 生成
-    的唯一目录内。
+    的唯一目录内。取消（cancel）后删除下载残留，不发完成/失败信号。
     """
 
     # 下载进度信号（0-100；总大小未知时报 -1）
@@ -258,23 +236,20 @@ class UpdateDownloader(QThread):
         self.filename = filename
         self.asset_size = asset_size
         self.digest = digest
-        self._cancelled = False
 
-    def cancel(self):
-        """请求取消下载"""
-        self._cancelled = True
+    def _report_progress(self, percent: int) -> None:
+        self.progress.emit(percent)
+        self.download_progress.emit(percent)
 
-    def run(self):
+    def execute(self, token: CancelToken) -> str:
         if not is_allowed_download_url(self.url):
             logger.error("拒绝下载：地址不在允许范围内: %s", self.url)
-            self.error_occurred.emit("安装包下载地址不受信任，请从发布页手动下载")
-            return
+            raise TaskError("安装包下载地址不受信任，请从发布页手动下载")
 
         expected_sha256 = parse_sha256_digest(self.digest)
         if expected_sha256 is None:
             logger.error("拒绝下载：release 资产缺少有效的 SHA-256 摘要: %s", self.url)
-            self.error_occurred.emit(MSG_CANNOT_VERIFY)
-            return
+            raise TaskError(MSG_CANNOT_VERIFY)
 
         work_dir = tempfile.mkdtemp(prefix='ProcessMonitor_update_')
         save_path = os.path.join(work_dir, os.path.basename(self.filename) or 'setup.exe')
@@ -287,7 +262,7 @@ class UpdateDownloader(QThread):
                 last_percent = -1
                 with open(save_path, 'wb') as f:
                     while True:
-                        if self._cancelled:
+                        if token.is_cancelled:
                             raise InterruptedError("用户取消下载")
                         chunk = resp.read(64 * 1024)
                         if not chunk:
@@ -299,9 +274,9 @@ class UpdateDownloader(QThread):
                             percent = downloaded * 100 // total
                             if percent != last_percent:
                                 last_percent = percent
-                                self.download_progress.emit(percent)
+                                self._report_progress(percent)
                         else:
-                            self.download_progress.emit(-1)
+                            self._report_progress(-1)
 
             # 完整性校验：优先用响应头 Content-Length，缺失（total<=0）时退回 release 资产
             # 元数据里的 asset_size；两者都拿不到时跳过长度检查（由 SHA-256 兜底）
@@ -309,26 +284,35 @@ class UpdateDownloader(QThread):
             if expected > 0 and downloaded != expected:
                 logger.error("下载不完整: 已下载=%d 预期=%d url=%s",
                              downloaded, expected, self.url)
-                self._cleanup(work_dir)
-                self.error_occurred.emit(
+                raise TaskError(
                     f"下载不完整：已下载 {downloaded} 字节，预期 {expected} 字节，请重试")
-                return
 
             if sha256.hexdigest() != expected_sha256:
                 logger.error("安装包 SHA-256 校验失败: 实际=%s 预期=%s url=%s",
                              sha256.hexdigest(), expected_sha256, self.url)
-                self._cleanup(work_dir)
-                self.error_occurred.emit(
+                raise TaskError(
                     "安装包校验失败（SHA-256 不一致），已删除下载文件，请重试或从发布页手动下载")
-                return
+        except BaseException:
+            # 失败与取消都删除整个唯一临时目录，再交给基类决定发不发信号
+            self._cleanup(work_dir)
+            raise
+        return save_path
 
-            self.download_finished.emit(save_path)
-        except InterruptedError:
-            self._cleanup(work_dir)
-        except Exception as e:
-            logger.error("下载更新失败", exc_info=True)
-            self._cleanup(work_dir)
-            self.error_occurred.emit(f"下载更新失败：{e}")
+    def failure_message(self, exc: Exception) -> str:
+        if isinstance(exc, TaskError):
+            return str(exc)
+        return f"下载更新失败：{exc}"
+
+    def handle_result(self, value: str) -> None:
+        super().handle_result(value)
+        self.download_finished.emit(value)
+
+    def handle_failure(self, exc: Exception) -> None:
+        if isinstance(exc, InterruptedError):
+            # 取消标志在检查点之外被置位时也走这里：取消不发失败信号
+            return
+        super().handle_failure(exc)
+        self.error_occurred.emit(self.failure_message(exc))
 
     @staticmethod
     def _cleanup(work_dir: str):

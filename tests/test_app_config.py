@@ -1,7 +1,7 @@
 """
 app_config 用例
-覆盖默认值、持久化 roundtrip、非法值回落、首启主题默认 AUTO 四类场景
-（方案 UI体验升级方案_v1.3.0.md §1.6）
+覆盖默认值、持久化 roundtrip、非法值回落、首启主题默认 AUTO、
+跳过版本（含旧 update_prefs.json 一次性导入）、取值范围单一来源
 """
 import json
 import os
@@ -10,6 +10,7 @@ from qfluentwidgets import Theme, qconfig
 
 import app_config
 import config
+from app.paths import AppPaths
 from app_config import AppConfig, cfg
 
 
@@ -51,11 +52,11 @@ def test_invalid_value_falls_back(tmp_path):
     assert cfg3.get(cfg3.retention_days) == config.DATA_RETENTION_DAYS
 
 
-def test_theme_default_auto(tmp_path, monkeypatch):
-    """首启（CONFIG_PATH 指向的配置文件尚不存在）时，load_app_config() 应将
+def test_theme_default_auto(tmp_path):
+    """首启（配置文件尚不存在）时，load_app_config() 应将
     主题偏好落盘为"跟随系统"（Theme.AUTO）"""
-    config_path = str(tmp_path / "config.json")
-    monkeypatch.setattr(app_config, "CONFIG_PATH", config_path)
+    paths = AppPaths.under(str(tmp_path))
+    config_path = paths.config_path
     assert not os.path.exists(config_path)
 
     # qconfig.set 在新值与当前值相同时会短路返回、不触发 save()（见 app_config.py
@@ -65,7 +66,7 @@ def test_theme_default_auto(tmp_path, monkeypatch):
     # AUTO，若不在这里显式改成别的值，本用例会因为"值没变"而误判落盘逻辑正常）
     cfg.themeMode.value = Theme.LIGHT
 
-    app_config.load_app_config()
+    app_config.load_app_config(paths)
 
     assert cfg.get(cfg.themeMode) == Theme.AUTO
     assert os.path.exists(config_path)
@@ -74,14 +75,110 @@ def test_theme_default_auto(tmp_path, monkeypatch):
     assert saved["QFluentWidgets"]["ThemeMode"] == "Auto"
 
 
-def test_theme_not_forced_when_config_exists(tmp_path, monkeypatch):
+def test_theme_not_forced_when_config_exists(tmp_path):
     """非首启（配置文件已存在）时，load_app_config() 不应覆盖用户已保存的主题选择"""
-    config_path = str(tmp_path / "config.json")
-    monkeypatch.setattr(app_config, "CONFIG_PATH", config_path)
+    paths = AppPaths.under(str(tmp_path))
 
-    app_config.load_app_config()  # 第一次启动：落盘 AUTO
+    app_config.load_app_config(paths)  # 第一次启动：落盘 AUTO
     qconfig.set(cfg.themeMode, Theme.LIGHT)  # 用户手动切换为固定浅色并保存
 
-    app_config.load_app_config()  # 模拟第二次启动
+    app_config.load_app_config(paths)  # 模拟第二次启动
 
     assert cfg.get(cfg.themeMode) == Theme.LIGHT
+
+
+def test_load_without_paths_uses_resolved_data_dir(app_paths):
+    """不传路径时按 AppPaths.resolve()（测试中即隔离的临时目录）落盘"""
+    app_config.load_app_config()
+    assert os.path.normcase(str(cfg.file)) == os.path.normcase(app_paths.config_path)
+    app_config.set_skipped_version("9.9.9")   # 已接管：落盘到隔离目录
+    assert os.path.exists(app_paths.config_path)
+
+
+# ========== 跳过的版本 ==========
+
+def _write_legacy_prefs(paths, data):
+    os.makedirs(paths.data_dir, exist_ok=True)
+    with open(paths.prefs_path, 'w', encoding='utf-8') as f:
+        f.write(data if isinstance(data, str) else json.dumps(data))
+
+
+def _saved_config(paths):
+    with open(paths.config_path, encoding='utf-8') as f:
+        return json.load(f)
+
+
+def test_skipped_version_default_empty():
+    assert app_config.get_skipped_version() == ""
+
+
+def test_set_skipped_version_persists_after_load(tmp_path):
+    paths = AppPaths.under(str(tmp_path))
+    app_config.load_app_config(paths)
+    app_config.set_skipped_version("1.5.0")
+    assert app_config.get_skipped_version() == "1.5.0"
+    assert _saved_config(paths)["Update"]["SkippedVersion"] == "1.5.0"
+
+
+def test_set_skipped_version_without_load_is_memory_only(tmp_path, monkeypatch):
+    """配置未加载时只改内存值，不在当前目录写默认配置文件"""
+    monkeypatch.chdir(tmp_path)
+    app_config.set_skipped_version("2.0.0")
+    assert app_config.get_skipped_version() == "2.0.0"
+    assert os.listdir(tmp_path) == []
+
+
+def test_legacy_prefs_imported_and_removed(tmp_path):
+    paths = AppPaths.under(str(tmp_path))
+    _write_legacy_prefs(paths, {"skipped_version": "1.4.9"})
+
+    app_config.load_app_config(paths)
+
+    assert app_config.get_skipped_version() == "1.4.9"
+    assert _saved_config(paths)["Update"]["SkippedVersion"] == "1.4.9"
+    assert not os.path.exists(paths.prefs_path)
+
+
+def test_legacy_prefs_do_not_override_existing_value(tmp_path):
+    paths = AppPaths.under(str(tmp_path))
+    app_config.load_app_config(paths)
+    app_config.set_skipped_version("2.0.0")
+    _write_legacy_prefs(paths, {"skipped_version": "1.4.9"})
+
+    app_config.load_app_config(paths)
+
+    assert app_config.get_skipped_version() == "2.0.0"
+    assert not os.path.exists(paths.prefs_path)
+
+
+def test_corrupt_legacy_prefs_is_ignored_and_removed(tmp_path):
+    paths = AppPaths.under(str(tmp_path))
+    _write_legacy_prefs(paths, "{not json")
+
+    app_config.load_app_config(paths)
+
+    assert app_config.get_skipped_version() == ""
+    assert not os.path.exists(paths.prefs_path)
+
+
+def test_no_legacy_prefs_is_noop(tmp_path):
+    paths = AppPaths.under(str(tmp_path))
+    app_config.load_app_config(paths)
+    assert app_config.get_skipped_version() == ""
+    assert not os.path.exists(paths.prefs_path)
+
+
+# ========== 取值范围单一来源 ==========
+
+def test_interval_range_comes_from_validator():
+    assert app_config.interval_range() == (1, 3600)
+    validator = cfg.default_interval.validator
+    assert app_config.interval_range() == (validator.min, validator.max)
+
+
+def test_retention_options_come_from_validator():
+    assert app_config.retention_options() == [0, 7, 30, 90, 180]
+    assert config.DATA_RETENTION_DAYS in app_config.retention_options()
+    # 返回副本，调用方改动不影响校验器
+    app_config.retention_options().append(999)
+    assert 999 not in cfg.retention_days.validator.options

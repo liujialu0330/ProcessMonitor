@@ -3,7 +3,7 @@
 
 连接、表结构与迁移在 data.db 包中，各表的读写在 data.repos 仓储与 data.maintenance 中。
 本类只做两件事：
-1. 构造时建连接工厂、跑迁移，并把仓储挂成公开属性（tasks / points / markers /
+1. 构造时建连接工厂、跑迁移（组合根以 migrate=False 构造、迁移由它显式调用），并把仓储挂成公开属性（tasks / points / markers /
    analytics / maintenance），新代码直接用这些属性：失败抛 StorageError，时间参数只收 datetime；
 2. 保留旧的公开方法，作为对仓储的薄委托，签名与返回语义不变：原来"吞异常返回
    None/[]/0/False"的，这里捕获 StorageError、记日志后返回原值。
@@ -45,10 +45,15 @@ def _since(since_iso: Optional[str]) -> Optional[datetime]:
 class Database:
     """数据库门面：仓储的持有者 + 旧接口的兼容委托"""
 
-    def __init__(self, db_path: str = None):
+    def __init__(self, db_path: str = None, migrate: bool = True,
+                 migration_report: Optional[MigrationReport] = None):
         """
         Args:
             db_path: 数据库文件路径，默认使用 config 中的配置
+            migrate: 是否在构造时跑迁移。组合根（app.bootstrap）先显式调用
+                MigrationRunner，再以 False 构造，并把得到的报告传给 migration_report
+                （或之后调用 apply_migration_report）；其余调用方保持默认 True
+            migration_report: migrate=False 时由调用方已跑出的迁移报告，用于映射提示标志
         """
         self.db_path = db_path or config.DB_PATH
         self._factory = ConnectionFactory(self.db_path)
@@ -62,7 +67,10 @@ class Database:
         self.backup_aborted: bool = False
         self.migration_report: Optional[MigrationReport] = None
         self._save_failures = 0   # save_data_points 连续失败次数（日志节流用）
-        self._init_database()
+        if migrate:
+            self._init_database()
+        elif migration_report is not None:
+            self.apply_migration_report(migration_report)
 
         # 仓储（公开属性）：失败抛 StorageError，时间参数只收 datetime
         self.tasks = TaskRepo(self._factory)
@@ -81,7 +89,10 @@ class Database:
 
     def _init_database(self):
         """新库建当前结构，旧库按需迁移；把迁移结果映射为三个提示标志"""
-        report = MigrationRunner(self._factory).migrate()
+        self.apply_migration_report(MigrationRunner(self._factory).migrate())
+
+    def apply_migration_report(self, report: MigrationReport) -> None:
+        """记录迁移报告并映射为三个互斥的提示标志"""
         self.migration_report = report
         outcome = report.outcome
         self.backup_aborted = outcome is MigrationOutcome.BACKUP_ABORTED

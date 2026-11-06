@@ -27,12 +27,12 @@ from pyqtgraph import exporters
 from core.contracts import TaskStatus
 from core.history_refresh_worker import (
     HistoryRefreshResult, HistoryRefreshWorker, query_history_data)
+from core.workers.base import LatestRequestGate
 from data.errors import StorageError
 from ui.chart_theme import chart_colors
 from ui.components.chart_axes import ContextDateAxisItem, MetricAxisItem
 from ui.components.sparkline import compute_y_range
 from ui.services import UiServices
-from ui.thread_shutdown import BackgroundThread
 from ui.formatting import (
     build_stat_texts, format_task_option_text, format_task_tooltip,
     marker_context
@@ -166,10 +166,10 @@ class HistoryPage(QScrollArea):
         self._auto_refresh_timer.timeout.connect(self._on_auto_refresh)
         self._auto_refresh_was_running = False
 
-        # 自动刷新的后台查询线程：同一时刻最多一个（在跑时跳过新的 tick）。请求序号
-        # 单调递增，任何"用户主动加载/整体重载/页面隐藏"都会推进它，使在途结果过期被丢弃
+        # 自动刷新的后台查询线程：同一时刻最多一个（在跑时跳过新的 tick）。请求序号门
+        # "最新请求获胜"：任何"用户主动加载/整体重载/页面隐藏"都会让它失效，在途结果被丢弃
         self._refresh_worker: Optional[HistoryRefreshWorker] = None
-        self._refresh_request_seq = 0
+        self._refresh_gate = LatestRequestGate()
         # 自动刷新连续读库失败时只提示一次；成功应用一次结果后复位
         self._refresh_error_notified = False
 
@@ -1338,14 +1338,9 @@ class HistoryPage(QScrollArea):
 
     # ========== 自动刷新：后台查询 + 主线程应用 ==========
 
-    def background_threads(self) -> list:
-        """退出时需要收尾的后台线程（由主窗口统一 shutdown）：自动刷新查询只读、
-        无取消机制，仅带超时等待，避免退出时线程仍在读库。"""
-        return [BackgroundThread("历史自动刷新", self._refresh_worker, timeout_ms=3000)]
-
     def _cancel_pending_refresh(self):
-        """使在途的后台刷新结果过期（推进请求序号）；不等待线程，线程自行跑完。"""
-        self._refresh_request_seq += 1
+        """使在途的后台刷新结果过期；不等待线程，线程自行跑完。"""
+        self._refresh_gate.invalidate()
 
     def _start_auto_refresh_worker(self):
         """
@@ -1359,16 +1354,16 @@ class HistoryPage(QScrollArea):
         if not task_id:
             return
 
-        self._refresh_request_seq += 1
         worker = HistoryRefreshWorker(
-            self.db, self._refresh_request_seq, task_id, self.current_metric,
+            self.db, self._refresh_gate.next_seq(), task_id, self.current_metric,
             self.current_range_key, TIME_RANGE_SECONDS.get(self.current_range_key),
             TABLE_POINT_LIMIT, CHART_MAX_BUCKETS)
         worker.result_ready.connect(self._on_refresh_result)
-        # 先清引用、再 deleteLater（同一信号按连接顺序执行）：保证 background_threads()
-        # 交给主窗口的 _refresh_worker 要么仍有效、要么已是 None，不会拿到已删除的对象
+        # 先连本页的 finished 槽、再登记（同一信号按连接顺序执行）：先清引用、后由
+        # 登记表 deleteLater，_refresh_worker 要么仍有效、要么已是 None。查询只读，
+        # 无取消机制，退出时仅带超时等待
         worker.finished.connect(lambda w=worker: self._on_refresh_worker_finished(w))
-        worker.finished.connect(worker.deleteLater)
+        self.services.threads.register(worker, name="历史自动刷新", timeout_ms=3000)
         self._refresh_worker = worker
         worker.start()
 
@@ -1383,7 +1378,7 @@ class HistoryPage(QScrollArea):
         请求序号过期、或用户已切换任务/指标/范围时丢弃；此刻已进入应跳过刷新的状态
         （明细视图/悬停图表/窗口最小化）时同样丢弃，等下一次 tick。
         """
-        if result.request_id != self._refresh_request_seq:
+        if not self._refresh_gate.is_current(result.request_id):
             return
         if (result.task_id != self.current_task_id
                 or result.metric_type != self.current_metric

@@ -5,7 +5,7 @@
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
-from PyQt5.QtCore import Qt, pyqtSignal, QStringListModel, QTimer
+from PyQt5.QtCore import Qt, pyqtSignal, QStringListModel
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QGridLayout,
                              QScrollArea, QSizePolicy, QCompleter)
@@ -176,7 +176,8 @@ class MonitorPage(QScrollArea):
         select_layout.addWidget(interval_label, 2, 2, Qt.AlignRight)
 
         self.interval_spinbox = SpinBox()
-        self.interval_spinbox.setRange(1, 3600)  # 1-3600秒
+        # 取值范围只在应用配置里定义一份，经偏好服务读取
+        self.interval_spinbox.setRange(*self.services.preferences.interval_range())
         # 默认值取自设置页
         self.interval_spinbox.setValue(self.services.preferences.default_interval())
         # 普通 Fluent SpinBox 横排两个步进按钮，宽度交由其尺寸提示计算，
@@ -550,18 +551,6 @@ class MonitorPage(QScrollArea):
         return self.services.dialogs.ask_marker_label(
             self.window(), default_label, timestamp)
 
-    def _find_processes_by_name(
-            self, process_name: str) -> List[Tuple[int, Optional[float]]]:
-        """按进程名（不区分大小写）查找当前正在运行的进程，返回 (pid, 创建时间) 列表"""
-        wanted = process_name.lower()
-        # 排除本程序自身：被测的同名进程（如 python.exe）退出后，"重新监控"
-        # 不能因为只剩本程序同名而自动监控起自己
-        query = self.services.process_query
-        own_pid = query.self_pid()
-        return [(pid, create_time)
-                for pid, name, create_time in query.list_processes()
-                if name.lower() == wanted and pid != own_pid]
-
     # ========== 任务列表 ==========
 
     def _update_tasks_label(self) -> None:
@@ -622,16 +611,14 @@ class MonitorPage(QScrollArea):
         self.services.notifier.success(self, "成功", "监控任务已启动", 1000)
 
     def _on_task_stopped(self, task_id: str, reason: StopReason):
-        """任务停止事件：卡片保留并切换为"已结束"，同时释放 core 侧的任务对象"""
+        """任务停止事件：卡片保留并切换为"已结束"，同时请 manager 移除 core 侧任务。
+        remove_task 不阻塞：线程若还没退出，manager 会在它 finished 后再释放对象。"""
         card = self.task_cards.get(task_id)
         if card is not None:
             card.set_finished(reason, self.services.clock.now())
             self._forget_exited_process(card.pid)
 
-        # 释放 core 侧任务对象（此时线程只剩收尾，wait 极短）。task_stopped 是 QThread
-        # 线程发出的信号、仍在该信号的槽调用栈内：这里是最后一个引用，同步移除会在
-        # 发射方栈内销毁 QThread 对象，故延后到事件循环下一轮；卡片转"已结束"保持即时
-        QTimer.singleShot(0, lambda tid=task_id: self.manager.remove_task(tid))
+        self.manager.remove_task(task_id)
         self._update_tasks_label()
 
         reason_text = stop_reason_text(reason)
@@ -749,7 +736,9 @@ class MonitorPage(QScrollArea):
         if card is None:
             return
 
-        matches = self._find_processes_by_name(card.process_name)
+        # 精确匹配（不区分大小写）并排除本程序自身：被测的同名进程（如 python.exe）
+        # 退出后，不能因为只剩本程序同名而自动监控起自己
+        matches = self.services.process_query.find_pids_by_name(card.process_name)
         if len(matches) == 1:
             pid, create_time = matches[0]
             interval = card.interval or float(self.interval_spinbox.value())

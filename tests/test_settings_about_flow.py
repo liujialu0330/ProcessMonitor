@@ -116,15 +116,87 @@ def test_open_data_dir_failure_shows_error(setting, dialogs, notifier):
 
 # ---------- 清理数据库：维护状态与线程释放 ----------
 
-def test_cleanup_refused_while_tasks_are_running(setting, manager, dialogs, notifier,
-                                                 monkeypatch):
-    monkeypatch.setattr(manager, 'begin_maintenance', lambda: False)
+def test_cleanup_lock_taken_and_released_on_ui_thread(setting, manager, dialogs,
+                                                     monkeypatch):
+    """两段式维护锁：确认后在界面线程占锁、线程结束后在界面线程释放；后台线程不碰锁"""
+    import threading
+    callers = []
+    real_begin, real_end = manager.begin_maintenance, manager.end_maintenance
+
+    def begin():
+        callers.append(("begin", threading.current_thread() is threading.main_thread()))
+        return real_begin()
+
+    def end():
+        callers.append(("end", threading.current_thread() is threading.main_thread()))
+        return real_end()
+
+    monkeypatch.setattr(manager, 'begin_maintenance', begin)
+    monkeypatch.setattr(manager, 'end_maintenance', end)
+    dialogs.always("confirm", True)
+
+    setting._on_cleanup_clicked()
+    # 线程启动前锁已在界面线程占好
+    assert callers == [("begin", True)]
+    assert setting._cleanup_worker.already_locked is True
+    assert poll_until(
+        lambda: (QApplication.processEvents() or True) and setting._cleanup_worker is None,
+        timeout=20)
+
+    assert callers == [("begin", True), ("end", True)]
+    assert manager.is_maintenance_running() is False
+
+
+@pytest.mark.parametrize("start_during_confirm, text", [
+    ("export", "正在导出数据"),
+    ("task", "有监控任务正在运行"),
+])
+def test_busy_started_during_confirm_refused_before_thread(setting, manager, notifier,
+                                                           monkeypatch, start_during_confirm,
+                                                           text):
+    """确认框弹出期间开始了导出/任务：占锁在启动线程之前被拒，按原因提示，不启动线程"""
+    def confirm(days):
+        if start_during_confirm == "export":
+            assert manager.begin_export() is True
+        else:
+            monkeypatch.setattr(manager, 'has_running_tasks', lambda: True)
+        return True
+
+    monkeypatch.setattr(setting, '_confirm_cleanup', confirm)
 
     setting._on_cleanup_clicked()
 
     assert setting._cleanup_worker is None
+    assert setting.services.threads.entries() == []
+    assert manager.is_maintenance_running() is False
     assert notifier.levels() == ["warning"]
-    assert "confirm" not in dialogs.methods_called(), "被拒绝时不应再弹确认"
+    notice = notifier.last("warning")
+    assert notice.title == "无法清理" and text in notice.content
+    assert notice.duration == 4000
+    assert setting._state_tooltip is None
+    if start_during_confirm == "export":
+        manager.end_export()
+
+
+def test_export_refused_while_cleanup_running(setting, db, manager, dialogs, monkeypatch):
+    """清理线程运行期间（锁已在界面线程占好）开始导出被拒绝"""
+    import threading
+    gate = threading.Event()
+    real_vacuum = db.maintenance.vacuum
+    monkeypatch.setattr(db.maintenance, 'vacuum', lambda: (gate.wait(10), real_vacuum())[1])
+    dialogs.always("confirm", True)
+
+    setting._on_cleanup_clicked()
+    try:
+        assert setting._cleanup_worker is not None
+        assert manager.begin_export() is False
+    finally:
+        gate.set()
+    assert poll_until(
+        lambda: (QApplication.processEvents() or True) and setting._cleanup_worker is None,
+        timeout=20)
+    assert manager.begin_export() is True
+    manager.end_export()
 
 
 def test_cleanup_refusal_reason_running_tasks(setting, manager, notifier, monkeypatch):
@@ -218,16 +290,16 @@ def test_cancelled_confirmation_leaves_maintenance(setting, manager, dialogs):
     assert setting._cleanup_worker is None
 
 
-def test_cleanup_holds_maintenance_until_thread_finished(setting, manager, dialogs,
+def test_cleanup_holds_maintenance_until_thread_finished(setting, db, manager, dialogs,
                                                          monkeypatch):
+    """压缩期间处于维护状态；线程结束后维护已退出、引用已释放、按钮恢复"""
     dialogs.always("confirm", True)
-    states = []
-    real_end = manager.end_maintenance
-    monkeypatch.setattr(
-        manager, 'end_maintenance', lambda: states.append("end") or real_end())
+    during = []
+    real_vacuum = db.maintenance.vacuum
+    monkeypatch.setattr(db.maintenance, 'vacuum', lambda: (
+        during.append(manager.is_maintenance_running()), real_vacuum())[1])
 
     setting._on_cleanup_clicked()
-    assert manager.is_maintenance_running() is True
     assert not setting.cleanup_card.button.isEnabled()
     worker = setting._cleanup_worker
     assert worker is not None
@@ -236,9 +308,30 @@ def test_cleanup_holds_maintenance_until_thread_finished(setting, manager, dialo
     assert poll_until(
         lambda: (QApplication.processEvents() or True) and setting._cleanup_worker is None,
         timeout=20)
-    assert states == ["end"]
+    assert during == [True]
     assert manager.is_maintenance_running() is False
     assert setting.cleanup_card.button.isEnabled()
+
+
+def test_cleanup_worker_registered_and_released(setting, dialogs):
+    """清理线程登记到 services.threads（不可取消、5 秒超时），结束后自动注销并释放"""
+    from PyQt5 import sip
+    from PyQt5.QtCore import QCoreApplication, QEvent
+    dialogs.always("confirm", True)
+
+    setting._on_cleanup_clicked()
+    worker = setting._cleanup_worker
+    entries = setting.services.threads.entries()
+    assert [(e.name, e.thread, e.cancel, e.timeout_ms) for e in entries] == [
+        ("清理数据库", worker, None, 5000)]
+
+    def released():
+        QApplication.processEvents()
+        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+        return setting.services.threads.entries() == [] and sip.isdeleted(worker)
+
+    assert poll_until(released, timeout=20)
+    assert setting._cleanup_worker is None
 
 
 @pytest.mark.parametrize("failing", ["vacuum", "cleanup_older_than"])
@@ -265,7 +358,10 @@ def test_cleanup_failure_reports_error_instead_of_done(setting, db, manager, dia
     error = notifier.last("error")
     assert error.title == "清理失败" and "database is locked" in error.content
     assert setting._state_tooltip is None
+    # 线程失败后（finished）界面线程已释放维护锁
     assert manager.is_maintenance_running() is False
+    assert manager.begin_export() is True
+    manager.end_export()
     assert setting.cleanup_card.button.isEnabled()
 
 
@@ -434,18 +530,33 @@ def test_install_launch_failure_shows_error_text_and_does_not_quit(about, dialog
     assert closed == []
 
 
-def test_install_launch_success_quits_for_install(about, dialogs, monkeypatch):
-    """安装程序已启动：调用窗口的 quit_for_install 走真退出路径"""
+def test_install_launch_success_emits_install_requested(about, dialogs, monkeypatch):
+    """安装程序已启动：发 install_requested（由主窗口接到 quit_for_install），
+    页面不再反向调用窗口方法"""
     _accept_install_dialog(monkeypatch)
-    quits = []
-    monkeypatch.setattr(about, 'quit_for_install', lambda: quits.append(True),
+    requested = []
+    about.install_requested.connect(lambda: requested.append(True))
+    monkeypatch.setattr(about, 'quit_for_install', lambda: pytest.fail("不应反向调用窗口"),
                         raising=False)
     about._pending_info = _info()
 
     about._on_download_finished(r"C:\temp\setup.exe")
 
     assert dialogs.methods_called() == ["open_file"]
-    assert quits == [True]
+    assert requested == [True]
+
+
+def test_install_launch_failure_does_not_emit_install_requested(about, dialogs,
+                                                                monkeypatch):
+    _accept_install_dialog(monkeypatch)
+    dialogs.push("open_file", OSError("拒绝访问"))
+    requested = []
+    about.install_requested.connect(lambda: requested.append(True))
+    about._pending_info = _info()
+
+    about._on_download_finished(r"C:\temp\setup.exe")
+
+    assert requested == []
 
 
 def test_install_postponed_keeps_installer_path(about, dialogs, monkeypatch):
@@ -456,3 +567,49 @@ def test_install_postponed_keeps_installer_path(about, dialogs, monkeypatch):
 
     assert dialogs.calls == []
     assert about.status_label.text() == r"安装包已保存：C:\temp\setup.exe"
+
+
+# ---------- 关于页：后台线程登记 ----------
+
+def _stub_thread_class(base_signals: dict):
+    """构造一个立即结束的线程桩：带关于页会连接的具名信号"""
+    from PyQt5.QtCore import pyqtSignal
+    from core.workers.base import BackgroundTask
+
+    attrs = {name: pyqtSignal(*types) for name, types in base_signals.items()}
+    attrs['__init__'] = lambda self, *a, **k: BackgroundTask.__init__(self)
+    attrs['execute'] = lambda self, token: None
+    attrs['handle_result'] = lambda self, value: None
+    return type('_StubThread', (BackgroundTask,), attrs)
+
+
+def test_update_checker_registered_and_reference_released(about, monkeypatch):
+    stub = _stub_thread_class({'check_finished': (dict,), 'error_occurred': (str,)})
+    monkeypatch.setattr(about_module, 'UpdateChecker', stub)
+
+    about.check_update(silent=True)
+    checker = about._checker
+    entries = about.services.threads.entries()
+    assert [(e.name, e.thread, e.cancel, e.timeout_ms) for e in entries] == [
+        ("检查更新", checker, None, 1000)]
+
+    assert poll_until(lambda: (QApplication.processEvents() or True)
+                      and about._checker is None, timeout=10)
+    assert about.services.threads.entries() == []
+
+
+def test_update_downloader_registered_with_cancel(about, monkeypatch):
+    monkeypatch.setattr(sys, 'frozen', True, raising=False)
+    stub = _stub_thread_class({'download_progress': (int,), 'download_finished': (str,),
+                               'error_occurred': (str,)})
+    monkeypatch.setattr(about_module, 'UpdateDownloader', stub)
+
+    about._start_update(_info(asset_digest='sha256:' + '0' * 64))
+    downloader = about._downloader
+    entries = about.services.threads.entries()
+    assert [(e.name, e.thread, e.cancel, e.timeout_ms) for e in entries] == [
+        ("更新下载", downloader, downloader.cancel, 2000)]
+
+    assert poll_until(lambda: (QApplication.processEvents() or True)
+                      and about._downloader is None, timeout=10)
+    assert about.services.threads.entries() == []

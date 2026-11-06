@@ -63,11 +63,12 @@ def test_reconcile_sample_counts_counts_distinct_timestamps(db, db_path):
     assert db.get_task(task.task_id).sample_count == 4
 
 
-def test_main_window_runs_reconcile_on_startup(qapp, tmp_path):
-    """MainWindow 启动时与 reconcile_orphan_tasks 一起调用一次"""
+def test_startup_reconcile_restores_sample_counts(qapp, tmp_path):
+    """启动校正由组合根经 MaintenanceService.startup_reconcile 执行（主窗口不再调用，
+    启动顺序见 tests/test_bootstrap.py）：旧版写入的任务在启动后重新可见"""
+    from core.maintenance_service import MaintenanceService
     from core.monitor_manager import MonitorManager
     from data.database import Database
-    from tests.factories import make_main_window
 
     db_file = str(tmp_path / "startup.db")
     db = Database(db_file)
@@ -75,10 +76,6 @@ def test_main_window_runs_reconcile_on_startup(qapp, tmp_path):
     db.save_task(task)
     _insert_points_like_old_version(db_file, task.task_id, datetime(2026, 3, 1), 3)
 
-    win = make_main_window(db, MonitorManager(db=db))
-    try:
-        assert db.get_task(task.task_id).sample_count == 3
-    finally:
-        win.about_page.check_update = lambda *a, **k: None
-        win.monitor_manager.stop_all_tasks()
-        win.close()
+    MaintenanceService(db, MonitorManager(db=db)).startup_reconcile(0)
+
+    assert db.get_task(task.task_id).sample_count == 3

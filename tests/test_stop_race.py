@@ -1,5 +1,5 @@
 """
-MonitorTask 停止竞态与停止延迟测量
+MonitorWorker 停止竞态与停止延迟测量
 真实起 QThread 监控当前测试进程（或短生命周期子进程），验证 teardown 在工作线程
 归位后的行为：双路径停止不重复 emit、task_stopped 触发时数据已落库、stop()->wait()
 不挂起、stop() 近乎立即返回、完全停止不与采集间隔成正比（Event 唤醒，无轮询）。
@@ -14,22 +14,23 @@ import pytest
 from PyQt5.QtCore import Qt
 
 from core.contracts import StopReason
-from core.monitor_task import MonitorTask
+from core.monitor_task import MonitorWorker
 from tests.helpers import poll_until
 
 
 @pytest.fixture
-def make_task(tmp_path, qapp):
-    """构造真实 MonitorTask（数据库由根 conftest 隔离到临时目录），用例结束后
-    兜底清理，防止某个断言失败导致线程遗留"""
+def make_task(db, qapp):
+    """构造真实 MonitorWorker（显式注入临时库），用例结束后兜底清理，防止某个断言
+    失败导致线程遗留"""
     created = []
 
     def _factory(pid=None, interval=0.2, metric_types=None):
-        t = MonitorTask(
+        t = MonitorWorker(
             pid=pid or os.getpid(),
             process_name="pytest-target",
             metric_types=metric_types or ["memory_rss"],
             interval=interval,
+            db=db,
         )
         created.append(t)
         return t
@@ -60,7 +61,7 @@ def test_double_stop_call_is_idempotent(make_task):
     task.start()
     assert poll_until(lambda: len(updates) >= 1), "线程未进入主循环"
     task.stop()
-    task.stop()  # 第二次调用是纯粹的 no-op（_running 已是 False）
+    task.stop()  # 第二次调用是纯粹的 no-op（已是 STOPPING）
 
     assert task.wait(5000) is True
     assert stopped_events == [(task.task_id, StopReason.USER)]

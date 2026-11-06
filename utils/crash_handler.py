@@ -15,6 +15,10 @@ _crash_log_file = None
 # 防止 excepthook 内部处理逻辑自身再抛异常导致递归调用
 _in_excepthook = False
 
+# 安装时传入的日志目录：弹窗里提示的日志位置必须与实际写入的位置一致，
+# 不能在出错时重新解析（入口可能显式传入了别的目录）
+_log_dir = None
+
 
 def install_excepthook(log_dir: str):
     """
@@ -23,8 +27,9 @@ def install_excepthook(log_dir: str):
     Args:
         log_dir: 日志目录（与 utils.logger.setup_logging 返回值一致）
     """
-    global _crash_log_file
+    global _crash_log_file, _log_dir
 
+    _log_dir = log_dir
     crash_log_path = os.path.join(log_dir, "crash.log")
     try:
         _crash_log_file = open(crash_log_path, 'a', encoding='utf-8')
@@ -75,8 +80,11 @@ def _maybe_show_message_box():
         if QThread.currentThread() is not app.thread():
             return
 
-        from utils.logger import get_log_dir
-        log_path = os.path.join(get_log_dir(), "app.log")
+        log_dir = _log_dir
+        if log_dir is None:
+            from utils.logger import get_log_dir
+            log_dir = get_log_dir()
+        log_path = os.path.join(log_dir, "app.log")
         QMessageBox.critical(
             None,
             "程序发生错误",

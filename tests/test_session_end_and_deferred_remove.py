@@ -1,7 +1,9 @@
 """
 注销/关机（commitDataRequest）跳过关闭确认直接真退出；
-监控页 task_stopped 槽内延后释放 MonitorTask 的最后引用。
+监控页 task_stopped 槽直接调用 remove_task（不阻塞、不再延后一轮），线程对象
+由 manager 在 QThread.finished 后自行移除释放，卡片保留为"已结束"。
 """
+import os
 from unittest.mock import MagicMock
 
 import pytest
@@ -9,8 +11,11 @@ from PyQt5.QtWidgets import QApplication
 
 from core.contracts import StopReason
 from core.monitor_manager import MonitorManager
+from core.monitor_task import WorkerState
 from data.database import Database
 from tests.factories import make_main_window, make_monitor_page
+from tests.helpers import process_events_until, stop_and_join
+from utils.metrics import MetricType
 
 
 @pytest.fixture
@@ -20,7 +25,7 @@ def window(tmp_path, qapp):
     win.about_page.check_update = lambda *args, **kwargs: None
     win.show()
     yield win
-    win.monitor_manager.stop_all_tasks()
+    stop_and_join(win.monitor_manager)
 
 
 def test_commit_data_request_skips_close_confirmation(window, monkeypatch):
@@ -56,19 +61,47 @@ def test_commit_data_request_signal_is_connected(qapp, tmp_path):
     try:
         assert app.receivers(app.commitDataRequest) == before + 1
     finally:
-        win.monitor_manager.stop_all_tasks()
-        win.close()
+        stop_and_join(win.monitor_manager)
+        win.about_page.check_update = lambda *a, **k: None
+        win.hide()
 
 
-def test_task_stopped_defers_remove_task(qapp, db):
-    """卡片即时转已结束，remove_task 延后到下一轮事件循环"""
+def test_task_stopped_calls_remove_task_directly(qapp, db):
+    """task_stopped 槽内直接调用 remove_task：它不阻塞，无需再延后一轮事件循环"""
     manager = MonitorManager(db=db)
     page = make_monitor_page(db, manager)  # 默认替身进程表为空，不枚举本机进程
     removed = []
     manager.remove_task = lambda tid: removed.append(tid) or True
 
     page._on_task_stopped("t-unknown", StopReason.USER)
-    assert removed == []
-    QApplication.processEvents()
     assert removed == ["t-unknown"]
     page.close()
+
+
+def test_real_stop_card_kept_and_worker_removed_on_finished(qapp, db):
+    """真实线程走完整链路：停止 → 卡片即时转"已结束" → 线程 finished 后 manager
+    移除任务并释放对象；卡片仍保留，配额不再计入"""
+    from PyQt5 import sip
+
+    manager = MonitorManager(db=db)
+    page = make_monitor_page(db, manager)
+    removed = []
+    manager.task_removed.connect(removed.append)
+    try:
+        task_id = manager.create_task(os.getpid(), "self.exe", [MetricType.NUM_THREADS], 0.05)
+        worker = manager.get_task(task_id)
+        assert manager.start_task(task_id)
+
+        assert manager.stop_task(task_id) is True
+        assert worker.state in (WorkerState.STOPPING, WorkerState.STOPPED)
+        assert process_events_until(lambda: removed == [task_id])
+
+        card = page.task_cards[task_id]
+        assert card.is_finished
+        assert manager.get_task_info(task_id) is None
+        assert process_events_until(lambda: sip.isdeleted(worker))
+        assert manager.running_task_count() == 0
+        assert "0/" in page.tasks_label.text() and "1 个已结束" in page.tasks_label.text()
+    finally:
+        stop_and_join(manager)
+        page.close()

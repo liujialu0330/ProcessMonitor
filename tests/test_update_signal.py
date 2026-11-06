@@ -29,10 +29,8 @@ def test_silent_update_emits_signal_not_dialog(qapp, monkeypatch):
     信号，不应直接弹出模态对话框"""
     page = make_about_page()
 
-    # 版本跳过偏好读取真实磁盘文件（data/update_prefs.json），用不存在的版本号
-    # 兜底之外，显式 monkeypatch 到恒返回空字符串，避免测试结果依赖开发机上
-    # 真实的历史"跳过版本"记录
-    monkeypatch.setattr('ui.pages.about_page.get_skipped_version', lambda: '')
+    # 跳过的版本存于 app_config：显式替换为恒返回空字符串，结果不依赖已有配置
+    monkeypatch.setattr('app_config.get_skipped_version', lambda: '')
 
     received = []
     page.update_available_silent.connect(lambda info: received.append(info))
@@ -51,7 +49,7 @@ def test_manual_update_still_shows_dialog(qapp, monkeypatch):
     """手动检查（silent=False）发现新版本时行为不变：直接弹模态对话框，不
     emit update_available_silent 信号"""
     page = make_about_page()
-    monkeypatch.setattr('ui.pages.about_page.get_skipped_version', lambda: '')
+    monkeypatch.setattr('app_config.get_skipped_version', lambda: '')
 
     received = []
     page.update_available_silent.connect(lambda info: received.append(info))

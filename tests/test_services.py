@@ -93,9 +93,12 @@ def test_production_implementations_satisfy_protocols():
 def test_production_services_binds_task_status_to_manager():
     fake_manager = SimpleNamespace(get_task_info=lambda task_id: (
         _info(task_id, TaskStatus.RUNNING) if task_id == "t1" else None))
-    services = production_services(fake_manager)
+    from core.shutdown import ThreadRegistry
+    registry = ThreadRegistry()
+    services = production_services(fake_manager, registry)
 
     assert isinstance(services, UiServices)
+    assert services.threads is registry
     assert isinstance(services.notifier, InfoBarNotifier)
     assert isinstance(services.dialogs, QtDialogs)
     assert isinstance(services.clock, SystemClock)
@@ -345,6 +348,14 @@ def test_config_preferences_reads_cfg_values():
     assert prefs.default_interval() == 7
     assert prefs.retention_days() == 30
     assert prefs.close_to_tray() is True
+
+
+def test_config_preferences_ranges_come_from_app_config():
+    """取值范围只在 app_config 定义一份，偏好服务原样转交"""
+    import app_config
+    prefs = ConfigPreferences()
+    assert prefs.interval_range() == app_config.interval_range() == (1, 3600)
+    assert prefs.retention_options() == app_config.retention_options()
 
 
 def test_config_preferences_remember_last_metrics_roundtrip(restore_last_metrics):

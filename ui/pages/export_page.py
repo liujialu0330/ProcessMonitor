@@ -20,7 +20,6 @@ from ui.formatting import (
     task_status_text
 )
 from ui.services import UiServices
-from ui.thread_shutdown import BackgroundThread
 from ui.typography import DataCaptionLabel, PageTitleLabel
 from utils.metrics import get_metric_display_name
 
@@ -70,7 +69,7 @@ class ExportPage(QScrollArea):
         self._running_refresh_timer.setInterval(RUNNING_TASK_REFRESH_INTERVAL_MS)
         self._running_refresh_timer.timeout.connect(self._refresh_running_tasks)
 
-        # 导出工作线程（持引用防GC；导出期间非None，退出时经 background_threads() 收尾）
+        # 导出工作线程（导出期间非None；生命周期与退出收尾由 services.threads 登记表负责）
         self._export_worker = None
 
         # 上次使用的保存目录：切换任务后默认文件名仍放在这里；首次默认"文档"目录
@@ -468,17 +467,17 @@ class ExportPage(QScrollArea):
         self.export_button.setEnabled(False)
         self.export_status_label.setText("正在导出…")
 
-        self._export_worker = ExportWorker(
-            self.db, self.current_task, save_path, metric_type=None, parent=self)
-        self._export_worker.export_progress.connect(self._on_export_progress)
-        self._export_worker.export_finished.connect(self._on_export_finished)
-        self._export_worker.error_occurred.connect(self._on_export_error)
-        # 线程对象的释放与导出注销都挂在 QThread.finished 上：完成/失败信号是 run()
-        # 的最后一个动作，但此时线程尚未真正结束，不能在这些信号的槽里 deleteLater；
-        # 取消导出（窗口关闭）时不发完成/失败信号，finished 仍会触发
-        worker = self._export_worker
+        worker = ExportWorker(self.db, self.current_task, save_path, metric_type=None)
+        self._export_worker = worker
+        worker.export_progress.connect(self._on_export_progress)
+        worker.export_finished.connect(self._on_export_finished)
+        worker.error_occurred.connect(self._on_export_error)
+        # 导出注销挂在 QThread.finished 上：完成/失败信号是 run() 的最后一个动作，
+        # 但此时线程尚未真正结束；取消导出（退出时）不发完成/失败信号，finished 仍会触发。
+        # 线程对象的释放由登记表负责；取消后线程会自行删除写了一半的临时文件
         worker.finished.connect(lambda w=worker: self._on_export_thread_finished(w))
-        worker.finished.connect(worker.deleteLater)
+        self.services.threads.register(
+            worker, name="导出数据", cancel=worker.cancel, timeout_ms=2000)
         worker.start()
 
     def _warn_no_task(self):
@@ -490,15 +489,6 @@ class ExportPage(QScrollArea):
         """清理数据库进行中，拒绝开始导出"""
         self.services.notifier.warning(
             self, "暂时无法导出", "正在清理数据库，请稍后再导出", duration=4000)
-
-    def background_threads(self) -> list:
-        """退出时需要收尾的后台线程（由主窗口统一 shutdown）：导出线程先置取消
-        标志（取消后会自行删除写了一半的临时文件），再等待结束。"""
-        worker = self._export_worker
-        return [BackgroundThread(
-            "导出数据", worker,
-            cancel_fn=worker.cancel if worker is not None else None,
-            timeout_ms=2000)]
 
     def _on_export_progress(self, processed: int):
         """导出进度更新（已处理的数据点行数）"""
@@ -533,7 +523,7 @@ class ExportPage(QScrollArea):
     def _on_export_thread_finished(self, worker):
         """
         导出线程真正结束（QThread.finished）：释放引用并恢复导出按钮。
-        deleteLater 由同一信号上的另一条连接负责；取消导出（窗口关闭）时不发
+        线程对象的 deleteLater 由线程登记表负责；取消导出（退出时）时不发
         完成/失败信号，但 finished 仍会触发，因此按钮恢复放在这里最可靠。
         """
         # 每个已启动的 worker 都只在这里注销一次，即使引用已被新 worker 替换

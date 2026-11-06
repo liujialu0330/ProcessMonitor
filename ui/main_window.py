@@ -4,25 +4,25 @@
 """
 import logging
 import os
-from typing import Optional
+from typing import List, Optional
 
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import QApplication, QSystemTrayIcon
 from qfluentwidgets import (
-    FluentWindow, NavigationItemPosition, FluentIcon,
-    PushButton, SystemTrayMenu, Action
+    FluentWindow, NavigationItemPosition, FluentIcon, PushButton
 )
 
+from core.shutdown import ShutdownCoordinator
 from ui.pages.monitor_page import MonitorPage
 from ui.pages.history_page import HistoryPage
 from ui.pages.export_page import ExportPage
 from ui.pages.about_page import AboutPage
 from ui.pages.setting_page import SettingPage
 from ui.services import CLOSE_ACTION_CANCEL, CLOSE_ACTION_TRAY, UiServices
+from ui.tray import TrayController
 from core.monitor_manager import MonitorManager
 from data.database import Database
-from utils.thread_utils import shutdown_thread
 from app_config import cfg
 import config
 
@@ -35,7 +35,7 @@ class MainWindow(FluentWindow):
     def __init__(self, db: Database, manager: MonitorManager, services: UiServices):
         """初始化主窗口
 
-        三项依赖都由入口（main.py）构造后注入，主窗口不再自建；测试注入隔离的
+        三项依赖都由组合根（app.bootstrap）构造后注入，主窗口不再自建；测试注入隔离的
         临时库与替身服务。同一份 services 向下分发给全部页面。
 
         Args:
@@ -50,30 +50,18 @@ class MainWindow(FluentWindow):
         self.services = services
 
         # 托盘驻留相关状态：必须在 _init_tray()/closeEvent 用到之前初始化完毕。
-        # - _really_quit：托盘菜单"退出"与 quit_for_install() 会置 True，
+        # - _really_quit：托盘菜单"退出"、关于页"立即安装"与会话结束会置 True，
         #   closeEvent 据此跳过隐藏分支与关窗确认、直接走真退出路径。
-        # - tray_icon：仅当 QSystemTrayIcon.isSystemTrayAvailable() 时由
-        #   _init_tray() 赋值；offscreen/CI 或精简系统下恒为 None，closeEvent
-        #   的托盘隐藏分支与各类补充气泡逻辑都因此天然短路，退化为无托盘现状
-        #   （不变式⑤）。
+        # - tray：托盘控制器，由 _init_tray() 创建；offscreen/CI 或精简系统下
+        #   is_available() 为 False，closeEvent 的托盘隐藏分支与各类补充气泡逻辑都
+        #   因此天然短路，退化为无托盘现状（不变式⑤）。
         # - _tray_tip_shown：首次隐藏到托盘时的提示气泡只弹一次。
+        # 启动校正（孤儿任务、采样计数、过期清理）由组合根在构造本窗口之前完成。
         self._really_quit = False
-        self.tray_icon: Optional[QSystemTrayIcon] = None
+        self.tray: Optional[TrayController] = None
         self._tray_tip_shown = False
-
-        # 孤儿任务校正：上次运行未正常退出遗留的 running 状态任务本次启动时统一校正为
-        # stopped。必须在任何任务启动前、每进程只调用一次；不能放进 Database.__init__。
-        self.db.reconcile_orphan_tasks()
-
-        # 采样计数校正：用户回退旧版本运行后再升级回来，旧版写入的任务 sample_count=0
-        # 会在历史页/导出页消失，这里按数据点重算一次（同样只在启动时、任务启动前调用）
-        self.db.reconcile_sample_counts()
-
-        # 启动自动清理：保留天数取自用户偏好（设置页可改），默认禁用
-        # （0=永久保留，config.DATA_RETENTION_DAYS 缺省值同此）。执行顺序固定在
-        # 孤儿校正之后，避免把本次启动才校正为 stopped 的"刚崩溃"任务当作过期
-        # 任务误删。
-        self.db.cleanup_old_tasks(self.services.preferences.retention_days())
+        # 真退出收尾期间报告过的进度文案（按顺序；供日志与测试核对）
+        self.shutdown_progress: List[str] = []
 
         # 初始化界面
         self._init_window()
@@ -92,6 +80,8 @@ class MainWindow(FluentWindow):
         # 而是发信号，这里统一处理为非模态提示（必须在 self.about_page 创建
         # 之后连接，故放在 _init_navigation 之后）
         self.about_page.update_available_silent.connect(self._on_update_available_silent)
+        # 关于页"立即安装"：安装向导已启动，主程序必须真退出释放文件占用
+        self.about_page.install_requested.connect(self.quit_for_install)
 
         # 启动3秒后静默检查更新（对齐参考实现，避免阻塞启动）
         QTimer.singleShot(3000, lambda: self.about_page.check_update(silent=True))
@@ -216,41 +206,23 @@ class MainWindow(FluentWindow):
         self.switchTo(self.monitor_page)
 
     def _init_tray(self) -> None:
-        """初始化系统托盘图标。
-
-        图标常驻：应用启动即出现，不随"关闭时最小化到托盘"开关增删——该开关
-        只控制 closeEvent 的关闭行为，不控制图标本身的显隐。
-
-        仅当当前系统支持系统托盘（QSystemTrayIcon.isSystemTrayAvailable()）时
-        才创建；offscreen/CI 或部分精简系统该判断为 False，self.tray_icon
-        保持 None，closeEvent 的托盘隐藏分支与各类补充气泡逻辑都因此天然短路，
-        退化为无托盘现状（不变式⑤）。
-        """
-        if not QSystemTrayIcon.isSystemTrayAvailable():
-            return
-
+        """创建托盘控制器（图标常驻；托盘不可用时 is_available() 为 False）"""
         icon_path = config.get_icon_path()
         icon = QIcon(icon_path) if os.path.exists(icon_path) else self.windowIcon()
+        self.tray = TrayController(self, icon, config.APP_NAME)
+        self.tray.show_requested.connect(self._show_from_tray)
+        self.tray.quit_requested.connect(self._quit_from_tray)
 
-        self.tray_icon = QSystemTrayIcon(icon, self)
-        self.tray_icon.setToolTip(config.APP_NAME)
+    @property
+    def tray_icon(self) -> Optional[QSystemTrayIcon]:
+        """兼容属性：托盘图标对象，托盘不可用时为 None。新代码请用 self.tray。"""
+        return self.tray.icon if self.tray is not None else None
 
-        menu = SystemTrayMenu(parent=self)
-
-        show_action = Action(FluentIcon.VIEW, "显示主界面", self)
-        show_action.triggered.connect(self._show_from_tray)
-        menu.addAction(show_action)
-
-        quit_action = Action(FluentIcon.CLOSE, "退出", self)
-        quit_action.triggered.connect(self._quit_from_tray)
-        menu.addAction(quit_action)
-
-        self.tray_icon.setContextMenu(menu)
-        self.tray_icon.activated.connect(self._on_tray_activated)
-        self.tray_icon.show()
+    def _tray_available(self) -> bool:
+        return self.tray is not None and self.tray.is_available()
 
     def _show_from_tray(self) -> None:
-        """托盘菜单"显示主界面"/双击图标：从隐藏态还原窗口"""
+        """托盘菜单"显示主界面"/单击或双击图标：从隐藏态还原窗口"""
         self.showNormal()
         self.activateWindow()
         self.raise_()
@@ -261,17 +233,10 @@ class MainWindow(FluentWindow):
         self._really_quit = True
         self.close()
 
-    def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
-        """托盘图标激活事件：单击（Trigger）与双击（DoubleClick）均还原主界面；
-        右键（Context）由 Qt 自动弹出 setContextMenu 设置的菜单，无需在此处理"""
-        if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
-            self._show_from_tray()
-
     def quit_for_install(self) -> None:
-        """供更新安装流程调用的公开方法：无论"关闭时最小化到
-        托盘"是否开启，都必须走真退出路径——否则该开关开启时，安装向导已经
-        启动，主程序却被 closeEvent 的隐藏分支拦截、常驻托盘继续占用文件，
-        导致覆盖安装因文件占用而失败。"""
+        """更新安装流程（关于页 install_requested）：无论"关闭时最小化到托盘"是否
+        开启，都必须走真退出路径——否则该开关开启时，安装向导已经启动，主程序却被
+        closeEvent 的隐藏分支拦截、常驻托盘继续占用文件，导致覆盖安装因文件占用而失败。"""
         self._really_quit = True
         self.close()
 
@@ -296,10 +261,9 @@ class MainWindow(FluentWindow):
         view_button.clicked.connect(lambda: self._show_update_detail(info))
         info_bar.addWidget(view_button)
 
-        if self.isHidden() and self.tray_icon is not None:
-            self.tray_icon.showMessage(
-                f"发现新版本 {info['version']}", "打开主界面查看",
-                QSystemTrayIcon.Information)
+        if self.isHidden() and self._tray_available():
+            self.tray.show_message(
+                f"发现新版本 {info['version']}", "打开主界面查看", 'info')
 
     def _show_update_detail(self, info: dict) -> None:
         """更新提示条「查看」按钮点击：切到关于页并弹出更新确认对话框"""
@@ -313,12 +277,11 @@ class MainWindow(FluentWindow):
 
     def _on_task_ended_abnormally(self, title: str, content: str) -> None:
         """被测进程自行结束（不是用户点停止）：主窗口隐藏或不在前台时补一条托盘气泡
-        （窗口在前台时监控页自身的提示条已足够显眼）。tray_icon 为 None
-        （无托盘环境）时短路。"""
-        if self.tray_icon is None:
+        （窗口在前台时监控页自身的提示条已足够显眼）。托盘不可用时短路。"""
+        if not self._tray_available():
             return
         if self.isHidden() or not self.isActiveWindow():
-            self.tray_icon.showMessage(title, content, QSystemTrayIcon.Warning)
+            self.tray.show_message(title, content, 'warning')
 
     def _ask_close_action(self) -> str:
         """仍有任务在监控时关闭窗口：询问用户的选择。
@@ -329,58 +292,59 @@ class MainWindow(FluentWindow):
         """
         return self.services.dialogs.ask_close_action(
             self, self.monitor_manager.running_task_count(),
-            self.tray_icon is not None)
+            self._tray_available())
 
     def _hide_to_tray(self, event) -> None:
         """隐藏到托盘：不停止任务、不做任何清理，忽略本次关闭事件。"""
         self.hide()
         if not self._tray_tip_shown:  # 每次运行只提示一次，避免反复打扰
-            self.tray_icon.showMessage(
-                config.APP_NAME, "已最小化到系统托盘，监控仍在后台运行",
-                QSystemTrayIcon.Information)
+            self.tray.show_message(
+                config.APP_NAME, "已最小化到系统托盘，监控仍在后台运行", 'info')
             self._tray_tip_shown = True
         event.ignore()
 
-    def _thread_owner_pages(self) -> tuple:
-        """有后台线程需要在退出时收尾的页面（各自实现 background_threads()）"""
-        return (self.about_page, self.export_page, self.setting_page, self.history_page)
-
-    def _shutdown_page_threads(self) -> None:
-        """逐页收尾后台线程：先取消（如有）再带超时等待，超时只记日志。
-
-        某一页取线程列表出错不影响其余页面——退出前漏收一个线程，main.py 的
-        os._exit 就会在它写库/写文件的中途把它掐断。
-        """
-        for page in self._thread_owner_pages():
+    def _on_shutdown_progress(self, text: str) -> None:
+        """退出收尾的进度：窗口此时已隐藏，进度写日志并显示在托盘图标的悬停文字上"""
+        self.shutdown_progress.append(text)
+        logger.info("退出收尾: %s", text)
+        if self.tray is not None:
             try:
-                threads = page.background_threads()
+                self.tray.set_tooltip(f"{config.APP_NAME}：{text}")
             except Exception:
-                logger.error("获取页面后台线程失败: %r", page, exc_info=True)
-                continue
-            for entry in threads:
-                if not shutdown_thread(entry.thread, cancel_fn=entry.cancel_fn,
-                                       timeout_ms=entry.timeout_ms):
-                    logger.error("退出时后台线程未在超时内结束: %s", entry.name)
+                logger.warning("更新托盘提示失败", exc_info=True)
+
+    def _run_shutdown(self) -> bool:
+        """真退出收尾：先隐藏窗口给出即时反馈，再交给 ShutdownCoordinator 按固定顺序
+        停任务、带超时 join、收尾登记表里的后台线程、关闭数据库。协调器有 30 秒
+        总期限，超时只记日志；入口随后用 os._exit() 结束进程，所以期限内没收完的
+        线程会被直接终止——"不丢数据"由期限加日志兜底，而不是无限等待。"""
+        self.hide()
+        coordinator = ShutdownCoordinator(
+            self.monitor_manager, self.services.threads, db=self.db)
+        ok = coordinator.run(on_progress=self._on_shutdown_progress)
+        if not ok:
+            logger.error("退出收尾未在期限内全部完成，详见上方日志")
+        return ok
 
     def closeEvent(self, event):
         """关闭窗口事件处理。
 
         默认（未开启"关闭时最小化到托盘"，或托盘不可用）：没有运行中任务时走
-        完整清理流程 -> QApplication.quit()（唯一真退出路径，main.py 用 os._exit
-        兜底）；仍有任务在监控时先询问"停止监控并退出 / 最小化到托盘 / 取消"。
+        真退出流程 -> QApplication.quit()（唯一真退出路径，入口用 os._exit
+        结束进程）；仍有任务在监控时先询问"停止监控并退出 / 最小化到托盘 / 取消"。
         开启该设置且托盘可用时直接隐藏到托盘，不停止任务、不做任何清理，等待
         用户从托盘菜单选择"退出"。
 
         退出路径不变式（绝不破坏）：
-        ① 默认配置（close_to_tray=False）且无运行中任务时，关闭行为与现状完全一致；
-        ② 托盘"退出"与 About 页"立即安装"都置 _really_quit=True，绕开隐藏分支与
-           关窗确认，走同一条真退出路径；
+        ① 默认配置（close_to_tray=False）且无运行中任务时直接走真退出；
+        ② 托盘"退出"、关于页"立即安装"与会话结束都置 _really_quit=True，绕开
+           隐藏分支与关窗确认，走同一条真退出路径；
         ③ 隐藏到托盘不停止任务、不做任何清理；
-        ④ 清理步骤中途抛异常，QApplication.quit() 仍必须执行（try/finally）；
-        ⑤ offscreen/无托盘环境（isSystemTrayAvailable() 为 False）下
-           tray_icon 为 None，隐藏分支天然短路，行为与现状一致。
+        ④ 收尾中途抛异常，QApplication.quit() 仍必须执行（try/finally）；
+        ⑤ offscreen/无托盘环境下托盘不可用，隐藏分支天然短路；
+        ⑥ 真退出的收尾只经 ShutdownCoordinator，总期限 30 秒，超时记日志。
         """
-        if (not self._really_quit and self.tray_icon is not None
+        if (not self._really_quit and self._tray_available()
                 and self.services.preferences.close_to_tray()):
             self._hide_to_tray(event)
             return
@@ -391,41 +355,25 @@ class MainWindow(FluentWindow):
             if action == CLOSE_ACTION_CANCEL:
                 event.ignore()
                 return
-            if action == CLOSE_ACTION_TRAY and self.tray_icon is not None:
+            if action == CLOSE_ACTION_TRAY and self._tray_available():
                 self._hide_to_tray(event)
                 return
             # 'quit'：继续走下面的真退出流程
 
-        # 真退出路径：既有全部清理步骤整体包进 try/finally，QApplication.quit() 放
-        # finally——setQuitOnLastWindowClosed(False) 拆掉了"closeEvent 异常也能退出"
-        # 的隐性保险丝，退出全靠这里显式调用 quit()；若清理中途抛异常又不放 finally，
-        # 会导致事件循环不退出且窗口已被隐藏，用户无法通过任何界面操作恢复。
+        # 真退出路径：QApplication.quit() 放 finally——setQuitOnLastWindowClosed(False)
+        # 拆掉了"closeEvent 异常也能退出"的隐性保险丝，退出全靠这里显式调用 quit()；
+        # 收尾中途抛异常又不放 finally，事件循环不会退出而窗口已隐藏，用户无从恢复。
         try:
-            # 1. 停止所有监控任务：stop_all_tasks 先给全部运行中线程置停止标志，再逐个
-            #    无超时 wait，返回时各任务的收尾 flush 与状态落库都已完成
-            self.monitor_manager.stop_all_tasks()
-
-            # 1.1 兜底 join：stop_all_tasks 只处理调用时 isRunning 的线程；对仍在
-            #     收尾的线程补一个带超时的 join。main.py 退出时用 os._exit() 直接
-            #     终止进程（规避下载线程残留导致的 0xC0000409），若不在此兜底等待，
-            #     可能在收尾写库的中途就被掐死，丢失最后一批数据。
-            self.monitor_manager.join_all(timeout_ms=3000)
-
-            # 2. 各页面登记的后台线程（下载、检查更新、导出、清理数据库、历史自动
-            #    刷新）：取消语义与超时由页面的 background_threads() 给出
-            self._shutdown_page_threads()
-
-            # 接受关闭事件（放 try 尾部：清理全部成功才显式 accept；异常路径下
-            # QCloseEvent 默认已 accepted，且 finally 的 quit() 与 main.py 的
-            # os._exit() 双重兜底退出，不依赖这一行）
+            self._run_shutdown()
+            # 收尾完成才显式 accept；异常路径下 QCloseEvent 默认已是 accepted，
+            # 且 finally 的 quit() 与入口的 os._exit() 兜底退出，不依赖这一行
             event.accept()
         finally:
-            # 真退出前主动隐藏托盘图标——main.py 用 os._exit() 结束进程，不经
-            # Qt 析构，不显式 hide 会在通知区残留幽灵图标直到鼠标划过。防御
-            # try/except：托盘对象异常不得妨碍 finally 里必须执行的 quit()
-            if self.tray_icon is not None:
+            # 真退出前主动隐藏托盘图标（理由见 TrayController.hide）。托盘对象出错
+            # 不得妨碍随后必须执行的 quit()
+            if self.tray is not None:
                 try:
-                    self.tray_icon.hide()
+                    self.tray.hide()
                 except Exception:
-                    pass
+                    logger.warning("隐藏托盘图标失败", exc_info=True)
             QApplication.quit()

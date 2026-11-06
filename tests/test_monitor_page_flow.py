@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 
 import pytest
 from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import QApplication, QWidget
+from PyQt5.QtWidgets import QWidget
 
 from core.contracts import StopReason, UnavailableReason
 from core.monitor_manager import MonitorManager
@@ -19,6 +19,7 @@ from tests.doubles import (
     DEFAULT_FAKE_NOW, FakeClock, FakePreferences, FakeProcessQuery, ScriptedDialogs,
 )
 from tests.factories import make_monitor_page, make_services
+from tests.helpers import stop_and_join
 from ui.components.metric_selector import MetricSelectorDialog
 from ui.services import InfoBarNotifier
 from utils.metrics import (
@@ -32,7 +33,9 @@ FAKE_PROCESSES = [
 
 @pytest.fixture
 def manager(db):
-    return MonitorManager(db=db)
+    mgr = MonitorManager(db=db)
+    yield mgr
+    stop_and_join(mgr)
 
 
 @pytest.fixture
@@ -491,10 +494,9 @@ def test_card_is_kept_in_finished_state_after_stop(page, manager, notifier):
 
     page._on_task_stopped(task_id, StopReason.USER)
 
-    # 卡片保留并即时转"已结束"；core 侧任务对象延后一轮事件循环释放
+    # 卡片保留并即时转"已结束"；未启动的任务没有线程可等，core 侧立即移除
+    # （线程仍在收尾时由 manager 在 finished 后移除，见 test_session_end_and_deferred_remove）
     assert task_id in page.task_cards and card.is_finished
-    assert manager.get_task_info(task_id) is not None
-    QApplication.processEvents()
     assert manager.get_task_info(task_id) is None
     # 最后值与较开始保留
     assert card.value_labels[MetricType.MEMORY_PRIVATE].text() == "2 MB"
@@ -579,9 +581,34 @@ def test_restart_with_zero_or_many_matches_fills_search_box(
     assert keyword in last.title + last.content
 
 
-def test_find_processes_by_name_is_case_insensitive(page):
-    assert page._find_processes_by_name("mprintexp.EXE") == [(1003, 1003.5)]
-    assert page._find_processes_by_name("nothing.exe") == []
+def test_restart_matches_process_name_case_insensitively(page, manager, query, monkeypatch):
+    """重新监控经 ProcessQuery.find_pids_by_name 按名查找（不区分大小写），页面不自行遍历进程表"""
+    task_id, card = _add_card(page, manager)
+    card.process_name = "mprintexp.EXE"
+    page._on_task_stopped(task_id, StopReason.PROCESS_EXITED)
+    started = []
+    monkeypatch.setattr(
+        page, "_start_monitoring", lambda *args, **kwargs: started.append((args, kwargs)))
+    query.calls.clear()
+
+    card.restart_button.click()
+
+    assert [args[0] for args, _ in started] == [1003]
+    assert started[0][1] == {"create_time": 1003.5}
+    assert ('find_pids_by_name', None) in query.calls
+    assert ('list_processes', None) not in query.calls
+
+
+def test_interval_range_comes_from_preferences(qapp, db, manager):
+    """采集周期输入框的范围取自偏好服务（只在 app_config 定义一份）"""
+    prefs = FakePreferences()
+    prefs.interval_bounds = (2, 120)
+    widget = make_monitor_page(db, manager, make_services(
+        process_query=FakeProcessQuery(FAKE_PROCESSES), preferences=prefs))
+    try:
+        assert (widget.interval_spinbox.minimum(), widget.interval_spinbox.maximum()) == (2, 120)
+    finally:
+        widget.close()
 
 
 # ---------- 只经 manager 只读接口 ----------
@@ -643,15 +670,26 @@ def test_user_stop_does_not_signal_abnormal(page, manager, notifier):
     assert notifier.last().level == "info"
 
 
-def test_find_processes_by_name_excludes_own_process(page, query):
+def test_restart_excludes_own_process(page, manager, query, notifier, monkeypatch):
     """被测的同名进程退出后，"重新监控"不能因为只剩本程序同名而监控起自己。"""
     own = query.self_pid()
+    task_id, card = _add_card(page, manager)
+    card.process_name = "PYTHON.EXE"
+    page._on_task_stopped(task_id, StopReason.PROCESS_EXITED)
+    started = []
+    monkeypatch.setattr(
+        page, "_start_monitoring", lambda *args, **kwargs: started.append(args))
+
     query.processes = [(own, "python.exe", 1.0), (99999, "python.exe", 2.0),
                        (12345, "other.exe", 3.0)]
-    assert page._find_processes_by_name("PYTHON.EXE") == [(99999, 2.0)]
+    card.restart_button.click()
+    assert [args[0] for args in started] == [99999]
 
+    started.clear()
     query.processes = [(own, "python.exe", 1.0)]
-    assert page._find_processes_by_name("python.exe") == []
+    card.restart_button.click()
+    assert started == []
+    assert "未找到" in notifier.last("warning").title
 
 
 def test_exited_process_is_cleared_from_form(page, manager, query):
