@@ -2,21 +2,26 @@
 MonitorManager 接口与线程释放语义：
 去单例（普通注入）、stop_task / remove_task / stop_all_tasks 都不阻塞、线程 finished 后
 manager 自行移除并释放对象、start_task 只接受未启动任务、计数只看 WorkerState、
-join_all 带超时、维护锁、标记、delete_task_data、note
+join_all 带超时、维护锁、打点（默认标签序列、基线唯一、增删改、markers_changed、
+基线样本）、delete_task_data、note
 """
 import os
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 
 import dataclasses
 
 from core.contracts import StopReason, TaskInfo, TaskStatus
-from core.monitor_manager import MonitorManager
+from core.monitor_manager import (
+    BASELINE_LABEL, BASELINE_SAMPLE_COUNT, MonitorManager, default_marker_kind, median_of,
+)
 from core.monitor_task import MonitorTask, MonitorWorker, WorkerState
 from data.database import Database
+from data.errors import StorageError
+from data.models import DataPoint, Marker, TaskRecord
 from tests.helpers import (
     poll_until, process_events_until, record_stop_reasons, stop_and_join,
 )
@@ -366,15 +371,16 @@ def test_begin_maintenance_refused_when_tasks_running(manager):
 
 # ========== 标记 / 删除 / note ==========
 
-def test_add_marker_returns_timestamp_and_persists(manager):
+def test_add_marker_returns_marker_and_persists(manager):
     task_id, task = _start_task_with_collector(manager, _SlowCollector())
     before = datetime.now()
 
-    ts = manager.add_marker(task_id, "  点击开始扫描  ")
+    marker = manager.add_marker(task_id, "  点击开始扫描  ")
 
-    assert isinstance(ts, datetime) and ts >= before
+    assert isinstance(marker, Marker) and marker.timestamp >= before
+    assert (marker.task_id, marker.label, marker.kind) == (task_id, "点击开始扫描", "user")
     markers = manager.db.get_markers(task_id)
-    assert [(m.label, m.timestamp) for m in markers] == [("点击开始扫描", ts)]
+    assert markers == [marker]
     manager.stop_all_tasks()
 
 
@@ -383,9 +389,9 @@ def test_add_marker_uses_given_click_time(manager):
     task_id = manager.create_task(os.getpid(), "x.exe", ["memory_rss"], 1.0)
     clicked = datetime(2026, 11, 6, 10, 0, 0)
 
-    ts = manager.add_marker(task_id, "开始第 3 轮", clicked)
+    marker = manager.add_marker(task_id, "开始第 3 轮", clicked)
 
-    assert ts == clicked
+    assert marker.timestamp == clicked
     assert [(m.label, m.timestamp) for m in manager.db.get_markers(task_id)] == [
         ("开始第 3 轮", clicked)]
 
@@ -406,16 +412,16 @@ def test_add_marker_persists_with_id_via_markers_repo(manager, monkeypatch):
     monkeypatch.setattr(manager.db.markers, 'add',
                         lambda *a, **k: seen.append(real(*a, **k)) or seen[-1])
 
-    ts = manager.add_marker(task_id, "第 1 轮", datetime(2026, 11, 6, 9, 0, 0))
+    marker = manager.add_marker(task_id, "第 1 轮", datetime(2026, 11, 6, 9, 0, 0))
 
-    assert ts == datetime(2026, 11, 6, 9, 0, 0)
+    assert marker.timestamp == datetime(2026, 11, 6, 9, 0, 0)
     markers = manager.db.markers.list(task_id)
     assert len(seen) == 1 and isinstance(seen[0], int) and seen[0] > 0
+    assert marker.id == seen[0]
     assert [(m.id, m.label, m.kind) for m in markers] == [(seen[0], "第 1 轮", "user")]
 
 
 def test_add_marker_storage_error_returns_none(manager, monkeypatch):
-    from data.errors import StorageError
     task_id = manager.create_task(os.getpid(), "x.exe", ["memory_rss"], 1.0)
 
     def boom(*a, **k):
@@ -455,6 +461,206 @@ def test_add_marker_failures_return_none(manager):
     assert manager.add_marker(task_id, "   ") is None
     assert manager.add_marker(task_id, "") is None
     assert manager.db.get_markers(task_id) == []
+    with pytest.raises(ValueError):
+        manager.add_marker(task_id, "x", kind="bogus")
+
+
+# ---------- 打点语义：默认标签序列、基线唯一、增删改、markers_changed ----------
+
+T0 = datetime(2026, 11, 6, 9, 0, 0)
+
+
+def _changes(manager):
+    seen = []
+    manager.markers_changed.connect(seen.append)
+    return seen
+
+
+def _kinds(manager, task_id):
+    return [(m.label, m.kind) for m in manager.list_markers(task_id)]
+
+
+def test_next_marker_label_sequence(manager):
+    task_id = manager.create_task(os.getpid(), "x.exe", ["memory_rss"], 1.0)
+    assert manager.next_marker_label(task_id) == BASELINE_LABEL == "基线"
+
+    manager.add_marker(task_id, "基线", T0, kind="baseline")
+    assert manager.next_marker_label(task_id) == "第 1 轮"
+    manager.add_marker(task_id, "第 1 轮", T0 + timedelta(minutes=1))
+    # 用户改了名称不影响计数：按 user 打点数 + 1
+    manager.add_marker(task_id, "建模 200 次", T0 + timedelta(minutes=2))
+    assert manager.next_marker_label(task_id) == "第 3 轮"
+    # 系统打点不计入轮次
+    manager.add_marker(task_id, "暂停", T0 + timedelta(minutes=3), kind="pause")
+    assert manager.next_marker_label(task_id) == "第 3 轮"
+
+
+def test_renamed_default_baseline_keeps_baseline_kind():
+    """默认名称决定类型：默认"基线"时用户改了名称仍是基线；名称恰为"基线"也是基线"""
+    assert default_marker_kind("基线", "预热完成") == "baseline"
+    assert default_marker_kind("第 2 轮", " 基线 ") == "baseline"
+    assert default_marker_kind("第 2 轮", "第 2 轮") == "user"
+    assert default_marker_kind("第 2 轮", "开始建模") == "user"
+
+
+def test_label_exactly_baseline_forces_baseline_kind(manager):
+    task_id = manager.create_task(os.getpid(), "x.exe", ["memory_rss"], 1.0)
+    marker = manager.add_marker(task_id, " 基线 ", T0)
+    assert marker.kind == "baseline"
+
+
+def test_new_baseline_demotes_previous_one(manager):
+    task_id = manager.create_task(os.getpid(), "x.exe", ["memory_rss"], 1.0)
+    first = manager.add_marker(task_id, "基线", T0, kind="baseline")
+    second = manager.add_marker(task_id, "重新预热", T0 + timedelta(minutes=5),
+                                kind="baseline")
+
+    assert _kinds(manager, task_id) == [("基线", "user"), ("重新预热", "baseline")]
+    assert manager.get_baseline(task_id).id == second.id != first.id
+
+
+def test_set_baseline_keeps_single_baseline_and_emits(manager):
+    task_id = manager.create_task(os.getpid(), "x.exe", ["memory_rss"], 1.0)
+    base = manager.add_marker(task_id, "基线", T0, kind="baseline")
+    round1 = manager.add_marker(task_id, "第 1 轮", T0 + timedelta(minutes=1))
+    pause = manager.add_marker(task_id, "暂停", T0 + timedelta(minutes=2), kind="pause")
+    seen = _changes(manager)
+
+    assert manager.set_baseline(task_id, round1.id) is True
+    assert _kinds(manager, task_id) == [
+        ("基线", "user"), ("第 1 轮", "baseline"), ("暂停", "pause")]
+    assert seen == [task_id]
+
+    # 已是基线：幂等成功；系统打点、别的任务的打点、不存在的打点都拒绝
+    assert manager.set_baseline(task_id, round1.id) is True
+    assert manager.set_baseline(task_id, pause.id) is False
+    assert manager.set_baseline("other", base.id) is False
+    assert manager.set_baseline(task_id, 99999) is False
+    assert [m.kind for m in manager.list_markers(task_id)].count("baseline") == 1
+
+
+def test_rename_marker_keeps_kind_and_emits(manager):
+    task_id = manager.create_task(os.getpid(), "x.exe", ["memory_rss"], 1.0)
+    base = manager.add_marker(task_id, "基线", T0, kind="baseline")
+    seen = _changes(manager)
+
+    assert manager.rename_marker(base.id, "  预热结束  ") is True
+    assert _kinds(manager, task_id) == [("预热结束", "baseline")]
+    assert seen == [task_id]
+
+    assert manager.rename_marker(base.id, "   ") is False
+    assert manager.rename_marker(99999, "x") is False
+    assert seen == [task_id]
+
+
+def test_rename_marker_of_unseen_marker_uses_given_task_id(manager):
+    """打点不是经本管理器添加/读取的（如库里旧打点）：用调用方给的 task_id 发信号"""
+    task_id = manager.create_task(os.getpid(), "x.exe", ["memory_rss"], 1.0)
+    marker_id = manager.db.markers.add(task_id, T0, "旧打点")
+    seen = _changes(manager)
+
+    assert manager.rename_marker(marker_id, "改名", task_id=task_id) is True
+    assert seen == [task_id]
+    other_id = manager.db.markers.add(task_id, T0, "另一个")
+    assert manager.rename_marker(other_id, "改名 2") is True   # 不知道所属任务：照改不发
+    assert seen == [task_id]
+
+
+def test_delete_marker_and_baseline_resets_sequence(manager):
+    task_id = manager.create_task(os.getpid(), "x.exe", ["memory_rss"], 1.0)
+    base = manager.add_marker(task_id, "基线", T0, kind="baseline")
+    round1 = manager.add_marker(task_id, "第 1 轮", T0 + timedelta(minutes=1))
+    seen = _changes(manager)
+
+    assert manager.delete_marker(round1.id) is True
+    assert manager.next_marker_label(task_id) == "第 1 轮"
+    assert manager.delete_marker(base.id) is True
+    assert manager.get_baseline(task_id) is None
+    assert manager.next_marker_label(task_id) == "基线"
+    assert seen == [task_id, task_id]
+    assert manager.delete_marker(base.id) is False
+    assert seen == [task_id, task_id]
+
+
+def test_add_marker_emits_markers_changed(manager):
+    task_id = manager.create_task(os.getpid(), "x.exe", ["memory_rss"], 1.0)
+    seen = _changes(manager)
+    manager.add_marker(task_id, "基线", T0)
+    manager.add_marker(task_id, "   ", T0)       # 失败不发
+    assert seen == [task_id]
+
+
+def test_marker_storage_errors_are_reported_as_false(manager, monkeypatch):
+    task_id = manager.create_task(os.getpid(), "x.exe", ["memory_rss"], 1.0)
+    marker = manager.add_marker(task_id, "第 1 轮", T0)
+
+    def boom(*a, **k):
+        raise StorageError("database is locked")
+
+    for name in ("update_label", "delete", "set_kind", "list"):
+        monkeypatch.setattr(manager.db.markers, name, boom)
+    assert manager.rename_marker(marker.id, "x") is False
+    assert manager.delete_marker(marker.id) is False
+    assert manager.list_markers(task_id) == []
+    assert manager.set_baseline(task_id, marker.id) is False
+
+
+def test_pause_resume_through_manager_emit_markers_changed(manager):
+    task_id, task = _start_task_with_collector(manager, _SlowCollector())
+    seen = _changes(manager)
+    clicked = datetime(2026, 11, 6, 10, 0, 0)
+
+    assert manager.pause_task(task_id, clicked) is True
+    assert manager.pause_task(task_id) is False          # 已暂停：不写打点、不发信号
+    assert manager.resume_task(task_id, clicked + timedelta(seconds=30)) is True
+    assert manager.resume_task("unknown") is False
+
+    assert seen == [task_id, task_id]
+    assert [(m.label, m.kind, m.timestamp) for m in manager.list_markers(task_id)] == [
+        ("暂停", "pause", clicked), ("恢复", "resume", clicked + timedelta(seconds=30))]
+    manager.stop_all_tasks()
+
+
+# ---------- 基线样本 ----------
+
+def _write_points(db, task_id, start, values, step=1.0, metric="memory_rss"):
+    db.save_data_points([
+        DataPoint(task_id=task_id, timestamp=start + timedelta(seconds=i * step),
+                  value=float(v), metric_type=metric)
+        for i, v in enumerate(values)])
+
+
+def test_baseline_samples_for_finished_task_takes_first_five_after_marker(manager, db):
+    db.save_task(TaskRecord(
+        task_id="old", pid=1, process_name="old.exe", metric_types=["memory_rss"],
+        interval=1.0, start_time=T0, end_time=T0 + timedelta(minutes=1),
+        status=TaskStatus.STOPPED))
+    _write_points(db, "old", T0, [1, 2, 3, 100, 200, 300, 400, 500, 9999])
+    base = manager.add_marker("old", "基线", T0 + timedelta(seconds=3))
+
+    seed = manager.baseline_samples("old")
+
+    assert seed.marker == base and seed.settled is True
+    assert seed.samples == {"memory_rss": [100.0, 200.0, 300.0, 400.0, 500.0]}
+    assert median_of(seed.samples["memory_rss"]) == 300.0
+
+
+def test_baseline_samples_recent_baseline_is_not_settled(manager, db):
+    task_id = manager.create_task(os.getpid(), "x.exe", ["memory_rss"], 1.0)
+    db.save_task(manager.get_task(task_id).task_model)
+    base = manager.add_marker(task_id, "基线", T0)
+    _write_points(db, task_id, T0 + timedelta(seconds=1), [10, 20])
+
+    seed = manager.baseline_samples(task_id, base)
+
+    assert seed.samples == {"memory_rss": [10.0, 20.0]}
+    assert seed.settled is False     # 任务还会继续采集：由调用方用实时数据补足
+
+
+def test_baseline_samples_without_baseline_is_none(manager):
+    task_id = manager.create_task(os.getpid(), "x.exe", ["memory_rss"], 1.0)
+    assert manager.baseline_samples(task_id) is None
+    assert BASELINE_SAMPLE_COUNT == 5
 
 
 def test_delete_task_data_refused_while_running(manager):

@@ -1,5 +1,5 @@
 """
-采样明细表：单指标的采样账本（时间 / 格式化值 / 原始值），最新一条在最上面。
+采集明细表：单指标的采集账本（时间 / 数值 / 较上次 / 较基线 / 原始值），最新一条在最上面。
 
 宽屏下表格与标题共享一条居中的阅读轨道（最宽 960px），避免时间和值被拉到卡片两端；
 窄窗口时轨道填满卡片内容区。原始值列默认隐藏，按需显示。
@@ -15,32 +15,38 @@ from qfluentwidgets import (CaptionLabel, CardWidget, StrongBodyLabel,
 
 from ui.typography import TypeScale, data_font, ui_font
 from ui.widgets.history.common import CARD_PADDING_H, DETAIL_TIME_FORMAT
-from utils.metrics import format_metric_value
+from utils.metrics import format_metric_delta, format_metric_value
 
 DETAIL_TABLE_MAX_WIDTH = 960
-DETAIL_TABLE_MIN_COLUMN_WIDTH = 144
+# 五列（含隐藏的原始值列）在 800 宽的最小窗口下也不出现横向滚动
+DETAIL_TABLE_MIN_COLUMN_WIDTH = 120
 DETAIL_TABLE_HEADER_HEIGHT = 40
 DETAIL_TABLE_ROW_HEIGHT = 38
 DETAIL_TABLE_MIN_HEIGHT = 340
-HEADER_LABELS = ('采样时间', '指标值', '原始值')
-RAW_VALUE_COLUMN = 2
+HEADER_LABELS = ('时间', '数值', '较上次', '较基线', '原始值')
+RAW_VALUE_COLUMN = 4
+EMPTY_CELL = "--"
 
 # 卡片内边距：上 12，左右 16，下 16；标题行与表格间距 8
 CARD_PADDING_TOP = 12
 CARD_PADDING_BOTTOM = 16
 CONTENT_SPACING = 8
 
-HINT_DEFAULT = "最新数据优先"
+HINT_DEFAULT = ""
 
 
 def table_hint_text(shown: int, total: Optional[int]) -> str:
-    """表格提示：已显示条数 / 所选范围内总条数（total 为 None 时按已显示条数）。"""
+    """表格提示："共 12 条（倒序）"；范围内总条数多于已显示条数时追加
+    "仅显示最近 2,000 条"（total 为 None 时按已显示条数）。"""
     total = shown if total is None else max(total, shown)
-    return f"{HINT_DEFAULT} · 显示最近 {shown:,} 条 / 共 {total:,} 条"
+    text = f"共 {total:,} 条（倒序）"
+    if total > shown:
+        text += f" · 仅显示最近 {shown:,} 条"
+    return text
 
 
 class SampleTable(CardWidget):
-    """采样明细卡片：标题 + 提示 + 三列表格。"""
+    """采集明细卡片：标题 + 提示 + 表格（原始值列默认隐藏）。"""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -94,7 +100,7 @@ class SampleTable(CardWidget):
         content_layout.setContentsMargins(0, 0, 0, 0)
         content_layout.setSpacing(CONTENT_SPACING)
         title_row = QHBoxLayout()
-        title_row.addWidget(StrongBodyLabel("采样明细", self.detail_table_content))
+        title_row.addWidget(StrongBodyLabel("采集明细", self.detail_table_content))
         title_row.addStretch()
         self.table_hint_label = CaptionLabel(HINT_DEFAULT, self.detail_table_content)
         title_row.addWidget(self.table_hint_label)
@@ -105,7 +111,8 @@ class SampleTable(CardWidget):
         outer_layout.addStretch()
 
     def set_points(self, points: Sequence, metric_type: Optional[str],
-                   total_count: Optional[int] = None, display_unit: str = '') -> None:
+                   total_count: Optional[int] = None, display_unit: str = '',
+                   baseline_value: Optional[float] = None) -> None:
         """
         填充表格并更新提示。
 
@@ -113,19 +120,30 @@ class SampleTable(CardWidget):
             points: 数据点（需有 timestamp / value；按时间升序，表格倒序显示，最新在前）
             metric_type: 指标类型
             total_count: 所选范围内的数据点总数；None 时按已显示条数
-            display_unit: 图表当前固定的显示单位（表格与图表、统计条同单位）
+            display_unit: 图表当前固定的显示单位（数值列与图表、统计条同单位）
+            baseline_value: 基线值；None 时"较基线"列显示 "--"
         """
         self.table_hint_label.setText(table_hint_text(len(points), total_count))
+        count = len(points)
 
         # 大批量 setItem 前关闭界面更新，避免逐行触发重排/重绘拖慢填表
         self.data_table.setUpdatesEnabled(False)
         self.data_table.setSortingEnabled(False)
         try:
-            self.data_table.setRowCount(len(points))
-            for row, dp in enumerate(reversed(points)):
+            self.data_table.setRowCount(count)
+            for row in range(count):
+                index = count - 1 - row
+                dp = points[index]
+                # 较上次/较基线按变化量自身量级自适应单位，小幅变化不会被大单位吞成 0
+                previous = (format_metric_delta(metric_type, dp.value - points[index - 1].value)
+                            if index > 0 else EMPTY_CELL)
+                vs_baseline = (format_metric_delta(metric_type, dp.value - baseline_value)
+                               if baseline_value is not None else EMPTY_CELL)
                 texts = (
                     dp.timestamp.strftime(DETAIL_TIME_FORMAT),
                     format_metric_value(metric_type, dp.value, display_unit=display_unit),
+                    previous,
+                    vs_baseline,
                     f"{dp.value:.4f}",
                 )
                 for column, text in enumerate(texts):

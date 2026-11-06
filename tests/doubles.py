@@ -235,10 +235,12 @@ class ScriptedDialogs:
         return self._answer('confirm', parent=parent, title=title, content=content,
                             confirm_text=confirm_text, cancel_text=cancel_text)
 
-    def ask_marker_label(self, parent, default_label: str,
-                         timestamp: datetime) -> Optional[str]:
+    def ask_marker_label(self, parent, default_label: str, timestamp: datetime, *,
+                         process_name: str = '', pid: Optional[int] = None
+                         ) -> Optional[str]:
         return self._answer('ask_marker_label', parent=parent,
-                            default_label=default_label, timestamp=timestamp)
+                            default_label=default_label, timestamp=timestamp,
+                            process_name=process_name, pid=pid)
 
     def choose_metrics(self, parent, selected: Sequence[str]) -> Optional[List[str]]:
         value = self._answer('choose_metrics', parent=parent, selected=list(selected))

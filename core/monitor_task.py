@@ -29,6 +29,10 @@ CONSECUTIVE_FAILURE_NOTIFY_THRESHOLD = 3
 # flush 持续失败时的日志节流：首次必记，之后每隔该次数记一条（带累计次数）
 FLUSH_FAILURE_LOG_INTERVAL = 100
 
+# 暂停/恢复时自动写入的系统打点 {kind: 标签}：分析时据此把暂停期间识别为空洞，
+# 而不是误判为"进程在这段时间没有变化"
+SYSTEM_MARKER_LABELS = {'pause': '暂停', 'resume': '恢复'}
+
 
 class WorkerState(Enum):
     """监控线程的显式状态。
@@ -343,19 +347,34 @@ class MonitorWorker(QThread):
         self._wake.set()
         return changed
 
-    def pause(self) -> bool:
-        """暂停监控（仅 RUNNING 可暂停；唤醒当前等待，工作线程转入暂停等待）"""
+    def pause(self, timestamp: Optional[datetime] = None) -> bool:
+        """暂停监控（仅 RUNNING 可暂停；唤醒当前等待，工作线程转入暂停等待）。
+        切换成功后写一条"暂停"系统打点，时间为 timestamp（缺省取调用时刻）。"""
         if not self._transition((WorkerState.RUNNING,), WorkerState.PAUSED):
             return False
         self._wake.set()
+        self._write_system_marker('pause', timestamp)
         return True
 
-    def resume(self) -> bool:
-        """恢复监控（仅 PAUSED 可恢复；唤醒暂停等待，工作线程立即采集一次）"""
+    def resume(self, timestamp: Optional[datetime] = None) -> bool:
+        """恢复监控（仅 PAUSED 可恢复；唤醒暂停等待，工作线程立即采集一次）。
+        切换成功后写一条"恢复"系统打点，时间为 timestamp（缺省取调用时刻）。"""
         if not self._transition((WorkerState.PAUSED,), WorkerState.RUNNING):
             return False
         self._wake.set()
+        self._write_system_marker('resume', timestamp)
         return True
+
+    def _write_system_marker(self, kind: str, timestamp: Optional[datetime]) -> None:
+        """写暂停/恢复系统打点。在调用 pause()/resume() 的线程（GUI 线程）同步写库：
+        时间取点击时刻，不受工作线程调度延迟影响。写库失败只记日志——打点只是
+        辅助信息，不能因此让暂停/恢复本身失败。"""
+        when = timestamp if timestamp is not None else datetime.now()
+        try:
+            self.db.markers.add(self.task_id, when, SYSTEM_MARKER_LABELS[kind], kind)
+        except Exception:
+            logger.error("task_id=%s 写入%s打点失败", self.task_id,
+                         SYSTEM_MARKER_LABELS[kind], exc_info=True)
 
     def is_running(self) -> bool:
         """已请求运行且未请求停止（暂停中也算）。只由状态派生，不与 isRunning()

@@ -92,7 +92,7 @@ def test_gui_smoke_full_lifecycle(qapp, e2e_db, tmp_path):
         # ========== 2. 轮询等待至少 2 次采集 ==========
         got_two_samples = _poll_until(lambda: card.count >= 2)
         assert got_two_samples, f"15s 内未采集到 2 次数据，实际 count={card.count}"
-        assert card.count_label.text() == f"已记录：{card.count} 次采集"
+        assert card.count_label.text().endswith(f"每 1 秒 · {card.count} 次采集")
 
         _pause()
 

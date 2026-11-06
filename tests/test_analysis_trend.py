@@ -12,6 +12,11 @@ import pytest
 from core.analysis.trend import (
     CI_Z,
     MIN_POINTS,
+    RISE_R2,
+    LinearFit,
+    RateText,
+    rate_display,
+    rate_unit_for_span,
     FitInput,
     Verdict,
     fit_input_from_aggregates,
@@ -191,10 +196,16 @@ def test_insufficient_has_zero_confidence_and_no_fit():
     assert j.confidence == 0.0
 
 
+def test_rise_r2_default_follows_product_rule():
+    """产品规则：持续上涨要求 R² > 0.8（方案 §6.3）"""
+    assert RISE_R2 == 0.8
+
+
 @pytest.mark.parametrize('r2, verdict, reason', [
-    (0.59, Verdict.FLUCTUATING, 'low_r2'),
-    (0.6, Verdict.RISING, 'rising'),
-    (0.61, Verdict.RISING, 'rising'),
+    (0.6, Verdict.FLUCTUATING, 'low_r2'),
+    (0.79, Verdict.FLUCTUATING, 'low_r2'),
+    (0.8, Verdict.RISING, 'rising'),
+    (0.81, Verdict.RISING, 'rising'),
 ])
 def test_r2_threshold(r2, verdict, reason):
     agg = synthetic(n=40, step=30.0, slope=0.5, r2=r2)
@@ -311,3 +322,41 @@ def test_fit_input_from_aggregates_empty_is_none(db):
     _seed_series(db, 't', range(5), float)
     assert fit_input_from_aggregates(db.analytics.aggregates('t', 'cpu_percent')) is None
     assert fit_input_from_aggregates(db.analytics.aggregates('missing', 'memory_rss')) is None
+
+
+# ---------- 增速的显示口径 ----------
+
+@pytest.mark.parametrize('span, suffix, seconds', [
+    (0.0, '/分', 60.0),
+    (3599.0, '/分', 60.0),
+    (3600.0, '/小时', 3600.0),
+    (86400.0, '/小时', 3600.0),
+])
+def test_rate_unit_for_span(span, suffix, seconds):
+    assert rate_unit_for_span(span) == (suffix, seconds)
+
+
+def test_rate_display_converts_slope_and_ci():
+    fit = LinearFit(slope_per_second=2.0, intercept=0.0, r2=0.9, stderr_slope=0.1)
+    assert rate_display(fit, 600.0) == RateText(
+        value=120.0, ci=pytest.approx(CI_Z * 0.1 * 60), unit_suffix='/分', unit_seconds=60.0)
+    hourly = rate_display(fit, 7200.0, 'bytes_kb')
+    assert (hourly.value, hourly.unit_suffix) == (7200.0, '/小时')
+    assert hourly.ci == pytest.approx(CI_Z * 0.1 * 3600)
+
+
+def test_rate_display_two_points_has_no_ci():
+    fit = LinearFit(slope_per_second=1.0, intercept=0.0, r2=1.0, stderr_slope=math.inf)
+    assert rate_display(fit, 10.0).ci is None
+
+
+@pytest.mark.parametrize('kind', ['cumulative_count', 'cumulative_bytes', 'seconds', 'peak'])
+def test_rate_display_not_applicable_kinds(kind):
+    from utils.metrics import MetricKind
+    fit = LinearFit(slope_per_second=1.0, intercept=0.0, r2=1.0, stderr_slope=0.0)
+    assert rate_display(fit, 600.0, kind) is None
+    assert rate_display(fit, 600.0, MetricKind(kind)) is None
+
+
+def test_rate_display_without_fit():
+    assert rate_display(None, 600.0) is None

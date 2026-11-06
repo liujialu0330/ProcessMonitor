@@ -15,48 +15,59 @@ from ui.widgets.qfw_compat import InputDialogBase
 MARKER_LABEL_MAX_LENGTH = 40
 
 
-class MarkerDialog(InputDialogBase):
-    """打点标签输入框：默认填入"标记 N"，确定后返回标签文本。
+def marker_target_text(process_name: str = '', pid: Optional[int] = None) -> str:
+    """打点对话框的信息行"进程名 · PID 1234"（缺哪项省哪项）。"""
+    parts = [process_name] if process_name else []
+    if pid is not None:
+        parts.append(f"PID {pid}")
+    return " · ".join(parts)
 
-    打点时间是用户点"打点"按钮的时刻（由调用方传入并最终写库），不是点"添加"的
-    时刻：输入标签要花好几秒，按确认时刻记录会让竖线落在事件之后。
+
+class MarkerDialog(InputDialogBase):
+    """打点名称输入框：默认填入序列中的下一个名称（基线 / 第 N 轮），确定后返回名称。
+
+    打点时间是用户点"打点"按钮的时刻（由调用方传入并最终写库），不是点"保存"的
+    时刻：输入名称要花好几秒，按确认时刻记录会让竖线落在事件之后。对话框文案因此
+    写"已在 HH:MM:SS 记录"——取消只是不保存，时刻本身早已确定。
     """
 
     def __init__(self, default_label: str, parent=None,
-                 timestamp: Optional[datetime] = None):
+                 timestamp: Optional[datetime] = None, *,
+                 process_name: str = '', pid: Optional[int] = None):
         super().__init__(parent)
         self.timestamp = timestamp if timestamp is not None else datetime.now()
-        self.viewLayout.addWidget(SubtitleLabel("添加打点", self))
-        self.viewLayout.addWidget(CaptionLabel(
-            "记录点击“打点”时发生的事件，历史图表上会画出对应的竖线", self))
+        self.viewLayout.addWidget(SubtitleLabel("打点", self))
+        self.target_label = CaptionLabel(marker_target_text(process_name, pid), self)
+        self.target_label.setVisible(bool(self.target_label.text()))
+        self.viewLayout.addWidget(self.target_label)
         self.time_label = BodyLabel(
-            f"时间 {self.timestamp.strftime('%H:%M:%S')}（点击时刻）", self)
+            f"已在 {self.timestamp.strftime('%H:%M:%S')} 记录，可修改名称", self)
         self.viewLayout.addWidget(self.time_label)
 
         self.label_edit = LineEdit(self)
         self.label_edit.setText(default_label)
         self.label_edit.setMaxLength(MARKER_LABEL_MAX_LENGTH)
-        self.label_edit.setPlaceholderText("标签，如：开始第 3 轮建模")
+        self.label_edit.setPlaceholderText("名称，如：第 3 轮建模")
         self.label_edit.setClearButtonEnabled(True)
         self.label_edit.selectAll()
         self.viewLayout.addWidget(self.label_edit)
 
-        self.yesButton.setText("添加")
+        self.yesButton.setText("保存")
         self.cancelButton.setText("取消")
         self.widget.setMinimumWidth(380)
-        # 标签为空时不能添加（禁用后回车触发的 click 也不会生效）
+        # 名称为空时不能保存（禁用后回车触发的 click 也不会生效）
         self.label_edit.textChanged.connect(self._update_yes_enabled)
         self._update_yes_enabled()
         # 回车直接确认
         self.label_edit.returnPressed.connect(self.yesButton.click)
-        # 弹出后焦点给输入框并全选默认标签：直接打字即覆盖（基类默认焦点在"添加"上）
+        # 弹出后焦点给输入框并全选默认名称：直接打字即覆盖（基类默认焦点在"保存"上）
         self.set_focus_widget(self.label_edit)
 
     def _update_yes_enabled(self, *_args) -> None:
         self.yesButton.setEnabled(bool(self.label_edit.text().strip()))
 
     def get_label(self) -> str:
-        """输入的标签（已去除首尾空白）。"""
+        """输入的名称（已去除首尾空白）。"""
         return self.label_edit.text().strip()
 
 

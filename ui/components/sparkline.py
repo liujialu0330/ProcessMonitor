@@ -6,7 +6,10 @@
 （取平均）并让后续每个点覆盖两倍的采集次数：点数始终有界，而曲线覆盖的时间
 范围始终是"任务开始至今"，各点代表的时间跨度保持一致。
 纵轴按数据 min-max 自适应，但跨度有下限，避免微小抖动被画成满幅波动。
+采集点带时间时还能画打点刻度：基线为注意色实线，普通打点为注意色虚线。
 """
+from bisect import bisect_right
+from datetime import datetime
 from typing import List, Optional, Sequence, Tuple
 
 from PyQt5.QtCore import Qt, QPointF
@@ -32,6 +35,12 @@ DEFAULT_MAX_POINTS = 240
 # 零信号残留。颜色自含常量，不依赖历史页的 ui/chart_theme.py。
 _LIGHT_COLOR = QColor("#0A8F8F")
 _DARK_COLOR = QColor("#44D7D1")
+# 打点刻度用注意色（与历史图表的打点竖线同色）
+_MARKER_LIGHT_COLOR = QColor("#C2410C")
+_MARKER_DARK_COLOR = QColor("#FFB454")
+
+# 画在迷你图上的打点类型：暂停/恢复系统打点不画，小图上只留用户关心的轮次边界
+TICK_KINDS = ('baseline', 'user')
 
 
 def merge_pairs(values: Sequence[float]) -> List[float]:
@@ -53,6 +62,8 @@ class TrendDownsampler:
     每个已完成的点是 stride 次采集的平均值；达到上限时全体成对合并、stride 翻倍。
     尚未攒满 stride 次的最新采集暂存为 pending，并以其平均值作为末尾点参与绘制，
     因此最新一次采集的走势能立即反映到曲线末端。
+    每个点另记其首个采集的时间（可为 None），合并时取两点中较早的，用于把打点
+    时刻换算到横轴位置。
     """
 
     def __init__(self, max_points: int = DEFAULT_MAX_POINTS):
@@ -60,28 +71,62 @@ class TrendDownsampler:
         self.max_points = max(2, max_points - max_points % 2)
         self.stride = 1
         self._points: List[float] = []
+        self._times: List[Optional[datetime]] = []
         self._pending: List[float] = []
+        self._pending_time: Optional[datetime] = None
 
-    def append(self, value: float) -> None:
+    def append(self, value: float, timestamp: Optional[datetime] = None) -> None:
+        if not self._pending:
+            self._pending_time = timestamp
         self._pending.append(value)
         if len(self._pending) < self.stride:
             return
         self._points.append(sum(self._pending) / len(self._pending))
+        self._times.append(self._pending_time)
         self._pending = []
+        self._pending_time = None
         if len(self._points) >= self.max_points:
             self._points = merge_pairs(self._points)
+            self._times = self._times[::2]
             self.stride *= 2
 
     def clear(self) -> None:
         self.stride = 1
         self._points = []
+        self._times = []
         self._pending = []
+        self._pending_time = None
 
     def series(self) -> List[float]:
         """当前用于绘制的序列（含尚未攒满一个点的最新采集）。"""
         if self._pending:
             return self._points + [sum(self._pending) / len(self._pending)]
         return list(self._points)
+
+    def times(self) -> List[Optional[datetime]]:
+        """与 series() 一一对应的各点起始时间。"""
+        if self._pending:
+            return self._times + [self._pending_time]
+        return list(self._times)
+
+
+def tick_fraction(times: Sequence[datetime], when: datetime) -> float:
+    """打点时刻在横轴上的位置（0 = 第一个点，1 = 最后一个点）。
+
+    落在两点之间时按时间线性插值；早于第一个点或晚于最后一个点时贴边。
+    只有一个点时返回 0.5（单点画在中间）。
+    """
+    count = len(times)
+    if count <= 1:
+        return 0.5
+    if when <= times[0]:
+        return 0.0
+    if when >= times[-1]:
+        return 1.0
+    i = bisect_right(times, when) - 1
+    span = (times[i + 1] - times[i]).total_seconds()
+    offset = (when - times[i]).total_seconds() / span if span > 0 else 0.0
+    return (i + offset) / (count - 1)
 
 
 def min_span(metric_type: Optional[str], reference: float) -> float:
@@ -116,13 +161,15 @@ class SparklineWidget(QWidget):
         super().__init__(parent)
         self._metric_type = metric_type
         self._sampler = TrendDownsampler(max_points)
+        # 打点刻度 [(时间, kind)]，只保留 TICK_KINDS
+        self._markers: List[Tuple[datetime, str]] = []
 
         self.setFixedHeight(FIXED_HEIGHT)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-    def append(self, value: float) -> None:
-        """追加一个采集点并触发重绘"""
-        self._sampler.append(value)
+    def append(self, value: float, timestamp: Optional[datetime] = None) -> None:
+        """追加一个采集点并触发重绘；timestamp 为采集时间（画打点刻度要用）"""
+        self._sampler.append(value, timestamp)
         self.update()
 
     def clear(self) -> None:
@@ -133,6 +180,21 @@ class SparklineWidget(QWidget):
     def series(self) -> List[float]:
         """当前绘制序列（测试与调试用）"""
         return self._sampler.series()
+
+    def set_markers(self, markers: Sequence[Tuple[datetime, str]]) -> None:
+        """设置打点刻度 [(时间, kind)]；非 TICK_KINDS 的打点忽略。"""
+        self._markers = sorted(
+            ((when, kind) for when, kind in markers if kind in TICK_KINDS),
+            key=lambda item: item[0])
+        self.update()
+
+    def tick_positions(self) -> List[Tuple[float, str]]:
+        """各打点刻度的横轴位置 [(0~1 的比例, kind)]。还没有点、或有点缺少时间时
+        无法换算，返回空列表（不画刻度）。"""
+        times = self._sampler.times()
+        if not times or any(t is None for t in times):
+            return []
+        return [(tick_fraction(times, when), kind) for when, kind in self._markers]
 
     def paintEvent(self, event):
         """
@@ -179,4 +241,22 @@ class SparklineWidget(QWidget):
             painter.drawPolyline(QPolygonF(points))
         # count == 0：不画任何内容
 
+        self._paint_ticks(painter, width, height)
         painter.end()
+
+    def _paint_ticks(self, painter: QPainter, width: int, height: int) -> None:
+        """打点刻度：基线注意色实线，普通打点注意色虚线，贯穿整个高度。"""
+        positions = self.tick_positions()
+        if not positions:
+            return
+        color = _MARKER_DARK_COLOR if isDarkTheme() else _MARKER_LIGHT_COLOR
+        for fraction, kind in positions:
+            pen = QPen(color)
+            if kind == 'baseline':
+                pen.setWidthF(1.5)
+            else:
+                pen.setWidthF(1.0)
+                pen.setStyle(Qt.DashLine)
+            painter.setPen(pen)
+            x = min(max(fraction * width, 0.5), max(width - 0.5, 0.5))
+            painter.drawLine(QPointF(x, 0), QPointF(x, height))

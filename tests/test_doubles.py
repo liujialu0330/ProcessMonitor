@@ -112,14 +112,25 @@ def test_scripted_dialogs_queue_then_fixed_value():
 def test_scripted_dialogs_none_is_a_valid_preset():
     dialogs = ScriptedDialogs(ask_marker_label=None, ask_save_path=None)
     clicked_at = datetime(2026, 1, 1, 8, 0, 0)
-    assert dialogs.ask_marker_label(None, "标记 1", clicked_at) is None
+    assert dialogs.ask_marker_label(None, "基线", clicked_at) is None
     assert dialogs.ask_save_path(None, "保存", "a.csv", "CSV 文件 (*.csv)") is None
-    assert dialogs.last_call("ask_marker_label")["timestamp"] == clicked_at
+    assert dialogs.last_call("ask_marker_label") == {
+        "parent": None, "default_label": "基线", "timestamp": clicked_at,
+        "process_name": "", "pid": None}
+
+
+def test_scripted_marker_dialog_records_process_and_pid():
+    dialogs = ScriptedDialogs(ask_marker_label="第 1 轮")
+    clicked_at = datetime(2026, 1, 1, 8, 0, 0)
+    assert dialogs.ask_marker_label(None, "第 1 轮", clicked_at,
+                                    process_name="demo.exe", pid=42) == "第 1 轮"
+    call = dialogs.last_call("ask_marker_label")
+    assert (call["process_name"], call["pid"]) == ("demo.exe", 42)
 
 
 @pytest.mark.parametrize("method, args", [
     ("confirm", (None, "t", "c", "确定")),
-    ("ask_marker_label", (None, "标记 1", datetime(2026, 1, 1))),
+    ("ask_marker_label", (None, "基线", datetime(2026, 1, 1))),
     ("choose_metrics", (None, [])),
     ("ask_save_path", (None, "保存", "a.png", "PNG 图片 (*.png)")),
     ("ask_close_action", (None, 1, True)),
@@ -338,3 +349,18 @@ def test_make_services_overrides_by_field_name():
     assert isinstance(services.notifier, RecordingNotifier)
     with pytest.raises(TypeError):
         make_services(clocks=clock)
+
+
+def test_scripted_marker_dialog_signature_matches_production():
+    """替身与生产实现的 ask_marker_label 参数（名称、种类、默认值）一致"""
+    import inspect
+
+    from ui.services.dialogs import Dialogs, QtDialogs
+
+    def params(fn):
+        return [(p.name, p.kind, p.default)
+                for p in inspect.signature(fn).parameters.values()]
+
+    expected = params(QtDialogs.ask_marker_label)
+    assert params(ScriptedDialogs.ask_marker_label) == expected
+    assert params(Dialogs.ask_marker_label) == expected

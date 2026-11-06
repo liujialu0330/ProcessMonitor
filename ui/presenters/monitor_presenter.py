@@ -1,9 +1,10 @@
 """
 监控页 Presenter
 
-开始 / 停止 / 暂停 / 恢复 / 打点 / 重新监控 / 查看历史 / 关闭卡片的业务流程，以及
-manager 各信号（任务添加、启动、停止、数据更新、指标不可用、错误、达到上限）的
-界面响应。依赖：
+开始 / 停止 / 暂停 / 恢复 / 打点 / 重新监控 / 分析 / 关闭卡片的业务流程，以及
+manager 各信号（任务添加、启动、停止、数据更新、打点变化、指标不可用、错误、达到上限）
+的界面响应。卡片上的"较基线"由这里维护：基线值 = 基线打点之后前 5 个样本的中位数，
+打点/换基线时先从库里取已有样本，不足部分随 data_updated 累积。依赖：
 - manager：只用命令与只读快照接口，不接触任务线程对象；
 - services：process_query / dialogs / notifier / clock / preferences；
 - form：新建任务表单（NewTaskForm 或同接口的替身）；
@@ -12,14 +13,16 @@ manager 各信号（任务添加、启动、停止、数据更新、指标不可
 
 中文文案（表单错误、提示）集中在这里；控件只发信号、显示给定内容。
 """
-from dataclasses import dataclass
-from typing import Any, Dict, Optional, Set, Tuple
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-from PyQt5.QtCore import QObject, pyqtSignal
+from PyQt5.QtCore import QObject, QTimer, pyqtSignal
 from PyQt5.QtWidgets import QWidget
 
 import config
 from core.contracts import StopReason, UnavailableReason
+from core.monitor_manager import BASELINE_SAMPLE_COUNT, default_marker_kind, median_of
 from ui.formatting import stop_reason_text, unavailable_reason_text
 from ui.services import UiServices
 from ui.widgets.monitor.new_task_form import TaskRequest
@@ -34,6 +37,10 @@ ABNORMAL_STOP_INFOBAR_MS = 15000
 UNAVAILABLE_INFOBAR_MS = 10000
 TASK_STARTED_INFOBAR_MS = 1000
 RESTART_HINT_INFOBAR_MS = 5000
+# 卡片"已运行"与"（N 分钟前）"的刷新间隔（毫秒）
+TICK_INTERVAL_MS = 1000
+
+STOP_CONFIRM_HINT = "停止后不能继续记录到这个任务；要继续请“重新监控”。已采集的数据会保留。"
 
 
 def resolve_error_text(error: ResolveError) -> str:
@@ -50,6 +57,16 @@ def resolve_error_text(error: ResolveError) -> str:
 
 
 @dataclass
+class _BaselineTracker:
+    """某任务当前基线的取值进度：每指标最多 BASELINE_SAMPLE_COUNT 个样本。
+    settled 为 True 时不再从实时数据补样本（基线较早，库里的样本就是全部）。"""
+    marker_id: Optional[int]
+    timestamp: datetime
+    samples: Dict[str, List[float]] = field(default_factory=dict)
+    settled: bool = False
+
+
+@dataclass
 class _TaskEntry:
     """面板上一张卡片对应的任务参数（取自建卡时的快照）与界面状态。"""
     task_id: str
@@ -59,8 +76,7 @@ class _TaskEntry:
     interval: Optional[float]
     note: str
     finished: bool = False
-    # 打点默认标签的递增序号（"标记 N"），成功打点后加一
-    marker_seq: int = 1
+    baseline: Optional[_BaselineTracker] = None
 
     @property
     def display_name(self) -> str:
@@ -71,7 +87,7 @@ class MonitorPresenter(QObject):
     """监控页业务流程。
 
     信号：
-        history_requested(str): 请求切到历史页并选中该任务（主窗口处理）
+        history_requested(str): 卡片"分析"：请求切到分析（历史）页并选中该任务（主窗口处理）
         task_ended_abnormally(str, str): 被测进程自行结束（不是用户停止）：(标题, 内容)，
             主窗口不在前台时据此弹托盘气泡
     """
@@ -95,6 +111,11 @@ class MonitorPresenter(QObject):
         # 同一任务同一错误重复上报时不再叠加
         self._error_bars: Dict[Tuple[str, str], Any] = {}
 
+        # 每秒刷新运行中卡片的"已运行"等时间文案（有运行中卡片时才走）
+        self._tick_timer = QTimer(self)
+        self._tick_timer.setInterval(TICK_INTERVAL_MS)
+        self._tick_timer.timeout.connect(self.tick)
+
         # 新建任务沿用上次选择的指标（默认"泄漏排查"预设）
         self.form.set_metrics_summary(self.services.preferences.last_metrics())
         self.form.set_collapsed(False)
@@ -116,6 +137,7 @@ class MonitorPresenter(QObject):
         manager.task_started.connect(self.on_task_started)
         manager.task_stopped.connect(self.on_task_stopped)
         manager.data_updated.connect(self.on_data_updated)
+        manager.markers_changed.connect(self.on_markers_changed)
         manager.error_occurred.connect(self.on_error)
         manager.metrics_unavailable.connect(self.on_metrics_unavailable)
         manager.task_limit_reached.connect(self.on_limit_reached)
@@ -131,8 +153,10 @@ class MonitorPresenter(QObject):
         return set(self._error_bars)
 
     def next_marker_label(self, task_id: str) -> Optional[str]:
-        entry = self._tasks.get(task_id)
-        return f"标记 {entry.marker_seq}" if entry is not None else None
+        """下一个打点的默认名称（基线 / 第 N 轮）；面板上没有该任务时返回 None。"""
+        if task_id not in self._tasks:
+            return None
+        return self.manager.next_marker_label(task_id)
 
     # ========== 公共小工具 ==========
 
@@ -150,6 +174,24 @@ class MonitorPresenter(QObject):
         has_tasks = bool(self._tasks)
         if has_tasks != had_tasks:
             self.form.set_collapsed(has_tasks)
+        self._sync_tick_timer()
+
+    def _sync_tick_timer(self) -> None:
+        running = any(not entry.finished for entry in self._tasks.values())
+        if running and not self._tick_timer.isActive():
+            self._tick_timer.start()
+        elif not running and self._tick_timer.isActive():
+            self._tick_timer.stop()
+
+    def tick(self) -> None:
+        """刷新运行中卡片的时间文案（定时器每秒调用；测试可直接调用）。"""
+        now = self.services.clock.now()
+        for task_id, entry in self._tasks.items():
+            if entry.finished:
+                continue
+            card = self.board.card(task_id)
+            if card is not None:
+                card.tick(now)
 
     # ========== 新建任务 ==========
 
@@ -206,7 +248,10 @@ class MonitorPresenter(QObject):
         self._sync_counts()
         self._set_has_tasks(had_tasks)
 
-    def on_task_started(self, _task_id: str) -> None:
+    def on_task_started(self, task_id: str) -> None:
+        card = self.board.card(task_id)
+        if card is not None:
+            card.set_started_at(self.services.clock.now())
         self._sync_counts()
         self.services.notifier.success(
             self.host, "成功", "监控任务已启动", TASK_STARTED_INFOBAR_MS)
@@ -219,6 +264,7 @@ class MonitorPresenter(QObject):
             entry.finished = True
             self.board.finish_card(task_id, reason, self.services.clock.now())
             self.form.forget_process_if(entry.pid)
+            self._sync_tick_timer()
 
         self.manager.remove_task(task_id)
         self._sync_counts()
@@ -236,11 +282,72 @@ class MonitorPresenter(QObject):
         self.task_ended_abnormally.emit(title, content)
 
     def on_data_updated(self, task_id: str, values: dict) -> None:
-        """每采集周期一次：卡片采集次数为内存自增，不查库。"""
+        """每采集周期一次：卡片采集次数为内存自增，基线样本在内存里累积，不查库。"""
         card = self.board.card(task_id)
-        if card is not None:
-            card.update_values(values)
-            card.increment_count()
+        if card is None:
+            return
+        card.update_values(values, self.services.clock.now())
+        card.increment_count()
+        self._feed_baseline(task_id, values)
+
+    # ========== 基线 ==========
+
+    def _feed_baseline(self, task_id: str, values: dict) -> None:
+        """把一批实时样本计入尚未采够的基线；某指标凑满 N 个时把中位数交给卡片。"""
+        entry = self._tasks.get(task_id)
+        tracker = entry.baseline if entry is not None else None
+        if tracker is None or tracker.settled:
+            return
+        card = self.board.card(task_id)
+        for metric, value in values.items():
+            samples = tracker.samples.setdefault(metric, [])
+            if len(samples) >= BASELINE_SAMPLE_COUNT:
+                continue
+            samples.append(value)
+            if len(samples) == BASELINE_SAMPLE_COUNT and card is not None:
+                card.set_baseline_value(metric, median_of(samples))
+        if all(len(tracker.samples.get(m, ())) >= BASELINE_SAMPLE_COUNT
+               for m in entry.metric_types):
+            tracker.settled = True
+
+    def baseline_values(self, task_id: str) -> Optional[Dict[str, float]]:
+        """某任务卡片当前已算出的基线值 {指标: 值}；无基线返回 None。
+        样本凑满 N 个（或基线较早、库里的样本就是全部）的指标才有值。"""
+        entry = self._tasks.get(task_id)
+        if entry is None or entry.baseline is None:
+            return None
+        tracker = entry.baseline
+        return {metric: median_of(samples) for metric, samples in tracker.samples.items()
+                if samples and (len(samples) >= BASELINE_SAMPLE_COUNT or tracker.settled)}
+
+    def on_markers_changed(self, task_id: str) -> None:
+        """打点有变化（本页打点、暂停/恢复，或分析页改名/删除/换基线）：刷新卡片刻度；
+        基线换了就重新取基线值，基线没了就回到"比开始时"。"""
+        entry = self._tasks.get(task_id)
+        card = self.board.card(task_id)
+        if entry is None or card is None:
+            return
+        markers = self.manager.list_markers(task_id)
+        card.set_markers(markers)
+
+        baseline = self.manager.get_baseline(task_id, markers)
+        if baseline is None:
+            if entry.baseline is not None:
+                entry.baseline = None
+                card.clear_baseline()
+            return
+        current = entry.baseline
+        if (current is not None and current.marker_id == baseline.id
+                and current.timestamp == baseline.timestamp):
+            return
+
+        seed = self.manager.baseline_samples(task_id, baseline)
+        tracker = _BaselineTracker(marker_id=baseline.id, timestamp=baseline.timestamp)
+        if seed is not None:
+            tracker.samples = {m: list(v) for m, v in seed.samples.items()}
+            tracker.settled = seed.settled or entry.finished
+        entry.baseline = tracker
+        card.set_baseline(baseline.timestamp, self.baseline_values(task_id))
 
     def on_metrics_unavailable(self, task_id: str,
                                reasons: Dict[str, UnavailableReason]) -> None:
@@ -284,8 +391,7 @@ class MonitorPresenter(QObject):
             return
         confirmed = self.services.dialogs.confirm(
             self._dialog_parent(), "停止监控",
-            f"确定要停止对 {entry.display_name} 的监控吗？\n"
-            "停止后本任务不可续采，如需继续请重新监控；已采集的数据会保留。",
+            f"确定要停止对 {entry.display_name} 的监控吗？\n{STOP_CONFIRM_HINT}",
             "停止")
         if not confirmed:
             return
@@ -308,28 +414,32 @@ class MonitorPresenter(QObject):
                 card.set_paused(False)
 
     def on_marker(self, task_id: str) -> None:
-        """打点：弹出标签输入框，经 manager 写库，成功后提示打点时间。"""
+        """打点：弹出名称输入框（默认名称按序列：基线 / 第 N 轮），经 manager 写库，
+        成功后提示打点时间。默认名称是"基线"时，用户改了名称也仍记为基线。"""
         entry = self._tasks.get(task_id)
         if entry is None or entry.finished:
             return
-        # 打点时间取点击按钮的这一刻：输入标签要花好几秒，按确认时刻记录会让
+        # 打点时间取点击按钮的这一刻：输入名称要花好几秒，按确认时刻记录会让
         # 竖线落在事件之后，短周期下甚至把增长归到下一轮
         clicked_at = self.services.clock.now()
+        default_label = self.manager.next_marker_label(task_id)
         label = self.services.dialogs.ask_marker_label(
-            self._dialog_parent(), f"标记 {entry.marker_seq}", clicked_at)
+            self._dialog_parent(), default_label, clicked_at,
+            process_name=entry.process_name, pid=entry.pid)
         if label is None:
             return
         if not label.strip():
-            self._warn("打点标签不能为空")
+            self._warn("打点名称不能为空")
             return
 
-        timestamp = self.manager.add_marker(task_id, label, clicked_at)
-        if timestamp is None:
+        marker = self.manager.add_marker(
+            task_id, label, clicked_at, kind=default_marker_kind(default_label, label))
+        if marker is None:
             self.services.notifier.error(self.host, "打点失败", "未能保存打点，请查看日志")
             return
-        entry.marker_seq += 1
         self.services.notifier.success(
-            self.host, "已打点", f"{label.strip()} · {timestamp.strftime('%H:%M:%S')}", 2000)
+            self.host, "已打点",
+            f"{marker.label} · {marker.timestamp.strftime('%H:%M:%S')}", 2000)
 
     def on_restart(self, task_id: str) -> Optional[str]:
         """已结束卡片的"重新监控"：按进程名找到唯一的运行进程时，以相同指标/间隔/
@@ -361,7 +471,7 @@ class MonitorPresenter(QObject):
         return None
 
     def on_close(self, task_id: str) -> None:
-        """移除卡片（历史数据仍保留）。"""
+        """从列表移除卡片（历史数据仍保留）。"""
         had_tasks = bool(self._tasks)
         self._tasks.pop(task_id, None)
         self.board.remove_card(task_id)

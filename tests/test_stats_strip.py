@@ -1,17 +1,25 @@
 """
-历史页统计条控件 StatsStrip：六格文本与 tooltip（与历史页安全网钉死的期望逐字一致）、
-清空、按自身宽度的响应式列数与"只在列数变化时重排"。
+历史页统计条控件 StatsStrip：六格标题与文本（与历史页安全网钉死的期望逐字一致）、
+判定胶囊、置灰、小字说明与依据行、按指标类别换标题、清空、按自身宽度的响应式列数与
+"只在列数变化时重排"。
 """
 from datetime import timedelta
 
 import pytest
+from qfluentwidgets import CaptionLabel
 
-from tests.helpers import fetch_history_render_inputs
+from core.history_query import build_request, run_history_query
+from tests.test_history_query import _seed_series
 from tests.test_safety_net_history import (
-    BASE, MAX_BUCKETS, QUERY_CASES, TABLE_LIMIT, _seed_query_dataset)
+    BASE, MAX_BUCKETS, QUERY_CASES, QUERY_JUDGEMENTS, TABLE_LIMIT, _seed_baseline_dataset,
+    _seed_query_dataset)
+from ui.formatting import STAT_SLOTS, StatCell
 from ui.widgets.history.chart_view import chart_display_unit
 from ui.widgets.history.common import VIEWPORT_TO_CONTENT_OFFSET
-from ui.widgets.history.stats_strip import STAT_KEYS, STAT_TOOLTIPS, StatsStrip
+from ui.widgets.history.stats_strip import StatsStrip
+from utils.metrics import MetricType
+
+DEFAULT_TITLES = ("开始值", "当前值", "变化量", "每小时增长", "最小", "最大")
 
 
 @pytest.fixture
@@ -21,18 +29,24 @@ def strip(qapp):
     widget.close()
 
 
-def _caption_tooltips(strip):
-    from qfluentwidgets import CaptionLabel
-    return {label.text(): label.toolTip()
-            for label in strip.findChildren(CaptionLabel)}
+def _snapshot(db, task_id, metric, range_key='all'):
+    return run_history_query(db, build_request(
+        task_id, metric, range_key, table_limit=TABLE_LIMIT, max_buckets=MAX_BUCKETS))
+
+
+def _render(strip, snapshot):
+    unit = chart_display_unit(snapshot.request.metric, [p.value for p in snapshot.buckets])
+    strip.set_snapshot(snapshot, unit)
 
 
 def test_default_cells_order_and_captions(strip):
-    assert tuple(strip.stat_value_labels) == (
-        "起点", "当前", "变化", "增速", "最小", "最大")
-    assert STAT_KEYS == tuple(strip.stat_value_labels)
+    assert tuple(strip.texts()) == DEFAULT_TITLES
     assert set(strip.texts().values()) == {"--"}
-    assert _caption_tooltips(strip) == STAT_TOOLTIPS
+    assert [cell.slot for cell in strip.cells()] == list(STAT_SLOTS)
+    captions = {label.text(): label.toolTip() for label in strip.findChildren(CaptionLabel)
+                if label.text() in DEFAULT_TITLES}
+    assert set(captions) == set(DEFAULT_TITLES) and all(captions.values())
+    assert strip.pill_text() == "" and strip.dimmed_titles() == []
 
 
 @pytest.mark.parametrize(
@@ -41,39 +55,71 @@ def test_default_cells_order_and_captions(strip):
 def test_values_match_history_safety_net(
         strip, db, metric, range_key, since_minutes, rows, count, buckets,
         markers, stat_texts):
-    """喂入与安全网同一数据集的查询结果，六格文本与安全网钉死的期望逐字一致，
-    tooltip 为完整文本（"--" 时为空）。"""
+    """喂入与安全网同一数据集的查询快照，六格标题与文本、判定胶囊、置灰与安全网一致；
+    值的 tooltip 以完整文本开头（"--" 时为空）。"""
     task = _seed_query_dataset(db)
-    since = None if since_minutes is None else BASE + timedelta(minutes=since_minutes)
-    _table, stats, chart_points, _markers = fetch_history_render_inputs(
-        db, task.task_id, metric, since, TABLE_LIMIT, MAX_BUCKETS)
-    unit = chart_display_unit(metric, [p.value for p in chart_points])
-
-    strip.set_values(stats, metric, unit)
+    _render(strip, _snapshot(db, task.task_id, metric, range_key))
 
     assert strip.texts() == stat_texts
-    for key, label in strip.stat_value_labels.items():
-        expected_tip = "" if stat_texts[key] == "--" else stat_texts[key]
-        assert label.toolTip() == expected_tip
+    pill, dimmed, rate_note = QUERY_JUDGEMENTS[(metric, range_key)]
+    assert strip.pill_text() == pill
+    assert strip.dimmed_titles() == dimmed
+    assert list(strip.notes().values())[3] == rate_note
+    for slot, (title, text) in zip(STAT_SLOTS, stat_texts.items()):
+        tip = strip.value_label(slot).toolTip()
+        assert tip.startswith(text) if text != "--" else tip == ""
 
 
-def test_flow_dataset_texts(strip):
-    """历史页流程测试的数据集：100 MB → 109 MB，每秒涨 1 MB。"""
-    stats = {'first': 1024.0 * 100, 'last': 1024.0 * 109, 'min': 1024.0 * 100,
-             'max': 1024.0 * 109, 'count': 10, 'slope_per_hour': 1024.0 * 3600}
-    strip.set_values(stats, "memory_private", "MB")
+def test_dimming_is_restored_when_data_becomes_sufficient(strip, db):
+    task = _seed_query_dataset(db)
+    _render(strip, _snapshot(db, task.task_id, MetricType.MEMORY_PRIVATE, '10m'))
+    assert strip.dimmed_titles() == ["每分钟增长"]
+    assert strip.cell_widget('rate').dimmed is True
+    _render(strip, _snapshot(db, task.task_id, MetricType.MEMORY_PRIVATE, '1h'))
+    assert strip.dimmed_titles() == []
+    assert strip.cell_widget('rate').dimmed is False
+
+
+def test_baseline_strip_shows_baseline_value_and_basis(strip, db):
+    task = _seed_baseline_dataset(db)
+    _render(strip, _snapshot(db, task.task_id, MetricType.MEMORY_PRIVATE))
     texts = strip.texts()
-    assert texts["起点"] == "100 MB" and texts["当前"] == "109 MB"
-    assert texts["变化"].startswith("+9 MB")
-    assert texts["增速"].startswith("+") and texts["增速"].endswith("/小时")
-    assert texts["最小"] == "100 MB" and texts["最大"] == "109 MB"
+    assert texts["基线值"] == "141 MB" and texts["每轮增长"] == "+20 MB"
+    assert strip.notes()["基线值"] == "基线 08:20:00"
+    assert strip.basis() == "基线 08:20:00 起 · 1小时40分 · 86 点"
+    assert strip.toolTip() == strip.basis()
+    assert strip.pill_text() == "持续上涨"
 
 
-def test_clear_resets_texts_and_tooltips(strip):
-    strip.set_texts({key: "1 MB" for key in STAT_KEYS})
+def test_cumulative_metric_titles(strip, db):
+    values = [1024.0 * 10 * i for i in range(40)]
+    task = _seed_series(db, values, metric=MetricType.IO_READ_BYTES)
+    _render(strip, _snapshot(db, task.task_id, MetricType.IO_READ_BYTES))
+    texts = strip.texts()
+    assert tuple(texts) == ("开始值", "当前值", "变化量", "平均速率", "峰值速率", "数据跨度")
+    assert texts["平均速率"] == texts["峰值速率"] == "171 KB/秒"   # 10 MB/分 ≈ 170.67 KB/秒
+    assert texts["数据跨度"] == "39分钟"
+    assert strip.pill_text() == ""
+
+
+def test_peak_metric_titles(strip, db):
+    values = [100.0] * 10 + [150.0] * 10 + [180.0] * 10
+    task = _seed_series(db, values, metric=MetricType.MEMORY_PEAK_WSET)
+    _render(strip, _snapshot(db, task.task_id, MetricType.MEMORY_PEAK_WSET))
+    texts = strip.texts()
+    assert tuple(texts) == ("开始值", "当前值", "变化量", "峰值抬升", "最小", "最大")
+    assert texts["峰值抬升"] == "2 次，共 +80 KB"
+
+
+def test_set_cells_partial_update_and_clear(strip):
+    strip.set_cells([StatCell("rate", "每小时增长", "+1 MB/小时", note="基于 1小时0分 / 61 点",
+                              dimmed=True, pill="平稳")])
+    assert strip.texts()["每小时增长"] == "+1 MB/小时"
+    assert strip.pill_text() == "平稳" and strip.dimmed_titles() == ["每小时增长"]
     strip.clear()
     assert set(strip.texts().values()) == {"--"}
-    assert {label.toolTip() for label in strip.stat_value_labels.values()} == {""}
+    assert {strip.value_label(slot).toolTip() for slot in STAT_SLOTS} == {""}
+    assert strip.pill_text() == "" and strip.dimmed_titles() == [] and strip.basis() == ""
 
 
 def _used_columns(strip):

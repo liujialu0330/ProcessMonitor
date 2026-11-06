@@ -1,6 +1,6 @@
 """
-历史页明细表控件 SampleTable：每格文本与提示文案（与历史页安全网/流程测试逐字一致）、
-倒序、原始值列开关、清空、居中阅读轨道与数据字体契约。
+历史页明细表控件 SampleTable：每格文本（时间 / 数值 / 较上次 / 较基线 / 原始值）与提示文案
+（与历史页安全网/流程测试逐字一致）、倒序、原始值列开关、清空、居中阅读轨道与数据字体契约。
 """
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -15,7 +15,8 @@ from tests.test_safety_net_history import (
 from ui.typography import TypeScale
 from ui.widgets.history.chart_view import chart_display_unit
 from ui.widgets.history.sample_table import (
-    DETAIL_TABLE_MAX_WIDTH, DETAIL_TABLE_ROW_HEIGHT, SampleTable)
+    DETAIL_TABLE_MAX_WIDTH, DETAIL_TABLE_ROW_HEIGHT, HEADER_LABELS, RAW_VALUE_COLUMN,
+    SampleTable, table_hint_text)
 from utils.metrics import MetricType
 
 # 页面左右边距 24：原页面里明细卡片宽度 = 视口 - 48
@@ -45,15 +46,18 @@ def test_rows_and_hint_match_history_safety_net(
 
     texts = table.row_texts()
     assert len(texts) == rows
-    assert table.table_hint_label.text() == (
-        f"最新数据优先 · 显示最近 {rows:,} 条 / 共 {count:,} 条")
+    truncated = f" · 仅显示最近 {rows:,} 条" if count > rows else ""
+    assert table.table_hint_label.text() == f"共 {count:,} 条（倒序）{truncated}"
     # 倒序：第一行是范围内最新一条，最后一行是最早一条
     newest, oldest = table_points[-1], table_points[0]
     assert texts[0][0] == newest.timestamp.strftime('%m-%d %H:%M:%S')
     assert texts[-1][0] == oldest.timestamp.strftime('%m-%d %H:%M:%S')
-    assert texts[0][2] == f"{newest.value:.4f}"
-    # 当前值列与统计条"当前"同单位、同格式
-    assert texts[0][1] == stat_texts["当前"]
+    assert texts[0][RAW_VALUE_COLUMN] == f"{newest.value:.4f}"
+    # 数值列与统计条"当前值"同单位、同格式
+    assert texts[0][1] == stat_texts["当前值"]
+    # 最早一行没有上一条可比；无基线时"较基线"为 "--"
+    assert texts[-1][2] == "--"
+    assert {row[3] for row in texts} == {"--"}
 
 
 def test_hint_shown_over_total_and_thousands_separator(table):
@@ -61,7 +65,7 @@ def test_hint_shown_over_total_and_thousands_separator(table):
     points = [DataPoint("t", base + timedelta(seconds=i), 1024.0 * (100 + i),
                         MetricType.MEMORY_PRIVATE) for i in range(4)]
     table.set_points(points, MetricType.MEMORY_PRIVATE, total_count=10)
-    assert table.table_hint_label.text() == "最新数据优先 · 显示最近 4 条 / 共 10 条"
+    assert table.table_hint_label.text() == "共 10 条（倒序） · 仅显示最近 4 条"
     assert table.data_table.rowCount() == 4
 
     threads = [DataPoint("t", base + timedelta(seconds=i), 1.0, MetricType.NUM_THREADS)
@@ -71,15 +75,35 @@ def test_hint_shown_over_total_and_thousands_separator(table):
 
     # 总数缺省或小于已显示条数时按已显示条数
     table.set_points(threads, MetricType.NUM_THREADS)
-    assert table.table_hint_label.text() == "最新数据优先 · 显示最近 3 条 / 共 3 条"
+    assert table.table_hint_label.text() == "共 3 条（倒序）"
     table.set_points(threads, MetricType.NUM_THREADS, total_count=1)
-    assert table.table_hint_label.text().endswith("共 3 条")
+    assert table.table_hint_label.text() == "共 3 条（倒序）"
+
+
+def test_hint_text_only_mentions_truncation_when_truncated():
+    assert table_hint_text(12, 12) == "共 12 条（倒序）"
+    assert table_hint_text(2000, 8100) == "共 8,100 条（倒序） · 仅显示最近 2,000 条"
+    assert table_hint_text(5, None) == "共 5 条（倒序）"
+
+
+def test_delta_columns_vs_previous_and_baseline(table):
+    base = datetime(2026, 7, 16, 20, 0, 0)
+    values = [100.0, 102.0, 102.0, 99.0]
+    points = [DataPoint("t", base + timedelta(seconds=i), 1024.0 * v,
+                        MetricType.MEMORY_PRIVATE) for i, v in enumerate(values)]
+    table.set_points(points, MetricType.MEMORY_PRIVATE, display_unit='MB',
+                     baseline_value=1024.0 * 101)
+    rows = table.row_texts()
+    # 倒序：99 → 102 → 102 → 100
+    assert [row[2] for row in rows] == ["-3 MB", "±0", "+2 MB", "--"]
+    assert [row[3] for row in rows] == ["-2 MB", "+1 MB", "+1 MB", "-1 MB"]
 
 
 def test_display_unit_is_applied_to_value_column(table):
     points = [SimpleNamespace(timestamp=datetime(2026, 7, 16, 20, 54, 51), value=185845.76)]
     table.set_points(points, MetricType.MEMORY_RSS, display_unit='MB')
-    assert table.row_texts() == [('07-16 20:54:51', '181.49 MB', '185845.7600')]
+    assert table.row_texts() == [
+        ('07-16 20:54:51', '181.49 MB', '--', '--', '185845.7600')]
 
 
 def test_clear_restores_default_hint(table):
@@ -87,16 +111,17 @@ def test_clear_restores_default_hint(table):
     table.set_points(points, MetricType.NUM_THREADS, total_count=5)
     table.clear()
     assert table.data_table.rowCount() == 0
-    assert table.table_hint_label.text() == "最新数据优先"
+    assert table.table_hint_label.text() == ""
 
 
 def test_raw_value_column_hidden_by_default_and_toggles(table):
-    assert table.data_table.isColumnHidden(2) is True
+    assert HEADER_LABELS == ('时间', '数值', '较上次', '较基线', '原始值')
+    assert table.data_table.isColumnHidden(RAW_VALUE_COLUMN) is True
     assert table.raw_values_visible() is False
     table.set_raw_values(True)
-    assert table.data_table.isColumnHidden(2) is False
+    assert table.data_table.isColumnHidden(RAW_VALUE_COLUMN) is False
     table.set_raw_values(False)
-    assert table.data_table.isColumnHidden(2) is True
+    assert table.data_table.isColumnHidden(RAW_VALUE_COLUMN) is True
 
 
 def test_wide_track_is_centered_and_bounded(qapp, table):
@@ -123,25 +148,25 @@ def test_wide_track_is_centered_and_bounded(qapp, table):
     data_table = table.data_table
     assert (data_table.horizontalHeader().defaultAlignment()
             & horizontal_mask) == Qt.AlignHCenter
-    assert [data_table.horizontalHeaderItem(c).text() for c in range(3)] == [
-        '采样时间', '指标值', '原始值']
-    for column in range(3):
+    assert [data_table.horizontalHeaderItem(c).text() for c in range(5)] == [
+        '时间', '数值', '较上次', '较基线', '原始值']
+    for column in range(5):
         item = data_table.item(0, column)
         assert (item.textAlignment() & horizontal_mask) == Qt.AlignHCenter
         assert item.font().pixelSize() == TypeScale.BODY
         assert item.font().fixedPitch() is True
 
-    hidden_widths = [data_table.columnWidth(c) for c in (0, 1)]
+    hidden_widths = [data_table.columnWidth(c) for c in range(4)]
     assert max(hidden_widths) - min(hidden_widths) <= 1
     table.set_raw_values(True)
     qapp.processEvents()
-    visible_widths = [data_table.columnWidth(c) for c in range(3)]
+    visible_widths = [data_table.columnWidth(c) for c in range(5)]
     assert max(visible_widths) - min(visible_widths) <= 1
     assert data_table.horizontalScrollBar().maximum() == 0
 
 
 def test_narrow_track_fills_card_padding(qapp, table):
-    """窄窗口：轨道回到卡片 16px 标准内边距，三列等分且无横向滚动。"""
+    """窄窗口：轨道回到卡片 16px 标准内边距，五列等分且无横向滚动。"""
     table.resize(800 - PAGE_MARGINS, 700)
     table.set_raw_values(True)
     table.show()
@@ -150,6 +175,6 @@ def test_narrow_track_fills_card_padding(qapp, table):
     content = table.detail_table_content
     assert content.width() == table.width() - 32
     assert content.x() == 16
-    widths = [table.data_table.columnWidth(c) for c in range(3)]
+    widths = [table.data_table.columnWidth(c) for c in range(5)]
     assert max(widths) - min(widths) <= 1
     assert table.data_table.horizontalScrollBar().maximum() == 0

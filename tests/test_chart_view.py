@@ -1,5 +1,6 @@
 """
-历史页趋势图控件 ChartView：曲线点数、打点竖线、纵轴标题与显示单位（与历史页安全网/
+历史页趋势图控件 ChartView：曲线点数、打点竖线与编号徽标（基线"基"、暂停/恢复不编号的
+短竖线）、空洞断开与阴影、累计量的速率曲线、纵轴标题与显示单位（与历史页安全网/
 流程测试逐字一致）、清空、十字线最近点吸附与读数、交互状态、最小纵向跨度、
 自适应范围、主题切换、导出图片与截图。
 """
@@ -12,12 +13,17 @@ from PyQt5.QtCore import QEvent
 from PyQt5.QtWidgets import QApplication
 from qfluentwidgets import Theme, qconfig
 
+from core.history_query import build_request, run_history_query
 from data.models import DataPoint
-from tests.helpers import fetch_history_render_inputs
+from tests.test_history_query import _seed_series
 from tests.test_safety_net_history import (
-    BASE, MAX_BUCKETS, MEM, QUERY_CASES, TABLE_LIMIT, THREADS, _seed_query_dataset)
+    BASE, MARKER_LINES, MAX_BUCKETS, MEM, QUERY_CASES, TABLE_LIMIT, THREADS,
+    _seed_baseline_dataset, _seed_query_dataset)
 from ui.components.sparkline import compute_y_range
-from ui.widgets.history.chart_view import ChartView, nearest_index
+from ui.widgets.history.chart_view import (
+    SYSTEM_MARKER_SPAN, ChartView, gap_label_text, marker_badges, nearest_index,
+    value_axis_title)
+from utils.metrics import MetricType
 
 # 每个用例的纵轴标题与显示单位（安全网快照里的 left_axis / display_unit）
 AXIS_TITLES = {MEM: ("私有字节（MB）", "MB"), THREADS: ("线程数（个）", "个")}
@@ -34,9 +40,14 @@ def chart(qapp):
 
 def _marker_lines(chart):
     return sorted(
-        (item.value(), item.label.toPlainText() if item.label else None)
+        (item.value(), item.label.toPlainText() if getattr(item, 'label', None) else None)
         for item in chart.chart_widget.getPlotItem().items
         if isinstance(item, pg.InfiniteLine) and item is not chart.crosshair_line)
+
+
+def _snapshot(db, task_id, metric, range_key='all'):
+    return run_history_query(db, build_request(
+        task_id, metric, range_key, table_limit=TABLE_LIMIT, max_buckets=MAX_BUCKETS))
 
 
 def _curves(chart):
@@ -50,8 +61,9 @@ def _flow_points(samples=10, metric=MEM):
             for i in range(samples)]
 
 
-def _marker(seconds, label):
-    return SimpleNamespace(timestamp=FLOW_BASE + timedelta(seconds=seconds), label=label)
+def _marker(seconds, label, kind='user'):
+    return SimpleNamespace(timestamp=FLOW_BASE + timedelta(seconds=seconds), label=label,
+                           kind=kind)
 
 
 @pytest.mark.parametrize(
@@ -61,18 +73,19 @@ def test_render_matches_history_safety_net(
         chart, db, metric, range_key, since_minutes, rows, count, buckets,
         markers, stat_texts):
     task = _seed_query_dataset(db)
-    since = None if since_minutes is None else BASE + timedelta(minutes=since_minutes)
-    _table, _stats, chart_points, marker_rows = fetch_history_render_inputs(
-        db, task.task_id, metric, since, TABLE_LIMIT, MAX_BUCKETS)
+    snapshot = _snapshot(db, task.task_id, metric, range_key)
 
-    chart.set_series(chart_points, metric, markers=marker_rows)
+    chart.set_snapshot(snapshot)
 
     assert [len(c.getData()[0]) for c in _curves(chart)] == [buckets]
     assert len(chart.x_values) == buckets
-    assert chart.x_values == [p.timestamp.timestamp() for p in chart_points]
+    assert chart.x_values == [p.timestamp.timestamp() for p in snapshot.buckets]
     lines = _marker_lines(chart)
     assert len(lines) == markers
-    assert lines == sorted((m.timestamp.timestamp(), m.label) for m in marker_rows)
+    assert lines == [(pos, badge) for pos, badge, _tip in MARKER_LINES]
+    assert [item.toolTip() for _kind, _badge, item in chart.marker_items()] == [
+        tip for _pos, _badge, tip in MARKER_LINES]
+    assert chart.gaps == [] and chart.gap_items() == [] and chart.is_rate is False
     title, unit = AXIS_TITLES[metric]
     assert chart.axis_title() == title
     assert chart.display_unit == unit
@@ -85,14 +98,17 @@ def test_markers_drawn_as_vertical_lines(chart):
     assert [value for value, _label in _marker_lines(chart)] == [
         (FLOW_BASE + timedelta(seconds=2)).timestamp(),
         (FLOW_BASE + timedelta(seconds=6)).timestamp()]
-    assert [label for _value, label in _marker_lines(chart)] == ["第1轮", "第2轮"]
+    # 标签横排编号，文字放在 tooltip
+    assert [label for _value, label in _marker_lines(chart)] == ["①", "②"]
+    assert [item.toolTip() for _k, _b, item in chart.marker_items()] == [
+        "① 第1轮 · 07-16 20:00:02", "② 第2轮 · 07-16 20:00:06"]
 
     # set_markers 只换打点；set_series 不传 markers 时保留现有打点
     chart.set_markers([])
     assert _marker_lines(chart) == []
-    chart.set_markers([_marker(3, "基线")])
+    chart.set_markers([_marker(3, "基线", 'baseline')])
     chart.set_series(_flow_points(5), MEM)
-    assert [label for _value, label in _marker_lines(chart)] == ["基线"]
+    assert [label for _value, label in _marker_lines(chart)] == ["基"]
 
 
 def test_axis_title_without_metric_and_non_byte_units(chart):
@@ -138,7 +154,7 @@ def test_hover_snaps_to_nearest_point_with_marker_context(chart):
     assert index == 4
     assert chart.crosshair_line.isVisible() is True
     assert chart.crosshair_line.value() == x4
-    assert chart.hover_label.text() == "07-16 20:00:04 · 104 MB · 打点「第1轮」后 2秒"
+    assert chart.hover_label.text() == "07-16 20:00:04 · 104 MB · 打点「① 第1轮」后 2秒"
 
     # 第一个打点之前没有区间说明
     chart.show_hover_at((FLOW_BASE + timedelta(seconds=1)).timestamp())
@@ -156,11 +172,83 @@ def test_hover_without_data_does_nothing(chart):
 
 def test_hover_text_matches_safety_net_dataset(chart, db):
     task = _seed_query_dataset(db)
-    _table, _stats, chart_points, markers = fetch_history_render_inputs(
-        db, task.task_id, MEM, None, TABLE_LIMIT, MAX_BUCKETS)
-    chart.set_series(chart_points, MEM, markers=markers)
+    chart.set_snapshot(_snapshot(db, task.task_id, MEM))
     chart.show_hover_at(chart.x_values[-1])
-    assert chart.hover_label.text() == "07-16 09:59:00 · 209.5 MB · 打点「第2轮」后 4分钟"
+    assert chart.hover_label.text() == "07-16 09:59:00 · 209.5 MB · 打点「② 第2轮」后 4分钟"
+
+
+# ---------- 打点种类、空洞与速率曲线 ----------
+
+def test_marker_badges_number_user_markers_only():
+    markers = [_marker(0, "预热", 'user'), _marker(1, "基线", 'baseline'),
+               _marker(2, "暂停", 'pause'), _marker(3, "恢复", 'resume'),
+               _marker(4, "第1轮"), SimpleNamespace(timestamp=FLOW_BASE, label="旧")]
+    assert marker_badges(markers) == ["①", "基", None, None, "②", "③"]
+
+
+def test_baseline_and_gaps_dataset(chart, db):
+    """基线实线 + "基"；暂停/恢复为底部浅色短竖线、不编号；空洞处断开并画阴影。"""
+    task = _seed_baseline_dataset(db)
+    chart.set_snapshot(_snapshot(db, task.task_id, MEM))
+
+    kinds = [(kind, badge) for kind, badge, _line in chart.marker_items()]
+    assert kinds == [('baseline', "基"), ('user', "①"), ('pause', None),
+                     ('resume', None), ('user', "②")]
+    lines = {kind: line for kind, _badge, line in chart.marker_items()}
+    assert lines['baseline'].pen.style() == pg.QtCore.Qt.SolidLine
+    assert lines['baseline'].pen.width() == 2
+    assert lines['user'].pen.style() == pg.QtCore.Qt.DashLine
+    assert lines['pause'].span == (0, SYSTEM_MARKER_SPAN)
+    assert lines['pause'].toolTip() == "暂停 · 07-16 09:09:30"
+
+    gap_start, gap_end = BASE + timedelta(minutes=69), BASE + timedelta(minutes=85)
+    assert chart.gaps == [(gap_start.timestamp(), gap_end.timestamp())]
+    assert [text for _region, text in chart.gap_items()] == ["无数据 16分钟"]
+    region, _text = chart.gap_items()[0]
+    assert region.getRegion() == (gap_start.timestamp(), gap_end.timestamp())
+    connect = chart.connect_array()
+    assert connect.count(False) == 1
+    broken = connect.index(False)
+    assert chart.x_values[broken] <= gap_start.timestamp()
+    assert chart.x_values[broken + 1] >= gap_end.timestamp()
+    # 曲线把 connect 数组交给 pyqtgraph
+    curve, = _curves(chart)
+    assert list(curve.opts['connect']) == connect
+
+    # 悬停区间说明只看用户打点与基线，不看暂停/恢复
+    chart.show_hover_at((BASE + timedelta(minutes=90)).timestamp())
+    assert chart.hover_label.text().endswith("打点「① 第1轮」后 40分钟")
+
+    # 主题切换重绘：阴影与打点仍在
+    chart.apply_theme()
+    assert len(chart.gap_items()) == 1 and len(chart.marker_items()) == 5
+
+
+def test_gap_label_text():
+    assert gap_label_text(BASE, BASE + timedelta(minutes=12)) == "无数据 12分钟"
+
+
+def test_cumulative_metric_draws_rate_series(chart, db):
+    values = [1024.0 * 6 * i for i in range(40)]   # 每分钟 6 MB → 每秒 0.1 MB
+    task = _seed_series(db, values, metric=MetricType.IO_READ_BYTES, skip=range(10, 15))
+    snapshot = _snapshot(db, task.task_id, MetricType.IO_READ_BYTES)
+    chart.set_snapshot(snapshot)
+
+    assert chart.is_rate is True
+    assert chart.y_values == pytest.approx([102.4] * len(snapshot.rate_series))
+    assert chart.axis_title() == "每秒IO读取字节（KB）"
+    assert chart.value_axis.integer_only is False
+    assert chart.connect_array().count(False) == 1
+    chart.show_hover_at(chart.x_values[0])
+    assert chart.hover_label.text().split(" · ")[1] == "102 KB/秒"
+
+
+def test_rate_axis_title_and_count_metric_not_integer(chart):
+    assert value_axis_title(MetricType.IO_READ_COUNT, "次", rate=True) == "每秒IO读取次数（次）"
+    points = [DataPoint("t", FLOW_BASE + timedelta(seconds=i), 0.5, MetricType.IO_READ_COUNT)
+              for i in range(3)]
+    chart.set_series(points, MetricType.IO_READ_COUNT, rate=True)
+    assert chart.value_axis.integer_only is False
 
 
 def test_leave_event_hides_crosshair(chart):

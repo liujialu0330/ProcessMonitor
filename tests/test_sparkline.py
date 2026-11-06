@@ -154,3 +154,57 @@ def test_paint_no_crash(qapp):
 
     stderr_output = stderr_capture.getvalue()
     assert "Traceback" not in stderr_output
+
+
+# ---------- 打点刻度 ----------
+
+def test_downsampler_times_follow_merges():
+    """每点记其首个采集时间：合并时取较早的，长度始终与 series() 一致"""
+    from datetime import datetime, timedelta
+    t0 = datetime(2026, 1, 1, 12, 0, 0)
+    sampler = TrendDownsampler(max_points=4)
+    for i in range(7):
+        sampler.append(float(i), t0 + timedelta(seconds=i))
+        assert len(sampler.times()) == len(sampler.series())
+    # 4 点时合并为 2 点（stride 2），之后再攒：[0-1][2-3][4-5][6 pending]
+    assert sampler.times() == [t0 + timedelta(seconds=s) for s in (0, 2, 4, 6)]
+    sampler.clear()
+    assert sampler.times() == []
+
+
+def test_tick_fraction_interpolates_and_clamps():
+    from datetime import datetime, timedelta
+
+    from ui.components.sparkline import tick_fraction
+    t0 = datetime(2026, 1, 1, 12, 0, 0)
+    times = [t0 + timedelta(seconds=s) for s in (0, 10, 20)]
+    assert tick_fraction(times, t0 + timedelta(seconds=5)) == 0.25
+    assert tick_fraction(times, t0 + timedelta(seconds=20)) == 1.0
+    assert tick_fraction(times, t0 - timedelta(seconds=1)) == 0.0     # 早于首点贴左
+    assert tick_fraction(times, t0 + timedelta(minutes=5)) == 1.0     # 晚于末点贴右
+    assert tick_fraction(times[:1], t0) == 0.5
+
+
+def test_ticks_need_timestamps_and_skip_system_markers(qapp):
+    from datetime import datetime, timedelta
+    t0 = datetime(2026, 1, 1, 12, 0, 0)
+    widget = SparklineWidget()
+    widget.set_markers([(t0, "baseline"), (t0, "pause"), (t0, "resume"), (t0, "user")])
+    assert widget.tick_positions() == []            # 还没有点
+    widget.append(1.0)                               # 无时间的点无法换算
+    assert widget.tick_positions() == []
+
+    widget.clear()
+    widget.append(1.0, t0)
+    widget.append(2.0, t0 + timedelta(seconds=4))
+    widget.set_markers([(t0 + timedelta(seconds=1), "baseline"),
+                        (t0 + timedelta(seconds=2), "pause"),
+                        (t0 + timedelta(seconds=3), "user")])
+    assert widget.tick_positions() == [(0.25, "baseline"), (0.75, "user")]
+
+    stderr = io.StringIO()
+    with contextlib.redirect_stderr(stderr):
+        widget.resize(200, 36)
+        widget.grab()
+    assert "Traceback" not in stderr.getvalue()
+    widget.deleteLater()

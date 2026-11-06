@@ -5,14 +5,17 @@
 选择语义（与旧页面 test_safety_net_history / test_history_page_flow 的选择用例同口径）、
 导航跳转只查一次、删除、范围与指标切换、锚点缓存、空状态与读取失败、加载态顺序、
 过期结果丢弃、自动刷新的跳过/单飞/任务结束重载/失败提示去重、间隔分档；
+基线存在性与"自基线"范围回落、打点变化（manager.markers_changed）后的静默重查；
 最后用真实后台线程验证查询不在主线程、线程登记与释放。
 """
+import dataclasses
 import os
 import threading
 import uuid
 from datetime import datetime, timedelta
 
 import pytest
+from PyQt5.QtCore import QObject, pyqtSignal
 from PyQt5.QtWidgets import QApplication
 
 from core.history_query import HistorySnapshot
@@ -423,8 +426,8 @@ def test_metric_without_data_in_all_range(vm_rec, db, monkeypatch):
 
 
 @pytest.mark.parametrize("repo_attr, method", [
-    ("tasks", "get"), ("points", "fetch"), ("analytics", "legacy_stats"),
-    ("analytics", "legacy_buckets"), ("markers", "list"),
+    ("tasks", "get"), ("points", "fetch"), ("analytics", "aggregates"),
+    ("analytics", "gaps"), ("analytics", "legacy_buckets"), ("markers", "list"),
 ])
 def test_load_failure_shows_read_error(vm_rec, db, monkeypatch, repo_attr, method):
     vm, rec = vm_rec
@@ -746,15 +749,29 @@ def test_interval_tiers(qapp, db, manager, services, runner, count, expected):
     assert auto.interval == expected
 
 
-def test_interval_follows_snapshot_stats(qapp, db, manager, services, runner, monkeypatch):
+def test_interval_follows_snapshot_total_count(qapp, db, manager, services, runner,
+                                               monkeypatch):
+    """按显示范围的总条数分档（存在基线时统计只覆盖基线之后，不能用统计条数）"""
     vm, _rec = _vm(qapp, db, manager, services, runner)
     auto = HistoryAutoRefresh(vm)
     _make_task(db, "a.exe", BASE)
-    real = db.analytics.legacy_stats
-    monkeypatch.setattr(db.analytics, 'legacy_stats',
-                        lambda *a, **k: {**real(*a, **k), 'count': 300_000})
+    real = db.analytics.aggregates
+    monkeypatch.setattr(db.analytics, 'aggregates',
+                        lambda *a, **k: dataclasses.replace(real(*a, **k), count=300_000))
     vm.reload_tasks()
     assert auto.interval == 15000
+
+
+def test_interval_ignores_baseline_limited_stats(qapp, db, manager, services, runner):
+    vm, _rec = _vm(qapp, db, manager, services, runner)
+    auto = HistoryAutoRefresh(vm)
+    task = _make_task(db, "a.exe", BASE, samples=6)
+    db.markers.add(task.task_id, BASE + timedelta(seconds=4), "基线", 'baseline')
+    snapshots = []
+    vm.snapshot_ready.connect(snapshots.append)
+    vm.reload_tasks()
+    assert snapshots[0].total_count == 6 and snapshots[0].stats['count'] == 2
+    assert auto.interval == 5000
 
 
 def test_start_stop_and_tick(qapp, db, manager, services, status):
@@ -868,3 +885,131 @@ def test_viewmodel_modules_hold_no_widgets():
         with open(os.path.join(root, "ui", "viewmodels", name), encoding="utf-8") as f:
             text = f.read()
         assert "QtWidgets" not in text and "qfluentwidgets" not in text, name
+
+
+# ====================================================================== 基线与打点变化
+
+
+class _SignalRecorder:
+    def __init__(self, signal):
+        self.values = []
+        signal.connect(lambda *args: self.values.append(args[0] if len(args) == 1 else args))
+
+
+class MarkerManager(QObject):
+    """带 markers_changed 信号的 manager 替身（视图模型只用到它与 delete_task_data）"""
+
+    markers_changed = pyqtSignal(str)
+
+    def delete_task_data(self, task_id):
+        return False
+
+
+def _add_baseline(db, task, seconds=1):
+    return db.markers.add(task.task_id, BASE + timedelta(seconds=seconds), "基线", 'baseline')
+
+
+def test_baseline_changed_follows_selected_task(vm_rec, db):
+    vm, _rec = vm_rec
+    plain = _make_task(db, "plain.exe", BASE - timedelta(days=1))
+    with_baseline = _make_task(db, "base.exe", BASE)
+    _add_baseline(db, with_baseline)
+    seen = _SignalRecorder(vm.baseline_changed)
+
+    vm.reload_tasks()
+    assert vm.has_baseline is True and seen.values[-1] is True
+    vm.select_task(plain.task_id)
+    assert vm.has_baseline is False and seen.values[-1] is False
+
+
+def test_baseline_known_even_when_range_is_empty(qapp, db, manager, services, runner,
+                                                 monkeypatch):
+    """范围内无数据（空状态）时也要知道有没有基线，"自基线"才能选"""
+    vm, rec = _vm(qapp, db, manager, services, runner)
+    task = _make_task(db, "a.exe", BASE, metrics=(MEM, THREADS))
+    _add_baseline(db, task)
+    monkeypatch.setattr(db.points, 'fetch', lambda *a, **k: [])
+    vm.reload_tasks()
+    assert rec.of('empty_state') and vm.has_baseline is True
+
+
+def test_set_range_accepts_baseline_key(vm_rec, db, runner):
+    vm, _rec = vm_rec
+    task = _make_task(db, "a.exe", BASE, samples=6)
+    _add_baseline(db, task, seconds=3)
+    vm.reload_tasks()
+    vm.set_range('baseline')
+    request = runner.requests[-1]
+    assert request.range_key == 'baseline'
+    assert vm.last_snapshot.request.since == BASE + timedelta(seconds=3)
+    assert len(vm.last_snapshot.points) == 3
+
+
+def test_baseline_range_falls_back_to_all_when_baseline_removed(vm_rec, db):
+    vm, rec = vm_rec
+    task = _make_task(db, "a.exe", BASE, samples=6)
+    marker_id = _add_baseline(db, task, seconds=3)
+    vm.reload_tasks()
+    vm.set_range('baseline')
+    resets = _SignalRecorder(vm.range_reset)
+
+    db.markers.delete(marker_id)
+    vm.refresh()
+
+    assert resets.values == ['all'] and vm.range_key == 'all'
+    assert vm.has_baseline is False
+    snapshot, = rec.of('snapshot_ready')[-1]
+    assert snapshot.request.since is None and len(snapshot.points) == 6
+
+
+def test_markers_changed_requeries_current_task_quietly(qapp, db, services, status):
+    manager = MarkerManager()
+    runner = ManualHistoryRunner(db)
+    vm, rec = _vm(qapp, db, manager, services, runner)
+    task = _make_task(db, "a.exe", BASE, samples=6)
+    other = _make_task(db, "b.exe", BASE - timedelta(days=1))
+    vm.reload_tasks()
+    runner.complete_all()
+    rec.clear()
+
+    manager.markers_changed.emit(other.task_id)     # 不是当前任务：忽略
+    assert runner.pending == []
+
+    vm.set_refresh_guard(lambda: True)              # 用户正在看图也要应用
+    _add_baseline(db, task)
+    manager.markers_changed.emit(task.task_id)
+    request = runner.pending[0][0]
+    assert request.auto_refresh is True             # 保留缩放、不置忙
+    runner.complete()
+    snapshot, = rec.of('snapshot_ready')[0]
+    assert snapshot.baseline is not None and vm.has_baseline is True
+    assert rec.of('busy') == []
+
+
+def test_markers_changed_during_user_load_reissues_it(qapp, db, services):
+    manager = MarkerManager()
+    runner = ManualHistoryRunner(db)
+    vm, rec = _vm(qapp, db, manager, services, runner)
+    task = _make_task(db, "a.exe", BASE, samples=6)
+    vm.reload_tasks()
+    assert vm.is_busy and len(runner.pending) == 1
+
+    _add_baseline(db, task)
+    manager.markers_changed.emit(task.task_id)
+    assert len(runner.pending) == 2 and runner.pending[1][0].auto_refresh is False
+    runner.complete(0)                              # 旧结果作废
+    assert rec.of('snapshot_ready') == [] and vm.is_busy
+    runner.complete(0)
+    assert rec.of('snapshot_ready')[0][0].baseline is not None
+    assert not vm.is_busy
+
+
+def test_manager_without_markers_changed_is_supported(qapp, db, services, runner):
+    """manager 尚无 markers_changed 信号（旧版或替身）时照常构造"""
+    class Plain:
+        def delete_task_data(self, task_id):
+            return False
+    vm, _rec = _vm(qapp, db, Plain(), services, runner)
+    _make_task(db, "a.exe", BASE)
+    vm.reload_tasks()
+    assert vm.last_snapshot is not None

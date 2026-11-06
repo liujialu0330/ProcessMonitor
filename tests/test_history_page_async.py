@@ -25,7 +25,7 @@ THREADS = MetricType.NUM_THREADS
 # 允许在主线程执行的读取：任务列表（单条 SQL）
 MAIN_THREAD_ALLOWED = {"tasks.list_with_data"}
 # 一次完整加载必经的数据查询：断言它们确实被调用过，防止"什么都没查所以都不在主线程"
-DATA_QUERIES = {"tasks.get", "points.fetch", "analytics.legacy_stats",
+DATA_QUERIES = {"tasks.get", "points.fetch", "analytics.aggregates", "analytics.gaps",
                 "analytics.legacy_buckets", "markers.list"}
 
 

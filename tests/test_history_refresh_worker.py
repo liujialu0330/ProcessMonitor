@@ -121,7 +121,7 @@ def test_auto_refresh_result_updates_page_and_keeps_view(shown, db, monkeypatch)
 
     assert page.sample_table.data_table.rowCount() == rows_before + 15
     assert "共 35 条" in page.sample_table.table_hint_label.text()
-    assert page.stats_strip.texts()["当前"] != "--"
+    assert page.stats_strip.texts()["当前值"] != "--"
     assert resets == []
     assert page.chart_view.chart_widget.viewRange()[0] == x_range_before
 

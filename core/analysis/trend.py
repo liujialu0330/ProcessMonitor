@@ -9,7 +9,7 @@
 import math
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 if TYPE_CHECKING:
     from data.repos.analytics_repo import MetricAggregates
@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 MIN_SPAN_FLOOR_SECONDS = 600.0      # 跨度下限：10 分钟
 MIN_SPAN_INTERVALS = 30             # 跨度至少覆盖 30 个采集周期
 MIN_POINTS = 30                     # 至少 30 个点
-RISE_R2 = 0.6                       # 判"持续上涨"所需的最低 R²
+RISE_R2 = 0.8                       # 判"持续上涨"所需的最低 R²（产品规则：R² > 0.8）
 RISE_FRACTION_OF_RANGE = 0.05       # 判"持续上涨"所需的拟合增量占值域的最低比例
 STABLE_FRACTION_OF_RANGE = 0.2      # 拟合增量占值域低于此比例视为"幅度很小"
 CI_Z = 1.96                         # 斜率置信区间的 z 值（约 95%）
@@ -197,7 +197,7 @@ def judge(agg: FitInput, interval_seconds: float, *,
     3. 持续上涨：slope > 0、R² ≥ rise_r2、斜率置信区间不含 0、Δ ≥ rise_fraction_of_range × R。
        值域 R 里既有趋势也有噪声，Δ/R 衡量"趋势占了整体起伏的多少"：纯噪声上的伪趋势
        Δ 远小于 R，干净的线性上涨 Δ ≈ R。默认 R² 门槛已隐含置信区间不含 0
-       （n ≥ 30、R² ≥ 0.6 时 t > 6），置信区间条件只在调低 rise_r2 时起作用。
+       （n ≥ 30、R² ≥ 0.8 时 t > 10），置信区间条件只在调低 rise_r2 时起作用。
     4. 平稳：斜率置信区间含 0 → 'slope_not_significant'；
        或 |Δ| < stable_fraction_of_range × R 且 R² < rise_r2 → 'slope_below_threshold'
        （点数很多时极小的漂移也会"显著"，所以还要看幅度）
@@ -247,3 +247,60 @@ def judge(agg: FitInput, interval_seconds: float, *,
     else:
         reason = 'rise_below_threshold'
     return make(Verdict.FLUCTUATING, reason, 1.0 - fit.r2)
+
+
+# ---------- 增速的显示口径 ----------
+
+# 跨度小于该值时增速按"每分钟"显示，否则按"每小时"：短数据按小时外推会把几秒的抖动
+# 放大成吓人的数字（11 秒数据显示 "+28.6 GB/小时"）
+RATE_MINUTE_SPAN_LIMIT = 3600.0
+RATE_SUFFIX_MINUTE = '/分'
+RATE_SUFFIX_HOUR = '/小时'
+
+# 不适用"增速外推"的指标种类（MetricKind 的取值）：累计计数/累计字节/CPU 累计时间/历史峰值。
+# 用取值字符串比较，本模块因此不必依赖 utils.metrics
+_NO_RATE_KIND_VALUES = frozenset({'cumulative_count', 'cumulative_bytes', 'seconds', 'peak'})
+
+
+@dataclass(frozen=True)
+class RateText:
+    """
+    增速的显示量（数值仍是原始单位，如 KB；换算显示单位与拼文案由 UI 层负责）。
+    value 为每个时间单位的变化量；ci 为 95% 置信区间半宽（同单位），
+    只有两个点、无法估计标准误时为 None；unit_suffix 为 '/分' 或 '/小时'。
+    """
+    value: float
+    ci: Optional[float]
+    unit_suffix: str
+    unit_seconds: float
+
+
+def rate_unit_for_span(span_seconds: float) -> Tuple[str, float]:
+    """按数据跨度选增速的时间单位：< 1 小时用 /分，否则 /小时。返回 (后缀, 秒数)。"""
+    if span_seconds < RATE_MINUTE_SPAN_LIMIT:
+        return RATE_SUFFIX_MINUTE, 60.0
+    return RATE_SUFFIX_HOUR, 3600.0
+
+
+def _kind_value(kind: Any) -> Optional[str]:
+    if kind is None:
+        return None
+    return getattr(kind, 'value', kind)
+
+
+def rate_display(fit: Optional[LinearFit], span_seconds: float, kind: Any = None,
+                 *, ci_z: float = CI_Z) -> Optional[RateText]:
+    """
+    把拟合斜率换算成显示用的增速：单位按跨度（rate_unit_for_span），
+    ± 为斜率标准误 × ci_z 换算到同一单位。
+
+    kind 为 MetricKind（或其取值字符串）；累计类与峰值类不适用增速，返回 None；
+    fit 为 None（数据不足或无法拟合）时同样返回 None。
+    """
+    if fit is None or _kind_value(kind) in _NO_RATE_KIND_VALUES:
+        return None
+    suffix, unit_seconds = rate_unit_for_span(span_seconds)
+    stderr = fit.stderr_slope
+    ci = None if math.isinf(stderr) or math.isnan(stderr) else ci_z * stderr * unit_seconds
+    return RateText(value=fit.slope_per_second * unit_seconds, ci=ci,
+                    unit_suffix=suffix, unit_seconds=unit_seconds)

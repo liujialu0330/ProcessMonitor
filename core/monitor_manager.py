@@ -3,9 +3,11 @@
 管理所有监控任务的创建、启动、停止等操作；由组合根构造并注入（不是单例）
 """
 import logging
+import statistics
 import time
-from datetime import datetime
-from typing import Dict, List, Optional
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Sequence
 
 from PyQt5 import sip
 from PyQt5.QtCore import QObject, pyqtSignal
@@ -14,11 +16,51 @@ from core.contracts import StopReason, TaskInfo, TaskStatus
 from core.monitor_task import ACTIVE_STATES, LIVE_STATES, MonitorWorker, WorkerState
 from data.database import Database
 from data.errors import StorageError
-from data.models import TaskRecord
+from data.models import MARKER_KINDS, Marker, TaskRecord
+from data.repos.point_repo import PointQuery
 from utils.thread_utils import shutdown_thread
 import config
 
 logger = logging.getLogger(__name__)
+
+# 打点默认标签序列：任务还没有基线时为"基线"，之后为"第 N 轮"（N = 用户打点数 + 1）
+BASELINE_LABEL = "基线"
+# 基线值 = 基线打点之后前 N 个样本的中位数（避免单个尖峰样本带偏参考值）
+BASELINE_SAMPLE_COUNT = 5
+# 查基线样本的时间窗口 = 周期 × 样本数 × 该倍数 + 余量：容忍调度抖动，又不至于
+# 为一个很早的基线把整段历史读出来
+_BASELINE_WINDOW_FACTOR = 4
+_BASELINE_WINDOW_SLACK = timedelta(seconds=5)
+
+
+def round_label(n: int) -> str:
+    """第 n 轮的默认打点标签。"""
+    return f"第 {n} 轮"
+
+
+def default_marker_kind(default_label: str, label: str) -> str:
+    """打点类型由点击时的默认标签决定：默认是"基线"（任务尚无基线）时，用户改了
+    名称也仍是基线；名称恰为"基线"时同样记为基线。其余为普通用户打点。"""
+    if default_label == BASELINE_LABEL or (label or '').strip() == BASELINE_LABEL:
+        return 'baseline'
+    return 'user'
+
+
+def median_of(values: Sequence[float]) -> float:
+    """基线值口径：前 BASELINE_SAMPLE_COUNT 个样本的中位数（偶数个取中间两值平均）。"""
+    return float(statistics.median(list(values)[:BASELINE_SAMPLE_COUNT]))
+
+
+@dataclass(frozen=True)
+class BaselineSamples:
+    """基线打点之后的样本（每指标最多 BASELINE_SAMPLE_COUNT 个，按时间先后）。
+
+    settled 为 True 表示样本不会再增加（窗口之后已有数据，或任务已不再采集），
+    不足 N 个也按已有的算；为 False 表示基线是刚打的，调用方应继续用实时数据补足。
+    """
+    marker: Marker
+    samples: Dict[str, List[float]] = field(default_factory=dict)
+    settled: bool = False
 
 # WorkerState -> 快照里的 TaskStatus（RUNNING 覆盖暂停中与停止收尾中）
 _STATUS_BY_STATE = {
@@ -47,6 +89,9 @@ class MonitorManager(QObject):
     # 指标不可用信号 (task_id, {指标类型: UnavailableReason})
     metrics_unavailable = pyqtSignal(str, dict)
     task_limit_reached = pyqtSignal()      # 任务数量达到上限信号
+    # 某任务的打点有变化（新增、改名、删除、换基线、暂停/恢复系统打点）(task_id)：
+    # 卡片与分析页据此重新读取打点，不必各自轮询
+    markers_changed = pyqtSignal(str)
 
     def __init__(self, db: Database, parent: Optional[QObject] = None):
         """
@@ -64,6 +109,10 @@ class MonitorManager(QObject):
 
         # 进行中的导出数：导出线程长时间读库，与压缩数据库互相抢锁，二者互斥
         self._export_count = 0
+
+        # 打点 ID -> 所属任务：改名/删除只给 marker_id，发 markers_changed 需要 task_id。
+        # 经 add_marker / list_markers 见过的打点都会登记
+        self._marker_owner: Dict[int, str] = {}
 
         self.db = db
 
@@ -186,31 +235,39 @@ class MonitorManager(QObject):
         self._discard(task_id)
         return True
 
-    def pause_task(self, task_id: str) -> bool:
+    def pause_task(self, task_id: str, timestamp: Optional[datetime] = None) -> bool:
         """
-        暂停监控任务
+        暂停监控任务；成功时任务线程对象写入"暂停"系统打点，随后发 markers_changed
 
         Args:
             task_id: 任务ID
+            timestamp: 系统打点时间（缺省取调用时刻，即用户点击的时刻）
 
         Returns:
             bool: 暂停是否成功
         """
         task = self._tasks.get(task_id)
-        return task is not None and task.pause()
+        if task is None or not task.pause(timestamp):
+            return False
+        self.markers_changed.emit(task_id)
+        return True
 
-    def resume_task(self, task_id: str) -> bool:
+    def resume_task(self, task_id: str, timestamp: Optional[datetime] = None) -> bool:
         """
-        恢复监控任务
+        恢复监控任务；成功时任务线程对象写入"恢复"系统打点，随后发 markers_changed
 
         Args:
             task_id: 任务ID
+            timestamp: 系统打点时间（缺省取调用时刻）
 
         Returns:
             bool: 恢复是否成功
         """
         task = self._tasks.get(task_id)
-        return task is not None and task.resume()
+        if task is None or not task.resume(timestamp):
+            return False
+        self.markers_changed.emit(task_id)
+        return True
 
     # ========== 只读快照（界面只用这一组，不接触任务线程对象） ==========
 
@@ -397,36 +454,216 @@ class MonitorManager(QObject):
         """是否有导出正在进行"""
         return self._export_count > 0
 
-    # ========== 任务数据与标记 ==========
+    # ========== 任务数据与打点 ==========
 
     def add_marker(self, task_id: str, label: str,
-                   timestamp: Optional[datetime] = None) -> Optional[datetime]:
+                   timestamp: Optional[datetime] = None,
+                   kind: str = 'user') -> Optional[Marker]:
         """
-        为任务添加一个时间标记。
+        为任务添加一个打点，成功后发 markers_changed。
 
         Args:
             task_id: 任务ID
-            label: 标记文字
-            timestamp: 标记时间。界面应传入用户点"打点"的时刻：输入标签要花好几秒，
+            label: 打点名称（去除首尾空白后不能为空）
+            timestamp: 打点时间。界面应传入用户点"打点"的时刻：输入名称要花好几秒，
                 取确认时刻会让竖线落在事件之后；为 None 时取当前时间
+            kind: 打点类型（MARKER_KINDS）。名称恰为"基线"时一律记为基线；新增基线
+                时同一任务原有的基线降为普通打点（每个任务至多一个基线）
 
         Returns:
-            Optional[datetime]: 标记时间戳；任务不存在、标签为空或写库失败返回 None
+            Optional[Marker]: 带数据库 ID 的打点；任务不存在、名称为空或写库失败返回 None
         """
         label = (label or '').strip()
         if not label:
             return None
+        if kind not in MARKER_KINDS:
+            raise ValueError(f"未知的打点类型 {kind!r}，可选：{', '.join(MARKER_KINDS)}")
+        if label == BASELINE_LABEL:
+            kind = 'baseline'
         if task_id not in self._tasks and self.db.get_task(task_id) is None:
             return None
         if timestamp is None:
             timestamp = datetime.now()
         try:
-            marker_id = self.db.markers.add(task_id, timestamp, label)
+            marker_id = self.db.markers.add(task_id, timestamp, label, kind)
         except StorageError:
-            logger.error("添加标记失败: task_id=%s", task_id, exc_info=True)
+            logger.error("添加打点失败: task_id=%s", task_id, exc_info=True)
             return None
-        logger.info("添加标记: task_id=%s marker_id=%s", task_id, marker_id)
-        return timestamp
+        self._marker_owner[marker_id] = task_id
+        if kind == 'baseline':
+            self._demote_other_baselines(task_id, keep_id=marker_id)
+        logger.info("添加打点: task_id=%s marker_id=%s kind=%s", task_id, marker_id, kind)
+        self.markers_changed.emit(task_id)
+        return Marker(task_id=task_id, timestamp=timestamp, label=label,
+                      id=marker_id, kind=kind)
+
+    def rename_marker(self, marker_id: int, label: str,
+                      task_id: Optional[str] = None) -> bool:
+        """
+        修改打点名称（不改变类型：基线改名后仍是基线），成功后发 markers_changed。
+
+        Args:
+            marker_id: 打点ID
+            label: 新名称（去除首尾空白后不能为空）
+            task_id: 所属任务（可选）。打点未经本管理器 add_marker/list_markers 见过时
+                用它发信号；两边都不知道时照常改库，只是不发信号
+
+        Returns:
+            bool: 是否改成功（名称为空、打点不存在或写库失败返回 False）
+        """
+        label = (label or '').strip()
+        if not label:
+            return False
+        try:
+            changed = self.db.markers.update_label(marker_id, label)
+        except StorageError:
+            logger.error("修改打点失败: marker_id=%s", marker_id, exc_info=True)
+            return False
+        if changed:
+            self._emit_markers_changed_for(marker_id, task_id)
+        return changed
+
+    def delete_marker(self, marker_id: int, task_id: Optional[str] = None) -> bool:
+        """
+        删除打点，成功后发 markers_changed。删掉基线后任务回到"无基线"，
+        下一个默认标签重新是"基线"。
+
+        Args:
+            marker_id: 打点ID
+            task_id: 所属任务（可选，含义同 rename_marker）
+
+        Returns:
+            bool: 是否删除成功
+        """
+        try:
+            deleted = self.db.markers.delete(marker_id)
+        except StorageError:
+            logger.error("删除打点失败: marker_id=%s", marker_id, exc_info=True)
+            return False
+        if deleted:
+            self._emit_markers_changed_for(marker_id, task_id)
+            self._marker_owner.pop(marker_id, None)
+        return deleted
+
+    def set_baseline(self, task_id: str, marker_id: int) -> bool:
+        """
+        把任务的某个打点设为基线：原基线降为普通打点，该打点改为基线，随后发
+        markers_changed。暂停/恢复系统打点不能设为基线（它们标记的是空洞边界）。
+
+        Returns:
+            bool: 是否设置成功（打点不属于该任务、是系统打点或写库失败返回 False）
+        """
+        markers = self.list_markers(task_id)
+        target = next((m for m in markers if m.id == marker_id), None)
+        if target is None or target.kind not in ('user', 'baseline'):
+            return False
+        if target.kind != 'baseline':
+            try:
+                self.db.markers.set_kind(marker_id, 'baseline')
+            except StorageError:
+                logger.error("设置基线失败: marker_id=%s", marker_id, exc_info=True)
+                return False
+        self._demote_other_baselines(task_id, keep_id=marker_id, markers=markers)
+        self.markers_changed.emit(task_id)
+        return True
+
+    def list_markers(self, task_id: str) -> List[Marker]:
+        """任务的全部打点（含系统打点，按时间升序）；读库失败返回空列表。"""
+        try:
+            markers = self.db.markers.list(task_id)
+        except StorageError:
+            logger.error("读取打点失败: task_id=%s", task_id, exc_info=True)
+            return []
+        for marker in markers:
+            if marker.id is not None:
+                self._marker_owner[marker.id] = task_id
+        return markers
+
+    def get_baseline(self, task_id: str,
+                     markers: Optional[List[Marker]] = None) -> Optional[Marker]:
+        """任务当前的基线打点；没有返回 None。库里万一残留多个，取最后添加的那个。
+
+        Args:
+            task_id: 任务ID
+            markers: 已读出的该任务打点（可选，省一次查库）
+        """
+        if markers is None:
+            markers = self.list_markers(task_id)
+        baselines = [m for m in markers if m.kind == 'baseline']
+        return max(baselines, key=lambda m: m.id or 0) if baselines else None
+
+    def next_marker_label(self, task_id: str) -> str:
+        """下一个打点的默认标签：尚无基线为"基线"，否则"第 N 轮"（N = 用户打点数 + 1）。
+        配套的类型用 default_marker_kind(默认标签, 用户最终输入) 求得。"""
+        markers = self.list_markers(task_id)
+        if self.get_baseline(task_id, markers) is None:
+            return BASELINE_LABEL
+        return round_label(sum(1 for m in markers if m.kind == 'user') + 1)
+
+    def baseline_samples(self, task_id: str,
+                         baseline: Optional[Marker] = None) -> Optional[BaselineSamples]:
+        """
+        基线打点之后、各指标的前 BASELINE_SAMPLE_COUNT 个样本（按时间先后）。
+
+        只在有限窗口内取数（周期 × 样本数 × 倍数 + 余量）。窗口之后已有数据，或任务
+        已不再采集时 settled=True，不足 N 个也按已有样本算；否则基线是刚打的，调用方
+        应继续用实时数据补足。只在打点、换基线时调用，不要在每个采集周期调用。
+
+        Args:
+            task_id: 任务ID
+            baseline: 基线打点；None 时取任务当前基线
+
+        Returns:
+            Optional[BaselineSamples]: 任务没有基线时返回 None
+        """
+        if baseline is None:
+            baseline = self.get_baseline(task_id)
+            if baseline is None:
+                return None
+        task = self._tasks.get(task_id)
+        record = task.task_model if task is not None else self.db.get_task(task_id)
+        if record is None:
+            return BaselineSamples(marker=baseline, settled=True)
+        # 尚未启动的任务也算：启动后的样本都在基线之后
+        live = task is not None and task.state is not WorkerState.STOPPED
+        interval = float(record.interval or config.DEFAULT_INTERVAL)
+        window_end = (baseline.timestamp + _BASELINE_WINDOW_SLACK
+                      + timedelta(seconds=interval * BASELINE_SAMPLE_COUNT
+                                  * _BASELINE_WINDOW_FACTOR))
+        samples: Dict[str, List[float]] = {}
+        try:
+            for metric in record.metric_types:
+                points = self.db.points.fetch(PointQuery(
+                    task_id, metric, since=baseline.timestamp, until=window_end))
+                values = [p.value for p in points[:BASELINE_SAMPLE_COUNT]]
+                if values:
+                    samples[metric] = values
+        except StorageError:
+            logger.error("读取基线样本失败: task_id=%s", task_id, exc_info=True)
+            return BaselineSamples(marker=baseline, settled=not live)
+        last = self.db.get_last_point_timestamp(task_id)
+        settled = (not live) or (last is not None and last > window_end)
+        return BaselineSamples(marker=baseline, samples=samples, settled=settled)
+
+    def _demote_other_baselines(self, task_id: str, keep_id: int,
+                                markers: Optional[List[Marker]] = None) -> None:
+        """把除 keep_id 外的基线降为普通打点（每个任务至多一个基线）。失败只记日志：
+        get_baseline 在残留多个基线时取最后添加的，结论不会乱。"""
+        if markers is None:
+            markers = self.list_markers(task_id)
+        for marker in markers:
+            if marker.kind == 'baseline' and marker.id != keep_id:
+                try:
+                    self.db.markers.set_kind(marker.id, 'user')
+                except StorageError:
+                    logger.error("旧基线降级失败: marker_id=%s", marker.id, exc_info=True)
+
+    def _emit_markers_changed_for(self, marker_id: int, task_id: Optional[str]) -> None:
+        owner = self._marker_owner.get(marker_id, task_id)
+        if owner is None:
+            logger.warning("打点 %s 的所属任务未知，未发出 markers_changed", marker_id)
+            return
+        self.markers_changed.emit(owner)
 
     def delete_task_data(self, task_id: str) -> bool:
         """

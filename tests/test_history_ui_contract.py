@@ -36,9 +36,9 @@ def test_history_page_uses_compact_analysis_contract(qapp, new_page):
     assert DEFAULT_RANGE_KEY == 'all'
     assert page.vm.range_key == page.filter_bar.current_range() == 'all'
     assert tuple(page.stats_strip.texts()) == (
-        "起点", "当前", "变化", "增速", "最小", "最大")
+        "开始值", "当前值", "变化量", "每小时增长", "最小", "最大")
     assert page.view_stack.currentWidget() is page.chart_view
-    assert page.sample_table.data_table.isColumnHidden(2) is True
+    assert page.sample_table.data_table.isColumnHidden(4) is True
 
     page.filter_bar.view_segmented.setCurrentItem('detail')
     qapp.processEvents()
@@ -46,7 +46,7 @@ def test_history_page_uses_compact_analysis_contract(qapp, new_page):
 
     page.filter_bar.raw_value_action.setChecked(True)
     qapp.processEvents()
-    assert page.sample_table.data_table.isColumnHidden(2) is False
+    assert page.sample_table.data_table.isColumnHidden(4) is False
 
     page.close()
 
@@ -77,25 +77,25 @@ def test_history_detail_table_uses_centered_bounded_data_track(qapp, new_page):
 
     horizontal_mask = int(Qt.AlignLeft | Qt.AlignRight | Qt.AlignHCenter)
     assert (table.horizontalHeader().defaultAlignment() & horizontal_mask) == Qt.AlignHCenter
-    assert [table.horizontalHeaderItem(c).text() for c in range(3)] == [
-        '采样时间', '指标值', '原始值']
-    for column in range(3):
+    assert [table.horizontalHeaderItem(c).text() for c in range(5)] == [
+        '时间', '数值', '较上次', '较基线', '原始值']
+    for column in range(5):
         item = table.item(0, column)
         assert (item.textAlignment() & horizontal_mask) == Qt.AlignHCenter
         assert item.font().pixelSize() == TypeScale.BODY
         assert item.font().fixedPitch() is True
 
-    hidden_widths = [table.columnWidth(c) for c in (0, 1)]
+    hidden_widths = [table.columnWidth(c) for c in range(4)]
     assert max(hidden_widths) - min(hidden_widths) <= 1
 
     page.filter_bar.raw_value_action.setChecked(True)
     qapp.processEvents()
-    visible_widths = [table.columnWidth(c) for c in range(3)]
+    visible_widths = [table.columnWidth(c) for c in range(5)]
     assert max(visible_widths) - min(visible_widths) <= 1
     assert table.horizontalScrollBar().maximum() == 0
     page.close()
 
-    # 窄窗口不保留人为留白，轨道回到卡片的 16px 标准内边距并继续三列等分
+    # 窄窗口不保留人为留白，轨道回到卡片的 16px 标准内边距并继续五列等分
     narrow = new_page()
     narrow.resize(800, 760)
     _show_detail(narrow)
@@ -105,7 +105,7 @@ def test_history_detail_table_uses_centered_bounded_data_track(qapp, new_page):
     narrow_content = narrow.sample_table.detail_table_content
     assert narrow_content.width() == narrow_content.parentWidget().width() - 32
     assert narrow_content.x() == 16
-    narrow_widths = [narrow.sample_table.data_table.columnWidth(c) for c in range(3)]
+    narrow_widths = [narrow.sample_table.data_table.columnWidth(c) for c in range(5)]
     assert max(narrow_widths) - min(narrow_widths) <= 1
     assert narrow.sample_table.data_table.horizontalScrollBar().maximum() == 0
     narrow.close()

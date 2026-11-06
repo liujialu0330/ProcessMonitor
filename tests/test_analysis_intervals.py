@@ -8,7 +8,10 @@ import pytest
 
 from core.analysis.intervals import (
     Boundary,
+    RoundDelta,
     baseline_delta,
+    mean_round_delta,
+    round_deltas,
     split_intervals,
     value_near,
 )
@@ -245,3 +248,49 @@ def test_baseline_delta_uses_latest_point_even_if_unsorted():
 
 def test_baseline_delta_empty():
     assert baseline_delta([], at(0)) is None
+
+
+# ---------- 逐轮增量与每轮均值 ----------
+
+def test_round_deltas_pairs_adjacent_boundaries_in_time_order():
+    values = {T0: 10.0, T0 + timedelta(minutes=5): 13.0, T0 + timedelta(minutes=9): 18.0}
+    calls = []
+
+    def value_at(ts):
+        calls.append(ts)
+        return values[ts]
+
+    boundaries = [
+        Boundary(T0 + timedelta(minutes=9), "第2轮", 'user'),
+        Boundary(T0, "基线", 'baseline'),
+        Boundary(T0 + timedelta(minutes=5), "第1轮", 'user'),
+    ]
+    rounds = round_deltas(boundaries, value_at)
+    assert rounds == [
+        RoundDelta(0, "第1轮", T0, T0 + timedelta(minutes=5), 10.0, 13.0, 3.0),
+        RoundDelta(1, "第2轮", T0 + timedelta(minutes=5), T0 + timedelta(minutes=9),
+                   13.0, 18.0, 5.0),
+    ]
+    assert sorted(calls) == sorted(values)   # 每个边界只取一次值
+    assert mean_round_delta(rounds) == 4.0
+
+
+def test_round_deltas_missing_value_gives_none_delta():
+    rounds = round_deltas(
+        [Boundary(T0, "a", 'user'), Boundary(T0 + timedelta(minutes=1), "b", 'user')],
+        lambda ts: None if ts == T0 else 5.0)
+    assert rounds[0].delta is None and rounds[0].end_value == 5.0
+    assert mean_round_delta(rounds) is None
+
+
+def test_round_deltas_needs_two_boundaries():
+    assert round_deltas([Boundary(T0, "a", 'user')], lambda ts: 1.0) == []
+    assert round_deltas([], lambda ts: 1.0) == []
+
+
+def test_mean_round_delta_skips_none_and_accepts_interval_stats():
+    pts = [(T0 + timedelta(minutes=i), float(i * i)) for i in range(7)]
+    intervals = split_intervals(pts, [Boundary(T0 + timedelta(minutes=3), "m", 'user')])
+    # [0,3) 增量 4 - 0 = 4；[3,6] 增量 36 - 9 = 27
+    assert mean_round_delta(intervals) == pytest.approx((4 + 27) / 2)
+    assert mean_round_delta([]) is None

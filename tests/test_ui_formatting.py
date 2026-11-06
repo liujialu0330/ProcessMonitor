@@ -1,19 +1,28 @@
 """
-ui/formatting.py 纯函数：时长、任务下拉文案、统计条文本、打点区间、默认导出文件名。
+ui/formatting.py 纯函数：时长、任务下拉文案、统计条六格与判定/增速文案、打点区间与
+编号徽标、默认导出文件名。
 """
-from datetime import datetime
+import math
+from datetime import datetime, timedelta
 
 import pytest
 
+from core.analysis.intervals import RoundDelta
+from core.analysis.trend import Judgement, LinearFit, RateText, Verdict
 from core.contracts import StopReason, UnavailableReason
-from data.models import MonitorTask
+from core.history_query import (
+    BaselineInfo, HistorySnapshot, PeakRises, RateStats, build_request)
+from data.models import Marker, MonitorTask
 from ui.formatting import (
-    build_stat_texts, default_export_filename, format_count, format_duration,
-    format_task_option_text, format_task_tooltip, marker_context,
+    STAT_SLOTS, build_stat_cells, default_export_filename, empty_stat_cells,
+    format_count, format_duration, format_per_second, format_rate_text,
+    format_task_option_text, format_task_tooltip, insufficient_text,
+    judgement_reason_text, marker_badge, marker_context, object_usage_text,
     sanitize_filename, stop_reason_text, task_duration_seconds, task_status_text,
-    truncate_text, unavailable_reason_text
+    truncate_text, unavailable_reason_text, verdict_text
 )
-from utils.metrics import RATE_NOT_APPLICABLE, MetricType
+from utils.metrics import (
+    VALUE_CLASS_PEAK, VALUE_CLASS_RATE, MetricType)
 
 # 已停止任务的时长不看 now；随便给一个远离起止时间的时刻，证明确实没被用到
 FAR_NOW = datetime(2030, 1, 1)
@@ -124,49 +133,183 @@ def test_unavailable_reason_text_covers_all_members():
         assert unavailable_reason_text(reason)
 
 
-def test_build_stat_texts_growth():
-    """起点/当前/变化(绝对值+百分比)/增速/最小/最大"""
-    stats = {
-        'count': 100, 'min': 100 * 1024.0, 'max': 150 * 1024.0, 'avg': 120 * 1024.0,
-        'first': 100 * 1024.0, 'last': 150 * 1024.0,
-        'slope_per_hour': 12 * 1024.0,
-    }
-    texts = build_stat_texts(MetricType.MEMORY_PRIVATE, stats, "MB")
-    assert texts["起点"] == "100 MB"
-    assert texts["当前"] == "150 MB"
-    assert texts["变化"] == "+50 MB (+50.0%)"
-    assert texts["增速"] == "+12 MB/小时"
-    assert texts["最小"] == "100 MB"
-    assert texts["最大"] == "150 MB"
+# ---------- 判定与增速文案 ----------
+
+def test_verdict_texts():
+    assert [verdict_text(v) for v in Verdict] == ["持续上涨", "平稳", "波动", "数据不足"]
+    assert verdict_text('rising') == "持续上涨"
 
 
-def test_build_stat_texts_flat_and_missing():
-    flat = {'count': 3, 'min': 10.0, 'max': 10.0, 'avg': 10.0, 'first': 10.0,
-            'last': 10.0, 'slope_per_hour': None}
-    texts = build_stat_texts(MetricType.NUM_THREADS, flat)
-    assert texts["变化"] == "±0"
-    assert texts["增速"] == "--"
-
-    empty = build_stat_texts(MetricType.NUM_THREADS, None)
-    assert set(empty.values()) == {"--"}
-    assert tuple(empty) == ("起点", "当前", "变化", "增速", "最小", "最大")
+def test_judgement_reason_text_with_and_without_fit():
+    fit = LinearFit(1.0, 0.0, 0.873, 0.1)
+    assert judgement_reason_text(Judgement(Verdict.RISING, fit, 'rising', 0.5)) == (
+        "斜率显著为正且拟合良好（R² 0.87）")
+    assert judgement_reason_text(
+        Judgement(Verdict.INSUFFICIENT, None, 'short_span', 0.0)) == "采集时长不足"
 
 
-def test_build_stat_texts_zero_baseline_has_no_percent():
-    stats = {'count': 2, 'min': 0.0, 'max': 5.0, 'avg': 2.5, 'first': 0.0,
-             'last': 5.0, 'slope_per_hour': 3.0}
-    texts = build_stat_texts(MetricType.NUM_HANDLES, stats)
-    assert texts["变化"] == "+5 个"
+@pytest.mark.parametrize("metric, rate, text", [
+    (MetricType.MEMORY_PRIVATE, RateText(1024 * 7.9, 1024 * 0.3, '/分', 60.0),
+     "+7.9 ±0.3 MB/分"),
+    (MetricType.MEMORY_PRIVATE, RateText(-512.0, None, '/小时', 3600.0), "-512 KB/小时"),
+    (MetricType.MEMORY_PRIVATE, RateText(0.001, 0.5, '/分', 60.0), "±0 ±0.5 KB/分"),
+    (MetricType.NUM_HANDLES, RateText(12.345, 1.5, '/小时', 3600.0), "+12.3 ±1.5 个/小时"),
+    (MetricType.NUM_HANDLES, RateText(0.25, math.inf, '/分', 60.0), "+0.25 个/分"),
+    (MetricType.MEMORY_PERCENT, RateText(0.5, 0.1, '/分', 60.0), "+0.5 ±0.1%/分"),
+])
+def test_format_rate_text(metric, rate, text):
+    assert format_rate_text(metric, rate) == text
 
 
-def test_build_stat_texts_cumulative_metric_rate_not_applicable():
-    """累计类指标（IO 字节等）单调不减：变化量照常显示，增速不外推"""
-    stats = {'count': 10, 'min': 1024.0, 'max': 3072.0, 'avg': 2048.0,
-             'first': 1024.0, 'last': 3072.0, 'slope_per_hour': 4096.0}
-    texts = build_stat_texts(MetricType.IO_READ_BYTES, stats, "MB")
-    assert texts["变化"] == "+2 MB (+200.0%)"
-    assert texts["增速"] == RATE_NOT_APPLICABLE
-    assert texts["当前"] == "3 MB"
+@pytest.mark.parametrize("metric, value, text", [
+    (MetricType.IO_READ_BYTES, 1024 * 1.5, "1.5 MB/秒"),
+    (MetricType.IO_READ_COUNT, 0.5, "0.5 次/秒"),
+    (MetricType.CPU_USER_TIME, 0.25, "0.25 秒/秒"),
+    (MetricType.IO_READ_COUNT, None, "--"),
+    (MetricType.IO_READ_COUNT, -2.0, "-2 次/秒"),
+])
+def test_format_per_second(metric, value, text):
+    assert format_per_second(metric, value) == text
+
+
+def test_insufficient_text_prefers_span_then_points():
+    # 周期 1 秒 → 门槛 10 分钟
+    assert insufficient_text(11, 12, 1.0) == "数据不足（已采 11秒）"
+    assert insufficient_text(3600, 20, 1.0) == "数据不足（仅 20 点）"
+
+
+def test_object_usage_text_only_for_gdi_user():
+    assert object_usage_text(MetricType.NUM_GDI_OBJECTS, 3750) == "已用 37.5%（上限 10000）"
+    assert object_usage_text(MetricType.NUM_USER_OBJECTS, 100) == "已用 1.0%（上限 10000）"
+    assert object_usage_text(MetricType.NUM_HANDLES, 100) == ""
+    assert object_usage_text(MetricType.NUM_GDI_OBJECTS, None) == ""
+
+
+def test_marker_badge():
+    assert [marker_badge(n) for n in (1, 2, 3, 20)] == ["①", "②", "③", "⑳"]
+    assert marker_badge(21) == "(21)"
+
+
+# ---------- 统计条六格 ----------
+
+T0 = datetime(2026, 7, 16, 8, 0, 0)
+
+
+def _stats(first, last, low=None, high=None, count=100, span=7200.0):
+    return {'count': count, 'min': first if low is None else low,
+            'max': last if high is None else high, 'avg': (first + last) / 2,
+            'first': first, 'first_ts': T0, 'last': last,
+            'last_ts': T0 + timedelta(seconds=span), 'slope_per_hour': None,
+            'span_seconds': span}
+
+
+def _snapshot(metric, stats, **fields):
+    return HistorySnapshot(request=build_request("t", metric, 'all'), stats=stats,
+                           interval_seconds=fields.pop('interval_seconds', 60.0), **fields)
+
+
+def _texts(cells):
+    return {cell.title: cell.value for cell in cells}
+
+
+def test_empty_cells_for_missing_stats_or_metric():
+    cells = empty_stat_cells()
+    assert [c.slot for c in cells] == list(STAT_SLOTS)
+    assert _texts(cells) == {"开始值": "--", "当前值": "--", "变化量": "--",
+                             "每小时增长": "--", "最小": "--", "最大": "--"}
+    assert build_stat_cells(None) == cells
+    assert build_stat_cells(_snapshot(MetricType.NUM_THREADS, None)) == cells
+    assert build_stat_cells(_snapshot(None, _stats(1, 2))) == cells
+
+
+def test_level_cells_with_rate_and_verdict():
+    fit = LinearFit(1.0, 0.0, 0.95, 0.01)
+    snapshot = _snapshot(
+        MetricType.MEMORY_PRIVATE, _stats(100 * 1024.0, 150 * 1024.0, count=8100, span=8100),
+        judgement=Judgement(Verdict.RISING, fit, 'rising', 0.9),
+        rate=RateText(1024 * 12.0, 1024 * 0.4, '/小时', 3600.0), fit_unit='/小时')
+    cells = build_stat_cells(snapshot, "MB")
+    assert _texts(cells) == {
+        "开始值": "100 MB", "当前值": "150 MB", "变化量": "+50 MB (+50.0%)",
+        "每小时增长": "+12 ±0.4 MB/小时", "最小": "100 MB", "最大": "150 MB"}
+    rate = cells[3]
+    assert rate.note == "基于 2小时15分 / 8,100 点"
+    assert rate.pill == "持续上涨" and "R² 0.95" in rate.pill_tooltip
+    assert not rate.dimmed
+    assert rate.tooltip.endswith("2小时15分 · 8,100 点")
+
+
+def test_level_cells_insufficient_is_dimmed_per_minute():
+    snapshot = _snapshot(
+        MetricType.NUM_THREADS, _stats(10.0, 10.0, count=12, span=11),
+        judgement=Judgement(Verdict.INSUFFICIENT, None, 'few_points', 0.0),
+        fit_unit='/分', interval_seconds=1.0)
+    cells = build_stat_cells(snapshot)
+    rate = cells[3]
+    assert (rate.title, rate.value, rate.dimmed) == ("每分钟增长", "数据不足（已采 11秒）", True)
+    assert rate.pill == "数据不足"
+    assert cells[2].value == "±0"
+
+
+def test_zero_start_has_no_percent():
+    cells = build_stat_cells(_snapshot(MetricType.NUM_HANDLES, _stats(0.0, 5.0)))
+    assert cells[2].value == "+5 个"
+
+
+def test_baseline_cells_and_rounds():
+    marker = Marker("t", T0 + timedelta(minutes=20), "基线", kind='baseline')
+    rounds = [RoundDelta(0, "第1轮", T0, T0, 0.0, 15 * 1024.0, 15 * 1024.0),
+              RoundDelta(1, "第2轮", T0, T0, 0.0, 25 * 1024.0, 25 * 1024.0),
+              RoundDelta(2, "第3轮", T0, T0, None, None, None)]
+    snapshot = _snapshot(
+        MetricType.MEMORY_PRIVATE, _stats(140 * 1024.0, 190 * 1024.0, count=86, span=6000),
+        baseline=BaselineInfo(marker, 141 * 1024.0, 5), stats_since=marker.timestamp,
+        rounds=rounds, judgement=Judgement(Verdict.RISING, LinearFit(1, 0, 1.0, 0), 'rising', 1),
+        rate=RateText(1024 * 0.5, 0.0, '/小时', 3600.0), fit_unit='/小时')
+    cells = build_stat_cells(snapshot, "MB")
+    assert _texts(cells)["基线值"] == "141 MB"
+    assert cells[0].note == "基线 08:20:00"
+    assert "5 个样本的中位数" in cells[0].tooltip
+    assert cells[2].value == "+49 MB (+34.8%)"
+    rate = cells[3]
+    assert (rate.title, rate.value, rate.note) == ("每轮增长", "+20 MB", "2 轮均值")
+    assert "第1轮：+15 MB" in rate.tooltip and "第2轮：+25 MB" in rate.tooltip
+    assert "基线 08:20:00 起 · 1小时40分 · 86 点" in rate.tooltip
+
+
+def test_baseline_only_off_shows_start_value():
+    marker = Marker("t", T0, "基线", kind='baseline')
+    snapshot = HistorySnapshot(
+        request=build_request("t", MetricType.NUM_HANDLES, 'all', baseline_only=False),
+        stats=_stats(10.0, 20.0), baseline=BaselineInfo(marker, 12.0, 5))
+    assert _texts(build_stat_cells(snapshot))["开始值"] == "10 个"
+
+
+def test_gdi_current_value_notes_quota():
+    cells = build_stat_cells(_snapshot(MetricType.NUM_GDI_OBJECTS, _stats(100.0, 3750.0)))
+    assert cells[1].note == "已用 37.5%（上限 10000）"
+
+
+def test_cumulative_cells_show_rates_not_growth():
+    snapshot = _snapshot(
+        MetricType.IO_READ_BYTES, _stats(1024.0, 3072.0, count=10, span=600),
+        value_class=VALUE_CLASS_RATE, rate_stats=RateStats(1024 / 600 * 2, 1024 * 1.5))
+    cells = build_stat_cells(snapshot, "MB")
+    assert _texts(cells) == {
+        "开始值": "1 MB", "当前值": "3 MB", "变化量": "+2 MB (+200.0%)",
+        "平均速率": "3.41 KB/秒", "峰值速率": "1.5 MB/秒", "数据跨度": "10分钟"}
+    assert cells[5].note == "10 点"
+    assert not any(cell.pill for cell in cells)
+
+
+def test_peak_cells_show_rises():
+    snapshot = _snapshot(
+        MetricType.MEMORY_PEAK_WSET, _stats(100.0, 180.0),
+        value_class=VALUE_CLASS_PEAK, peak_rises=PeakRises(2, 80.0))
+    assert _texts(build_stat_cells(snapshot))["峰值抬升"] == "2 次，共 +80 KB"
+    none = _snapshot(MetricType.MEMORY_PEAK_WSET, _stats(100.0, 100.0),
+                     value_class=VALUE_CLASS_PEAK, peak_rises=PeakRises(0, 0.0))
+    assert _texts(build_stat_cells(none))["峰值抬升"] == "未抬升"
 
 
 def test_marker_context_locates_interval():
