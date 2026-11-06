@@ -31,6 +31,7 @@ qfluentwidgets 兼容封装
 """
 from typing import Optional
 
+from PyQt5.QtCore import QEvent, QTimer
 from PyQt5.QtWidgets import QWidget
 from qfluentwidgets import MessageBoxBase, SwitchSettingCard
 
@@ -56,11 +57,36 @@ class InputDialogBase(MessageBoxBase):
     def set_focus_widget(self, widget: Optional[QWidget], *,
                          select_all: bool = True) -> None:
         """指定显示后获得焦点的控件；select_all 为 True 时显示后全选其内容。"""
+        if self._focus_widget is not None:
+            self._focus_widget.removeEventFilter(self)
         self._focus_widget = widget
         self._select_all = select_all
+        if widget is not None:
+            # 监听焦点进入：窗口可能在显示之后才被激活并把焦点交给输入控件
+            # （焦点原因不同，QLineEdit 会自动全选），选区状态要在那之后再定
+            widget.installEventFilter(self)
 
     def focus_widget(self) -> Optional[QWidget]:
         return self._focus_widget
+
+    def _apply_selection(self) -> None:
+        widget = self._focus_widget
+        if widget is None:
+            return
+        if self._select_all:
+            if hasattr(widget, "selectAll"):
+                widget.selectAll()
+        elif hasattr(widget, "deselect"):
+            # select_all=False 必须确定地表示"不选中"
+            widget.deselect()
+
+    def eventFilter(self, watched, event):
+        # 基类构造期间就会以本对象为过滤器收到事件，此时属性尚未赋值
+        focus_widget = getattr(self, "_focus_widget", None)
+        if focus_widget is not None and watched is focus_widget and event.type() == QEvent.FocusIn:
+            # 等 QLineEdit 自己的 focusInEvent（可能全选）处理完再统一设定选区
+            QTimer.singleShot(0, self._apply_selection)
+        return super().eventFilter(watched, event)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -68,13 +94,7 @@ class InputDialogBase(MessageBoxBase):
         if widget is None:
             return
         widget.setFocus()
-        if self._select_all:
-            if hasattr(widget, "selectAll"):
-                widget.selectAll()
-        elif hasattr(widget, "deselect"):
-            # 焦点进入时 QLineEdit 在某些焦点原因/库版本下会自动全选，
-            # select_all=False 必须确定地表示"不选中"，所以显式清掉选区
-            widget.deselect()
+        self._apply_selection()
 
 
 class CnSwitchSettingCard(SwitchSettingCard):
