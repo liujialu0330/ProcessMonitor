@@ -70,7 +70,7 @@ def test_default_range_is_all_and_initial_empty_state(page):
 def test_empty_state_wording_depends_on_selected_range(page, db, monkeypatch):
     task = _seed_task(db, samples=3)
     page.select_task(task.task_id)
-    monkeypatch.setattr(db, 'get_task_data_points', lambda *a, **k: [])
+    monkeypatch.setattr(db.points, 'fetch', lambda *a, **k: [])
 
     page.current_range_key = 'all'
     page._load_task_data(task.task_id, MetricType.MEMORY_PRIVATE)
@@ -103,9 +103,9 @@ def test_cache_is_reused_between_range_switches(page, db, monkeypatch):
     task = _seed_task(db, samples=5)
     page.select_task(task.task_id)
     calls = []
-    real = db.get_last_point_timestamp
+    real = db.analytics.last_point_timestamp
     monkeypatch.setattr(
-        db, 'get_last_point_timestamp', lambda tid: calls.append(tid) or real(tid))
+        db.analytics, 'last_point_timestamp', lambda tid: calls.append(tid) or real(tid))
 
     page._on_time_range_changed('1h')
     page._on_time_range_changed('6h')
@@ -592,3 +592,55 @@ def test_running_task_duration_label_updates_in_place(page, db, services, monkey
     assert "运行中" not in text and "20分钟" in text
     assert reloads == []
     assert page.current_task_id == other.task_id
+
+
+# ---------- 读库失败（StorageError）与"暂无数据"区分 ----------
+
+def _raise_storage(*a, **k):
+    from data.errors import StorageError
+    raise StorageError("读取数据点失败: database disk image is malformed")
+
+
+@pytest.mark.parametrize("repo_attr, method", [
+    ("points", "fetch"),
+    ("analytics", "legacy_stats"),
+    ("analytics", "legacy_buckets"),
+    ("markers", "list"),
+    ("tasks", "get"),
+])
+def test_load_failure_shows_read_error_not_empty(page, db, services, monkeypatch,
+                                                 repo_attr, method):
+    task = _seed_task(db, samples=5, markers=[(1, "m")])
+    page.select_task(task.task_id)
+    assert page.content_stack.currentWidget() is page.analysis_page
+    notices_before = len(services.notifier.notices)
+
+    monkeypatch.setattr(getattr(db, repo_attr), method, _raise_storage)
+    page._load_task_data(task.task_id, MetricType.MEMORY_PRIVATE)
+
+    assert page.content_stack.currentWidget() is page.empty_state_page
+    assert page.empty_title_label.text() == "读取数据失败"
+    new = services.notifier.notices[notices_before:]
+    assert [(n.level, n.title) for n in new] == [("error", "读取数据失败")]
+    assert "malformed" in new[0].content
+
+
+def test_task_list_failure_shows_read_error(page, db, services, monkeypatch):
+    _seed_task(db, samples=3)
+    monkeypatch.setattr(db.tasks, "list_with_data", _raise_storage)
+
+    page._load_tasks()
+
+    assert page.empty_title_label.text() == "读取数据失败"
+    assert services.notifier.last().level == "error"
+    assert page.task_combo.count() == 0 and page.current_task_id is None
+
+
+def test_empty_range_still_shows_no_data_wording(page, db, services):
+    """真正没有数据时仍是"暂无数据"文案，且不弹错误"""
+    task = _seed_task(db, samples=3)
+    page.select_task(task.task_id)
+    page.current_range_key = 'all'
+    page._load_task_data(task.task_id, MetricType.NUM_THREADS)   # 该任务没有这个指标的数据
+    assert page.empty_title_label.text() == "该任务暂无数据"
+    assert services.notifier.messages("error") == []

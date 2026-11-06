@@ -8,7 +8,7 @@ import threading
 from datetime import timedelta
 
 import pytest
-from PyQt5.QtCore import QCoreApplication, QEvent
+from PyQt5.QtCore import QCoreApplication, QEvent, Qt
 from PyQt5.QtWidgets import QApplication
 
 from core.history_refresh_worker import HistoryRefreshResult
@@ -86,7 +86,7 @@ def _block_table_query(page, db):
     gate = threading.Event()
     entered = threading.Event()
     calls = []
-    real = db.get_task_data_points
+    real = db.points.fetch
 
     def blocking(*a, **k):
         # 只阻塞工作线程；主线程的同步加载（用户主动操作）不受影响
@@ -96,7 +96,7 @@ def _block_table_query(page, db):
             gate.wait(10)
         return real(*a, **k)
 
-    db.get_task_data_points = blocking
+    db.points.fetch = blocking
     page._gate = gate
     return entered, calls
 
@@ -144,13 +144,13 @@ def test_refresh_query_runs_off_main_thread(shown, db):
     """查询在工作线程执行，而不是主线程"""
     page = shown
     threads = []
-    real = db.get_task_data_points
+    real = db.points.fetch
 
     def spy(*a, **k):
         threads.append(threading.current_thread())
         return real(*a, **k)
 
-    db.get_task_data_points = spy
+    db.points.fetch = spy
     page._on_auto_refresh()
     assert _wait(lambda: page._refresh_worker is None and threads)
     assert threads[0] is not threading.main_thread()
@@ -222,7 +222,7 @@ def test_failed_query_keeps_current_display(shown, db, monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("db locked")
 
-    db.get_task_data_points = boom
+    db.points.fetch = boom
     page._on_auto_refresh()
     assert _wait(lambda: page._refresh_worker is None)
     assert applied == []
@@ -249,7 +249,7 @@ def test_tick_skipped_while_worker_in_flight(shown, db):
     assert _wait(lambda: page._refresh_worker is None)
 
     # 上一个结束后，下一次 tick 才会启动新 worker
-    db.get_task_data_points = type(db).get_task_data_points.__get__(db)
+    del db.points.fetch   # 撤销实例上的替身，恢复类方法
     page._on_auto_refresh()
     assert page._refresh_worker is not None and page._refresh_worker is not first
     assert _wait(lambda: page._refresh_worker is None)
@@ -324,3 +324,48 @@ def test_main_window_close_joins_history_refresh_worker(qapp, tmp_path, monkeypa
         worker.wait(5000)
         win.history_page._refresh_worker = None
         manager.stop_all_tasks()
+
+
+# ---------- 存储故障上报 ----------
+
+def test_query_storage_error_is_reported_via_error_field(db):
+    """worker 内仓储抛 StorageError：结果的 error 非空且标记为存储故障"""
+    from core.history_refresh_worker import HistoryRefreshWorker
+    from data.errors import StorageError
+    task = _seed_task(db, samples=5)
+
+    def boom(*a, **k):
+        raise StorageError("读取数据点失败: disk I/O error")
+
+    db.points.fetch = boom
+    worker = HistoryRefreshWorker(db, 7, task.task_id, METRIC, 'all', None, 50, 20)
+    results = []
+    worker.result_ready.connect(results.append, type=Qt.DirectConnection)
+    worker.run()   # 直接在当前线程执行 run，只验证结果打包
+
+    assert len(results) == 1
+    assert results[0].request_id == 7
+    assert results[0].storage_error is True and "disk I/O error" in results[0].error
+
+
+def test_auto_refresh_storage_error_notifies_once_and_keeps_display(shown, services):
+    """自动刷新读库失败：保持当前显示；连续失败只弹一次"读取数据失败"，成功后复位"""
+    page = shown
+    rows = page.data_table.rowCount()
+    failing = _result(page, error="读取数据点失败: disk I/O error", storage_error=True)
+
+    page._on_refresh_result(failing)
+    page._on_refresh_result(_result(page, error="again", storage_error=True))
+    errors = services.notifier.messages("error")
+    assert [(n.title, n.content) for n in errors] == [
+        ("读取数据失败", "读取数据点失败: disk I/O error")]
+    assert page.data_table.rowCount() == rows
+    assert page.content_stack.currentWidget() is page.analysis_page
+
+    page._on_refresh_result(_result(page))            # 成功一次后复位
+    page._on_refresh_result(_result(page, error="x", storage_error=True))
+    assert len(services.notifier.messages("error")) == 2
+
+    # 非存储故障（编程错误等）只记日志，不弹提示
+    page._on_refresh_result(_result(page, error="boom"))
+    assert len(services.notifier.messages("error")) == 2

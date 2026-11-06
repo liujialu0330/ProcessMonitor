@@ -42,14 +42,14 @@ class _CleanupWorker(QThread):
     """"清理并压缩数据库"后台线程：按保留天数删除过期任务（retention_days>0 时）
     再执行 VACUUM，避免大库操作阻塞 UI 线程。
 
-    异常处理沿用 Database 层"静默失败"约定（cleanup_old_tasks/vacuum 内部已
-    自行捕获异常并记日志，不向上抛出）；这里的 try/except/finally 是额外一层
-    防御，确保无论如何都会 emit finished_ok，避免 StateToolTip 卡在"进行中"
-    不再收尾。线程对象的释放与维护状态的退出都挂在 QThread.finished 上
-    （见 SettingPage._on_cleanup_thread_finished）。
+    直接用 db.maintenance（失败抛 StorageError），成功发 finished_ok，任何失败都发
+    failed——不再像旧实现那样压缩失败也提示"完成"。两个信号恰好发一个，且是 run()
+    的最后动作，StateToolTip 不会卡在"进行中"。线程对象的释放与维护状态的退出都挂在
+    QThread.finished 上（见 SettingPage._on_cleanup_thread_finished）。
     """
 
     finished_ok = pyqtSignal(int)  # 参数：被删除的任务数（未执行清理时为0）
+    failed = pyqtSignal(str)       # 参数：失败原因
 
     def __init__(self, db, retention_days: int, parent=None):
         super().__init__(parent)
@@ -60,12 +60,13 @@ class _CleanupWorker(QThread):
         deleted = 0
         try:
             if self.retention_days > 0:
-                deleted = self.db.cleanup_old_tasks(self.retention_days)
-            self.db.vacuum()
-        except Exception:
+                deleted = self.db.maintenance.cleanup_older_than(self.retention_days)
+            self.db.maintenance.vacuum()
+        except Exception as e:
             logger.error("清理并压缩数据库失败", exc_info=True)
-        finally:
-            self.finished_ok.emit(deleted)
+            self.failed.emit(str(e) or type(e).__name__)
+            return
+        self.finished_ok.emit(deleted)
 
 
 class _CnSwitchSettingCard(SwitchSettingCard):
@@ -318,6 +319,7 @@ class SettingPage(ScrollArea):
         worker = _CleanupWorker(self.db, days, self)
         self._cleanup_worker = worker
         worker.finished_ok.connect(self._on_cleanup_finished)
+        worker.failed.connect(self._on_cleanup_failed)
         # 线程对象的释放与维护状态的退出都挂在 QThread.finished 上：finished_ok 是
         # run() 的最后一个动作，但此时线程尚未真正结束
         worker.finished.connect(lambda w=worker: self._on_cleanup_thread_finished(w))
@@ -330,6 +332,16 @@ class SettingPage(ScrollArea):
             self._state_tooltip.setContent("数据库清理完成")
             self._state_tooltip.setState(True)
             self._state_tooltip = None
+        self._refresh_data_management_state()
+
+    def _on_cleanup_failed(self, reason: str) -> None:
+        """清理线程失败：StateToolTip 关闭（不显示"完成"），弹出"清理失败"错误提示"""
+        if self._state_tooltip is not None:
+            self._state_tooltip.close()
+            self._state_tooltip.deleteLater()
+            self._state_tooltip = None
+        self.services.notifier.error(
+            self.window(), "清理失败", f"清理并压缩数据库失败：{reason}")
         self._refresh_data_management_state()
 
     def _on_cleanup_thread_finished(self, worker) -> None:

@@ -6,16 +6,20 @@
 一个普通 dataclass 经信号发回，UI 槽在主线程用既有的 _update_chart/_update_table/
 _update_stats 等方法应用，绝不在工作线程触碰任何 Qt 控件。
 
-Database 每次操作都新建 sqlite 连接，可直接在工作线程调用（不共享连接对象）。
+Database 的仓储每次操作都新建 sqlite 连接，可直接在工作线程调用（不共享连接对象）。
+查询直接用仓储接口（失败抛 StorageError），不经门面的"吞异常返回空"——否则读取失败
+会被当成"暂无数据"显示。
 """
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from PyQt5.QtCore import QThread, pyqtSignal
 
+from data.errors import StorageError
 from data.models import DataPoint, Marker
+from data.repos.point_repo import PointQuery
 
 logger = logging.getLogger(__name__)
 
@@ -35,8 +39,33 @@ class HistoryRefreshResult:
     stats: Optional[dict] = None
     chart_points: List[DataPoint] = field(default_factory=list)
     markers: List[Marker] = field(default_factory=list)
-    # 查询过程抛出异常时的描述；非空时其余字段无意义，UI 侧只记日志不改界面
+    # 查询过程抛出异常时的描述；非空时其余字段无意义，UI 侧不改界面
     error: Optional[str] = None
+    # 失败是否为存储故障（StorageError）：UI 侧据此提示"读取数据失败"
+    storage_error: bool = False
+
+
+def query_history_data(db, task_id: str, metric_type: Optional[str],
+                       since: Optional[datetime], table_limit: int,
+                       max_buckets: int) -> Tuple[List[DataPoint], Optional[dict],
+                                                  List[DataPoint], List[Marker]]:
+    """
+    历史页的四类数据查询（手动加载与自动刷新共用，保证两条路径同口径）：
+    表格最近 table_limit 条、统计、分桶降采样、打点。范围内没有明细点时只查明细
+    （其余返回空），由调用方显示空状态。时间参数一律 datetime，失败抛 StorageError。
+
+    Returns:
+        (table_points, stats, chart_points, markers)
+    """
+    table_points = db.points.fetch(
+        PointQuery(task_id, metric_type, since=since, limit=table_limit))
+    if not table_points:
+        return table_points, None, [], []
+    stats = (db.analytics.legacy_stats(task_id, metric_type, since=since)
+             if metric_type else None)
+    chart_points = db.analytics.legacy_buckets(task_id, metric_type, max_buckets, since=since)
+    markers = db.markers.list(task_id, since=since)
+    return table_points, stats, chart_points, markers
 
 
 def query_history_refresh(db, request_id: int, task_id: str,
@@ -45,9 +74,10 @@ def query_history_refresh(db, request_id: int, task_id: str,
                           table_limit: int, max_buckets: int) -> HistoryRefreshResult:
     """
     执行自动刷新所需的全部只读查询（与 HistoryPage._load_task_data 的同步路径同口径）。
+    存储失败抛 StorageError，由 HistoryRefreshWorker.run 转成结果的 error 字段。
 
     Args:
-        db: Database 实例（或同接口的假对象）
+        db: Database 实例（用其仓储属性 tasks/points/analytics/markers）
         request_id/task_id/metric_type/range_key: 请求标识，原样写入结果
         range_seconds: 时间范围秒数，None 表示"全部"（不过滤）
         table_limit: 表格取最近多少条
@@ -57,7 +87,7 @@ def query_history_refresh(db, request_id: int, task_id: str,
         request_id=request_id, task_id=task_id,
         metric_type=metric_type, range_key=range_key)
 
-    task_info = db.get_task(task_id)
+    task_info = db.tasks.get(task_id)
     if not task_info:
         result.task_missing = True
         return result
@@ -65,24 +95,16 @@ def query_history_refresh(db, request_id: int, task_id: str,
     # 锚点：优先 tasks.last_sample_at，仅其为空才回退 MAX(timestamp) 查询
     last_dt = task_info.last_sample_at
     if last_dt is None:
-        last_dt = db.get_last_point_timestamp(task_id)
+        last_dt = db.analytics.last_point_timestamp(task_id)
     result.last_dt = last_dt
 
-    since_iso = None
+    since = None
     if range_seconds is not None and last_dt is not None:
-        since_iso = (last_dt - timedelta(seconds=range_seconds)).isoformat()
+        since = last_dt - timedelta(seconds=range_seconds)
 
-    result.table_points = db.get_task_data_points(
-        task_id, metric_type=metric_type, limit=table_limit, since_iso=since_iso)
-    if not result.table_points:
-        # 范围内无数据：UI 侧据此显示空状态，无需再查统计/分桶
-        return result
-
-    result.stats = (db.get_metric_stats(task_id, metric_type, since_iso=since_iso)
-                    if metric_type else None)
-    result.chart_points = db.get_task_data_points_bucketed(
-        task_id, metric_type=metric_type, max_buckets=max_buckets, since_iso=since_iso)
-    result.markers = db.get_markers(task_id, since_iso=since_iso)
+    (result.table_points, result.stats,
+     result.chart_points, result.markers) = query_history_data(
+        db, task_id, metric_type, since, table_limit, max_buckets)
     return result
 
 
@@ -123,5 +145,6 @@ class HistoryRefreshWorker(QThread):
             result = HistoryRefreshResult(
                 request_id=self._request_id, task_id=self._task_id,
                 metric_type=self._metric_type, range_key=self._range_key,
-                error=str(e) or type(e).__name__)
+                error=str(e) or type(e).__name__,
+                storage_error=isinstance(e, StorageError))
         self.result_ready.emit(result)

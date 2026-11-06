@@ -106,6 +106,7 @@ class MonitorTask(QThread):
             end_time=None,
             status=TaskStatus.PENDING,
             note=self.note,
+            create_time=create_time,   # 随任务行落库，供事后识别 PID 复用
         )
 
     def start(self, priority=QThread.InheritPriority):

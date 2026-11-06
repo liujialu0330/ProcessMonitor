@@ -5,6 +5,7 @@
 import math
 import random
 import statistics
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -13,6 +14,7 @@ from core.analysis.trend import (
     MIN_POINTS,
     FitInput,
     Verdict,
+    fit_input_from_aggregates,
     judge,
     linear_fit,
     min_span_for,
@@ -275,3 +277,37 @@ def test_confidence_uses_r2_for_rising():
 def test_verdict_is_str_enum():
     assert Verdict.RISING == 'rising'
     assert str(Verdict.INSUFFICIENT) == 'insufficient'
+
+
+# ========== 数据层聚合结果 → 拟合输入（原 MetricAggregates.to_fit_input） ==========
+
+def _seed_series(db, task_id, seconds, value_of, metric='memory_rss'):
+    from data.models import DataPoint, MonitorTask
+    t0 = datetime(2026, 3, 1, 10, 0, 0)
+    db.save_task(MonitorTask(task_id=task_id, pid=1, process_name='a.exe',
+                             metric_types=[metric], interval=2.0, start_time=t0,
+                             end_time=None, status='stopped'))
+    db.save_data_points([DataPoint(task_id, t0 + timedelta(seconds=s), value_of(s), metric)
+                         for s in seconds])
+
+
+def test_fit_input_from_aggregates_linear_slope(db):
+    # 完全线性：y = 3 + 0.25·x，每 2 秒一个点
+    _seed_series(db, 't', range(0, 400, 2), lambda s: 3 + 0.25 * s)
+
+    fit_input = fit_input_from_aggregates(db.analytics.aggregates('t', 'memory_rss'))
+    assert isinstance(fit_input, FitInput)
+    assert fit_input.count == 200
+    assert fit_input.span_seconds == 398.0
+    assert fit_input.first_value == 3.0 and fit_input.last_value == 3 + 0.25 * 398
+    assert (fit_input.min_value, fit_input.max_value) == (3.0, 3 + 0.25 * 398)
+    fit = linear_fit(fit_input)
+    assert math.isclose(fit.slope_per_second, 0.25, rel_tol=1e-9)
+    assert math.isclose(fit.intercept, 3.0, rel_tol=1e-9)
+    assert math.isclose(fit.r2, 1.0, rel_tol=1e-9)
+
+
+def test_fit_input_from_aggregates_empty_is_none(db):
+    _seed_series(db, 't', range(5), float)
+    assert fit_input_from_aggregates(db.analytics.aggregates('t', 'cpu_percent')) is None
+    assert fit_input_from_aggregates(db.analytics.aggregates('missing', 'memory_rss')) is None

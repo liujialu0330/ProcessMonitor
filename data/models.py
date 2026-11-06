@@ -27,44 +27,13 @@ class MonitorTask:
     note: str = ''                          # 任务备注
     sample_count: int = 0                   # 已采集次数（同一周期多指标算一次）
     last_sample_at: Optional[datetime] = None  # 最后一次采样时间
+    # 被监控进程的创建时间（psutil.Process.create_time() 的 epoch 秒）；
+    # 用于识别 PID 复用，不是查询用的时间参数，因此保留 float
+    create_time: Optional[float] = None
 
     def is_running(self) -> bool:
         """判断任务是否正在运行"""
         return self.status == 'running'   # 与 TaskStatus.RUNNING 的值一致
-
-    def to_dict(self) -> dict:
-        """转换为字典"""
-        return {
-            'task_id': self.task_id,
-            'pid': self.pid,
-            'process_name': self.process_name,
-            'metric_types': self.metric_types,
-            'interval': self.interval,
-            'start_time': self.start_time.isoformat() if self.start_time else None,
-            'end_time': self.end_time.isoformat() if self.end_time else None,
-            'status': self.status,
-            'note': self.note,
-            'sample_count': self.sample_count,
-            'last_sample_at': self.last_sample_at.isoformat() if self.last_sample_at else None,
-        }
-
-    @staticmethod
-    def from_dict(data: dict) -> 'MonitorTask':
-        """从字典创建（兼容旧版单指标 metric_type 字段）"""
-        return MonitorTask(
-            task_id=data['task_id'],
-            pid=data['pid'],
-            process_name=data['process_name'],
-            metric_types=data.get('metric_types') or [data['metric_type']],
-            interval=data['interval'],
-            start_time=datetime.fromisoformat(data['start_time']) if data['start_time'] else None,
-            end_time=datetime.fromisoformat(data['end_time']) if data['end_time'] else None,
-            status=data['status'],
-            note=data.get('note') or '',
-            sample_count=data.get('sample_count') or 0,
-            last_sample_at=(datetime.fromisoformat(data['last_sample_at'])
-                            if data.get('last_sample_at') else None),
-        )
 
 
 @dataclass
@@ -75,25 +44,6 @@ class DataPoint:
     value: float                # 指标值
     metric_type: str = ""       # 指标类型（空串兼容旧数据）
 
-    def to_dict(self) -> dict:
-        """转换为字典"""
-        return {
-            'task_id': self.task_id,
-            'timestamp': self.timestamp.isoformat() if self.timestamp else None,
-            'value': self.value,
-            'metric_type': self.metric_type,
-        }
-
-    @staticmethod
-    def from_dict(data: dict) -> 'DataPoint':
-        """从字典创建"""
-        return DataPoint(
-            task_id=data['task_id'],
-            timestamp=datetime.fromisoformat(data['timestamp']) if data['timestamp'] else None,
-            value=data['value'],
-            metric_type=data.get('metric_type', ''),
-        )
-
 
 @dataclass
 class Marker:
@@ -102,3 +52,11 @@ class Marker:
     timestamp: datetime         # 标记时间
     label: str                  # 标记文字
     id: Optional[int] = None    # 数据库自增ID（未入库时为 None）
+    kind: str = 'user'          # 打点类型，取值见 MARKER_KINDS
+
+
+# 打点类型：用户手动打点 / 基线 / 暂停 / 恢复（task_markers.kind 列的合法取值）
+MARKER_KINDS = ('user', 'baseline', 'pause', 'resume')
+
+# 阶段性改名：MonitorTask 与 core 层的同名线程类易混，新代码请用 TaskRecord
+TaskRecord = MonitorTask

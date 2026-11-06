@@ -2,7 +2,6 @@
 数据库 schema v3 用例：迁移（v0/v1/v2 -> v3）、新库结构一致性、事务性、
 sample_count/last_sample_at 维护、upsert、标记、统计与流式读取等数据层新接口
 """
-import json
 import logging
 import os
 import sqlite3
@@ -12,9 +11,13 @@ from datetime import datetime, timedelta
 import pytest
 
 import data.database as database_module
-from data.database import Database, SCHEMA_VERSION
+from data.database import Database
+from data.db.migrations.runner import MigrationOutcome
+from data.db.schema import SCHEMA_VERSION
 from data.models import DataPoint, Marker, MonitorTask
-from tests.test_migration import _create_v0_db, _get_user_version
+from tests.test_migration import (
+    _create_v0_db, _get_user_version, patched_migrations, run_migration,
+)
 from tests.test_migration_v2 import _create_v1_db
 
 
@@ -77,13 +80,14 @@ def _schema_signature(path: str):
 
 # ========== schema 一致性 ==========
 
-def test_new_db_has_v3_structure(db_path):
+def test_new_db_has_current_structure(db_path):
     Database(db_path)
     tables, columns, indexes = _schema_signature(db_path)
-    assert _get_user_version(db_path) == SCHEMA_VERSION == 3
+    assert _get_user_version(db_path) == SCHEMA_VERSION == 4
     assert tables == ['data_points', 'task_markers', 'tasks']
     task_cols = [c[0] for c in columns['tasks']]
-    assert task_cols[-3:] == ['note', 'sample_count', 'last_sample_at']
+    assert task_cols[-4:] == ['note', 'sample_count', 'last_sample_at', 'create_time']
+    assert [c[0] for c in columns['task_markers']][-1] == 'kind'
     assert indexes == {
         'idx_data_points_task_metric_ts': ('data_points', ['task_id', 'metric_type', 'timestamp']),
         'idx_task_markers_task_ts': ('task_markers', ['task_id', 'timestamp']),
@@ -130,6 +134,7 @@ def test_v2_to_v3_cleans_backfills_and_reindexes(db_path):
     db = Database(db_path)
 
     assert db.migration_failed is False
+    assert db.migration_report.outcome is MigrationOutcome.MIGRATED
     assert os.path.exists(db_path + '.bak_v2')
     conn = sqlite3.connect(db_path)
     try:
@@ -151,7 +156,7 @@ def test_v2_to_v3_cleans_backfills_and_reindexes(db_path):
     assert [t.task_id for t in db.get_tasks_with_data()] == ['t1']
 
 
-def test_v3_migration_failure_rolls_back_ddl_and_restores(db_path, monkeypatch):
+def test_v3_migration_failure_rolls_back_ddl_and_restores(db_path):
     """v3 步骤失败：整条链回滚并从备份还原，库仍为 v2"""
     _create_v2_db(db_path, {'t1': ['memory_rss']},
                   [('t1', '2026-01-01T00:00:01', 1.0, 'memory_rss')])
@@ -160,11 +165,9 @@ def test_v3_migration_failure_rolls_back_ddl_and_restores(db_path, monkeypatch):
         cursor.execute("ALTER TABLE tasks ADD COLUMN note TEXT NOT NULL DEFAULT ''")
         raise RuntimeError("模拟迁移失败")
 
-    monkeypatch.setattr(Database, '_migrate_v2_to_v3', staticmethod(_boom))
+    report = run_migration(db_path, patched_migrations(3, _boom))
 
-    db = Database(db_path)
-
-    assert db.migration_failed is True
+    assert report.outcome is MigrationOutcome.FAILED_RESTORED
     assert _get_user_version(db_path) == 2
     conn = sqlite3.connect(db_path)
     try:
@@ -245,15 +248,17 @@ def test_failed_save_rolls_back_sample_count(db, monkeypatch):
     """同一事务：写数据点失败时 sample_count 不会被单独更新"""
     task = _make_task()
     db.save_task(task)
-    original = Database._insert_data_points
+    # 触发器让"插入数据点之后的 UPDATE tasks"失败：数据点已插入、计数更新时中途出错
+    conn = sqlite3.connect(db.db_path)
+    try:
+        conn.execute("""
+            CREATE TRIGGER fail_count BEFORE UPDATE OF sample_count ON tasks
+            BEGIN SELECT RAISE(ABORT, '模拟写入中途失败'); END""")
+        conn.commit()
+    finally:
+        conn.close()
 
-    def _fail_after_insert(cursor, points):
-        original(cursor, points)
-        raise sqlite3.OperationalError("模拟写入中途失败")
-
-    with monkeypatch.context() as m:
-        m.setattr(Database, '_insert_data_points', staticmethod(_fail_after_insert))
-        assert db.save_data_points(_points(task.task_id, datetime(2026, 1, 1), 2)) is False
+    assert db.save_data_points(_points(task.task_id, datetime(2026, 1, 1), 2)) is False
 
     assert db.get_sample_count(task.task_id) == 0
     assert db.get_data_point_count(task.task_id) == 0
@@ -264,7 +269,8 @@ def test_save_data_points_failure_log_throttled(db, monkeypatch, caplog):
     def _boom(*args, **kwargs):
         raise sqlite3.OperationalError("disk full")
 
-    monkeypatch.setattr(db, '_get_connection', _boom)
+    # 打在连接工厂上：走真实的 PointRepo → StorageError → 门面吞异常的链路
+    monkeypatch.setattr(db._factory, 'transaction', _boom)
     point = DataPoint("t", datetime(2026, 1, 1), 1.0, "memory_rss")
 
     with caplog.at_level(logging.ERROR, logger=database_module.logger.name):
@@ -359,6 +365,8 @@ def test_markers_roundtrip_ascending_and_since(db):
 
     since = (t0 + timedelta(minutes=1)).isoformat()
     assert [m.label for m in db.get_markers(task.task_id, since_iso=since)] == ["后"]
+    # 新接口：markers.list 收 datetime
+    assert [m.label for m in db.markers.list(task.task_id, since=t0 + timedelta(minutes=1))]         == ["后"]
 
 
 # ========== 统计 ==========
@@ -466,15 +474,3 @@ def test_iter_data_points_early_close_and_empty(db):
     gen.close()   # 提前终止不应报错，且之后库仍可正常读写
     assert db.get_data_point_count(task.task_id) == 10
     assert db.save_data_points(_points(task.task_id, datetime(2026, 2, 1), 1)) is True
-
-
-def test_task_dict_roundtrip_includes_new_fields():
-    task = _make_task(note="n", sample_count=4, last_sample_at=datetime(2026, 1, 1, 1, 2, 3))
-    restored = MonitorTask.from_dict(json.loads(json.dumps(task.to_dict())))
-    assert (restored.note, restored.sample_count, restored.last_sample_at) == (
-        "n", 4, datetime(2026, 1, 1, 1, 2, 3))
-    # 旧字典（无新键）仍可还原
-    legacy = {k: v for k, v in task.to_dict().items()
-              if k not in ('note', 'sample_count', 'last_sample_at')}
-    old = MonitorTask.from_dict(legacy)
-    assert (old.note, old.sample_count, old.last_sample_at) == ('', 0, None)

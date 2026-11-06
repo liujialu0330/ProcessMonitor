@@ -20,6 +20,7 @@ os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 import config  # noqa: E402
 from core.monitor_manager import MonitorManager  # noqa: E402
 from data.database import Database  # noqa: E402
+from data.db.migrations.runner import reset_guard_for_tests  # noqa: E402
 import app_config  # noqa: E402
 from qfluentwidgets import qconfig, Theme  # noqa: E402
 
@@ -87,25 +88,14 @@ def db(db_path):
 @pytest.fixture(autouse=True)
 def _reset_migration_guard():
     """
-    重置 Database 类级迁移 guard（_migration_attempted/_migration_state）。
+    重置进程级迁移记录（MigrationRunner 按库路径记住本进程内的迁移结果）。
 
-    该 guard 设计为进程级（防止 backup_aborted 场景下每个新 Database() 实例重复
-    触发备份），但测试进程内会连续实例化多个指向不同 tmp db_path 的 Database，
-    若不在用例间重置会互相污染（前一个用例触发迁移后置位，后续用例直接被跳过）。
+    该记录用于防止 backup_aborted 场景下每个新 Database() 实例重复触发备份；
+    测试里 tmp_path 每个用例不同，但为避免同名路径或异常残留互相污染，用例前后都清空。
     """
-    Database._migration_attempted = False
-    Database._migration_state = {
-        'migration_failed': False,
-        'data_reset': False,
-        'backup_aborted': False,
-    }
+    reset_guard_for_tests()
     yield
-    Database._migration_attempted = False
-    Database._migration_state = {
-        'migration_failed': False,
-        'data_reset': False,
-        'backup_aborted': False,
-    }
+    reset_guard_for_tests()
 
 
 @pytest.fixture(autouse=True)

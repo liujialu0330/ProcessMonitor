@@ -280,6 +280,57 @@ def test_create_task_passes_create_time_to_task(manager):
     assert manager.get_task(without_ct).expected_create_time is None
 
 
+def test_add_marker_persists_with_id_via_markers_repo(manager, monkeypatch):
+    """manager 经 db.markers.add 写入：落库的打点带自增 ID、类型为用户打点"""
+    task_id = manager.create_task(os.getpid(), "x.exe", ["memory_rss"], 1.0)
+    seen = []
+    real = manager.db.markers.add
+    monkeypatch.setattr(manager.db.markers, 'add',
+                        lambda *a, **k: seen.append(real(*a, **k)) or seen[-1])
+
+    ts = manager.add_marker(task_id, "第 1 轮", datetime(2026, 11, 6, 9, 0, 0))
+
+    assert ts == datetime(2026, 11, 6, 9, 0, 0)
+    markers = manager.db.markers.list(task_id)
+    assert len(seen) == 1 and isinstance(seen[0], int) and seen[0] > 0
+    assert [(m.id, m.label, m.kind) for m in markers] == [(seen[0], "第 1 轮", "user")]
+
+
+def test_add_marker_storage_error_returns_none(manager, monkeypatch):
+    from data.errors import StorageError
+    task_id = manager.create_task(os.getpid(), "x.exe", ["memory_rss"], 1.0)
+
+    def boom(*a, **k):
+        raise StorageError("添加打点失败: database is locked")
+
+    monkeypatch.setattr(manager.db.markers, 'add', boom)
+    assert manager.add_marker(task_id, "x") is None
+
+
+def test_create_time_is_written_to_task_row(manager):
+    """create_task 的 create_time 随任务行落库（任务线程启动时 save_task 写入）"""
+    create_time = 1_700_000_000.25
+
+    class _Collector(_SlowCollector):
+        def get_create_time(self):
+            return create_time          # 与所选进程一致：不触发 PID 复用判定
+
+    task_id, task = _start_task_with_collector(
+        manager, _Collector(), create_time=create_time)
+    assert poll_until(lambda: manager.db.get_task(task_id) is not None)
+    assert manager.db.get_task(task_id).create_time == create_time
+    manager.stop_all_tasks()
+    # 停止收尾再次保存任务行，create_time 不丢
+    assert manager.db.get_task(task_id).create_time == create_time
+
+    plain = manager.create_task(os.getpid(), "y.exe", ["memory_rss"], 1.0)
+    manager.get_task(plain).collector = _SlowCollector()
+    manager.start_task(plain)
+    assert poll_until(lambda: manager.db.get_task(plain) is not None)
+    manager.stop_all_tasks()
+    assert manager.db.get_task(plain).create_time is None
+
+
 def test_add_marker_failures_return_none(manager):
     task_id = manager.create_task(os.getpid(), "x.exe", ["memory_rss"], 1.0)
     assert manager.add_marker("unknown-task", "x") is None

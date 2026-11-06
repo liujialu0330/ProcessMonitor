@@ -241,6 +241,34 @@ def test_cleanup_holds_maintenance_until_thread_finished(setting, manager, dialo
     assert setting.cleanup_card.button.isEnabled()
 
 
+@pytest.mark.parametrize("failing", ["vacuum", "cleanup_older_than"])
+def test_cleanup_failure_reports_error_instead_of_done(setting, db, manager, dialogs,
+                                                       notifier, monkeypatch, failing):
+    """压缩/清理抛 StorageError：发失败信号、提示"清理失败"，不再显示"数据库清理完成"；
+    维护状态照常在线程结束时退出"""
+    from data.errors import StorageError
+
+    def boom(*a, **k):
+        raise StorageError("压缩数据库失败: database is locked")
+
+    monkeypatch.setattr(db.maintenance, failing, boom)
+    done = []
+    monkeypatch.setattr(setting, '_on_cleanup_finished', lambda deleted: done.append(deleted))
+    dialogs.always("confirm", True)
+
+    setting._on_cleanup_clicked()
+    assert poll_until(
+        lambda: (QApplication.processEvents() or True) and setting._cleanup_worker is None,
+        timeout=20)
+
+    assert done == []
+    error = notifier.last("error")
+    assert error.title == "清理失败" and "database is locked" in error.content
+    assert setting._state_tooltip is None
+    assert manager.is_maintenance_running() is False
+    assert setting.cleanup_card.button.isEnabled()
+
+
 def test_result_slot_does_not_release_worker_or_leave_maintenance(setting, manager):
     manager.begin_maintenance()
     sentinel = SimpleNamespace(isRunning=lambda: False, wait=lambda *a: True)

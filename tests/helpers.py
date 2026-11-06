@@ -37,3 +37,105 @@ def record_stop_reasons(task) -> list:
     task.task_stopped.connect(
         lambda _tid, reason: reasons.append(reason), Qt.DirectConnection)
     return reasons
+
+
+class ConnectionFactoryStub:
+    """
+    与 data.db.connection.ConnectionFactory 同接口的测试桩（db_path / connect() / transaction()），
+    两个上下文管理器照搬 Database._get_connection / Database._transaction，
+    供仓储单元测试在连接工厂就绪前独立驱动仓储。
+    """
+
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+
+    def _open(self, **kwargs):
+        import sqlite3
+        conn = sqlite3.connect(self.db_path, **kwargs)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    @staticmethod
+    def _pragmas(conn):
+        conn.execute('PRAGMA journal_mode=WAL')
+        conn.execute('PRAGMA busy_timeout=5000')
+        conn.execute('PRAGMA synchronous=NORMAL')
+
+    def connect(self):
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _cm():
+            conn = self._open()
+            try:
+                self._pragmas(conn)
+                yield conn
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+        return _cm()
+
+    def transaction(self):
+        import sqlite3
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _cm():
+            conn = self._open(isolation_level=None)
+            try:
+                self._pragmas(conn)
+                conn.execute('BEGIN IMMEDIATE')
+                try:
+                    yield conn.cursor()
+                    conn.execute('COMMIT')
+                except BaseException:
+                    try:
+                        conn.execute('ROLLBACK')
+                    except sqlite3.Error:
+                        pass
+                    raise
+            finally:
+                conn.close()
+        return _cm()
+
+
+def make_v4_db(db_path: str) -> str:
+    """
+    建一个 v4 结构的临时库并返回路径。
+    现在先用 Database(path) 建 v3，再补 v4 的两列；连接工厂/迁移的 v4 就绪后改为直接用 Database。
+    """
+    import sqlite3
+    from data.database import Database
+
+    Database(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        columns = {row[1] for row in conn.execute('PRAGMA table_info(tasks)')}
+        if 'create_time' not in columns:
+            conn.execute('ALTER TABLE tasks ADD COLUMN create_time REAL')
+        columns = {row[1] for row in conn.execute('PRAGMA table_info(task_markers)')}
+        if 'kind' not in columns:
+            conn.execute("ALTER TABLE task_markers ADD COLUMN kind TEXT NOT NULL DEFAULT 'user'")
+        conn.commit()
+    finally:
+        conn.close()
+    return db_path
+
+
+def make_broken_factories(tmp_dir: str) -> list:
+    """
+    两个必然触发 sqlite3.Error 的连接工厂桩：库所在目录不存在（打不开）、库文件已损坏
+    （不是 SQLite 文件），用于验证仓储把 sqlite3.Error 包成 StorageError。
+    """
+    import os
+
+    corrupt = os.path.join(tmp_dir, 'corrupt.db')
+    with open(corrupt, 'wb') as f:
+        f.write(b'this is not a sqlite database file' * 64)
+    return [
+        ConnectionFactoryStub(os.path.join(tmp_dir, 'no_such_dir', 'x.db')),
+        ConnectionFactoryStub(corrupt),
+    ]

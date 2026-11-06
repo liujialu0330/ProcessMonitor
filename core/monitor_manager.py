@@ -11,6 +11,7 @@ from PyQt5.QtCore import QObject, pyqtSignal
 from core.contracts import StopReason, TaskInfo, TaskStatus
 from core.monitor_task import MonitorTask
 from data.database import Database
+from data.errors import StorageError
 from data.models import MonitorTask as TaskModel
 from utils.thread_utils import shutdown_thread
 import config
@@ -433,8 +434,12 @@ class MonitorManager(QObject):
             return None
         if timestamp is None:
             timestamp = datetime.now()
-        if not self.db.add_marker(task_id, timestamp, label):
+        try:
+            marker_id = self.db.markers.add(task_id, timestamp, label)
+        except StorageError:
+            logger.error("添加标记失败: task_id=%s", task_id, exc_info=True)
             return None
+        logger.info("添加标记: task_id=%s marker_id=%s", task_id, marker_id)
         return timestamp
 
     def delete_task_data(self, task_id: str) -> bool:

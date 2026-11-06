@@ -165,6 +165,30 @@ def test_export_failure_keeps_existing_target_and_removes_tmp(qapp, db, db_path,
         assert f.read() == "原有重要文件"
 
 
+def test_export_storage_error_mid_read_reports_failure(qapp, db, tmp_path, monkeypatch):
+    """读库中途失败（仓储抛 StorageError）：走导出失败路径，不留临时文件、不发完成信号"""
+    from data.errors import StorageError
+    task = _seeded_task(db)
+    save_path = str(tmp_path / "storage_fail.csv")
+    real = db.points.iter_batches
+
+    def _failing(task_id, batch_size=5000):
+        def gen():
+            yield from list(real(task_id, batch_size))[:1]
+            raise StorageError("流式读取数据点失败: disk I/O error")
+        return gen()
+
+    monkeypatch.setattr(db.points, 'iter_batches', _failing)
+    worker = ExportWorker(db, task, save_path)
+
+    results = _run_sync(worker)
+
+    assert results['finished'] == [] and len(results['errors']) == 1
+    assert "disk I/O error" in results['errors'][0]
+    assert not os.path.exists(save_path + '.tmp')
+    assert not os.path.exists(save_path)
+
+
 def test_export_cancel_keeps_existing_target(qapp, db, db_path, tmp_path):
     task = _seeded_task(db)
     save_path = str(tmp_path / "keep_cancel.csv")
