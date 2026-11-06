@@ -51,6 +51,13 @@ def test_normalize_metrics_filters_unknown_and_canonicalizes():
     assert normalize_metrics(None) == LEAK_CHECK_PRESET
 
 
+def test_normalize_metrics_drops_deprecated_involuntary_ctx_switches():
+    """旧配置里记住的已废弃指标（非自愿上下文切换）被丢弃，不再带进新任务"""
+    assert normalize_metrics(
+        [MetricType.NUM_CTX_SWITCHES_INVOL, MetricType.NUM_THREADS]
+    ) == [MetricType.NUM_THREADS]
+
+
 def test_last_metrics_assignment_is_validated():
     """直接赋值非法内容也会被校验器纠正"""
     cfg.last_metrics.value = ["bogus", "memory_pagefile"]
@@ -84,7 +91,7 @@ def test_last_metrics_roundtrip_through_config_file(tmp_path):
 # ---------- 说明 ----------
 
 def test_every_metric_has_one_sentence_description():
-    """全部 27 项指标都有说明，且键集合与显示名一致"""
+    """全部 27 项指标（26 项可选 + 1 项已废弃）都有说明，且键集合与显示名一致"""
     assert len(METRIC_DESCRIPTIONS) == 27
     assert set(METRIC_DESCRIPTIONS) == set(METRIC_DISPLAY_NAMES)
     for metric, text in METRIC_DESCRIPTIONS.items():

@@ -1,6 +1,6 @@
 """
 历史页：默认范围与空状态文案、缓存失效、运行中任务自动刷新、自适应范围、统计条、
-打点竖线、表格提示、任务下拉文案、经 manager 删除。
+打点竖线、表格提示、任务下拉文案、经 manager 删除、删除确认框、错误提示停留时长。
 """
 import uuid
 from datetime import datetime, timedelta
@@ -8,10 +8,13 @@ from types import SimpleNamespace
 
 import pyqtgraph as pg
 import pytest
+from PyQt5.QtCore import Qt
+from PyQt5.QtTest import QTest
 
 import ui.pages.history_page as history_module
 from core.monitor_manager import MonitorManager
 from data.models import DataPoint, MonitorTask
+from ui.components.confirm import DestructiveConfirmBox
 from ui.pages.history_page import AUTO_REFRESH_INTERVAL_MS, HistoryPage
 from utils.metrics import MetricType
 
@@ -273,8 +276,13 @@ def test_select_task_picks_given_task(page, db):
     assert "b.exe" in page.task_combo.currentText()
 
     page.select_task("missing-task")
-    # 不在列表中：回落到首项，不抛异常
-    assert page.current_task_id in (first.task_id, second.task_id, None)
+    # 不在列表中（已删除或尚无数据）：清空选择并显示"请选择监控任务"，
+    # 不静默回落到首项；列表本身保持完整
+    assert page.current_task_id is None
+    assert page.current_metric is None
+    assert page.task_combo.currentIndex() == -1
+    assert page.task_combo.count() == 2
+    assert page.empty_title_label.text() == "请选择监控任务"
 
 
 # ---------- 删除经 manager ----------
@@ -290,7 +298,7 @@ def test_delete_goes_through_manager(page, db, manager, monkeypatch):
         def exec(self):
             return True
 
-    monkeypatch.setattr(history_module, 'MessageBox', _Yes)
+    monkeypatch.setattr(history_module, 'DestructiveConfirmBox', _Yes)
     monkeypatch.setattr(history_module, 'InfoBar', SimpleNamespace(
         success=lambda **k: None, error=lambda **k: None, warning=lambda **k: None))
     deleted = []
@@ -318,7 +326,7 @@ def test_delete_failure_keeps_task(page, db, manager, monkeypatch):
             return True
 
     errors = []
-    monkeypatch.setattr(history_module, 'MessageBox', _Yes)
+    monkeypatch.setattr(history_module, 'DestructiveConfirmBox', _Yes)
     monkeypatch.setattr(history_module, 'InfoBar', SimpleNamespace(
         success=lambda **k: None, error=lambda **k: errors.append(k),
         warning=lambda **k: None))
@@ -327,7 +335,101 @@ def test_delete_failure_keeps_task(page, db, manager, monkeypatch):
     page._on_delete_task_clicked()
 
     assert len(errors) == 1
+    # 错误提示不能一闪即逝：不自动消失，由用户手动关闭
+    assert errors[0]['duration'] == -1
     assert db.get_task(task.task_id) is not None
+
+
+def test_delete_confirm_is_chinese_and_enter_does_not_delete(page, db, manager, monkeypatch):
+    """真实确认框：按钮为"删除/取消"，显示后焦点在"取消"，回车不会删除"""
+    task = _seed_task(db, samples=5)
+    page.show()
+    page.select_task(task.task_id)
+    seen = {}
+
+    class _Probe(DestructiveConfirmBox):
+        def exec(self):
+            # 不进模态循环：显示后记录状态，再向焦点控件按回车，模拟用户顺手回车
+            self.show()
+            QTest.qWait(300)  # 等淡入动画结束，避免动画回调落到后续用例里
+            seen.update(yes=self.yesButton.text(), cancel=self.cancelButton.text(),
+                        focus=self.focusWidget())
+            accepted = []
+            self.yesSignal.connect(lambda: accepted.append(True))
+            QTest.keyClick(self.focusWidget(), Qt.Key_Return)
+            for _ in range(50):  # 等 100ms 淡出动画结束、对话框真正关闭
+                if not self.isVisible():
+                    break
+                QTest.qWait(20)
+            seen['cancel_button'] = self.cancelButton
+            return bool(accepted)
+
+    monkeypatch.setattr(history_module, 'DestructiveConfirmBox', _Probe)
+    deleted = []
+    monkeypatch.setattr(manager, 'delete_task_data', lambda tid: deleted.append(tid) or True)
+
+    page._on_delete_task_clicked()
+
+    assert seen['yes'] == "删除"
+    assert seen['cancel'] == "取消"
+    assert seen['focus'] is seen['cancel_button']
+    assert deleted == []
+    assert db.get_task(task.task_id) is not None
+
+
+# ---------- 错误提示停留时长 ----------
+
+def _capture_errors(monkeypatch):
+    errors = []
+    monkeypatch.setattr(history_module, 'InfoBar', SimpleNamespace(
+        success=lambda **k: None, error=lambda **k: errors.append(k),
+        warning=lambda **k: None, info=lambda **k: None))
+    return errors
+
+
+def test_load_task_failure_error_stays_until_closed(page, monkeypatch):
+    errors = _capture_errors(monkeypatch)
+
+    page._load_task_data("不存在的任务")
+
+    assert len(errors) == 1
+    assert errors[0]['duration'] == -1
+
+
+def test_save_chart_failure_error_stays_until_closed(page, db, monkeypatch, tmp_path):
+    task = _seed_task(db, samples=5)
+    page.select_task(task.task_id)
+    assert page._chart_x
+    errors = _capture_errors(monkeypatch)
+    monkeypatch.setattr(history_module, 'QFileDialog', SimpleNamespace(
+        getSaveFileName=lambda *a, **k: (str(tmp_path / "chart.png"), "")))
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("导出失败")
+
+    monkeypatch.setattr(history_module, 'exporters', SimpleNamespace(ImageExporter=_boom))
+
+    page._save_chart_as_png()
+
+    assert len(errors) == 1
+    assert errors[0]['duration'] == -1
+
+
+def test_copy_chart_failure_error_stays_until_closed(page, db, monkeypatch):
+    task = _seed_task(db, samples=5)
+    page.select_task(task.task_id)
+    assert page._chart_x
+    errors = _capture_errors(monkeypatch)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("截图失败")
+
+    monkeypatch.setattr(page.chart_widget, 'grab', _boom)
+
+    page._copy_chart_to_clipboard()
+
+    assert len(errors) == 1
+    assert errors[0]['duration'] == -1
 
 
 def test_small_window_scrolls_instead_of_clipping_chart(qapp, db, manager):

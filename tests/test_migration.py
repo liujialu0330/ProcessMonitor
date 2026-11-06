@@ -269,12 +269,6 @@ def test_restore_from_backup_also_fails_resets_to_empty_db(db_path, monkeypatch)
 
     # 原始数据的权威留存位置是迁移前只写一次、之后只读不写的 .bak_v0 备份文件——
     # 这是数据"没有真正丢失"的可靠断言依据。
-    # 注：_migrate_v0_to_v1 的 for attempt in (1, 2) 循环里，每次失败都会触发一次
-    # "还原失败->改名保留->新建空库"，磁盘上可能出现多个 .broken_* 文件；但改名用的
-    # 时间戳只精确到秒，同一秒内的第二次 os.replace 可能与第一次同名而相互覆盖——
-    # 这是 _restore_from_backup 里预先存在、超出本轮 M1/M3 范围的边界情况（发现后未
-    # 修复，已在验收报告中注明留给后续处理），因此这里不依赖 .broken_* 的具体份数与
-    # 内容做强断言，只确认至少留下了改名痕迹。
     backup_path = db_path + '.bak_v0'
     assert os.path.exists(backup_path), "迁移前的 .bak_v0 备份应始终存在，不受还原失败影响"
     conn = sqlite3.connect(backup_path)
@@ -287,5 +281,101 @@ def test_restore_from_backup_also_fails_resets_to_empty_db(db_path, monkeypatch)
     assert row is not None and row[0] == 'memory_rss', (
         ".bak_v0 备份应完整保留原始任务数据（证明数据从未真正丢失）")
 
+    # 重置为空库后立即停止重试：只改名一次，不会拿旧版本号在新空库上再跑迁移链
     broken_files = glob.glob(db_path + '.broken_*')
-    assert len(broken_files) >= 1, "应至少留下一个 .broken_* 改名痕迹"
+    assert len(broken_files) == 1, broken_files
+
+    # 损坏库原样保留在 .broken_* 中（仍是 v0 结构与数据）
+    assert _get_user_version(broken_files[0]) == 0
+
+
+def test_restore_and_rename_both_fail_never_stamps_schema_on_old_db(db_path, monkeypatch):
+    """
+    迁移失败 + 备份还原失败 + 改名损坏库也失败：不得在原路径建表或写 user_version，
+    否则旧表会被标成当前版本、永不再迁移。应原样留下旧库并置 migration_failed。
+    """
+    _create_v0_db(db_path)
+
+    def _boom_migrate(cursor):
+        raise RuntimeError("模拟迁移失败")
+
+    monkeypatch.setattr(Database, '_migrate_v0_to_v1', staticmethod(_boom_migrate))
+
+    original_copy2 = shutil.copy2
+    call_count = {'n': 0}
+
+    def _copy2_side_effect(src, dst, *args, **kwargs):
+        call_count['n'] += 1
+        if call_count['n'] == 1:
+            return original_copy2(src, dst, *args, **kwargs)
+        raise OSError("模拟还原失败")
+
+    def _deny_replace(src, dst):
+        raise PermissionError("模拟文件被占用，无法改名")
+
+    monkeypatch.setattr(database_module.shutil, 'copy2', _copy2_side_effect)
+    monkeypatch.setattr(database_module.os, 'replace', _deny_replace)
+
+    db = Database(db_path)
+
+    assert db.migration_failed is True
+    assert db.data_reset is False
+    assert db.backup_aborted is False
+
+    # 原路径仍是 v0 旧库：版本号未被改写，没有新建 v3 的表或列
+    assert _get_user_version(db_path) == 0
+    conn = sqlite3.connect(db_path)
+    try:
+        tables = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'")}
+        task_columns = {row[1] for row in conn.execute('PRAGMA table_info(tasks)')}
+        dp_columns = {row[1] for row in conn.execute('PRAGMA table_info(data_points)')}
+        raw_value = conn.execute(
+            "SELECT metric_type FROM tasks WHERE task_id = 'task-1'").fetchone()[0]
+    finally:
+        conn.close()
+    assert 'task_markers' not in tables
+    assert 'note' not in task_columns
+    assert 'metric_type' not in dp_columns
+    assert raw_value == 'memory_rss'
+    assert glob.glob(db_path + '.broken_*') == []
+
+
+def test_move_aside_broken_db_moves_wal_and_shm_together(db, db_path):
+    """损坏库改名时连同 -wal/-shm 一起挪走，原路径不残留旧日志"""
+    for suffix, content in (('-wal', b'old wal'), ('-shm', b'old shm')):
+        with open(db_path + suffix, 'wb') as f:
+            f.write(content)
+
+    assert db._move_aside_broken_db() is True
+
+    for suffix in ('', '-wal', '-shm'):
+        assert not os.path.exists(db_path + suffix), suffix
+    broken_main = [p for p in glob.glob(db_path + '.broken_*')
+                   if not p.endswith(('-wal', '-shm'))]
+    assert len(broken_main) == 1
+    with open(broken_main[0] + '-wal', 'rb') as f:
+        assert f.read() == b'old wal'
+    with open(broken_main[0] + '-shm', 'rb') as f:
+        assert f.read() == b'old shm'
+
+
+def test_move_aside_broken_db_puts_sidecars_back_when_main_fails(db, db_path, monkeypatch):
+    """主库挪不动时把已挪走的伴随文件放回，旧库保持原样"""
+    with open(db_path + '-wal', 'wb') as f:
+        f.write(b'old wal')
+
+    real_replace = os.replace
+
+    def _replace(src, dst):
+        if src == db_path:
+            raise PermissionError("主库被占用")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(database_module.os, 'replace', _replace)
+
+    assert db._move_aside_broken_db() is False
+    assert os.path.exists(db_path)
+    with open(db_path + '-wal', 'rb') as f:
+        assert f.read() == b'old wal'
+    assert glob.glob(db_path + '.broken_*') == []

@@ -17,7 +17,7 @@ English | [简体中文](./README.zh-CN.md)
 
 </div>
 
-ProcessMonitor is a Windows 11 Fluent Design desktop app for keeping an eye on any running process. Pick a process by PID or from a live list, choose from 27 metrics across memory, CPU, system and I/O categories, and watch the numbers update on a configurable sampling interval — from every second up to once an hour. Every sample is persisted locally, so you can replay it as a chart, browse it as a table, or export it to CSV for further analysis.
+ProcessMonitor is a Windows 11 Fluent Design desktop app for keeping an eye on any running process. Pick a process by PID or from a live list, choose from 26 metrics across memory, CPU, system and I/O categories, and watch the numbers update on a configurable sampling interval — from every second up to once an hour. Every sample is persisted locally, so you can replay it as a chart, browse it as a table, or export it to CSV for further analysis.
 
 ## ✨ Features
 
@@ -29,7 +29,7 @@ ProcessMonitor is a Windows 11 Fluent Design desktop app for keeping an eye on a
 4. On the History page, look at the marker lines on the chart and at the stats strip's "Change" and "Growth rate" (per hour, least-squares slope). A value that climbs after every round and never falls back is the classic leak signature.
 
 ### 🔍 Monitoring
-- **27 metrics, 4 categories** — memory (working set, private bytes, page faults, USS, ...), CPU (usage, user/kernel time, priority), system (threads, handles, GDI/USER objects, context switches) and I/O (read/write bytes and counts); every metric has a one-line description, shown as a tooltip in the metric picker
+- **26 metrics, 4 categories** — memory (working set, private bytes, page faults, USS, ...), CPU (usage, user/kernel time, priority), system (threads, handles, GDI/USER objects, voluntary context switches) and I/O (read/write bytes and counts); every metric has a one-line description, shown as a tooltip in the metric picker
 - **Private bytes as the leak indicator** — the former "virtual memory", "commit size" and "private working set" metrics were identical on Windows and are merged into "private bytes", the primary metric for spotting memory leaks
 - **Honest gaps instead of fake zeros** — when a metric cannot be read, the task card shows "unavailable" with the reason and nothing is recorded for it. Without administrator rights only USS of higher-privilege processes is unreadable; GDI/USER objects of processes in other sessions (e.g. system services) show "not supported"
 - **Change since start and full-run trend** — each card shows every metric's change since the task began, and the sparkline covers "task start until now" (automatically thinned out on long runs)
@@ -135,7 +135,7 @@ flowchart TD
 python -m pytest tests/
 ```
 
-- List the test cases with `pytest --collect-only -q`; tests use a temporary data directory by default, and the runtime data directory can be overridden with the `PROCESS_MONITOR_DATA_DIR` environment variable
+- List the test cases with `pytest --collect-only -q`; tests use a temporary data directory by default, and the runtime data directory can be overridden with the `PROCESS_MONITOR_DATA_DIR` environment variable (logs then go to its `logs\` subfolder)
 - CI runs the test suite on every push and pull request (see the CI badge above)
 - To build a Windows installer, see [build/README_打包说明.md](build/README_打包说明.md)
 

@@ -41,7 +41,7 @@ class MonitorTask(QThread):
 
     def __init__(self, pid: int, process_name: str, metric_types: List[str],
                  interval: float = None, task_id: str = None, db: Database = None,
-                 note: str = ''):
+                 note: str = '', create_time: Optional[float] = None):
         """
         初始化监控任务
 
@@ -53,6 +53,9 @@ class MonitorTask(QThread):
             task_id: 任务ID，默认自动生成
             db: 数据库实例（可选，默认回退新建 Database()；生产路径由 MonitorManager 注入）
             note: 任务备注（随任务行一并落库）
+            create_time: 用户所选进程的创建时间（来自进程列表）。线程启动时与该 PID
+                当前进程比对，不一致说明 PID 已被别的进程复用；为 None（如手动输入
+                PID）时跳过比对
         """
         super().__init__()
 
@@ -63,6 +66,7 @@ class MonitorTask(QThread):
         self.metric_types = list(metric_types)
         self.interval = interval or config.DEFAULT_INTERVAL
         self.note = note or ''
+        self.expected_create_time = create_time
 
         # 任务状态
         self._running = False
@@ -150,16 +154,32 @@ class MonitorTask(QThread):
             self.error_occurred.emit(self.task_id, error_msg)
             return "进程不存在"
 
-        # 含CPU使用率指标时先预热，丢弃cpu_percent首次返回的无效0值
-        if MetricType.CPU_PERCENT in self.metric_types:
+        # 进程列表可能已过期：选中到开始之间该 PID 若被别的进程复用，继续采集会把
+        # 另一个进程的数据记到所选进程名下。读不到创建时间（如权限不足）时无法确认，
+        # 按原进程处理，不误停任务
+        if self.expected_create_time is not None:
+            actual_create_time = self.collector.get_create_time()
+            if (actual_create_time is not None
+                    and abs(actual_create_time - self.expected_create_time) > 0.01):
+                error_msg = (f"进程 {self.process_name} (PID: {self.pid}) 已退出，"
+                             "该 PID 已被其他进程占用，未开始监控")
+                self.error_occurred.emit(self.task_id, error_msg)
+                return "进程已终止"
+
+        # 含CPU使用率指标时先预热，丢弃cpu_percent首次返回的无效0值。预热后要隔满
+        # 一个周期再采：紧接着采的 CPU 样本统计窗口近乎为零，仍是 0 或量化尖峰
+        cpu_primed = MetricType.CPU_PERCENT in self.metric_types
+        if cpu_primed:
             self.collector.prime_cpu()
 
         stop_reason = "用户停止"
 
         # 调度：用单调时钟的截止时间驱动，每周期 deadline += interval，避免
         # "采集耗时 + 睡眠"造成的累积漂移；等待统一走 Event.wait，stop/pause/resume
-        # 置位事件即可立即唤醒，无需轮询。
+        # 置位事件即可立即唤醒，无需轮询。不含 CPU 指标时启动即采一次。
         next_deadline = time.monotonic()
+        if cpu_primed:
+            next_deadline += self.interval
         while self._running:
             # 暂停：无超时等待，直到 resume()/stop() 唤醒；恢复后立即采一次
             if self._paused:

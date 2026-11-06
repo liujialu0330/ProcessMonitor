@@ -68,7 +68,7 @@ def test_export_worker_large_dataset_matches_one_shot_pivot_rows(qapp, db, db_pa
 
     # 实际：ExportWorker 后台线程流式导出
     save_path = str(tmp_path / "export_worker_out.csv")
-    worker = ExportWorker(db_path, task, save_path)
+    worker = ExportWorker(db, task, save_path)
 
     finished = {}
     worker.export_finished.connect(
@@ -98,7 +98,7 @@ def test_export_worker_cancel_deletes_file_and_thread_exits(qapp, db, db_path, t
     _seed_points(db, task, n, datetime(2026, 1, 1))
 
     save_path = str(tmp_path / "export_worker_cancel.csv")
-    worker = ExportWorker(db_path, task, save_path)
+    worker = ExportWorker(db, task, save_path)
 
     worker.start()
     worker.cancel()  # 大概率在导出仍在进行中时请求取消
@@ -133,7 +133,7 @@ def test_export_writes_tmp_then_replaces_target(qapp, db, db_path, tmp_path):
     save_path = str(tmp_path / "out.csv")
     with open(save_path, 'w', encoding='utf-8') as f:
         f.write("旧内容")
-    worker = ExportWorker(db_path, task, save_path)
+    worker = ExportWorker(db, task, save_path)
 
     results = _run_sync(worker)
 
@@ -154,7 +154,7 @@ def test_export_failure_keeps_existing_target_and_removes_tmp(qapp, db, db_path,
         raise RuntimeError("模拟导出中途失败")
 
     monkeypatch.setattr('core.export_worker.pivot_rows', _boom)
-    worker = ExportWorker(db_path, task, save_path)
+    worker = ExportWorker(db, task, save_path)
 
     results = _run_sync(worker)
 
@@ -170,7 +170,7 @@ def test_export_cancel_keeps_existing_target(qapp, db, db_path, tmp_path):
     save_path = str(tmp_path / "keep_cancel.csv")
     with open(save_path, 'w', encoding='utf-8') as f:
         f.write("原有重要文件")
-    worker = ExportWorker(db_path, task, save_path)
+    worker = ExportWorker(db, task, save_path)
     worker.cancel()
 
     results = _run_sync(worker)
@@ -192,7 +192,7 @@ def test_export_replace_failure_keeps_target_and_reports_error(qapp, db, db_path
         raise PermissionError("目标被占用")
 
     monkeypatch.setattr('core.export_worker.os.replace', _deny)
-    worker = ExportWorker(db_path, task, save_path)
+    worker = ExportWorker(db, task, save_path)
 
     results = _run_sync(worker)
 
@@ -206,7 +206,7 @@ def test_export_signal_is_last_action(qapp, db, db_path, tmp_path):
     """信号发出时收尾已全部完成：目标文件已就位、临时文件已不存在"""
     task = _seeded_task(db)
     save_path = str(tmp_path / "order.csv")
-    worker = ExportWorker(db_path, task, save_path)
+    worker = ExportWorker(db, task, save_path)
     observed = {}
 
     def _on_finished(path, rows, points):
@@ -224,7 +224,7 @@ def test_export_error_signal_after_cleanup(qapp, db, db_path, tmp_path, monkeypa
     save_path = str(tmp_path / "err_order.csv")
     monkeypatch.setattr('core.export_worker.pivot_rows',
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
-    worker = ExportWorker(db_path, task, save_path)
+    worker = ExportWorker(db, task, save_path)
     observed = {}
     worker.error_occurred.connect(
         lambda msg: observed.update(tmp_exists=os.path.exists(save_path + '.tmp')),
@@ -244,7 +244,7 @@ def test_export_metric_filter_and_finished_signal_triggers_after_thread_end(qapp
         [DataPoint(task.task_id, base + timedelta(seconds=i), float(i), "memory_rss") for i in range(5)]
         + [DataPoint(task.task_id, base + timedelta(seconds=i), 100.0 + i, "cpu_percent") for i in range(5)])
     save_path = str(tmp_path / "filtered.csv")
-    worker = ExportWorker(db_path, task, save_path, metric_type="cpu_percent")
+    worker = ExportWorker(db, task, save_path, metric_type="cpu_percent")
     finished_calls = []
     worker.export_finished.connect(lambda p, rc, pc: finished_calls.append((rc, pc)),
                                    Qt.DirectConnection)
@@ -269,7 +269,7 @@ def test_export_worker_writes_markers_into_last_column(qapp, db, db_path, tmp_pa
     db.add_marker(task.task_id, base + timedelta(seconds=3), "第2轮")
 
     save_path = str(tmp_path / "with_markers.csv")
-    worker = ExportWorker(db_path, task, save_path)
+    worker = ExportWorker(db, task, save_path)
     results = _run_sync(worker)
     assert results['errors'] == []
 
@@ -277,3 +277,23 @@ def test_export_worker_writes_markers_into_last_column(qapp, db, db_path, tmp_pa
         rows = list(csv.reader(f))
     assert rows[0][-1] == '打点'
     assert [row[-1] for row in rows[1:]] == ["", "", "第1轮", "第2轮", ""]
+
+
+def test_export_worker_uses_injected_db_and_never_constructs_database(
+        qapp, db, tmp_path, monkeypatch):
+    """线程内不得新建 Database：构造会开写事务，与"清理并压缩数据库"抢写锁"""
+    import core.export_worker as export_worker_module
+
+    def _forbidden(*args, **kwargs):
+        raise AssertionError("导出线程不应自行构造 Database")
+
+    monkeypatch.setattr(export_worker_module, 'Database', _forbidden)
+    task = _seeded_task(db)
+    save_path = str(tmp_path / "injected.csv")
+    worker = ExportWorker(db, task, save_path)
+    assert worker.db is db
+
+    results = _run_sync(worker)
+
+    assert results['errors'] == []
+    assert results['finished'] == [(save_path, 20, 20)]

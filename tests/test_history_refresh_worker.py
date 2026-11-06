@@ -283,9 +283,38 @@ def test_shutdown_thread_joins_refresh_worker_with_timeout(shown, db):
     assert _wait(lambda: page._refresh_worker is None)
 
 
-def test_main_window_close_joins_history_refresh_worker():
-    """MainWindow.closeEvent 的清理步骤里包含对历史页刷新线程的 join"""
-    import inspect
+def test_main_window_close_joins_history_refresh_worker(qapp, tmp_path, monkeypatch):
+    """关窗真退出时，历史页经 background_threads() 登记的在途刷新线程被带超时
+    join：closeEvent 返回时线程已结束（不 join 的话它还要再跑几百毫秒）"""
+    import time
+    from unittest.mock import MagicMock
+    from PyQt5.QtCore import QThread
+    from data.database import Database
     from ui.main_window import MainWindow
-    source = inspect.getsource(MainWindow.closeEvent)
-    assert "_refresh_worker" in source and "history_page" in source
+
+    class _SlowRefresh(QThread):
+        def __init__(self):
+            super().__init__()
+            self.started_evt = threading.Event()
+
+        def run(self):
+            self.started_evt.set()
+            time.sleep(0.5)
+
+    win = MainWindow(db=Database(str(tmp_path / "close_join.db")))
+    win.about_page.check_update = lambda *args, **kwargs: None
+    monkeypatch.setattr(QApplication, 'quit', MagicMock())
+    worker = _SlowRefresh()
+    win.history_page._refresh_worker = worker
+    try:
+        entries = win.history_page.background_threads()
+        assert [(e.thread, e.cancel_fn, e.timeout_ms) for e in entries] ==             [(worker, None, 3000)]
+
+        worker.start()
+        assert worker.started_evt.wait(5)
+        win.closeEvent(MagicMock())
+        assert worker.isFinished()
+    finally:
+        worker.wait(5000)
+        win.history_page._refresh_worker = None
+        win.monitor_manager.stop_all_tasks()

@@ -40,11 +40,13 @@ class ExportWorker(QThread):
     # 导出失败信号，携带错误描述
     error_occurred = pyqtSignal(str)
 
-    def __init__(self, db_path: str, task: MonitorTask, save_path: str,
+    def __init__(self, db: Database, task: MonitorTask, save_path: str,
                  metric_type: str = None, parent=None):
         """
         Args:
-            db_path: 数据库文件路径，run() 内据此构造专用的 Database 读取数据
+            db: 调用方已有的 Database 实例。线程内不再新建实例：Database 构造时会开
+                BEGIN IMMEDIATE 写事务，会和"清理并压缩数据库"抢写锁；而这里用到的
+                iter_data_points / get_markers 每次调用都自建连接，跨线程共用是安全的
             task: 待导出的任务（提供表头与透视所需的 process_name/pid/metric_types）
             save_path: CSV 保存路径
             metric_type: 指标类型过滤（None 表示导出任务全部指标：宽表每次采集一行，
@@ -52,7 +54,7 @@ class ExportWorker(QThread):
             parent: 父对象
         """
         super().__init__(parent)
-        self.db_path = db_path
+        self.db = db
         self.task = task
         self.save_path = save_path
         self.metric_type = metric_type
@@ -83,10 +85,9 @@ class ExportWorker(QThread):
         processed = 0
         batches = None
         try:
-            db = Database(self.db_path)
-            batches = db.iter_data_points(self.task.task_id, FETCH_BATCH_SIZE)
+            batches = self.db.iter_data_points(self.task.task_id, FETCH_BATCH_SIZE)
             # 打点随宽表导出：写在"时间不早于打点时刻的第一行"的"打点"列
-            markers = db.get_markers(self.task.task_id)
+            markers = self.db.get_markers(self.task.task_id)
             header = build_csv_header(self.task, include_markers=True)
 
             def _counted_iter():

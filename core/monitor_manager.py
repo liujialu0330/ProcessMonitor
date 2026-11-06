@@ -58,6 +58,9 @@ class MonitorManager(QObject):
         # 维护锁：数据库清理/压缩期间禁止创建、启动任务
         self._maintenance = False
 
+        # 进行中的导出数：导出线程长时间读库，与压缩数据库互相抢锁，二者互斥
+        self._export_count = 0
+
         # 数据库（生产路径应由 MainWindow 注入，回退仅为兼容兜底）
         self.db = db if db is not None else Database()
 
@@ -65,7 +68,8 @@ class MonitorManager(QObject):
         self._initialized = True
 
     def create_task(self, pid: int, process_name: str, metric_types: List[str],
-                    interval: float = None, note: str = '') -> Optional[str]:
+                    interval: float = None, note: str = '',
+                    create_time: Optional[float] = None) -> Optional[str]:
         """
         创建新的监控任务
 
@@ -75,6 +79,8 @@ class MonitorManager(QObject):
             metric_types: 监控指标类型列表
             interval: 采集间隔（可选）
             note: 任务备注（可选）
+            create_time: 所选进程的创建时间（可选）。任务线程启动时据此确认 PID
+                未被别的进程复用；为 None 时跳过比对
 
         Returns:
             Optional[str]: 任务ID，创建失败（数据库维护中/任务数达上限）返回None
@@ -97,6 +103,7 @@ class MonitorManager(QObject):
             interval=interval,
             db=self.db,
             note=note,
+            create_time=create_time,
         )
 
         # 连接任务信号
@@ -290,10 +297,12 @@ class MonitorManager(QObject):
 
     def begin_maintenance(self) -> bool:
         """
-        进入数据库维护状态（清理/压缩前调用）。有运行中任务时拒绝返回 False；
-        否则置位并返回 True，此后 create_task / start_task 被拒绝，直到 end_maintenance。
+        进入数据库维护状态（清理/压缩前调用）。有运行中任务或导出进行中时拒绝返回
+        False（调用方可用 has_running_tasks / has_running_exports 区分原因）；否则置位
+        并返回 True，此后 create_task / start_task / begin_export 被拒绝，直到
+        end_maintenance。
         """
-        if self.has_running_tasks():
+        if self.has_running_tasks() or self.has_running_exports():
             return False
         self._maintenance = True
         return True
@@ -306,11 +315,36 @@ class MonitorManager(QObject):
         """是否处于数据库维护状态"""
         return self._maintenance
 
+    def begin_export(self) -> bool:
+        """
+        登记一次导出（启动导出线程前调用）。维护进行中时拒绝返回 False；否则计数加一
+        并返回 True。每次成功的 begin_export 都必须对应一次 end_export。
+        """
+        if self._maintenance:
+            return False
+        self._export_count += 1
+        return True
+
+    def end_export(self):
+        """注销一次导出（导出线程结束后调用，无论成功、失败还是取消）"""
+        self._export_count = max(0, self._export_count - 1)
+
+    def has_running_exports(self) -> bool:
+        """是否有导出正在进行"""
+        return self._export_count > 0
+
     # ========== 任务数据与标记 ==========
 
-    def add_marker(self, task_id: str, label: str) -> Optional[datetime]:
+    def add_marker(self, task_id: str, label: str,
+                   timestamp: Optional[datetime] = None) -> Optional[datetime]:
         """
-        以当前时间为任务添加一个时间标记。
+        为任务添加一个时间标记。
+
+        Args:
+            task_id: 任务ID
+            label: 标记文字
+            timestamp: 标记时间。界面应传入用户点"打点"的时刻：输入标签要花好几秒，
+                取确认时刻会让竖线落在事件之后；为 None 时取当前时间
 
         Returns:
             Optional[datetime]: 标记时间戳；任务不存在、标签为空或写库失败返回 None
@@ -320,7 +354,8 @@ class MonitorManager(QObject):
             return None
         if task_id not in self._tasks and self.db.get_task(task_id) is None:
             return None
-        timestamp = datetime.now()
+        if timestamp is None:
+            timestamp = datetime.now()
         if not self.db.add_marker(task_id, timestamp, label):
             return None
         return timestamp

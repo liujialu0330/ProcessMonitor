@@ -9,13 +9,15 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtWidgets import QWidget
 from qfluentwidgets import (
     ScrollArea, ExpandLayout, SettingCardGroup, OptionsSettingCard,
-    PushSettingCard, SwitchSettingCard, MessageBox, StateToolTip,
+    PushSettingCard, SwitchSettingCard, StateToolTip,
     InfoBar, InfoBarPosition,
     FluentIcon as FIF, setTheme, qconfig, Theme
 )
 
 from app_config import cfg
+from ui.components.confirm import DestructiveConfirmBox
 from ui.components.spinbox_setting_card import SpinBoxSettingCard
+from ui.thread_shutdown import BackgroundThread
 from ui.typography import PageTitleLabel
 import config
 
@@ -235,6 +237,14 @@ class SettingPage(ScrollArea):
 
     # ========== 数据管理 ==========
 
+    def background_threads(self) -> list:
+        """退出时需要收尾的后台线程（由主窗口统一 shutdown）。
+
+        清理线程无取消机制、只等待：VACUUM 中途被打断会让数据库处于中间态，
+        所以给较长的超时让它尽量跑完。
+        """
+        return [BackgroundThread("清理数据库", self._cleanup_worker, timeout_ms=5000)]
+
     def _is_cleanup_running(self) -> bool:
         """清理线程是否仍在运行"""
         return self._cleanup_worker is not None and self._cleanup_worker.isRunning()
@@ -267,7 +277,7 @@ class SettingPage(ScrollArea):
             content = f"将删除超过 {days} 天的已停止任务数据并压缩数据库文件，此操作不可撤销。"
         else:
             content = "当前为永久保留，仅压缩数据库文件，不会删除数据。"
-        box = MessageBox("清理并压缩数据库", content, self.window())
+        box = DestructiveConfirmBox("清理并压缩数据库", content, "清理", self.window())
         return bool(box.exec())
 
     def _on_cleanup_clicked(self) -> None:
@@ -281,9 +291,14 @@ class SettingPage(ScrollArea):
 
         # 先占维护锁再弹确认：确认期间不会有新任务被创建/启动
         if self.manager is not None and not self.manager.begin_maintenance():
+            if self.manager.has_running_tasks():
+                content = "有监控任务正在运行，请先停止全部任务再清理数据库"
+            else:
+                # 导出线程长时间读库，与压缩数据库互相抢锁
+                content = "正在导出数据，请等导出完成后再清理数据库"
             InfoBar.warning(
                 title="无法清理",
-                content="有监控任务正在运行，请先停止全部任务再清理数据库",
+                content=content,
                 parent=self.window(),
                 position=InfoBarPosition.TOP,
                 duration=4000

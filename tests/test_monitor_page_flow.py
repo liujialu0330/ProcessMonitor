@@ -6,6 +6,7 @@
 这里一律 monkeypatch，测试中不会阻塞。
 """
 import os
+from datetime import datetime, timedelta
 
 import pytest
 from PyQt5.QtCore import Qt
@@ -21,7 +22,9 @@ from utils.metrics import (
     AVAILABLE_METRICS, LEAK_CHECK_PRESET, MetricType, get_metric_description
 )
 
-FAKE_PROCESSES = [(1001, "alpha.exe"), (1002, "beta.exe"), (1003, "MPrintExp.exe")]
+# (pid, name, create_time)：与 ProcessCollector.get_all_processes 的返回形态一致
+FAKE_PROCESSES = [
+    (1001, "alpha.exe", 1001.5), (1002, "beta.exe", 1002.5), (1003, "MPrintExp.exe", 1003.5)]
 
 
 @pytest.fixture(autouse=True)
@@ -170,19 +173,50 @@ def test_unmatched_combo_text_without_pid_is_rejected(page, manager, infobar, mo
 def test_combo_selection_is_used_when_pid_empty(page, manager, monkeypatch):
     started = []
     monkeypatch.setattr(
-        page, "_start_monitoring", lambda *args: started.append(args))
+        page, "_start_monitoring", lambda *args, **kwargs: started.append((args, kwargs)))
     page.process_combo.setCurrentIndex(1)
     page.pid_input.clear()  # 用户清空了自动填入的 PID
 
     page._on_start_clicked()
 
-    assert started[0][:2] == (1002, "beta.exe")
+    args, kwargs = started[0]
+    assert args[:2] == (1002, "beta.exe")
+    # 带上列表里该进程的创建时间，任务启动时据此确认 PID 未被复用
+    assert kwargs["create_time"] == 1002.5
+
+
+def test_autofilled_pid_carries_create_time_but_manual_pid_does_not(page, monkeypatch):
+    """下拉选择自动填入的 PID 沿用列表的创建时间；手动输入的 PID 没有可比对信息"""
+    started = []
+    monkeypatch.setattr(
+        page, "_start_monitoring", lambda *args, **kwargs: started.append((args, kwargs)))
+    monkeypatch.setattr(ProcessCollector, "get_process_name", lambda self: "beta.exe")
+
+    page.process_combo.setCurrentIndex(1)
+    assert page.pid_input.text() == "1002"
+    page._on_start_clicked()
+    assert started[-1][0][0] == 1002 and started[-1][1]["create_time"] == 1002.5
+
+    # 用户清掉后手动输入同一个 PID（列表可能已过期）：不带创建时间，跳过比对
+    page.pid_input.clear()
+    page.pid_input.setText("1002")
+    page._on_start_clicked()
+    assert started[-1][0][0] == 1002 and started[-1][1]["create_time"] is None
+
+
+def test_create_time_is_passed_through_to_manager(page, manager, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        manager, "create_task", lambda *a, **k: calls.append((a, k)) or None)
+    page._start_monitoring(1001, "alpha.exe", [MetricType.NUM_THREADS], 1.0,
+                           create_time=1001.5)
+    assert calls[0][1]["create_time"] == 1001.5
 
 
 def test_pid_input_takes_precedence_over_combo(page, monkeypatch):
     started = []
     monkeypatch.setattr(
-        page, "_start_monitoring", lambda *args: started.append(args))
+        page, "_start_monitoring", lambda *args, **kwargs: started.append(args))
     page.process_combo.setCurrentIndex(0)
     page.pid_input.setText(str(os.getpid()))
 
@@ -317,7 +351,7 @@ def test_marker_flow_writes_via_manager_with_incrementing_default_label(
     defaults = []
     answers = iter(["", None, "第 3 轮"])  # 第一次用默认标签，第二次取消，第三次自定义
 
-    def _ask(default_label):
+    def _ask(default_label, timestamp):
         defaults.append(default_label)
         answer = next(answers)
         return default_label if answer == "" else answer
@@ -337,13 +371,55 @@ def test_marker_flow_writes_via_manager_with_incrementing_default_label(
 
 def test_marker_failure_is_reported(page, manager, infobar, monkeypatch):
     task_id, card = _add_card(page, manager)
-    monkeypatch.setattr(page, "_ask_marker_label", lambda default: default)
-    monkeypatch.setattr(manager, "add_marker", lambda tid, label: None)
+    monkeypatch.setattr(page, "_ask_marker_label", lambda default, ts: default)
+    monkeypatch.setattr(manager, "add_marker", lambda tid, label, ts=None: None)
 
     page._on_marker_task(task_id)
 
     assert infobar.levels() == ["error"]
+    # 错误提示不自动消失（可手动关闭）
+    assert infobar.calls[-1][1]["duration"] == -1
     assert card.next_marker_label() == "标记 1"
+
+
+class _FakeClock:
+    """可手动拨动的 datetime 替身：只提供 now()"""
+
+    def __init__(self, start):
+        self.current = start
+
+    def now(self):
+        return self.current
+
+
+def test_marker_time_is_click_time_not_confirm_time(
+        page, manager, db, infobar, monkeypatch):
+    """打点时间取点击"打点"按钮的时刻：用户输入标签花了 12 秒，落库时间不能是确认时刻"""
+    import core.monitor_manager as manager_module
+
+    task_id, _ = _add_card(page, manager)
+    clicked = datetime(2026, 11, 6, 10, 0, 0)
+    confirmed = clicked + timedelta(seconds=12)
+    clock = _FakeClock(clicked)
+    monkeypatch.setattr(monitor_module, "datetime", clock)
+    monkeypatch.setattr(manager_module, "datetime", clock)
+
+    shown = []
+
+    def _ask(default_label, timestamp):
+        shown.append(timestamp)
+        clock.current = confirmed   # 对话框开着期间时间流逝
+        return "开始第 3 轮"
+
+    monkeypatch.setattr(page, "_ask_marker_label", _ask)
+
+    page._on_marker_task(task_id)
+
+    markers = db.get_markers(task_id)
+    assert [m.label for m in markers] == ["开始第 3 轮"]
+    assert markers[0].timestamp == clicked
+    assert shown == [clicked]
+    assert "10:00:00" in infobar.calls[-1][1]["content"]
 
 
 # ---------- 停止确认 ----------
@@ -453,24 +529,27 @@ def test_restart_with_single_match_creates_task_with_same_settings(page, manager
     card.interval = 5.0
     page._on_task_stopped(task_id, "进程已终止")
     started = []
-    monkeypatch.setattr(page, "_find_pids_by_name", lambda name: [4321])
-    monkeypatch.setattr(page, "_start_monitoring", lambda *args: started.append(args))
+    monkeypatch.setattr(page, "_find_processes_by_name", lambda name: [(4321, 777.25)])
+    monkeypatch.setattr(
+        page, "_start_monitoring", lambda *args, **kwargs: started.append((args, kwargs)))
 
     card.restart_button.click()
 
-    assert started == [(
-        4321, "demo.exe", [MetricType.NUM_HANDLES, MetricType.NUM_THREADS], 5.0, "第二轮")]
+    assert started == [((
+        4321, "demo.exe", [MetricType.NUM_HANDLES, MetricType.NUM_THREADS], 5.0, "第二轮"),
+        {"create_time": 777.25})]
 
 
-@pytest.mark.parametrize("pids, keyword", [([], "未找到"), ([11, 22], "找到 2 个")])
+@pytest.mark.parametrize("matches, keyword", [
+    ([], "未找到"), ([(11, 1.0), (22, 2.0)], "找到 2 个")])
 def test_restart_with_zero_or_many_matches_fills_search_box(
-        page, manager, infobar, monkeypatch, pids, keyword):
+        page, manager, infobar, monkeypatch, matches, keyword):
     task_id, card = _add_card(page, manager)
     page._on_task_stopped(task_id, "进程已终止")
     infobar.calls.clear()
-    monkeypatch.setattr(page, "_find_pids_by_name", lambda name: pids)
+    monkeypatch.setattr(page, "_find_processes_by_name", lambda name: matches)
     monkeypatch.setattr(
-        page, "_start_monitoring", lambda *args: pytest.fail("不应直接创建任务"))
+        page, "_start_monitoring", lambda *a, **k: pytest.fail("不应直接创建任务"))
     page.pid_input.setText("999")
 
     card.restart_button.click()
@@ -480,9 +559,9 @@ def test_restart_with_zero_or_many_matches_fills_search_box(
     assert keyword in infobar.calls[-1][1]["title"] + infobar.calls[-1][1]["content"]
 
 
-def test_find_pids_by_name_is_case_insensitive(page):
-    assert page._find_pids_by_name("mprintexp.EXE") == [1003]
-    assert page._find_pids_by_name("nothing.exe") == []
+def test_find_processes_by_name_is_case_insensitive(page):
+    assert page._find_processes_by_name("mprintexp.EXE") == [(1003, 1003.5)]
+    assert page._find_processes_by_name("nothing.exe") == []
 
 
 # ---------- 异常结束提醒 ----------
@@ -512,15 +591,16 @@ def test_user_stop_does_not_signal_abnormal(page, manager, infobar):
     assert infobar.calls[-1][0] == "info"
 
 
-def test_find_pids_by_name_excludes_own_process(page, monkeypatch):
+def test_find_processes_by_name_excludes_own_process(page, monkeypatch):
     """被测的同名进程退出后，"重新监控"不能因为只剩本程序同名而监控起自己。"""
     monkeypatch.setattr(ProcessCollector, "get_all_processes", staticmethod(
-        lambda: [(os.getpid(), "python.exe"), (99999, "python.exe"), (12345, "other.exe")]))
-    assert page._find_pids_by_name("PYTHON.EXE") == [99999]
+        lambda: [(os.getpid(), "python.exe", 1.0), (99999, "python.exe", 2.0),
+                 (12345, "other.exe", 3.0)]))
+    assert page._find_processes_by_name("PYTHON.EXE") == [(99999, 2.0)]
 
     monkeypatch.setattr(ProcessCollector, "get_all_processes", staticmethod(
-        lambda: [(os.getpid(), "python.exe")]))
-    assert page._find_pids_by_name("python.exe") == []
+        lambda: [(os.getpid(), "python.exe", 1.0)]))
+    assert page._find_processes_by_name("python.exe") == []
 
 
 def test_exited_process_is_cleared_from_form(page, manager, infobar, monkeypatch):
@@ -531,7 +611,7 @@ def test_exited_process_is_cleared_from_form(page, manager, infobar, monkeypatch
 
     monkeypatch.setattr(ProcessCollector, "is_process_running", lambda self: False)
     monkeypatch.setattr(ProcessCollector, "get_all_processes", staticmethod(
-        lambda: [(1001, "alpha.exe"), (1003, "MPrintExp.exe")]))
+        lambda: [(1001, "alpha.exe", 1001.5), (1003, "MPrintExp.exe", 1003.5)]))
     page._on_task_stopped(task_id, "进程已终止")
 
     assert page.pid_input.text() == ""
@@ -558,3 +638,62 @@ def test_form_is_kept_when_selection_is_another_or_still_alive(page, manager, in
     page._on_task_stopped(other_id, "用户停止")
     assert page.pid_input.text() == "1002"
     assert page.process_combo.currentIndex() == 1
+
+
+# ---------- 表单校验错误与错误提示 ----------
+
+@pytest.mark.parametrize("pid_text, expected", [
+    ("abc", "PID 必须是数字"),
+    ("999999", "进程 PID 999999 不存在或无法访问"),
+])
+def test_form_validation_error_shows_under_field_and_clears_on_edit(
+        page, manager, infobar, monkeypatch, pid_text, expected):
+    """PID 无效/进程不存在：错误显示在输入框下方（不用一闪即逝的 InfoBar），改输入即清除"""
+    monkeypatch.setattr(ProcessCollector, "get_process_name", lambda self: None)
+    created = []
+    monkeypatch.setattr(manager, "create_task", lambda *a, **k: created.append(a))
+    page.show()
+
+    page.pid_input.setText(pid_text)
+    page._on_start_clicked()
+
+    assert created == []
+    assert page.form_error_label.isVisible()
+    assert page.form_error_label.text() == expected
+    assert infobar.calls == []
+
+    page.pid_input.setText(pid_text + "1")
+    assert not page.form_error_label.isVisible()
+    assert page.form_error_label.text() == ""
+
+    # 改为在下拉框里搜索同样清除
+    page.pid_input.setText(pid_text)
+    page._on_start_clicked()
+    assert page.form_error_label.isVisible()
+    page.process_combo.setText("al")
+    assert not page.form_error_label.isVisible()
+
+
+def test_task_error_infobar_is_persistent(page, infobar):
+    """运行期错误提示不自动消失（可手动关闭）"""
+    page._on_error("t1", "采集数据时发生错误: x")
+    assert infobar.levels() == ["error"]
+    assert infobar.calls[0][1]["duration"] == -1
+
+
+def test_repeated_task_error_is_not_stacked_until_closed(page):
+    """错误提示不再自动消失后，每周期重复上报的同一错误不能越叠越多；关掉后可再次提示"""
+    from qfluentwidgets import InfoBar as RealInfoBar
+    page.show()
+
+    for _ in range(3):
+        page._on_error("t1", "采集数据时发生错误: x")
+    page._on_error("t2", "采集数据时发生错误: x")
+
+    bars = [w for w in page.findChildren(RealInfoBar) if not w.isHidden()]
+    assert len(bars) == 2
+    assert set(page._error_bars) == {("t1", "采集数据时发生错误: x"),
+                                     ("t2", "采集数据时发生错误: x")}
+
+    page._error_bars[("t1", "采集数据时发生错误: x")].close()
+    assert ("t1", "采集数据时发生错误: x") not in page._error_bars
