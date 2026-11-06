@@ -114,14 +114,16 @@ def task_duration_seconds(
 
 def format_task_option_text(
         task: MonitorTask, running: bool, now: datetime,
-        note_max: int = NOTE_MAX_CHARS, full_date: bool = False) -> str:
-    """任务下拉项文本：进程名 · PID · 开始时间 · 时长 · 备注（运行中标"运行中"）。"""
-    time_format = '%Y-%m-%d %H:%M' if full_date else '%m-%d %H:%M'
+        note_max: int = NOTE_MAX_CHARS) -> str:
+    """任务下拉项文本：进程名 · PID · 开始时间 · 时长 · 备注（运行中标"运行中"）。
+
+    开始时间固定为"月-日 时:分"以压缩下拉宽度，带年份的完整日期由 format_task_tooltip 给出。
+    """
     duration = format_duration(task_duration_seconds(task, running, now))
     parts = [
         task.process_name,
         f"PID {task.pid}",
-        task.start_time.strftime(time_format),
+        task.start_time.strftime('%m-%d %H:%M'),
         f"运行中 {duration}" if running else duration,
     ]
     note = (task.note or '').strip()

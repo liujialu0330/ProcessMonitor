@@ -1,7 +1,7 @@
 """
 ChartView 为分析页增加的扩展点：min/max 带（空洞处断开、读数带范围）、十字线联动
-（hover_moved / set_crosshair）、打点命中、相对时间轴、标题与工具按钮、右键菜单开关；
-以及 OverlayChart / OverviewStrip 的基本行为。
+（hover_moved / set_crosshair）、打点命中、相对时间轴、标题与工具按钮、右键菜单开关、
+挨得太近的打点徽标错开高度；以及 OverlayChart / OverviewStrip 的基本行为。
 """
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -13,7 +13,8 @@ from data.models import DataPoint, Marker
 from ui.components.chart_axes import relative_tick_spacing
 from ui.widgets.analysis.overlay_chart import OverlayChart, OverlaySeries
 from ui.widgets.analysis.overview_strip import OverviewStrip
-from ui.widgets.history.chart_view import RELATIVE_TIME_AXIS_TITLE, ChartView
+from ui.widgets.history.chart_view import (
+    BADGE_POSITION, BADGE_STEP, RELATIVE_TIME_AXIS_TITLE, ChartView, badge_positions)
 from utils.metrics import MetricType
 
 BASE = datetime(2026, 7, 16, 16, 0, 0)
@@ -77,6 +78,50 @@ def test_marker_near_skips_system_markers(chart):
     assert chart.marker_near(near).label == "第 1 轮"
     assert chart.marker_near((BASE + timedelta(seconds=20)).timestamp()) is None
     assert chart.marker_near((BASE + timedelta(seconds=80)).timestamp()) is None
+
+
+def test_badge_positions_pure():
+    top, step = 0.94, 0.07
+    assert badge_positions([], 22, top, step, 3) == []
+    assert badge_positions([100.0], 22, top, step, 3) == [top]
+    assert badge_positions([100, 105, 110], 22, top, step, 3) == pytest.approx(
+        [top, top - step, top - 2 * step])
+    # 第四个挤在一起的回到顶层
+    assert badge_positions([100, 105, 110, 115], 22, top, step, 3) == pytest.approx(
+        [top, top - step, top - 2 * step, top])
+    # 簇间互不影响：隔开足够远的从顶层重新开始
+    assert badge_positions([100, 110, 300, 310], 22, top, step, 3) == pytest.approx(
+        [top, top - step, top, top - step])
+
+
+def _badge_chart(chart, offsets):
+    """跨度 1 小时、每分钟一点的曲线，在 offsets（秒）处打用户点；窗口显示后再排版。"""
+    markers = [Marker("t", BASE + timedelta(seconds=s), f"第 {i + 1} 轮", i + 1, 'user')
+               for i, s in enumerate(offsets)]
+    chart.set_series(_points(range(0, 3601, 60)), MEM, markers)
+    chart.resize(900, 400)
+    chart.show()
+    QApplication.processEvents()
+
+
+def test_close_badges_are_staggered_and_relayout_on_zoom(chart):
+    _badge_chart(chart, (1800, 1802))
+    first, second = chart.badge_layout()
+    assert first == pytest.approx(BADGE_POSITION)
+    assert second == pytest.approx(BADGE_POSITION - BADGE_STEP)
+    # 放大到两点相隔足够远后，重新回到同一高度
+    t1 = (BASE + timedelta(seconds=1800)).timestamp()
+    t2 = (BASE + timedelta(seconds=1802)).timestamp()
+    chart.chart_widget.setXRange(t1 - 5, t2 + 5, padding=0)
+    QApplication.processEvents()
+    assert chart.badge_layout() == pytest.approx([BADGE_POSITION, BADGE_POSITION])
+    # marker_items 结构不变
+    assert [badge for _kind, badge, _line in chart.marker_items()] == ["①", "②"]
+
+
+def test_far_badges_share_top_row(chart):
+    _badge_chart(chart, (600, 2400))
+    assert chart.badge_layout() == pytest.approx([BADGE_POSITION, BADGE_POSITION])
 
 
 def test_relative_origin_title_and_tools(chart):

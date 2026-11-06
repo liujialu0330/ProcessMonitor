@@ -2,12 +2,30 @@
 全局异常兜底
 安装 sys.excepthook 并启用 faulthandler，避免未捕获异常/致命信号导致进程静默退出、
 用户看不到任何提示且日志里也无迹可寻。
+
+crash.log 的噪音：Windows 上 faulthandler 注册的是向量化异常处理器，会在首次机会
+（first-chance）阶段看到所有 SEH 异常。读屏、UI 自动化等辅助功能工具通过 UIA/COM 访问
+本进程窗口时，常触发 0x8001010d（RPC_E_CANTCALLOUT_ININPUTSYNCCALL）、
+0x80040155（REGDB_E_IIDNOTREG）这类带"不可继续"标志的 COM 异常；它们随后被系统或
+COM 自身处理掉，进程并未崩溃，但 faulthandler 仍会把它们记成
+"Windows fatal exception" 连同全部线程堆栈写进 crash.log（真机一轮操作就能写上百条），
+且 faulthandler 没有按异常码过滤的接口。
+
+因此：
+- 判断是否真的崩溃，看进程是否已退出、app.log 里是否有"未捕获异常"；crash.log 里
+  0x8001010d / 0x80040155 的条目可以忽略；
+- 为免 crash.log 无限增长，每次安装时若它超过 CRASH_LOG_MAX_BYTES 就先轮转为
+  crash.log.1（覆盖旧的 .1）再重新打开，最多保留两份。
 """
 import logging
 import os
 import sys
 
 logger = logging.getLogger(__name__)
+
+CRASH_LOG_NAME = "crash.log"
+# crash.log 超过该大小时在下次启动安装钩子时轮转为 crash.log.1
+CRASH_LOG_MAX_BYTES = 1024 * 1024
 
 # crash.log 文件对象需模块级全局持有，防止被 GC 回收后自动关闭（faulthandler 要求句柄常驻）
 _crash_log_file = None
@@ -30,7 +48,8 @@ def install_excepthook(log_dir: str):
     global _crash_log_file, _log_dir
 
     _log_dir = log_dir
-    crash_log_path = os.path.join(log_dir, "crash.log")
+    crash_log_path = os.path.join(log_dir, CRASH_LOG_NAME)
+    _rotate_crash_log(crash_log_path)
     try:
         _crash_log_file = open(crash_log_path, 'a', encoding='utf-8')
         import faulthandler
@@ -39,6 +58,24 @@ def install_excepthook(log_dir: str):
         logger.error("faulthandler 初始化失败", exc_info=True)
 
     sys.excepthook = _global_excepthook
+
+
+def _rotate_crash_log(crash_log_path: str) -> None:
+    """crash.log 超过 CRASH_LOG_MAX_BYTES 时改名为 crash.log.1（覆盖旧的 .1）。
+
+    必须在 faulthandler 打开文件之前做：之后句柄常驻，Windows 上无法再改名。
+    轮转失败（如另一个实例正占用文件）只记日志，继续以追加方式打开原文件。
+    """
+    try:
+        if os.path.getsize(crash_log_path) <= CRASH_LOG_MAX_BYTES:
+            return
+    except OSError:
+        # 文件不存在（首次运行）或无法读取大小：无需轮转
+        return
+    try:
+        os.replace(crash_log_path, crash_log_path + ".1")
+    except OSError:
+        logger.warning("crash.log 轮转失败，继续追加写入: %s", crash_log_path, exc_info=True)
 
 
 def _global_excepthook(exc_type, exc_value, exc_tb):

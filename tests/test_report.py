@@ -1,6 +1,7 @@
 """
 报告导出：文件命名、CSV 元数据与空洞空行、摘要 CSV 内容、ReportWorker 写文件（临时文件
-+ 原子替换、取消不留残留）、报告图片的文字与离屏渲染。
++ 原子替换、取消与失败不留残留且不动已有目标、信号收尾、只用注入的 db）、报告图片的
+文字与离屏渲染。
 """
 import csv
 import os
@@ -10,7 +11,7 @@ from datetime import datetime, timedelta
 import pytest
 from PyQt5.QtGui import QColor, QImage
 
-from core.export_worker import ReportJob, ReportWorker
+from core.report_worker import ReportJob, ReportWorker
 from core.history_query import TaskAnalysis, build_request, run_history_query
 from core.report import (
     ELAPSED_COLUMN_NAME, METADATA_PREFIX, SUMMARY_HEADER, ReportPaths,
@@ -194,6 +195,137 @@ def test_report_worker_image_failure_raises_and_cleans(qapp, db, tmp_path):
     with pytest.raises(OSError):
         worker.execute(CancelToken())
     assert os.listdir(tmp_path) == []
+
+
+def _run_sync(worker):
+    """同线程直接执行 run()（QThread 子类的 run 是普通方法），便于断言信号与文件状态"""
+    from PyQt5.QtCore import Qt
+    signals = {'result': [], 'failed': []}
+    worker.result.connect(signals['result'].append, Qt.DirectConnection)
+    worker.failed.connect(signals['failed'].append, Qt.DirectConnection)
+    worker.run()
+    return signals
+
+
+def _out_dir(tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    return out
+
+
+def test_report_worker_cancel_mid_write_removes_tmp_and_keeps_targets(
+        qapp, db, tmp_path, monkeypatch):
+    """写明细中途取消：已写出的临时文件（含摘要）全部删除、目标文件不变、不发任何信号"""
+    import core.report_worker as report_worker_module
+    task = _seed(db)
+    out = _out_dir(tmp_path)
+    csv_target, summary_target = out / "keep.csv", out / "keep_摘要.csv"
+    csv_target.write_text("旧明细", encoding="utf-8")
+    summary_target.write_text("旧摘要", encoding="utf-8")
+    worker = ReportWorker(db, ReportJob(task=task, csv_path=str(csv_target),
+                                        summary_path=str(summary_target)))
+    real_rows = report_worker_module.report_rows
+    seen_tmp = []
+
+    def _cancel_after_first_row(*args, **kwargs):
+        for i, row in enumerate(real_rows(*args, **kwargs)):
+            if i == 1:
+                seen_tmp.extend(sorted(p for p in os.listdir(out) if p.endswith(".tmp")))
+                worker.cancel()
+            yield row
+
+    monkeypatch.setattr(report_worker_module, 'report_rows', _cancel_after_first_row)
+
+    signals = _run_sync(worker)
+
+    assert seen_tmp == ["keep.csv.tmp", "keep_摘要.csv.tmp"]   # 取消时临时文件确已写出
+    assert signals == {'result': [], 'failed': []}
+    assert sorted(os.listdir(out)) == ["keep.csv", "keep_摘要.csv"]
+    assert csv_target.read_text(encoding="utf-8") == "旧明细"
+    assert summary_target.read_text(encoding="utf-8") == "旧摘要"
+
+
+def test_report_worker_replace_failure_keeps_target_and_emits_failed(
+        qapp, db, tmp_path, monkeypatch):
+    """目标被占用等导致 os.replace 失败：目标不变、临时文件被清理、发 failed 且不发 result"""
+    task = _seed(db)
+    out = _out_dir(tmp_path)
+    target = out / "locked.csv"
+    target.write_text("被占用的旧文件", encoding="utf-8")
+
+    def _deny(src, dst):
+        raise PermissionError("目标被占用")
+
+    monkeypatch.setattr('core.report_worker.os.replace', _deny)
+    worker = ReportWorker(db, ReportJob(task=task, csv_path=str(target)))
+
+    signals = _run_sync(worker)
+
+    assert signals['result'] == [] and len(signals['failed']) == 1
+    assert "导出失败" in signals['failed'][0] and "目标被占用" in signals['failed'][0]
+    assert os.listdir(out) == ["locked.csv"]
+    assert target.read_text(encoding="utf-8") == "被占用的旧文件"
+
+
+def test_report_worker_storage_error_mid_read_emits_failed(qapp, db, tmp_path, monkeypatch):
+    """读库中途失败（仓储抛 StorageError）：走失败路径，不留临时文件、不发 result"""
+    from data.errors import StorageError
+    task = _seed(db)
+    out = _out_dir(tmp_path)
+    real = db.points.iter_batches
+
+    def _failing(task_id, batch_size=5000):
+        def gen():
+            yield from list(real(task_id, batch_size))[:1]
+            raise StorageError("流式读取数据点失败: disk I/O error")
+        return gen()
+
+    monkeypatch.setattr(db.points, 'iter_batches', _failing)
+    worker = ReportWorker(db, ReportJob(task=task, csv_path=str(out / "x.csv")))
+
+    signals = _run_sync(worker)
+
+    assert signals['result'] == [] and len(signals['failed']) == 1
+    assert "disk I/O error" in signals['failed'][0]
+    assert os.listdir(out) == []
+
+
+def test_report_worker_result_signal_is_last_action(qapp, db, tmp_path):
+    """result 发出时收尾已全部完成：目标文件已就位、临时文件已不存在"""
+    from PyQt5.QtCore import Qt
+    task = _seed(db)
+    out = _out_dir(tmp_path)
+    target = out / "order.csv"
+    worker = ReportWorker(db, ReportJob(task=task, csv_path=str(target)))
+    observed = {}
+    worker.result.connect(lambda _r: observed.update(files=sorted(os.listdir(out))),
+                          Qt.DirectConnection)
+
+    worker.run()
+
+    assert observed == {'files': ["order.csv"]}
+
+
+def test_report_worker_uses_injected_db_and_never_constructs_database(
+        qapp, db, tmp_path, monkeypatch):
+    """线程内不得新建 Database：构造会开写事务，与"清理并压缩数据库"抢写锁"""
+    import core.report_worker as report_worker_module
+
+    def _forbidden(*args, **kwargs):
+        raise AssertionError("导出线程不应自行构造 Database")
+
+    monkeypatch.setattr(report_worker_module, 'Database', _forbidden)
+    task = _seed(db)
+    target = tmp_path / "injected.csv"
+    worker = ReportWorker(db, ReportJob(task=task, csv_path=str(target)))
+    assert worker.db is db
+
+    signals = _run_sync(worker)
+
+    assert signals['failed'] == []
+    assert len(signals['result']) == 1
+    assert signals['result'][0].row_count == 100 and signals['result'][0].point_count == 200
+    assert target.exists()
 
 
 # ---------------------------------------------------------------- 图片

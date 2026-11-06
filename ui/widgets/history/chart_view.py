@@ -5,7 +5,8 @@
 - 空洞（相邻采样间隔 > 2.5 × 周期）：曲线在空洞处断开（pyqtgraph connect 数组），
   空洞区间画灰色阴影并标注"无数据 12分钟"；
 - 打点：用户打点画注意色虚线、顶部横排编号徽标 ①②③，基线画注意色实线、徽标"基"，
-  标签放在 tooltip 与悬停读数里；暂停/恢复是系统打点，画在底部的浅色短竖线、不编号；
+  标签放在 tooltip 与悬停读数里；屏幕上挨得太近的徽标错开高度（badge_positions），
+  缩放/平移/改变窗口大小后重新排；暂停/恢复是系统打点，画在底部的浅色短竖线、不编号；
 - 累计类指标由调用方传入每秒速率序列（rate=True），纵轴标题为"每秒 X"。
 
 分析页用到的扩展点：标题（小倍数各图的指标名）、隐藏保存/复制
@@ -23,7 +24,7 @@ from typing import Callable, List, Optional, Sequence, Tuple
 import numpy as np
 import pyqtgraph as pg
 from pyqtgraph import exporters
-from PyQt5.QtCore import QEvent, Qt, pyqtSignal
+from PyQt5.QtCore import QEvent, QPointF, Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QPixmap
 from PyQt5.QtWidgets import QHBoxLayout, QSizePolicy, QVBoxLayout
 from qfluentwidgets import (CardWidget, FluentIcon, StrongBodyLabel, TransparentToolButton,
@@ -68,6 +69,11 @@ SYSTEM_MARKER_TEXTS = {'pause': '暂停', 'resume': '恢复'}
 # 徽标在竖线上的纵向位置（0 底、1 顶）；系统打点短竖线占绘图区高度的比例
 BADGE_POSITION = 0.94
 SYSTEM_MARKER_SPAN = 0.08
+# 相邻徽标横向相距不足 BADGE_MIN_GAP_PX 像素（约一个徽标宽）时视为挤在一起，
+# 依次下移 BADGE_STEP 错开，最多 BADGE_ROWS 层后回到顶层
+BADGE_MIN_GAP_PX = 22
+BADGE_STEP = 0.07
+BADGE_ROWS = 3
 # 空洞阴影的不透明度（0–255）与说明文字的纵向位置
 GAP_SHADE_ALPHA = 36
 GAP_LABEL_POSITION = 0.85
@@ -114,6 +120,21 @@ def marker_badges(markers: Sequence) -> List[Optional[str]]:
             number += 1
             badges.append(marker_badge(number))
     return badges
+
+
+def badge_positions(pixel_xs: Sequence[float], min_gap_px: float, top: float,
+                    step: float, rows: int) -> List[float]:
+    """各徽标的纵向位置（0 底、1 顶）。pixel_xs 为按时间升序的屏幕 x 像素；
+    相邻两个相距 < min_gap_px 归入同一簇，簇内第 k 个位于 top - (k % rows) * step，
+    簇间互不影响（每簇都从 top 开始）。"""
+    positions: List[float] = []
+    k = 0
+    previous: Optional[float] = None
+    for x in pixel_xs:
+        k = k + 1 if previous is not None and abs(x - previous) < min_gap_px else 0
+        positions.append(top - (k % rows) * step)
+        previous = x
+    return positions
 
 
 def nearest_index(x_array: Sequence[float], x: float) -> int:
@@ -195,6 +216,11 @@ class ChartView(CardWidget):
         # 两者都能正确处理 connect 数组（空洞断开）
         self.chart_widget.setDownsampling(auto=True, mode='peak')
         self.chart_widget.setClipToView(True)
+        # 徽标错开取决于屏幕上的像素距离：缩放、平移、改变大小后重新排。
+        # chart_widget.clear() 不会替换 ViewBox，连一次即可
+        view_box = self.chart_widget.getPlotItem().vb
+        view_box.sigXRangeChanged.connect(self._layout_badges)
+        view_box.sigResized.connect(self._layout_badges)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(
@@ -269,6 +295,11 @@ class ChartView(CardWidget):
     def marker_items(self) -> list:
         """本次绘制的打点竖线：[(kind, 徽标或 None, InfiniteLine)]，按时间升序。"""
         return list(self._marker_items)
+
+    def badge_layout(self) -> List[float]:
+        """带徽标竖线的标签当前纵向位置（0 底、1 顶），按时间升序（系统打点不计）。"""
+        return [line.label.orthoPos for _kind, badge, line in self._marker_items
+                if badge is not None]
 
     def gap_items(self) -> list:
         """本次绘制的空洞阴影：[(LinearRegionItem, 说明文本)]。"""
@@ -548,6 +579,24 @@ class ChartView(CardWidget):
             line.setToolTip(tooltip)
             self.chart_widget.addItem(line, ignoreBounds=True)
             self._marker_items.append((kind, badge, line))
+        self._layout_badges()
+
+    def _layout_badges(self, *_args) -> None:
+        """按徽标在屏幕上的横向距离错开高度，避免相隔几秒的打点徽标重叠。
+        只改标签位置，不改视图范围，不会反过来触发 sigXRangeChanged。"""
+        lines = [line for _kind, badge, line in self._marker_items if badge is not None]
+        if not lines:
+            return
+        view_box = self.chart_widget.getPlotItem().vb
+        pixel_xs = [view_box.mapViewToScene(QPointF(line.value(), 0)).x() for line in lines]
+        if not all(np.isfinite(pixel_xs)):
+            # 视图尚未布局（尺寸为零等）时映射无意义，先放回顶层，sigResized 后再排
+            positions = [BADGE_POSITION] * len(lines)
+        else:
+            positions = badge_positions(
+                pixel_xs, BADGE_MIN_GAP_PX, BADGE_POSITION, BADGE_STEP, BADGE_ROWS)
+        for line, position in zip(lines, positions):
+            line.label.setPosition(position)
 
     # ---------- 悬停十字线 ----------
 

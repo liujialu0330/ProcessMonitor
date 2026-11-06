@@ -34,28 +34,25 @@ def _tasks():
 
 def test_text_and_tooltip_match_formatting():
     tasks = _tasks()
-    for full_date in (False, True):
-        model = TaskOptionsModel(full_date=full_date)
-        options = model.rebuild(tasks, {"run"}, NOW)
-        for task, option in zip(tasks, options):
-            running = task.task_id == "run"
-            assert option == TaskOption(
-                task_id=task.task_id,
-                text=format_task_option_text(task, running, NOW, full_date=full_date),
-                tooltip=format_task_tooltip(task, running, NOW),
-                running=running)
+    options = TaskOptionsModel().rebuild(tasks, {"run"}, NOW)
+    for task, option in zip(tasks, options):
+        running = task.task_id == "run"
+        assert option == TaskOption(
+            task_id=task.task_id,
+            text=format_task_option_text(task, running, NOW),
+            tooltip=format_task_tooltip(task, running, NOW),
+            running=running)
 
 
 def test_pinned_texts():
-    """两种日期格式的具体文案（与安全网测试同一组数据）。"""
+    """具体文案（与安全网测试同一组数据）：文本不带年份，完整日期在 tooltip。"""
     short = TaskOptionsModel().rebuild(_tasks(), {"run"}, NOW)
-    full = TaskOptionsModel(full_date=True).rebuild(_tasks(), {"run"}, NOW)
     assert [o.text for o in short] == [
         "run.exe · PID 1000 · 07-16 23:00 · 运行中 5分钟",
         "noted.exe · PID 1000 · 07-16 21:00 · 42分钟 · 建模 200 次回归测试，连续运…",
         "plain.exe · PID 1000 · 12-31 23:30 · 2小时15分",
     ]
-    assert full[2].text == "plain.exe · PID 1000 · 2025-12-31 23:30 · 2小时15分"
+    assert "开始：2025-12-31 23:30:00" in short[2].tooltip
     assert "备注：建模 200 次回归测试，连续运行过夜观察内存增长" in short[1].tooltip
 
 
@@ -99,14 +96,14 @@ def test_refresh_running_returns_changed_indices():
 
 
 def test_refresh_after_task_ends_uses_final_duration_and_freezes():
-    model = TaskOptionsModel(full_date=True)
+    model = TaskOptionsModel()
     model.rebuild(_tasks(), {"run"}, NOW)
     ended = _task("run", BASE + timedelta(hours=3), end=BASE + timedelta(hours=3, minutes=40))
 
     changed = model.refresh_running(BASE + timedelta(hours=6), set(), {"run": ended})
     assert changed == [0]
     option = model.options()[0]
-    assert option.text == "run.exe · PID 1000 · 2026-07-16 23:00 · 40分钟"
+    assert option.text == "run.exe · PID 1000 · 07-16 23:00 · 40分钟"
     assert not option.running and "状态：已结束" in option.tooltip
     assert model.task("run") is ended
     assert model.tracked_running_ids() == []
