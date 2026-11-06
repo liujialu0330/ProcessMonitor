@@ -2,9 +2,8 @@
 实时监控页面
 进程选择、新建监控任务，并以任务卡片编排各任务的实时数据与结束后的回看入口
 """
-import os
 from datetime import datetime
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from PyQt5.QtCore import Qt, pyqtSignal, QStringListModel, QTimer
 from PyQt5.QtGui import QColor
@@ -12,26 +11,21 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QGridLayout,
                              QScrollArea, QSizePolicy, QCompleter)
 from qfluentwidgets import (
     LineEdit, EditableComboBox, PushButton, PrimaryPushButton, SpinBox,
-    CardWidget, FluentIcon, InfoBar, InfoBarPosition, MessageBox,
-    BodyLabel, CaptionLabel, StrongBodyLabel
+    CardWidget, FluentIcon, BodyLabel, CaptionLabel, StrongBodyLabel
 )
 
+from core.contracts import StopReason, UnavailableReason
 from core.monitor_manager import MonitorManager
-from core.process_collector import ProcessCollector
-from ui.components import MetricSelectorDialog, TaskCard
-from ui.components.dialogs import MarkerDialog
-from ui.components.task_card import USER_STOP_REASON
+from ui.components import TaskCard
+from ui.formatting import stop_reason_text, unavailable_reason_text
+from ui.services import UiServices
 from ui.typography import PageTitleLabel
 from utils.metrics import LEAK_CHECK_PRESET, get_metric_display_name
-from app_config import cfg, remember_last_metrics
 import config
 
 # 异常结束提示的显示时长（毫秒）：被测进程崩溃是测试里最需要被注意到的事件，
 # 不能像普通提示那样两秒就消失
 ABNORMAL_STOP_INFOBAR_MS = 15000
-
-# 错误类提示不自动消失（可手动关闭）：InfoBar.error 默认只停 1 秒，用户来不及看清
-ERROR_INFOBAR_DURATION = -1
 
 # 表单校验错误文字颜色（浅色 / 深色主题，取 Fluent 的错误色）
 FORM_ERROR_LIGHT = QColor(196, 43, 28)
@@ -43,25 +37,27 @@ class MonitorPage(QScrollArea):
 
     # 请求切换到历史页并选中该任务（由 MainWindow 处理，页面之间不互相引用）
     history_requested = pyqtSignal(str)
-    # 被测进程非用户停止而结束：(标题, 内容)。主窗口隐藏/不在前台时据此弹托盘气泡
+    # 被测进程自行结束（不是用户点停止）：(标题, 内容)。主窗口隐藏/不在前台时据此弹托盘气泡
     task_ended_abnormally = pyqtSignal(str, str)
 
-    def __init__(self, parent=None, db=None, manager=None):
+    def __init__(self, db, manager: MonitorManager, services: UiServices, parent=None):
         """初始化页面
 
         Args:
+            db: 数据库实例（本页面所有数据读写都经由 manager 完成，不直接使用；
+                与其他页面保持统一的构造签名）
+            manager: 监控管理器
+            services: 界面服务（提示、对话框、时钟、进程查询、用户偏好）
             parent: 父窗口
-            db: 数据库实例（未使用，仅为与其他页面保持统一的构造签名；本页面
-                所有数据读写都经由 self.manager 完成）
-            manager: 监控管理器（生产路径由 MainWindow 注入；为 None 时回退到
-                MonitorManager() 单例，仅为兼容独立构造的测试）
         """
         super().__init__(parent)
 
         # 设置对象名称
         self.setObjectName("monitorPage")
 
-        self.manager = manager if manager is not None else MonitorManager()
+        self.db = db
+        self.manager = manager
+        self.services = services
 
         # 任务卡片字典 {task_id: TaskCard}（含已结束、尚未关闭的卡片）
         self.task_cards = {}
@@ -71,12 +67,12 @@ class MonitorPage(QScrollArea):
         # 进程列表中各进程的创建时间 {pid: create_time}，开始监控时用于确认身份
         self.process_create_times = {}
 
-        # 当前显示中的错误提示 {(task_id, 内容): InfoBar}：错误提示不自动消失，
+        # 当前显示中的错误提示 {(task_id, 内容): 提示对象}：错误提示不自动消失，
         # 同一任务同一错误重复上报时不再叠加
         self._error_bars = {}
 
         # 已选监控指标：沿用上次选择，默认"泄漏排查"预设
-        self.selected_metrics: List[str] = list(cfg.get(cfg.last_metrics))
+        self.selected_metrics: List[str] = self.services.preferences.last_metrics()
 
         # 同步标志，防止循环触发
         self._syncing = False
@@ -181,13 +177,14 @@ class MonitorPage(QScrollArea):
 
         self.interval_spinbox = SpinBox()
         self.interval_spinbox.setRange(1, 3600)  # 1-3600秒
-        self.interval_spinbox.setValue(cfg.get(cfg.default_interval))  # 默认值取自设置页
+        # 默认值取自设置页
+        self.interval_spinbox.setValue(self.services.preferences.default_interval())
         # 普通 Fluent SpinBox 横排两个步进按钮，宽度交由其尺寸提示计算，
         # 避免紧凑布局把内部数值编辑区压缩为 0。
         select_layout.addWidget(self.interval_spinbox, 2, 3)
 
-        # 表单校验错误（PID 无效/进程不存在）就近显示在输入框下方，内容一改即清除；
-        # 不用 InfoBar，避免一闪即逝或与运行期提示混在一起
+        # 表单校验错误（PID 无效、找不到该进程）就近显示在输入框下方，内容一改即清除；
+        # 不用页面顶部提示，避免一闪即逝或与运行期提示混在一起
         self.form_error_label = CaptionLabel()
         self.form_error_label.setTextColor(FORM_ERROR_LIGHT, FORM_ERROR_DARK)
         self.form_error_label.setWordWrap(True)
@@ -264,11 +261,13 @@ class MonitorPage(QScrollArea):
 
     def _on_select_metric_clicked(self):
         """选择指标按钮点击事件：弹出多选对话框，确定后记住本次选择"""
-        dialog = MetricSelectorDialog(self.selected_metrics, self.window())
-        if dialog.exec():
-            self.selected_metrics = dialog.get_selected()
-            remember_last_metrics(self.selected_metrics)
-            self._update_metric_summary()
+        selected = self.services.dialogs.choose_metrics(
+            self.window(), self.selected_metrics)
+        if selected is None:
+            return
+        self.selected_metrics = list(selected)
+        self.services.preferences.remember_last_metrics(self.selected_metrics)
+        self._update_metric_summary()
 
     def _update_metric_summary(self):
         """更新已选指标摘要文案"""
@@ -307,7 +306,7 @@ class MonitorPage(QScrollArea):
         self.process_create_times.clear()
 
         # 4. 获取并添加进程
-        processes = ProcessCollector.get_all_processes()
+        processes = self.services.process_query.list_processes()
 
         for pid, name, create_time in processes:
             # 保存到字典
@@ -360,10 +359,10 @@ class MonitorPage(QScrollArea):
 
     def _forget_exited_process(self, pid: int) -> None:
         """被测进程已退出时，若表单仍选着它（下拉项或 PID 框），清掉选择并刷新进程列表：
-        避免已不存在的 PID 一直留在表单里，用户再点"开始监控"才报"进程不存在"。"""
+        避免已不存在的 PID 一直留在表单里，用户再点"开始监控"才报找不到该进程。"""
         if self._selected_form_pid() != pid:
             return
-        if ProcessCollector(pid).is_process_running():
+        if self.services.process_query.is_alive(pid):
             return
         self._syncing = True
         try:
@@ -442,9 +441,7 @@ class MonitorPage(QScrollArea):
 
     def _warn(self, content: str, title: str = "提示", duration: int = 3000):
         """页面顶部的警告提示"""
-        InfoBar.warning(
-            title=title, content=content, parent=self,
-            position=InfoBarPosition.TOP, duration=duration)
+        self.services.notifier.warning(self, title, content, duration)
 
     def _show_form_error(self, text: str) -> None:
         """在新建任务表单的输入框下方显示校验错误"""
@@ -471,7 +468,7 @@ class MonitorPage(QScrollArea):
             except ValueError:
                 self._show_form_error("PID 必须是数字")
                 return None
-            process_name = ProcessCollector(pid).get_process_name()
+            process_name = self.services.process_query.name_of(pid)
             if not process_name:
                 self._show_form_error(f"进程 PID {pid} 不存在或无法访问")
                 return None
@@ -514,8 +511,7 @@ class MonitorPage(QScrollArea):
 
     def _has_running_task_for_pid(self, pid: int) -> bool:
         """该 PID 是否已有运行中（未在停止）的任务"""
-        return any(task.pid == pid and task.is_running()
-                   for task in self.manager.get_all_tasks())
+        return self.manager.has_running_task_for_pid(pid)
 
     def _start_monitoring(self, pid: int, process_name: str, metrics: List[str],
                           interval: float, note: str = '',
@@ -531,36 +527,28 @@ class MonitorPage(QScrollArea):
             self.manager.start_task(task_id)
         return task_id
 
-    # ========== 需要弹模态对话框的交互（抽成方法，测试中可 monkeypatch） ==========
+    # ========== 模态对话框（经 services.dialogs；确认框焦点落在"取消"，顺手回车不执行） ==========
 
     def _confirm_duplicate_pid(self, pid: int, process_name: str) -> bool:
         """同一 PID 已有运行中任务：确认是否仍要再创建一个"""
-        box = MessageBox(
-            "已在监控该进程",
+        return self.services.dialogs.confirm(
+            self.window(), "已在监控该进程",
             f"{process_name}（PID {pid}）已有一个运行中的监控任务。\n仍要再创建一个吗？",
-            self.window())
-        box.yesButton.setText("继续创建")
-        box.cancelButton.setText("取消")
-        return bool(box.exec())
+            "继续创建")
 
     def _confirm_stop(self, card: TaskCard) -> bool:
         """停止确认：说明停止后本任务不可续采"""
-        box = MessageBox(
-            "停止监控",
+        return self.services.dialogs.confirm(
+            self.window(), "停止监控",
             f"确定要停止对 {card.process_name}（PID {card.pid}）的监控吗？\n"
             "停止后本任务不可续采，如需继续请重新监控；已采集的数据会保留。",
-            self.window())
-        box.yesButton.setText("停止")
-        box.cancelButton.setText("取消")
-        return bool(box.exec())
+            "停止")
 
     def _ask_marker_label(self, default_label: str,
                           timestamp: datetime) -> Optional[str]:
         """弹出打点标签输入框（显示点击时刻）；取消返回 None"""
-        dialog = MarkerDialog(default_label, self.window(), timestamp=timestamp)
-        if dialog.exec():
-            return dialog.get_label()
-        return None
+        return self.services.dialogs.ask_marker_label(
+            self.window(), default_label, timestamp)
 
     def _find_processes_by_name(
             self, process_name: str) -> List[Tuple[int, Optional[float]]]:
@@ -568,9 +556,10 @@ class MonitorPage(QScrollArea):
         wanted = process_name.lower()
         # 排除本程序自身：被测的同名进程（如 python.exe）退出后，"重新监控"
         # 不能因为只剩本程序同名而自动监控起自己
-        own_pid = os.getpid()
+        query = self.services.process_query
+        own_pid = query.self_pid()
         return [(pid, create_time)
-                for pid, name, create_time in ProcessCollector.get_all_processes()
+                for pid, name, create_time in query.list_processes()
                 if name.lower() == wanted and pid != own_pid]
 
     # ========== 任务列表 ==========
@@ -599,16 +588,15 @@ class MonitorPage(QScrollArea):
 
     def _on_task_added(self, task_id: str):
         """任务添加事件"""
-        task = self.manager.get_task(task_id)
-        if not task:
+        task_info = self.manager.get_task_info(task_id)
+        if task_info is None:
             return
-        task_info = task.get_task_info()
 
         card = TaskCard(
             task_id=task_id,
             process_name=task_info.process_name,
             pid=task_info.pid,
-            metric_types=task_info.metric_types,
+            metric_types=list(task_info.metric_types),
             parent=self,
             interval=task_info.interval,
             note=task_info.note,
@@ -631,19 +619,13 @@ class MonitorPage(QScrollArea):
     def _on_task_started(self, task_id: str):
         """任务启动事件"""
         self._update_tasks_label()
-        InfoBar.success(
-            title="成功",
-            content="监控任务已启动",
-            parent=self,
-            position=InfoBarPosition.TOP,
-            duration=1000
-        )
+        self.services.notifier.success(self, "成功", "监控任务已启动", 1000)
 
-    def _on_task_stopped(self, task_id: str, reason: str):
+    def _on_task_stopped(self, task_id: str, reason: StopReason):
         """任务停止事件：卡片保留并切换为"已结束"，同时释放 core 侧的任务对象"""
         card = self.task_cards.get(task_id)
         if card is not None:
-            card.set_finished(reason, datetime.now())
+            card.set_finished(reason, self.services.clock.now())
             self._forget_exited_process(card.pid)
 
         # 释放 core 侧任务对象（此时线程只剩收尾，wait 极短）。task_stopped 是 QThread
@@ -652,28 +634,17 @@ class MonitorPage(QScrollArea):
         QTimer.singleShot(0, lambda tid=task_id: self.manager.remove_task(tid))
         self._update_tasks_label()
 
-        if reason == USER_STOP_REASON:
-            InfoBar.info(
-                title="任务已停止",
-                content=f"原因：{reason}",
-                parent=self,
-                position=InfoBarPosition.TOP,
-                duration=2000
-            )
+        reason_text = stop_reason_text(reason)
+        if reason is StopReason.USER:
+            self.services.notifier.info(self, "任务已停止", f"原因：{reason_text}", 2000)
             return
 
-        # 被测进程崩溃/退出等非用户停止：提示要显眼且停留更久，
+        # 被测进程崩溃/退出等自行结束的情形：提示要显眼且停留更久，
         # 并通知主窗口在后台时补一条托盘气泡
         name = f"{card.process_name}（PID {card.pid}）" if card is not None else task_id
         title = "监控任务异常结束"
-        content = f"{name}：{reason}"
-        InfoBar.warning(
-            title=title,
-            content=content,
-            parent=self,
-            position=InfoBarPosition.TOP,
-            duration=ABNORMAL_STOP_INFOBAR_MS
-        )
+        content = f"{name}：{reason_text}"
+        self.services.notifier.warning(self, title, content, ABNORMAL_STOP_INFOBAR_MS)
         self.task_ended_abnormally.emit(title, content)
 
     def _on_data_updated(self, task_id: str, values: dict):
@@ -683,7 +654,8 @@ class MonitorPage(QScrollArea):
             card.update_values(values)
             card.increment_count()
 
-    def _on_metrics_unavailable(self, task_id: str, reasons: dict):
+    def _on_metrics_unavailable(self, task_id: str,
+                                reasons: Dict[str, UnavailableReason]):
         """部分指标无法采集：卡片标"不可用"，并弹出一次警告"""
         card = self.task_cards.get(task_id)
         if card is None:
@@ -691,18 +663,12 @@ class MonitorPage(QScrollArea):
         card.mark_unavailable(reasons)
 
         items = "、".join(
-            f"{get_metric_display_name(metric)}（{reason}）"
+            f"{get_metric_display_name(metric)}（{unavailable_reason_text(reason)}）"
             for metric, reason in reasons.items())
         content = f"{items}，这些指标不会记录数据。"
-        if "权限不足" in reasons.values():
+        if UnavailableReason.ACCESS_DENIED in reasons.values():
             content += "以管理员身份运行本工具可采集全部指标。"
-        InfoBar.warning(
-            title="部分指标无法采集",
-            content=content,
-            parent=self,
-            position=InfoBarPosition.TOP,
-            duration=10000
-        )
+        self.services.notifier.warning(self, "部分指标无法采集", content, 10000)
 
     def _on_error(self, task_id: str, error_msg: str):
         """错误事件：提示不自动消失；同一任务的同一错误仍在显示时不再叠加
@@ -710,26 +676,16 @@ class MonitorPage(QScrollArea):
         key = (task_id, error_msg)
         if key in self._error_bars:
             return
-        bar = InfoBar.error(
-            title="错误",
-            content=error_msg,
-            parent=self,
-            position=InfoBarPosition.TOP,
-            duration=ERROR_INFOBAR_DURATION
-        )
+        # 错误提示用 notifier 的默认时长：不自动消失，可手动关闭
+        bar = self.services.notifier.error(self, "错误", error_msg)
         if bar is not None:
             self._error_bars[key] = bar
             bar.closedSignal.connect(lambda k=key: self._error_bars.pop(k, None))
 
     def _on_limit_reached(self):
         """任务数量达到上限"""
-        InfoBar.warning(
-            title="提示",
-            content=f"最多只能同时监控 {config.MAX_MONITOR_TASKS} 个任务",
-            parent=self,
-            position=InfoBarPosition.TOP,
-            duration=2000
-        )
+        self.services.notifier.warning(
+            self, "提示", f"最多只能同时监控 {config.MAX_MONITOR_TASKS} 个任务", 2000)
 
     # ========== 卡片按钮 ==========
 
@@ -766,7 +722,7 @@ class MonitorPage(QScrollArea):
             return
         # 打点时间取点击按钮的这一刻：输入标签要花好几秒，按确认时刻记录会让
         # 竖线落在事件之后，短周期下甚至把增长归到下一轮
-        clicked_at = datetime.now()
+        clicked_at = self.services.clock.now()
         label = self._ask_marker_label(card.next_marker_label(), clicked_at)
         if label is None:
             return
@@ -776,16 +732,11 @@ class MonitorPage(QScrollArea):
 
         timestamp = self.manager.add_marker(task_id, label, clicked_at)
         if timestamp is None:
-            InfoBar.error(
-                title="打点失败", content="未能保存打点，请查看日志",
-                parent=self, position=InfoBarPosition.TOP,
-                duration=ERROR_INFOBAR_DURATION)
+            self.services.notifier.error(self, "打点失败", "未能保存打点，请查看日志")
             return
         card.note_marker_added()
-        InfoBar.success(
-            title="已打点",
-            content=f"{label.strip()} · {timestamp.strftime('%H:%M:%S')}",
-            parent=self, position=InfoBarPosition.TOP, duration=2000)
+        self.services.notifier.success(
+            self, "已打点", f"{label.strip()} · {timestamp.strftime('%H:%M:%S')}", 2000)
 
     def _on_history_task(self, task_id: str):
         """已结束卡片的"查看历史"：交给主窗口切页并选中该任务"""

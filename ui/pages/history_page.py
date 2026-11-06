@@ -7,17 +7,16 @@
 import bisect
 import logging
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from PyQt5.QtCore import Qt, QEvent, QTimer
 from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
                              QScrollArea, QTableWidgetItem, QHeaderView,
-                             QSizePolicy, QFileDialog, QApplication,
-                             QStackedWidget)
+                             QSizePolicy, QStackedWidget)
 from qfluentwidgets import (
     ComboBox, CardWidget, PushButton, FluentIcon,
-    StrongBodyLabel, BodyLabel, CaptionLabel, InfoBar, InfoBarPosition,
+    StrongBodyLabel, BodyLabel, CaptionLabel,
     TableWidget, SegmentedWidget, TransparentToolButton, qconfig,
     TransparentDropDownPushButton, RoundMenu, Action,
     IconWidget, setCustomStyleSheet
@@ -25,13 +24,12 @@ from qfluentwidgets import (
 import pyqtgraph as pg
 from pyqtgraph import exporters
 
+from core.contracts import TaskStatus
 from core.history_refresh_worker import HistoryRefreshResult, HistoryRefreshWorker
-from core.monitor_manager import MonitorManager
-from data.database import Database
 from ui.chart_theme import chart_colors
 from ui.components.chart_axes import ContextDateAxisItem, MetricAxisItem
-from ui.components.confirm import DestructiveConfirmBox
 from ui.components.sparkline import compute_y_range
+from ui.services import UiServices
 from ui.thread_shutdown import BackgroundThread
 from ui.formatting import (
     build_stat_texts, format_task_option_text, format_task_tooltip,
@@ -45,6 +43,10 @@ from utils.metrics import (
     format_metric_value, get_metric_display_name, get_metric_display_unit,
     is_integer_metric
 )
+
+if TYPE_CHECKING:
+    from core.monitor_manager import MonitorManager
+    from data.database import Database
 
 logger = logging.getLogger(__name__)
 
@@ -102,24 +104,24 @@ DETAIL_TABLE_ROW_HEIGHT = 38
 class HistoryPage(QScrollArea):
     """历史数据页面"""
 
-    def __init__(self, parent=None, db=None, manager=None):
+    def __init__(self, db: "Database", manager: "MonitorManager",
+                 services: UiServices, parent=None):
         """初始化页面
 
         Args:
+            db: 数据库实例（只读查询；与主窗口共用同一实例）
+            manager: 监控管理器：删除任务数据经它执行（UI 写库一律走 manager）
+            services: 界面层服务（提示、对话框、时钟、任务运行状态等）
             parent: 父窗口
-            db: 数据库实例（可选，默认回退新建 Database()；生产路径必须由
-                MainWindow 注入，回退仅为兼容兜底）
-            manager: 监控管理器（可选；生产路径由 MainWindow 注入。用于判断任务
-                是否仍在运行，以及经它删除任务数据——UI 写库一律走 manager。
-                为 None 时按需回退到 MonitorManager(db=self.db)）
         """
         super().__init__(parent)
 
         # 设置对象名称
         self.setObjectName("historyPage")
 
-        self.db = db if db is not None else Database()
+        self.db = db
         self.manager = manager
+        self.services = services
 
         # 当前选中的任务ID、指标类型与任务状态（用于删除按钮的运行中保护）
         self.current_task_id = None
@@ -326,7 +328,7 @@ class HistoryPage(QScrollArea):
 
         self.copy_chart_button = TransparentToolButton(FluentIcon.COPY, chart_card)
         self.copy_chart_button.setToolTip("复制图表到剪贴板")
-        self.copy_chart_button.clicked.connect(self._copy_chart_to_clipboard)
+        self.copy_chart_button.clicked.connect(self._copy_chart_image)
 
         chart_toolbar.addWidget(self.save_png_button)
         chart_toolbar.addWidget(self.copy_chart_button)
@@ -448,7 +450,7 @@ class HistoryPage(QScrollArea):
         self.view_segmented.setCurrentItem('trend')
         analysis_layout.addWidget(self.view_stack, 1)
 
-        # 空状态作为内容区的一种状态，不再反复用 InfoBar 打断操作。
+        # 空状态作为内容区的一种状态，不再反复用浮层提示打断操作。
         self.empty_state_page = CardWidget()
         empty_layout = QVBoxLayout(self.empty_state_page)
         empty_layout.setContentsMargins(24, 48, 24, 48)
@@ -543,16 +545,10 @@ class HistoryPage(QScrollArea):
         self._last_dt_cache_task_id = None
         self._last_dt_cache_value = None
 
-    def _get_manager(self) -> MonitorManager:
-        """监控管理器：优先用注入的，否则回退到单例（首次构造时绑定本页的 db）。"""
-        if self.manager is None:
-            self.manager = MonitorManager(db=self.db)
-        return self.manager
-
     def _is_task_running(self, task_id: str) -> bool:
-        """所选任务当前是否仍有采集线程在运行（以 manager 为准，而非数据库状态列）。"""
-        task = self._get_manager().get_task(task_id)
-        return task is not None and task.isRunning()
+        """所选任务当前是否仍有采集线程在运行（以任务状态服务为准，而非数据库状态列；
+        停止收尾中仍算运行，收尾写完结束时间后才转为已停止）。"""
+        return self.services.task_status.is_running(task_id)
 
     def _on_refresh_clicked(self):
         """刷新按钮：重新载入任务列表与当前任务数据（_load_tasks 会使最后时间戳缓存失效）。"""
@@ -569,13 +565,7 @@ class HistoryPage(QScrollArea):
         self._selection_is_auto = False
         self._load_tasks()
         if self.current_task_id != task_id:
-            InfoBar.info(
-                title="提示",
-                content="该任务暂无采样数据",
-                parent=self,
-                position=InfoBarPosition.TOP,
-                duration=2000
-            )
+            self.services.notifier.info(self, "提示", "该任务暂无采样数据")
 
     def _load_tasks(self):
         """加载任务列表"""
@@ -615,7 +605,7 @@ class HistoryPage(QScrollArea):
         self.task_combo.setEnabled(True)
 
         # 3. 添加到下拉框（使用setItemData设置userData）
-        now = datetime.now()
+        now = self.services.clock.now()
         for task in tasks:
             # 下拉项承载任务身份与上下文：进程 · PID · 开始时间 · 时长 · 备注；
             # 指标由下一行专门的选择器展示
@@ -681,7 +671,7 @@ class HistoryPage(QScrollArea):
     def _refresh_task_option_texts(self):
         """原地刷新下拉项的时长标签：运行中任务的时长随时间增长；任务刚结束时
         从数据库取回结束时间，标签改为最终时长。不重建列表，不影响当前选择与图表。"""
-        now = datetime.now()
+        now = self.services.clock.now()
         for index in range(self.task_combo.count()):
             task_id = self.task_combo.itemData(index)
             task = self._task_by_id.get(task_id)
@@ -852,13 +842,7 @@ class HistoryPage(QScrollArea):
         # 获取任务信息
         task_info = self.db.get_task(task_id)
         if not task_info:
-            InfoBar.error(
-                title="错误",
-                content="无法加载任务信息",
-                parent=self,
-                position=InfoBarPosition.TOP,
-                duration=-1
-            )
+            self.services.notifier.error(self, "错误", "无法加载任务信息")
             return
 
         since_iso = self._compute_since_iso(task_id, task_info)
@@ -1156,7 +1140,7 @@ class HistoryPage(QScrollArea):
             self.delete_button.setToolTip("")
             self.delete_action.setEnabled(False)
             self.delete_action.setToolTip("")
-        elif self.current_task_status == 'running':
+        elif self.current_task_status == TaskStatus.RUNNING:
             self.delete_button.setEnabled(False)
             self.delete_button.setToolTip("任务正在运行中，请先停止任务再删除")
             self.delete_action.setEnabled(False)
@@ -1172,64 +1156,44 @@ class HistoryPage(QScrollArea):
         if not self.current_task_id:
             return
 
-        if self.current_task_status == 'running':
-            InfoBar.warning(
-                title="提示",
-                content="任务正在运行中，请先停止任务再删除",
-                parent=self,
-                position=InfoBarPosition.TOP,
-                duration=2000
-            )
+        notifier = self.services.notifier
+        if self.current_task_status == TaskStatus.RUNNING:
+            notifier.warning(self, "提示", "任务正在运行中，请先停止任务再删除",
+                             duration=2000)
             return
 
         task = self.db.get_task(self.current_task_id)
         task_desc = f"{task.process_name} (PID: {task.pid})" if task else self.current_task_id
 
-        dialog = DestructiveConfirmBox(
+        confirmed = self.services.dialogs.confirm(
+            self.window(),
             "确认删除",
             f"确定要删除任务「{task_desc}」的全部历史数据吗？此操作不可恢复。",
             "删除",
-            self.window()
         )
-        if not dialog.exec():
+        if not confirmed:
             return
 
-        if self._get_manager().delete_task_data(self.current_task_id):
-            InfoBar.success(
-                title="删除成功",
-                content="该任务的历史数据已删除",
-                parent=self,
-                position=InfoBarPosition.TOP,
-                duration=2000
-            )
+        if self.manager.delete_task_data(self.current_task_id):
+            notifier.success(self, "删除成功", "该任务的历史数据已删除")
             self._load_tasks()
         else:
-            InfoBar.error(
-                title="删除失败",
-                content="删除任务数据失败，请查看日志",
-                parent=self,
-                position=InfoBarPosition.TOP,
-                duration=-1
-            )
+            notifier.error(self, "删除失败", "删除任务数据失败，请查看日志")
 
     def _save_chart_as_png(self):
         """保存当前图表为 PNG 图片"""
+        notifier = self.services.notifier
         if not self.current_task_id or not self._chart_x:
-            InfoBar.warning(
-                title="提示",
-                content="当前无图表数据可导出",
-                parent=self,
-                position=InfoBarPosition.TOP,
-                duration=2000
-            )
+            notifier.warning(self, "提示", "当前无图表数据可导出", duration=2000)
             return
 
         task_info = self.db.get_task(self.current_task_id)
         process_name = (task_info.process_name if task_info else "task").replace('.exe', '')
         metric_name = get_metric_display_name(self.current_metric) if self.current_metric else "指标"
-        default_name = f"{process_name}_{metric_name}_{datetime.now().strftime('%Y%m%d%H%M%S')}.png"
+        stamp = self.services.clock.now().strftime('%Y%m%d%H%M%S')
+        default_name = f"{process_name}_{metric_name}_{stamp}.png"
 
-        save_path, _ = QFileDialog.getSaveFileName(
+        save_path = self.services.dialogs.ask_save_path(
             self, "保存图表为图片", default_name, "PNG 图片 (*.png)")
         if not save_path:
             return
@@ -1240,56 +1204,27 @@ class HistoryPage(QScrollArea):
             exporter.export(save_path)
         except Exception:
             logger.error("保存图表图片失败", exc_info=True)
-            InfoBar.error(
-                title="保存失败",
-                content="保存图表图片失败，请查看日志",
-                parent=self,
-                position=InfoBarPosition.TOP,
-                duration=-1
-            )
+            notifier.error(self, "保存失败", "保存图表图片失败，请查看日志")
             return
 
-        InfoBar.success(
-            title="保存成功",
-            content=f"图表已保存到 {save_path}",
-            parent=self,
-            position=InfoBarPosition.TOP,
-            duration=2000
-        )
+        notifier.success(self, "保存成功", f"图表已保存到 {save_path}")
 
-    def _copy_chart_to_clipboard(self):
+    def _copy_chart_image(self):
         """复制当前图表为图片到剪贴板"""
+        notifier = self.services.notifier
         if not self.current_task_id or not self._chart_x:
-            InfoBar.warning(
-                title="提示",
-                content="当前无图表数据可复制",
-                parent=self,
-                position=InfoBarPosition.TOP,
-                duration=2000
-            )
+            notifier.warning(self, "提示", "当前无图表数据可复制", duration=2000)
             return
 
         try:
             pixmap = self.chart_widget.grab()
-            QApplication.clipboard().setPixmap(pixmap)
+            self.services.dialogs.copy_pixmap(pixmap)
         except Exception:
             logger.error("复制图表到剪贴板失败", exc_info=True)
-            InfoBar.error(
-                title="复制失败",
-                content="复制图表到剪贴板失败，请查看日志",
-                parent=self,
-                position=InfoBarPosition.TOP,
-                duration=-1
-            )
+            notifier.error(self, "复制失败", "复制图表到剪贴板失败，请查看日志")
             return
 
-        InfoBar.success(
-            title="复制成功",
-            content="图表已复制到剪贴板",
-            parent=self,
-            position=InfoBarPosition.TOP,
-            duration=2000
-        )
+        notifier.success(self, "复制成功", "图表已复制到剪贴板")
 
     def _apply_chart_theme(self):
         """

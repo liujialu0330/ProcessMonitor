@@ -13,6 +13,7 @@ import time
 import pytest
 from PyQt5.QtCore import Qt
 
+from core.contracts import StopReason
 from core.monitor_task import MonitorTask
 from tests.helpers import poll_until
 
@@ -62,7 +63,7 @@ def test_double_stop_call_is_idempotent(make_task):
     task.stop()  # 第二次调用是纯粹的 no-op（_running 已是 False）
 
     assert task.wait(5000) is True
-    assert len(stopped_events) == 1
+    assert stopped_events == [(task.task_id, StopReason.USER)]
 
 
 def test_stop_then_wait_does_not_hang(make_task):
@@ -124,6 +125,8 @@ def test_process_death_and_user_stop_race_single_emit(make_task):
 
         assert task.wait(5000) is True
         assert len(stopped_events) == 1
+        # 两种诱因谁先被主循环看到取决于时序，但原因一定是二者之一
+        assert stopped_events[0] in (StopReason.USER, StopReason.PROCESS_EXITED)
     finally:
         child.kill()
         child.wait(timeout=5)

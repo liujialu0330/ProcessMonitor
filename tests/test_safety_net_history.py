@@ -11,8 +11,8 @@
 2. 选择语义：select_task 显式选中后不被新任务切走；自动选中时新任务出现会一路
    跟到最新；自动选中的任务被删除时回落到最新任务（而用户显式选中的任务消失时清空）。
 
-不依赖真实时间流逝：页面模块里的 datetime 换成固定时钟；不依赖机器进程列表：
-"是否运行中"一律打桩；数据库为 conftest 的临时库。
+不依赖真实时间流逝：注入固定时钟（FakeClock）；不依赖机器进程列表：
+"是否运行中"由注入的任务状态替身给出；数据库为 conftest 的临时库。
 """
 import uuid
 from datetime import datetime, timedelta
@@ -21,11 +21,11 @@ import pyqtgraph as pg
 import pytest
 from PyQt5.QtWidgets import QApplication
 
-import ui.pages.history_page as history_module
 from core.monitor_manager import MonitorManager
 from data.models import DataPoint, MonitorTask
+from tests.doubles import FakeClock, FakeTaskStatus
+from tests.factories import make_history_page, make_services
 from tests.helpers import poll_until
-from ui.pages.history_page import HistoryPage
 from utils.metrics import MetricType
 
 BASE = datetime(2026, 7, 16, 8, 0, 0)
@@ -37,13 +37,8 @@ TABLE_LIMIT = 50
 MAX_BUCKETS = 20
 
 
-class _Clock(datetime):
-    """固定的当前时间：替换页面模块里的 datetime（只影响下拉时长文案，不影响查询锚点）"""
-    current = BASE + timedelta(minutes=121)
-
-    @classmethod
-    def now(cls, tz=None):
-        return cls.current
+# 固定的当前时间：只影响下拉时长文案，不影响查询锚点
+NOW = BASE + timedelta(minutes=121)
 
 
 def _pump():
@@ -98,13 +93,12 @@ def manager(db):
 
 @pytest.fixture
 def page(qapp, db, manager, monkeypatch):
-    monkeypatch.setattr(history_module, 'datetime', _Clock)
-    monkeypatch.setattr(history_module, 'TABLE_POINT_LIMIT', TABLE_LIMIT)
-    monkeypatch.setattr(history_module, 'CHART_MAX_BUCKETS', MAX_BUCKETS)
-    widget = HistoryPage(db=db, manager=manager)
-    widget.resize(1200, 800)
+    monkeypatch.setattr('ui.pages.history_page.TABLE_POINT_LIMIT', TABLE_LIMIT)
+    monkeypatch.setattr('ui.pages.history_page.CHART_MAX_BUCKETS', MAX_BUCKETS)
     # 所选任务视为运行中：_on_auto_refresh 走后台 worker 分支
-    monkeypatch.setattr(widget, '_is_task_running', lambda tid: True)
+    services = make_services(clock=FakeClock(NOW), task_status=FakeTaskStatus(all_running=True))
+    widget = make_history_page(db, manager, services)
+    widget.resize(1200, 800)
     yield widget
     widget._auto_refresh_timer.stop()
     worker = widget._refresh_worker
@@ -357,11 +351,10 @@ def _seed_simple(db, name, start, metrics=(MEM,), samples=3):
 
 
 @pytest.fixture
-def plain_page(qapp, db, manager, monkeypatch):
+def plain_page(qapp, db, manager):
     """不显示、不跑自动刷新的页面：只观察 _load_tasks / select_task 的选择结果。"""
-    monkeypatch.setattr(history_module, 'datetime', _Clock)
-    widget = HistoryPage(db=db, manager=manager)
-    monkeypatch.setattr(widget, '_is_task_running', lambda tid: False)
+    services = make_services(clock=FakeClock(NOW), task_status=FakeTaskStatus())
+    widget = make_history_page(db, manager, services)
     yield widget
     widget._auto_refresh_timer.stop()
     widget.close()

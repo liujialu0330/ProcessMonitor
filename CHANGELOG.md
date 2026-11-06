@@ -60,6 +60,11 @@
 - `MonitorManager` 新增导出登记（`begin_export` / `end_export` / `has_running_exports`），`begin_maintenance` 在导出进行中时拒绝，设置页按原因分别提示
 - 退出时改由各页面的 `background_threads()` 登记需要收尾的线程，主窗口统一收尾，不再按私有属性名 `getattr`
 - 废弃“非自愿上下文切换”（`num_ctx_switches_involuntary`）：Windows 上 psutil 恒为 0，不再可选，旧数据仍可显示与导出；可选指标 27 → 26（系统资源 6 → 5）
+- 新增 `core/contracts.py`：任务状态、停止原因、指标不可用原因改用枚举跨层传递，中文文案集中到 `ui/formatting.py`，不再以中文字面量作为 core 与界面之间的协议
+- `MonitorManager` 对界面只提供只读快照 `TaskInfo` 与状态查询（`is_task_active` / `has_running_task_for_pid` 等），退出时的兜底限时 join 并入 `join_all`；界面不再持有任务线程对象
+- `ui/formatting.py` 的时长与任务下拉文案函数改为必须由调用方传入当前时刻，不再自取系统时间
+- 新增界面服务层 `ui/services/`（提示、对话框与系统交互、时钟、进程查询、任务运行状态、用户偏好），页面与主窗口不再直接调用 InfoBar、对话框类、`os.startfile`、浏览器与系统时间；测试注入替身即可断言提示与预设用户选择
+- 页面与主窗口的依赖改为构造时必填注入（`db`、`manager`、`services`），删除页面内自建数据库/管理器的兜底；入口 `main.py` 显式组装唯一的数据库、监控管理器与服务集合
 
 ### v1.4.1 (2026-07-16)
 - 修复实时监控页“周期（秒）”输入框过窄，导致数值编辑区被 Fluent 步进按钮压缩为零、界面只显示箭头的问题

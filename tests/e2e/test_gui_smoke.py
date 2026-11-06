@@ -13,10 +13,12 @@ GUI 端到端冒烟测试（tests/e2e/，零生产代码改动）
       断言与 offscreen 模式完全一致，仅在关键步骤间追加停顿方便人工观察。
 
 隔离核实：db 注入 tmp 库（不碰项目真实 data\\monitor.db）、不写 logs（MainWindow
-不调用 setup_logging）、monkeypatch os.startfile 与 about_page.check_update
-避免真联网/真弹资源管理器。
+不调用 setup_logging）。服务用生产实现（真实进程查询、时钟、提示条），只把
+对话框换成 ScriptedDialogs（不真弹资源管理器、关窗确认直接给出"退出"），并把
+about_page.check_update 覆写为 no-op 避免真联网。
 """
 import csv
+import dataclasses
 import os
 import time
 
@@ -24,7 +26,10 @@ from PyQt5.QtTest import QTest
 from qfluentwidgets import Theme, qconfig, isDarkTheme
 
 from app_config import cfg
+from core.monitor_manager import MonitorManager
+from tests.doubles import ScriptedDialogs
 from ui.main_window import MainWindow
+from ui.services import production_services
 from utils.metrics import MetricType
 
 # 真窗口观察态开关：GUI_SMOKE_VISIBLE=1 时追加停顿，断言逻辑不变
@@ -51,16 +56,15 @@ def _poll_until(condition, timeout=POLL_TIMEOUT, interval_ms=100):
     return condition()
 
 
-def test_gui_smoke_full_lifecycle(qapp, e2e_db, tmp_path, monkeypatch):
+def test_gui_smoke_full_lifecycle(qapp, e2e_db, tmp_path):
     """完整链路冒烟：创建任务 -> 采集 -> 停止落库 -> 历史页查看 -> 导出 CSV -> 关闭窗口"""
-    # 拦截真实副作用：导出/更新下载完成后不真弹资源管理器
-    startfile_calls = []
-    monkeypatch.setattr(os, 'startfile', lambda path: startfile_calls.append(path),
-                         raising=False)
-    # 关闭确认是模态对话框：用例中途失败时若仍有任务在跑，收尾的 close() 不能被它阻塞
-    monkeypatch.setattr(MainWindow, '_ask_close_action', lambda self: 'quit')
+    # 与 main.py 相同的组装方式，只替换对话框：打开文件夹只做记录；关闭确认是模态
+    # 对话框，用例中途失败时若仍有任务在跑，收尾的 close() 不能被它阻塞
+    manager = MonitorManager(db=e2e_db)
+    dialogs = ScriptedDialogs(ask_close_action='quit')
+    services = dataclasses.replace(production_services(manager), dialogs=dialogs)
 
-    window = MainWindow(db=e2e_db)
+    window = MainWindow(e2e_db, manager, services)
     # 覆写为 no-op：防止 3 秒后 QTimer 触发真实联网检查更新；MainWindow 内部 QTimer
     # lambda 以 silent=True 调用，no-op 必须接受 **kwargs
     window.about_page.check_update = lambda *args, **kwargs: None
@@ -96,6 +100,9 @@ def test_gui_smoke_full_lifecycle(qapp, e2e_db, tmp_path, monkeypatch):
         QTest.qWait(200)
 
         assert e2e_db.get_sample_count(task_id) >= 2, "停止后落库的采集次数应 >= 2"
+        # task_stopped 携带 StopReason 枚举跨线程排队投递：卡片转已结束并显示中文原因
+        assert _poll_until(lambda: card.is_finished), "停止后卡片应转为已结束"
+        assert "用户停止" in card.finished_detail_label.text()
 
         _pause()
 
@@ -156,10 +163,11 @@ def test_gui_smoke_full_lifecycle(qapp, e2e_db, tmp_path, monkeypatch):
             rows = list(csv.reader(f))
         assert len(rows) >= 3, f"导出 CSV 应至少含表头+2 行数据，实际 {len(rows)} 行"
 
-        assert not startfile_calls, "导出完成后不应自动打开文件夹抢占焦点"
+        assert not dialogs.calls_of('open_folder'), "导出完成后不应自动打开文件夹抢占焦点"
         assert export_page.open_folder_button.isVisible()
         export_page.open_folder_button.click()
-        assert startfile_calls == [str(tmp_path)], "用户点击后才应打开导出目录"
+        assert dialogs.calls_of('open_folder') == [{"path": str(tmp_path)}], \
+            "用户点击后才应打开导出目录"
 
         _pause()
 

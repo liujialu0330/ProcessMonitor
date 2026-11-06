@@ -8,9 +8,11 @@ from datetime import datetime
 from typing import Dict, List, Optional
 from PyQt5.QtCore import QObject, pyqtSignal
 
+from core.contracts import StopReason, TaskInfo, TaskStatus
 from core.monitor_task import MonitorTask
 from data.database import Database
 from data.models import MonitorTask as TaskModel
+from utils.thread_utils import shutdown_thread
 import config
 
 logger = logging.getLogger(__name__)
@@ -28,11 +30,12 @@ class MonitorManager(QObject):
     # 信号定义
     task_added = pyqtSignal(str)           # 任务添加信号 (task_id)
     task_started = pyqtSignal(str)         # 任务启动信号 (task_id)
-    task_stopped = pyqtSignal(str, str)    # 任务停止信号 (task_id, reason)
+    task_stopped = pyqtSignal(str, object)  # 任务停止信号 (task_id, StopReason)
     task_removed = pyqtSignal(str)         # 任务移除信号 (task_id)
     data_updated = pyqtSignal(str, dict)   # 数据更新信号 (task_id, {指标类型: 指标值})
     error_occurred = pyqtSignal(str, str)  # 错误信号 (task_id, error_message)
-    metrics_unavailable = pyqtSignal(str, dict)  # 指标不可用信号 (task_id, {指标类型: 原因})
+    # 指标不可用信号 (task_id, {指标类型: UnavailableReason})
+    metrics_unavailable = pyqtSignal(str, dict)
     task_limit_reached = pyqtSignal()      # 任务数量达到上限信号
 
     def __new__(cls, db=None):
@@ -223,9 +226,65 @@ class MonitorManager(QObject):
             return True
         return False
 
+    # ========== 只读快照（界面只用这一组，不接触任务线程对象） ==========
+
+    @staticmethod
+    def _snapshot(task: MonitorTask) -> TaskInfo:
+        """由任务线程对象生成只读快照。status 取线程实际状态而非任务模型字段：
+        模型里的 stopped 要等收尾写库时才置，收尾期间线程仍算 RUNNING。"""
+        if task.isRunning():
+            status = TaskStatus.RUNNING
+        elif task.isFinished():
+            status = TaskStatus.STOPPED
+        else:
+            status = TaskStatus.PENDING
+        model = task.task_model
+        return TaskInfo(
+            task_id=task.task_id,
+            pid=task.pid,
+            process_name=task.process_name,
+            metric_types=tuple(task.metric_types),
+            interval=task.interval,
+            note=task.note,
+            status=status,
+            start_time=model.start_time,
+            end_time=model.end_time,
+            create_time=task.expected_create_time,
+            is_paused=task.is_paused(),
+            is_stopping=task.isRunning() and not task.is_running(),
+        )
+
+    def get_task_info(self, task_id: str) -> Optional[TaskInfo]:
+        """manager 中某任务的只读快照；任务不在 manager 中（已移除或从未创建）返回 None。
+        历史任务请直接查数据库。"""
+        task = self._tasks.get(task_id)
+        return self._snapshot(task) if task is not None else None
+
+    def list_task_infos(self) -> List[TaskInfo]:
+        """manager 中全部任务的只读快照（按创建顺序）"""
+        return [self._snapshot(task) for task in self._tasks.values()]
+
+    def is_task_active(self, task_id: str) -> bool:
+        """任务是否在采集：线程在运行且未请求停止（暂停中也算）"""
+        task = self._tasks.get(task_id)
+        return task is not None and task.isRunning() and task.is_running()
+
+    def is_task_paused(self, task_id: str) -> bool:
+        """任务是否处于暂停状态（不在 manager 中返回 False）"""
+        task = self._tasks.get(task_id)
+        return task is not None and task.is_paused()
+
+    def has_running_task_for_pid(self, pid: int) -> bool:
+        """该 PID 是否已有在采集（未在停止）的任务"""
+        return any(task.pid == pid and task.is_running()
+                   for task in self._tasks.values())
+
+    # ========== 任务线程对象（core 内部与测试使用，UI 禁用） ==========
+
     def get_task(self, task_id: str) -> Optional[MonitorTask]:
         """
-        获取监控任务对象
+        获取监控任务线程对象。UI 禁用：界面请用 get_task_info 等只读快照接口，
+        不得持有或调用任务线程。
 
         Args:
             task_id: 任务ID
@@ -237,7 +296,7 @@ class MonitorManager(QObject):
 
     def get_all_tasks(self) -> List[MonitorTask]:
         """
-        获取所有监控任务
+        获取所有监控任务线程对象。UI 禁用：界面请用 list_task_infos。
 
         Returns:
             List[MonitorTask]: 任务列表
@@ -246,7 +305,7 @@ class MonitorManager(QObject):
 
     def get_running_tasks(self) -> List[MonitorTask]:
         """
-        获取所有正在运行的任务
+        获取所有正在运行的任务线程对象。UI 禁用。
 
         Returns:
             List[MonitorTask]: 正在运行的任务列表
@@ -284,6 +343,24 @@ class MonitorManager(QObject):
         for task in tasks:
             if task.isRunning():
                 task.wait()
+
+    def join_all(self, timeout_ms: int) -> bool:
+        """
+        退出路径的兜底 join：对仍在运行的任务线程逐个带超时等待（超时只记日志）。
+        stop_all_tasks 只处理调用时 isRunning 的线程；入口用 os._exit() 结束进程，
+        若不等待，仍在收尾写库的线程会被中途掐死、丢失最后一批数据。
+
+        Args:
+            timeout_ms: 每个线程的等待上限（毫秒）
+
+        Returns:
+            bool: 全部线程都在超时前结束返回 True
+        """
+        all_finished = True
+        for task in list(self._tasks.values()):
+            if task.isRunning() and not shutdown_thread(task, timeout_ms=timeout_ms):
+                all_finished = False
+        return all_finished
 
     # ========== 运行状态与维护 ==========
 
@@ -370,22 +447,6 @@ class MonitorManager(QObject):
             return False
         return self.db.delete_task(task_id)
 
-    def get_task_info(self, task_id: str) -> Optional[TaskModel]:
-        """
-        获取任务信息
-
-        Args:
-            task_id: 任务ID
-
-        Returns:
-            Optional[TaskModel]: 任务信息模型
-        """
-        task = self._tasks.get(task_id)
-        if task:
-            return task.get_task_info()
-        # 如果当前不在运行，尝试从数据库获取
-        return self.db.get_task(task_id)
-
     def load_historical_tasks(self) -> List[TaskModel]:
         """
         从数据库加载历史任务
@@ -401,7 +462,7 @@ class MonitorManager(QObject):
         """任务数据更新处理"""
         self.data_updated.emit(task_id, values)
 
-    def _on_task_stopped(self, task_id: str, reason: str):
+    def _on_task_stopped(self, task_id: str, reason: StopReason):
         """任务停止处理"""
         self.task_stopped.emit(task_id, reason)
 
@@ -442,7 +503,7 @@ if __name__ == "__main__":
         print(f"[任务启动] ID: {task_id[:8]}...")
 
     def on_task_stopped(task_id, reason):
-        print(f"[任务停止] ID: {task_id[:8]}..., 原因: {reason}")
+        print(f"[任务停止] ID: {task_id[:8]}..., 原因: {reason.value}")
 
     def on_data_updated(task_id, values):
         formatted = ", ".join(f"{k}={v:.2f}" for k, v in values.items())

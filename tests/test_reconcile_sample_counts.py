@@ -65,8 +65,9 @@ def test_reconcile_sample_counts_counts_distinct_timestamps(db, db_path):
 
 def test_main_window_runs_reconcile_on_startup(qapp, tmp_path):
     """MainWindow 启动时与 reconcile_orphan_tasks 一起调用一次"""
+    from core.monitor_manager import MonitorManager
     from data.database import Database
-    from ui.main_window import MainWindow
+    from tests.factories import make_main_window
 
     db_file = str(tmp_path / "startup.db")
     db = Database(db_file)
@@ -74,7 +75,7 @@ def test_main_window_runs_reconcile_on_startup(qapp, tmp_path):
     db.save_task(task)
     _insert_points_like_old_version(db_file, task.task_id, datetime(2026, 3, 1), 3)
 
-    win = MainWindow(db=db)
+    win = make_main_window(db, MonitorManager(db=db))
     try:
         assert db.get_task(task.task_id).sample_count == 3
     finally:

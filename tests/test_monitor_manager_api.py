@@ -11,10 +11,13 @@ from datetime import datetime
 import pytest
 from PyQt5.QtCore import Qt
 
+import dataclasses
+
+from core.contracts import StopReason, TaskInfo, TaskStatus
 from core.monitor_manager import MonitorManager
 from core.monitor_task import MonitorTask
 from data.database import Database
-from tests.helpers import poll_until
+from tests.helpers import poll_until, record_stop_reasons
 
 
 @pytest.fixture
@@ -364,3 +367,177 @@ def test_begin_export_refused_during_maintenance(manager):
     manager.end_maintenance()
     assert manager.begin_export() is True
     manager.end_export()
+
+
+# ========== 只读快照与状态查询（界面只用这一组） ==========
+
+def test_task_info_snapshot_fields_and_status_lifecycle(manager):
+    task_id = manager.create_task(
+        os.getpid(), "snap.exe", ["memory_rss", "num_threads"], 0.05,
+        note="快照", create_time=1234.5)
+
+    info = manager.get_task_info(task_id)
+    assert isinstance(info, TaskInfo)
+    assert (info.task_id, info.pid, info.process_name) == (task_id, os.getpid(), "snap.exe")
+    assert info.metric_types == ("memory_rss", "num_threads")
+    assert (info.interval, info.note, info.create_time) == (0.05, "快照", 1234.5)
+    assert info.status is TaskStatus.PENDING
+    assert info.start_time is None and info.end_time is None
+    assert info.is_paused is False and info.is_stopping is False
+    # 快照不可变，也不暴露任务线程对象
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        info.note = "改"
+    assert not any(isinstance(v, MonitorTask) for v in dataclasses.astuple(info))
+
+    gate = threading.Event()
+    collector = _SlowCollector(gate)
+    collector.get_create_time = lambda: 1234.5   # 与所选进程一致，正常采集
+    manager.get_task(task_id).collector = collector
+    assert manager.start_task(task_id) is True
+    assert collector.entered.wait(5)
+    running = manager.get_task_info(task_id)
+    assert running.status is TaskStatus.RUNNING and running.start_time is not None
+
+    manager.stop_task(task_id)
+    gate.set()
+    assert manager.get_task(task_id).wait(5000)
+    stopped = manager.get_task_info(task_id)
+    assert stopped.status is TaskStatus.STOPPED and stopped.end_time is not None
+    assert [i.task_id for i in manager.list_task_infos()] == [task_id]
+
+
+def test_get_task_info_unknown_returns_none(manager):
+    assert manager.get_task_info("nope") is None
+    assert manager.list_task_infos() == []
+    assert manager.is_task_active("nope") is False
+    assert manager.is_task_paused("nope") is False
+
+
+def test_is_task_active_false_while_stopping(manager):
+    """停止收尾中（标志已清、线程未结束）：is_task_active 为 False，快照 is_stopping 为 True，
+    status 仍是 RUNNING（与 running_task_count 口径一致）"""
+    gate = threading.Event()
+    collector = _SlowCollector(gate)
+    task_id, task = _start_task_with_collector(manager, collector)
+    assert collector.entered.wait(5)
+    assert manager.is_task_active(task_id) is True
+
+    manager.stop_task(task_id)
+    info = manager.get_task_info(task_id)
+    assert manager.is_task_active(task_id) is False
+    assert info.is_stopping is True and info.status is TaskStatus.RUNNING
+
+    gate.set()
+    assert task.wait(5000)
+    assert manager.is_task_active(task_id) is False
+    assert manager.get_task_info(task_id).is_stopping is False
+
+
+def test_is_task_active_false_before_start(manager):
+    task_id = manager.create_task(os.getpid(), "p.exe", ["memory_rss"], 1.0)
+    assert manager.is_task_active(task_id) is False
+
+
+def test_is_task_paused_follows_pause_resume(manager):
+    gate = threading.Event()
+    collector = _SlowCollector(gate)
+    task_id, task = _start_task_with_collector(manager, collector)
+    assert collector.entered.wait(5)
+
+    assert manager.pause_task(task_id) is True
+    assert manager.is_task_paused(task_id) is True
+    assert manager.get_task_info(task_id).is_paused is True
+    assert manager.is_task_active(task_id) is True   # 暂停中仍算在采集任务
+
+    assert manager.resume_task(task_id) is True
+    assert manager.is_task_paused(task_id) is False
+    gate.set()
+    manager.stop_all_tasks()
+
+
+def test_has_running_task_for_pid(manager):
+    gate = threading.Event()
+    collector = _SlowCollector(gate)
+    assert manager.has_running_task_for_pid(os.getpid()) is False
+
+    pending = manager.create_task(os.getpid(), "p.exe", ["memory_rss"], 1.0)
+    assert manager.has_running_task_for_pid(os.getpid()) is False   # 未启动不算
+    assert pending is not None
+
+    task_id, task = _start_task_with_collector(manager, collector)
+    assert manager.has_running_task_for_pid(os.getpid()) is True
+    assert manager.has_running_task_for_pid(os.getpid() + 1) is False
+
+    manager.stop_task(task_id)
+    assert manager.has_running_task_for_pid(os.getpid()) is False   # 停止中不算
+    gate.set()
+    assert task.wait(5000)
+
+
+def test_manager_task_stopped_carries_stop_reason(manager, qapp):
+    reasons = record_stop_reasons(manager)
+    task_id, task = _start_task_with_collector(manager, _SlowCollector())
+    manager.stop_task(task_id)
+    assert task.wait(5000)
+    assert poll_until(lambda: (qapp.processEvents(), reasons)[1], timeout=5)
+    assert reasons == [StopReason.USER]
+
+
+# ========== join_all（退出路径兜底 join） ==========
+
+class _JoinTask:
+    """记录 wait 超时参数的假线程；hang=True 时 wait 超时返回 False"""
+
+    def __init__(self, log, name, alive=True, hang=False):
+        self.log, self.name, self._alive, self.hang = log, name, alive, hang
+
+    def isRunning(self):
+        return self._alive
+
+    def stop(self):
+        pass
+
+    def wait(self, timeout_ms=None):
+        if timeout_ms is None:   # 用例结束时 conftest 的 stop_all_tasks 无超时收尾
+            self._alive = False
+            return True
+        self.log.append((self.name, timeout_ms))
+        if self.hang:
+            return False
+        self._alive = False
+        return True
+
+
+def test_join_all_waits_running_tasks_with_timeout(manager):
+    log = []
+    manager._tasks = {
+        "a": _JoinTask(log, "a"),
+        "idle": _JoinTask(log, "idle", alive=False),
+        "b": _JoinTask(log, "b"),
+    }
+    assert manager.join_all(timeout_ms=3000) is True
+    assert log == [("a", 3000), ("b", 3000)]   # 已结束的线程不等
+
+
+def test_join_all_reports_timeout_and_still_joins_rest(manager):
+    log = []
+    manager._tasks = {"stuck": _JoinTask(log, "stuck", hang=True), "ok": _JoinTask(log, "ok")}
+    assert manager.join_all(timeout_ms=50) is False
+    assert log == [("stuck", 50), ("ok", 50)]   # 一个超时不影响后面的线程
+
+
+def test_join_all_real_stuck_thread_times_out(manager):
+    """真实线程卡在收尾：join_all 按超时返回 False，放开后能正常结束"""
+    gate = threading.Event()
+    collector = _SlowCollector(gate)
+    task_id, task = _start_task_with_collector(manager, collector)
+    assert collector.entered.wait(5)
+    manager.stop_task(task_id)
+
+    t0 = time.perf_counter()
+    assert manager.join_all(timeout_ms=100) is False
+    assert time.perf_counter() - t0 < 2.0
+
+    gate.set()
+    assert manager.join_all(timeout_ms=5000) is True
+    assert task.isFinished()

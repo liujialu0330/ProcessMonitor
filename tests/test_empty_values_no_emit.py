@@ -4,6 +4,7 @@ import time
 
 from PyQt5.QtCore import Qt
 
+from core.contracts import UnavailableReason
 from core.monitor_task import MonitorTask
 from utils.metrics import MetricType
 
@@ -19,7 +20,7 @@ class _AllUnavailableCollector:
         pass
 
     def collect_metrics(self, metric_types):
-        self.last_unavailable = {m: "权限不足" for m in metric_types}
+        self.last_unavailable = {m: UnavailableReason.ACCESS_DENIED for m in metric_types}
         return {}
 
 
@@ -44,5 +45,5 @@ def test_monitor_task_does_not_emit_data_updated_for_empty_values(db, qapp):
     task.wait(3000)
 
     assert cycles == []
-    assert notices == [(task.task_id, {MetricType.MEMORY_USS: "权限不足"})]
+    assert notices == [(task.task_id, {MetricType.MEMORY_USS: UnavailableReason.ACCESS_DENIED})]
     assert db.get_data_point_count(task.task_id) == 0

@@ -8,6 +8,7 @@ import sys
 from ctypes import wintypes
 import psutil
 from typing import Any, Optional, Dict, List, Tuple
+from core.contracts import UnavailableReason
 from utils.metrics import MetricType
 
 logger = logging.getLogger(__name__)
@@ -25,8 +26,12 @@ _win32_funcs = None
 class MetricNotSupported(Exception):
     """该指标对目标进程不适用（不是权限问题，以管理员运行也无法采集）。
 
-    异常消息即显示给用户的原因文案。
+    reason 区分具体原因，界面文案由 ui/formatting 按枚举映射。
     """
+
+    def __init__(self, reason: UnavailableReason = UnavailableReason.NOT_SUPPORTED):
+        super().__init__(reason.value)
+        self.reason = reason
 
 
 def _init_win32():
@@ -62,7 +67,7 @@ class ProcessCollector:
         self._process: Optional[psutil.Process] = None
         self._last_io_counters = None  # 用于计算IO增量
         # 最近一次 collect_metrics 中无法采集的指标：{指标类型: 原因}
-        self.last_unavailable: Dict[str, str] = {}
+        self.last_unavailable: Dict[str, UnavailableReason] = {}
         # 已记录过异常日志的指标，避免持续失败时每个周期都刷日志
         self._logged_failures = set()
 
@@ -124,7 +129,7 @@ class ProcessCollector:
             MetricNotSupported: 非 Windows，或进程不在当前会话（如 session 0 的系统服务）
         """
         if sys.platform != "win32":
-            raise MetricNotSupported("仅支持 Windows")
+            raise MetricNotSupported(UnavailableReason.NOT_SUPPORTED)
 
         kernel32, user32 = _init_win32()
         handle = kernel32.OpenProcess(
@@ -141,7 +146,7 @@ class ProcessCollector:
                 if error == _ERROR_INVALID_PARAMETER:
                     # 其他会话的进程（如 session 0 的系统服务）返回 0 且 LastError=87；
                     # 这类进程不在当前桌面会话，提权也无法采集，不能提示"权限不足"
-                    raise MetricNotSupported("进程不在当前会话，不支持采集")
+                    raise MetricNotSupported(UnavailableReason.NOT_IN_SESSION)
                 if error != 0:
                     raise psutil.AccessDenied(self.pid)
             return float(count)
@@ -335,18 +340,18 @@ class ProcessCollector:
                         value = self._collect_one(metric_type)
                     except psutil.AccessDenied:
                         # 权限不足：跳过该指标（不记0），进程可能仍存在，不中断
-                        self.last_unavailable[metric_type] = "权限不足"
+                        self.last_unavailable[metric_type] = UnavailableReason.ACCESS_DENIED
                         continue
                     except psutil.ZombieProcess:
                         # 注意：ZombieProcess是NoSuchProcess的子类，必须先于父类捕获
-                        self.last_unavailable[metric_type] = "进程正在退出"
+                        self.last_unavailable[metric_type] = UnavailableReason.PROCESS_EXITING
                         continue
                     except psutil.NoSuchProcess:
                         # 进程确实不存在，整体返回None停止任务
                         return None
                     except MetricNotSupported as e:
                         # 指标对该进程不适用（非权限问题），跳过且不提示提权
-                        self.last_unavailable[metric_type] = str(e)
+                        self.last_unavailable[metric_type] = e.reason
                         continue
                     except Exception:
                         # 其他异常，进程可能仍存在，跳过该指标继续
@@ -354,7 +359,7 @@ class ProcessCollector:
                             self._logged_failures.add(metric_type)
                             logger.exception(
                                 "采集指标 %s 失败（PID %s）", metric_type, self.pid)
-                        self.last_unavailable[metric_type] = "采集失败"
+                        self.last_unavailable[metric_type] = UnavailableReason.ERROR
                         continue
 
                     if value is not None:

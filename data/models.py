@@ -4,7 +4,11 @@
 """
 from dataclasses import dataclass
 from datetime import datetime
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional, Union
+
+if TYPE_CHECKING:
+    # 仅用于类型标注：数据层在运行时不依赖 core（分层单向）
+    from core.contracts import TaskStatus
 
 
 @dataclass
@@ -15,16 +19,18 @@ class MonitorTask:
     process_name: str               # 进程名称
     metric_types: List[str]         # 监控指标类型列表（支持多指标）
     interval: float                 # 采集间隔（秒）
-    start_time: datetime            # 开始时间
+    start_time: Optional[datetime]  # 开始时间（任务线程启动前为 None）
     end_time: Optional[datetime]    # 结束时间（None表示正在运行）
-    status: str                     # 状态：running/stopped
+    # 状态：pending（已创建未启动，仅内存）/running/stopped。内存中写 TaskStatus，
+    # 从数据库读出的是原字符串；TaskStatus 继承 str，两者可直接比较
+    status: Union['TaskStatus', str]
     note: str = ''                          # 任务备注
     sample_count: int = 0                   # 已采集次数（同一周期多指标算一次）
     last_sample_at: Optional[datetime] = None  # 最后一次采样时间
 
     def is_running(self) -> bool:
         """判断任务是否正在运行"""
-        return self.status == 'running'
+        return self.status == 'running'   # 与 TaskStatus.RUNNING 的值一致
 
     def to_dict(self) -> dict:
         """转换为字典"""

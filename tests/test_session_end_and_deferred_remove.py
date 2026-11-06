@@ -7,17 +7,16 @@ from unittest.mock import MagicMock
 import pytest
 from PyQt5.QtWidgets import QApplication
 
+from core.contracts import StopReason
 from core.monitor_manager import MonitorManager
-from core.process_collector import ProcessCollector
 from data.database import Database
-from ui.main_window import MainWindow
-from ui.pages.monitor_page import MonitorPage
+from tests.factories import make_main_window, make_monitor_page
 
 
 @pytest.fixture
-def window(tmp_path, qapp, monkeypatch):
+def window(tmp_path, qapp):
     db = Database(str(tmp_path / "session_end.db"))
-    win = MainWindow(db=db)
+    win = make_main_window(db, MonitorManager(db=db))
     win.about_page.check_update = lambda *args, **kwargs: None
     win.show()
     yield win
@@ -26,8 +25,7 @@ def window(tmp_path, qapp, monkeypatch):
 
 def test_commit_data_request_skips_close_confirmation(window, monkeypatch):
     """会话结束：处理函数置 _really_quit，随后的 closeEvent 不弹三选确认、走真退出"""
-    asked = []
-    monkeypatch.setattr(window, '_ask_close_action', lambda: asked.append(1) or 'cancel')
+    window.services.dialogs.always('ask_close_action', 'cancel')
     monkeypatch.setattr(window.monitor_manager, 'has_running_tasks', lambda: True)
     stop_all = MagicMock()
     monkeypatch.setattr(window.monitor_manager, 'stop_all_tasks', stop_all)
@@ -41,7 +39,7 @@ def test_commit_data_request_skips_close_confirmation(window, monkeypatch):
     event = MagicMock()
     window.closeEvent(event)
 
-    assert asked == []
+    assert window.services.dialogs.calls_of('ask_close_action') == []
     stop_all.assert_called_once()
     quit_mock.assert_called_once()
     event.accept.assert_called_once()
@@ -53,7 +51,8 @@ def test_commit_data_request_signal_is_connected(qapp, tmp_path):
     （无法在测试里构造真实 QSessionManager 来 emit，故校验接收者数量增加）"""
     app = QApplication.instance()
     before = app.receivers(app.commitDataRequest)
-    win = MainWindow(db=Database(str(tmp_path / "signal.db")))
+    db = Database(str(tmp_path / "signal.db"))
+    win = make_main_window(db, MonitorManager(db=db))
     try:
         assert app.receivers(app.commitDataRequest) == before + 1
     finally:
@@ -61,16 +60,14 @@ def test_commit_data_request_signal_is_connected(qapp, tmp_path):
         win.close()
 
 
-def test_task_stopped_defers_remove_task(qapp, db, monkeypatch):
+def test_task_stopped_defers_remove_task(qapp, db):
     """卡片即时转已结束，remove_task 延后到下一轮事件循环"""
-    monkeypatch.setattr(
-        ProcessCollector, "get_all_processes", staticmethod(lambda: []))
     manager = MonitorManager(db=db)
-    page = MonitorPage(manager=manager)
+    page = make_monitor_page(db, manager)  # 默认替身进程表为空，不枚举本机进程
     removed = []
     manager.remove_task = lambda tid: removed.append(tid) or True
 
-    page._on_task_stopped("t-unknown", "用户停止")
+    page._on_task_stopped("t-unknown", StopReason.USER)
     assert removed == []
     QApplication.processEvents()
     assert removed == ["t-unknown"]

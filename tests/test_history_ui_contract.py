@@ -3,21 +3,30 @@
 from datetime import datetime
 from types import SimpleNamespace
 
+import pytest
 from PyQt5.QtCore import Qt
 
+from core.monitor_manager import MonitorManager
+from tests.factories import make_history_page, make_services
 from ui.pages.history_page import (
     DEFAULT_TIME_RANGE_KEY,
     DETAIL_TABLE_MAX_WIDTH,
     DETAIL_TABLE_ROW_HEIGHT,
-    HistoryPage,
 )
 from ui.typography import TypeScale
 from utils.metrics import MetricType
 
 
-def test_history_page_uses_compact_analysis_contract(qapp, db):
+@pytest.fixture
+def new_page(qapp, db):
+    """按需构造历史页（全替身服务），返回构造函数供同一用例多次调用。"""
+    manager = MonitorManager(db=db)
+    return lambda: make_history_page(db, manager, make_services())
+
+
+def test_history_page_uses_compact_analysis_contract(qapp, new_page):
     """统计、子视图和原始值列保持数据优先的默认形态。"""
-    page = HistoryPage(db=db)
+    page = new_page()
 
     assert DEFAULT_TIME_RANGE_KEY == 'all'
     assert page.current_range_key == 'all'
@@ -37,9 +46,9 @@ def test_history_page_uses_compact_analysis_contract(qapp, db):
     page.close()
 
 
-def test_history_filters_wrap_at_narrow_width(qapp, db):
+def test_history_filters_wrap_at_narrow_width(qapp, new_page):
     """窄内容区时，时间范围必须换行而不是横向裁切。"""
-    page = HistoryPage(db=db)
+    page = new_page()
     page._update_filter_layout(600)
 
     index = page.select_layout.indexOf(page.range_segmented)
@@ -54,9 +63,9 @@ def test_history_filters_wrap_at_narrow_width(qapp, db):
     page.close()
 
 
-def test_history_detail_table_uses_centered_bounded_data_track(qapp, db):
+def test_history_detail_table_uses_centered_bounded_data_track(qapp, new_page):
     """宽屏明细保持居中阅读轨道，表头、正文和数据字体使用同一契约。"""
-    page = HistoryPage(db=db)
+    page = new_page()
     page.resize(1400, 760)
     page.content_stack.setCurrentWidget(page.analysis_page)
     page.view_segmented.setCurrentItem('detail')
@@ -113,7 +122,7 @@ def test_history_detail_table_uses_centered_bounded_data_track(qapp, db):
     page.close()
 
     # 窄窗口不保留人为留白，轨道应回到卡片的 16px 标准内边距并继续三列等分。
-    narrow_page = HistoryPage(db=db)
+    narrow_page = new_page()
     narrow_page.resize(800, 760)
     narrow_page.content_stack.setCurrentWidget(narrow_page.analysis_page)
     narrow_page.view_segmented.setCurrentItem('detail')

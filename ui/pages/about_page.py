@@ -4,7 +4,6 @@
 """
 import os
 import sys
-import webbrowser
 
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QPixmap
@@ -15,7 +14,7 @@ from qfluentwidgets import (
     CardWidget, PrimaryPushButton, FluentIcon,
     StrongBodyLabel, BodyLabel,
     MessageBoxBase, SubtitleLabel, PushButton,
-    InfoBar, InfoBarPosition, ProgressBar, TextEdit
+    ProgressBar, TextEdit
 )
 
 import config
@@ -23,6 +22,7 @@ from core.update_checker import (
     UpdateChecker, UpdateDownloader, MSG_CANNOT_VERIFY,
     get_skipped_version, set_skipped_version
 )
+from ui.services import UiServices
 from ui.thread_shutdown import BackgroundThread
 from ui.typography import DataCaptionLabel, PageTitleLabel
 
@@ -85,14 +85,20 @@ class AboutPage(QScrollArea):
     """关于页面"""
 
     # 静默检查（启动3秒后自动检查）发现新版本时发出：不由本页面直接弹模态对话框
-    # 打断用户，改由主窗口统一处理为非模态 InfoBar 提示；参数为
+    # 打断用户，改由主窗口统一处理为非模态提示；参数为
     # core.update_checker.parse_release_info 返回的 info 字典
     update_available_silent = pyqtSignal(object)
 
-    def __init__(self, parent=None):
-        """初始化页面"""
+    def __init__(self, services: UiServices, parent=None):
+        """初始化页面
+
+        Args:
+            services: 界面服务（提示、打开网址、启动安装包）
+            parent: 父窗口
+        """
         super().__init__(parent)
         self.setObjectName("aboutPage")
+        self.services = services
 
         # 更新相关状态
         self._checker = None
@@ -189,7 +195,7 @@ class AboutPage(QScrollArea):
 
     def _open_project_homepage(self) -> None:
         """打开 GitHub 项目主页。"""
-        webbrowser.open(self.repo_url)
+        self.services.dialogs.open_url(self.repo_url)
 
     def _on_manual_check_clicked(self) -> None:
         """手动检查更新，避免用 lambda 隐藏按钮的操作语义。"""
@@ -252,13 +258,13 @@ class AboutPage(QScrollArea):
         self.status_label.setText(f"发现新版本 v{info['version']}")
         if silent:
             # 静默检查不直接弹模态对话框打断用户，改为发信号，由主窗口用非模态
-            # InfoBar 提示（手动检查路径不变，仍直接弹下方模态对话框）
+            # 提示（手动检查路径不变，仍直接弹下方模态对话框）
             self.update_available_silent.emit(info)
         else:
             self._show_update_dialog(info)
 
     def show_update_dialog_for(self, info: dict):
-        """供主窗口在用户点击 InfoBar「查看」按钮后调用：弹出与手动检查路径
+        """供主窗口在用户点击提示条「查看」按钮后调用：弹出与手动检查路径
         一致的确认对话框（内部直接复用 _show_update_dialog，不重复实现）"""
         self._show_update_dialog(info)
 
@@ -270,15 +276,7 @@ class AboutPage(QScrollArea):
             self.status_label.setText("自动检查未完成，可手动重试")
             return
         self.status_label.setText("检查更新失败，可稍后重试")
-        InfoBar.warning(
-            title="检查更新失败",
-            content=msg,
-            orient=Qt.Horizontal,
-            isClosable=True,
-            position=InfoBarPosition.TOP,
-            duration=4000,
-            parent=self
-        )
+        self.services.notifier.warning(self, "检查更新失败", msg, duration=4000)
 
     def _show_update_dialog(self, info: dict):
         """弹出发现新版本对话框"""
@@ -292,24 +290,18 @@ class AboutPage(QScrollArea):
     def _start_update(self, info: dict):
         """开始更新：开发环境仅提示；有安装包则下载，否则打开发布页"""
         if not getattr(sys, 'frozen', False):
-            InfoBar.info(
-                title="开发环境",
-                content="当前为源码运行环境，请使用 git pull 更新代码。",
-                orient=Qt.Horizontal,
-                isClosable=True,
-                position=InfoBarPosition.TOP,
-                duration=4000,
-                parent=self
-            )
+            self.services.notifier.info(
+                self, "开发环境", "当前为源码运行环境，请使用 git pull 更新代码。",
+                duration=4000)
             self.status_label.setText(
                 f"发现新版本 v{info['version']}；源码环境不支持自动安装")
             return
 
         if not info.get('asset_url'):
             # 该 release 未附带安装包，降级为打开发布页
-            webbrowser.open(info['html_url'] or
-                            f"https://github.com/{config.GITHUB_OWNER}/"
-                            f"{config.GITHUB_REPO}/releases")
+            self.services.dialogs.open_url(
+                info['html_url'] or
+                f"https://github.com/{config.GITHUB_OWNER}/{config.GITHUB_REPO}/releases")
             self.status_label.setText("未找到安装包，已打开发布页")
             return
 
@@ -350,8 +342,8 @@ class AboutPage(QScrollArea):
         dialog = InstallConfirmDialog(self.window(), version)
         if dialog.exec():
             try:
-                os.startfile(path)
-            except Exception as e:
+                self.services.dialogs.open_file(path)
+            except OSError as e:
                 self.status_label.setText(f"启动安装程序失败：{e}")
                 return
             # 退出应用，交给安装向导。必须调用 quit_for_install()
@@ -377,7 +369,8 @@ class AboutPage(QScrollArea):
 
     def _open_release_page(self, info: dict = None):
         """打开发布页（按钮点击时 info 为 False/None，使用已记录的地址）"""
-        webbrowser.open(self._release_page_url(info if isinstance(info, dict) else None))
+        self.services.dialogs.open_url(
+            self._release_page_url(info if isinstance(info, dict) else None))
 
     def _show_no_digest(self, info: dict = None):
         """该版本未提供安装包校验信息：不自动下载（无法确认安装包完整性），
@@ -388,15 +381,8 @@ class AboutPage(QScrollArea):
         self.status_label.setText(MSG_NO_DIGEST)
         self.release_button.setVisible(True)
 
-        info_bar = InfoBar.warning(
-            title="无法自动更新",
-            content=MSG_NO_DIGEST,
-            orient=Qt.Horizontal,
-            isClosable=True,
-            position=InfoBarPosition.TOP,
-            duration=8000,
-            parent=self
-        )
+        info_bar = self.services.notifier.warning(
+            self, "无法自动更新", MSG_NO_DIGEST, duration=8000)
         open_button = PushButton("打开发布页")
         open_button.clicked.connect(self._open_release_page)
         info_bar.addWidget(open_button)
@@ -409,12 +395,4 @@ class AboutPage(QScrollArea):
         self.progress_bar.setVisible(False)
         self.check_button.setEnabled(True)
         self.status_label.setText("下载失败，可稍后重试")
-        InfoBar.warning(
-            title="下载失败",
-            content=msg,
-            orient=Qt.Horizontal,
-            isClosable=True,
-            position=InfoBarPosition.TOP,
-            duration=4000,
-            parent=self
-        )
+        self.services.notifier.warning(self, "下载失败", msg, duration=4000)

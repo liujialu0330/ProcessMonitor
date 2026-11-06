@@ -26,3 +26,14 @@ def wait_stable(getter, quiet: float = 0.4, timeout: float = 10.0) -> bool:
         elif time.monotonic() - last_change >= quiet:
             return True
     return False
+
+
+def record_stop_reasons(task) -> list:
+    """直连记录 task_stopped 的停止原因（StopReason），在发射线程内同步追加，
+    适用于 MonitorTask 与 MonitorManager"""
+    from PyQt5.QtCore import Qt
+
+    reasons = []
+    task.task_stopped.connect(
+        lambda _tid, reason: reasons.append(reason), Qt.DirectConnection)
+    return reasons
