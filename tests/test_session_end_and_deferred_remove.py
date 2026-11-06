@@ -22,7 +22,7 @@ from utils.metrics import MetricType
 def window(tmp_path, qapp):
     db = Database(str(tmp_path / "session_end.db"))
     win = make_main_window(db, MonitorManager(db=db))
-    win.about_page.check_update = lambda *args, **kwargs: None
+    win.about_group.check_update = lambda *args, **kwargs: None
     win.show()
     yield win
     stop_and_join(win.monitor_manager)
@@ -62,7 +62,7 @@ def test_commit_data_request_signal_is_connected(qapp, tmp_path):
         assert app.receivers(app.commitDataRequest) == before + 1
     finally:
         stop_and_join(win.monitor_manager)
-        win.about_page.check_update = lambda *a, **k: None
+        win.about_group.check_update = lambda *a, **k: None
         win.hide()
 
 
@@ -101,8 +101,8 @@ def test_real_stop_card_kept_and_worker_removed_on_finished(qapp, db):
         assert manager.get_task_info(task_id) is None
         assert process_events_until(lambda: sip.isdeleted(worker))
         assert manager.running_task_count() == 0
-        count_text = page.board.count_label.text()
-        assert "0/" in count_text and "1 个已结束" in count_text
+        summary = page.board.summary()
+        assert summary.startswith("运行中 0/") and summary.endswith("已结束 1")
     finally:
         stop_and_join(manager)
         page.close()

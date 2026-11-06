@@ -107,7 +107,7 @@ def test_refresh_after_task_ends_uses_final_duration_and_freezes():
     assert changed == [0]
     option = model.options()[0]
     assert option.text == "run.exe · PID 1000 · 2026-07-16 23:00 · 40分钟"
-    assert not option.running and "状态：已停止" in option.tooltip
+    assert not option.running and "状态：已结束" in option.tooltip
     assert model.task("run") is ended
     assert model.tracked_running_ids() == []
 

@@ -1,7 +1,7 @@
 """
 任务下拉选项模型（纯 Python，不依赖 Qt）
 
-历史页与导出页的任务下拉同口径：选项文本 = format_task_option_text，
+分析页的任务下拉与对比任务下拉同口径：选项文本 = format_task_option_text，
 提示 = format_task_tooltip，"是否运行中"以调用方给出的运行中 ID 集合为准
 （即任务状态服务的视角，不看数据库 status 列）。
 
@@ -44,7 +44,7 @@ class TaskOptionsModel:
     def __init__(self, *, full_date: bool = False):
         """
         Args:
-            full_date: 开始时间是否带年份（导出页 True，历史页 False）
+            full_date: 开始时间是否带年份（分析页下拉用 False，跨年时由 tooltip 给完整日期）
         """
         self._full_date = full_date
         self._entries: List[_Entry] = []

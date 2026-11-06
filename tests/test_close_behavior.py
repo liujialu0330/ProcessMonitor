@@ -40,7 +40,7 @@ from utils.metrics import MetricType
 
 @pytest.fixture
 def window(tmp_path, qapp):
-    """构造真实 MainWindow（tmp 库），并做好测试隔离：覆写 about_page.
+    """构造真实 MainWindow（tmp 库），并做好测试隔离：覆写 about_group.
     check_update 为 no-op，防止 3 秒后 QTimer 触发真实联网检查更新（对齐
     tests/e2e/test_gui_smoke.py 的同一手法）。用例结束后兜底停止残留任务，
     避免遗留 QThread。
@@ -54,7 +54,7 @@ def window(tmp_path, qapp):
         notifier=RecordingNotifier(), dialogs=ScriptedDialogs(),
         preferences=FakePreferences(), task_status=ManagerTaskStatus(manager))
     win = make_main_window(db, manager, services)
-    win.about_page.check_update = lambda *args, **kwargs: None
+    win.about_group.check_update = lambda *args, **kwargs: None
     win.show()
     yield win
     stop_and_join(win.monitor_manager)
@@ -290,14 +290,14 @@ def test_quit_for_install_bypasses_tray(window, monkeypatch):
     assert window.isHidden() is True  # 真退出路径下 close() 使窗口被隐藏/关闭
 
 
-def test_about_page_install_request_goes_through_quit_for_install(window, monkeypatch):
+def test_about_group_install_request_goes_through_quit_for_install(window, monkeypatch):
     """关于页只发 install_requested，主窗口连接到 quit_for_install（不靠 hasattr 反向调用）"""
     _enable_close_to_tray(window)
     window.tray = _FakeTray()
     quit_mock = MagicMock()
     monkeypatch.setattr(QApplication, 'quit', quit_mock)
 
-    window.about_page.install_requested.emit()
+    window.about_group.install_requested.emit()
 
     assert window._really_quit is True
     quit_mock.assert_called_once()
@@ -726,17 +726,18 @@ def test_other_migration_tips_stay_until_closed(window, tip, title):
 
 
 def test_silent_update_notice_offers_view_button(window, monkeypatch):
-    """静默检查发现新版本：主窗口弹非模态提示，「查看」切到关于页并弹确认框"""
+    """静默检查发现新版本：主窗口弹非模态提示，「查看」切到设置页"关于与更新"并弹确认框"""
     shown = []
-    monkeypatch.setattr(window.about_page, 'show_update_dialog_for', shown.append)
+    monkeypatch.setattr(window.about_group, 'show_update_dialog_for', shown.append)
     info = {'version': '9.9.9'}
 
-    window.about_page.update_available_silent.emit(info)
+    window.about_group.update_available_silent.emit(info)
 
     notice = window.services.notifier.last("info")
     assert notice.title == "发现新版本 9.9.9" and notice.duration == 10000
     notice.bar.widgets[0].click()
-    assert window.stackedWidget.currentWidget() is window.about_page
+    assert window.stackedWidget.currentWidget() is window.setting_page
+    assert window.about_group is window.setting_page.about_group
     assert shown == [info]
 
 
@@ -751,7 +752,7 @@ def test_main_window_does_not_run_startup_maintenance(tmp_path, qapp, monkeypatc
     services = make_services(preferences=FakePreferences(retention_days=7),
                              task_status=ManagerTaskStatus(manager))
     win = make_main_window(db, manager, services)
-    win.about_page.check_update = lambda *args, **kwargs: None
+    win.about_group.check_update = lambda *args, **kwargs: None
     monkeypatch.setattr(QApplication, 'quit', MagicMock())
     win.close()
     dispose_widget(win)
@@ -766,9 +767,117 @@ def test_main_window_requires_injected_dependencies(qapp):
 
 def test_pages_share_the_window_services(window):
     """主窗口把同一份 services 分发给全部页面"""
-    pages = (window.monitor_page, window.history_page, window.export_page,
-             window.setting_page, window.about_page)
+    pages = (window.monitor_page, window.analysis_page,
+             window.setting_page, window.about_group)
     assert all(page.services is window.services for page in pages)
-    assert all(page.db is window.db for page in pages if page is not window.about_page)
+    assert all(page.db is window.db for page in pages if page is not window.about_group)
     assert all(page.manager is window.monitor_manager for page in pages
-               if page is not window.about_page)
+               if page is not window.about_group)
+
+
+# ---------- 导航、快速打点与全局快捷键接线 ----------
+
+def _nav_texts(window):
+    items = window.navigationInterface.panel.items
+    return {key: item.widget.text() for key, item in items.items()}
+
+
+def test_navigation_is_monitor_analysis_settings(window):
+    texts = _nav_texts(window)
+    assert sorted(texts.values()) == sorted(["监控", "分析", "设置"])
+    assert window.stackedWidget.currentWidget() is window.monitor_page
+    assert window.navigationInterface.panel.returnButton.isHidden()
+    assert window.navigationInterface.panel.minimumExpandWidth == 1200
+    # 只有三个一级页面（旧的历史/导出/关于页都已并入）
+    assert {name for name in vars(window) if name.endswith('_page')} == {
+        'monitor_page', 'analysis_page', 'setting_page'}
+
+
+def test_analysis_page_is_the_new_page(window):
+    from ui.pages.analysis_page import AnalysisPage
+    assert isinstance(window.analysis_page, AnalysisPage)
+
+
+def test_card_analysis_switches_to_analysis_page_and_selects(window, monkeypatch):
+    selected = []
+    monkeypatch.setattr(window.analysis_page, 'select_task', selected.append)
+    window.monitor_page.history_requested.emit("t-42")
+    assert window.stackedWidget.currentWidget() is window.analysis_page
+    assert selected == ["t-42"]
+
+
+def test_navigation_expands_when_crossing_1200(window):
+    panel = window.navigationInterface.panel
+    window.resize(1000, 700)
+    panel.collapse()
+    window._sync_navigation_expand(1000, 1300)
+    assert not panel.isCollapsed()
+
+
+def test_quick_marker_feedback_goes_to_tray_balloon(window):
+    tray = _FakeTray()
+    window.tray = tray
+    window.monitor_page.presenter.quick_marker_feedback.emit('ok', "已打点：第 2 轮 16:41:03", "x")
+    window.monitor_page.presenter.quick_marker_feedback.emit('none', "没有可打点的任务", "y")
+    assert tray.messages == [("已打点：第 2 轮 16:41:03", "x"), ("没有可打点的任务", "y")]
+
+
+def test_quick_marker_feedback_without_tray_uses_notice(window):
+    window.monitor_page.presenter.quick_marker_feedback.emit('ok', "已打点：基线 16:41:03", "x")
+    notice = window.services.notifier.last()
+    assert (notice.level, notice.title) == ("success", "已打点：基线 16:41:03")
+
+
+def test_tray_marker_request_marks_through_presenter(window, monkeypatch):
+    calls = []
+    monkeypatch.setattr(window.monitor_page.presenter, 'quick_marker', calls.append)
+    window.tray.marker_requested.emit("")
+    window.tray.marker_requested.emit("t1")
+    assert calls == [None, "t1"]
+
+
+class _FakeHotkeyBackend:
+    def __init__(self):
+        self.registered = {}
+
+    def register(self, hotkey_id, modifiers, vk):
+        self.registered[hotkey_id] = (modifiers, vk)
+        return True
+
+    def unregister(self, hotkey_id):
+        self.registered.pop(hotkey_id, None)
+
+
+def test_hotkey_wiring_and_unbind_on_quit(tmp_path, qapp, monkeypatch):
+    """全局快捷键：触发即快速打点；改键同步监控页引导；真退出时注销"""
+    from ui.hotkey import MarkerHotkey
+    backend = _FakeHotkeyBackend()
+    hotkey = MarkerHotkey(backend)
+    hotkey.bind("Ctrl+Alt+M")
+    db = Database(str(tmp_path / "hotkey_window.db"))
+    manager = MonitorManager(db=db)
+    services = make_services(
+        notifier=RecordingNotifier(), dialogs=ScriptedDialogs(),
+        preferences=FakePreferences(), task_status=ManagerTaskStatus(manager))
+    from ui.main_window import MainWindow
+    win = MainWindow(db, manager, services, hotkey=hotkey)
+    win.about_group.check_update = lambda *args, **kwargs: None
+    try:
+        calls = []
+        monkeypatch.setattr(win.monitor_page.presenter, 'quick_marker', calls.append)
+        hotkey.handle_hotkey(hotkey._hotkey_id)
+        assert calls == [None]
+        assert win.setting_page.hotkey_status().startswith("已启用")
+
+        guide = win.monitor_page.board.empty_state
+        assert any("Ctrl+Alt+M" in label.text() for label in guide.step_hints)
+        hotkey.bind("")
+        assert not any("Ctrl+Alt+M" in label.text() for label in guide.step_hints)
+        hotkey.bind("Ctrl+Alt+M")
+
+        monkeypatch.setattr(QApplication, 'quit', MagicMock())
+        win.closeEvent(_fake_event())
+        assert backend.registered == {}
+    finally:
+        stop_and_join(manager)
+        dispose_widget(win)

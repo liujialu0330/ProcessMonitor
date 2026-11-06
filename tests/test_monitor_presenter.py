@@ -3,7 +3,8 @@
 新建任务（指标、目标校验文案、重复 PID 确认）、停止确认、暂停/恢复、打点（点击时刻、
 默认标签序列"基线 / 第 N 轮"、类型推断、失败提示）、卡片基线（5 个样本中位数、换基线、
 删基线）、任务结束（卡片转已结束、表单清掉已退出进程、异常结束提示）、
-指标不可用（管理员提示）、错误去重、上限提示、重新监控三种情况、关闭卡片与表单折叠。
+指标不可用（管理员提示）、错误去重、上限提示、同配置再测三种情况、关闭卡片与表单折叠、
+免弹窗打点（托盘 / 全局快捷键）与"清除全部"已结束卡片。
 """
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
@@ -18,7 +19,8 @@ from data.models import Marker
 from tests.doubles import DEFAULT_FAKE_NOW, FakePreferences, FakeProcessQuery
 from tests.factories import make_services
 from ui.presenters.monitor_presenter import (
-    ABNORMAL_STOP_INFOBAR_MS, MonitorPresenter, resolve_error_text,
+    ABNORMAL_STOP_INFOBAR_MS, QUICK_MARKER_FAILED, QUICK_MARKER_NONE, QUICK_MARKER_OK,
+    MonitorPresenter, resolve_error_text,
 )
 from ui.widgets.monitor.new_task_form import TaskRequest
 from ui.widgets.monitor.process_picker import (
@@ -193,12 +195,21 @@ class FakeBoard(QObject):
     history_requested = pyqtSignal(str)
     restart_requested = pyqtSignal(str)
     close_requested = pyqtSignal(str)
+    clear_finished_requested = pyqtSignal()
+    wait_cancel_requested = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
         self.cards: Dict[str, FakeCard] = {}
         self.finished: Dict[str, tuple] = {}
         self.counts = None
+        self.waiting: Dict[str, tuple] = {}
+
+    def add_waiting(self, wait_id, name, detail=''):
+        self.waiting[wait_id] = (name, detail)
+
+    def remove_waiting(self, wait_id):
+        self.waiting.pop(wait_id, None)
 
     def create_card(self, info):
         self.cards[info.task_id] = FakeCard(info)
@@ -220,6 +231,7 @@ class FakeBoard(QObject):
 
 class FakeForm(QObject):
     start_requested = pyqtSignal(object)
+    wait_requested = pyqtSignal(object)
     target_invalid = pyqtSignal(object)
     choose_metrics_requested = pyqtSignal()
 
@@ -420,11 +432,12 @@ def test_task_added_for_unknown_task_is_ignored(presenter, manager, board):
     assert board.cards == {}
 
 
-def test_task_started_updates_counts_and_notifies(presenter, manager, board, services):
+def test_task_started_updates_counts_without_notice(presenter, manager, board, services):
     manager.running = 1
     manager.task_started.emit("t1")
     assert board.counts == (1, 5)
-    assert services.notifier.last().level == "success"
+    # 卡片就在眼前，结果直接可见：不再弹"已启动"
+    assert services.notifier.notices == []
 
 
 def test_data_updated_updates_card_values_and_count(presenter, manager, board):
@@ -505,7 +518,7 @@ def test_stop_requires_confirmation(presenter, manager, board, services):
     assert call["title"] == "停止监控"
     assert call["confirm_text"] == "停止" and call["cancel_text"] == "取消"
     assert "demo.exe（PID 1001）" in call["content"]
-    assert "停止后不能继续记录到这个任务；要继续请“重新监控”" in call["content"]
+    assert "停止后不能继续记录到这个任务；要继续请用“同配置再测”" in call["content"]
 
 
 def test_stop_returning_false_is_tolerated(presenter, manager, board, services):
@@ -740,7 +753,8 @@ def test_user_stop_finishes_card_removes_task_and_informs(presenter, manager, bo
     assert ("remove", task_id) in manager.commands
     assert form.forgotten == [1002]
     assert received == []
-    assert services.notifier.last().level == "info"
+    # 用户自己点的停止：卡片转为"已结束"即是结果，不再弹提示
+    assert services.notifier.notices == []
 
 
 def test_abnormal_stop_is_prominent_and_signals_main_window(presenter, manager, services, host):
@@ -899,3 +913,89 @@ def test_restart_excludes_own_process(presenter, manager, board, services):
 def test_restart_unknown_task_does_nothing(presenter, board, services):
     board.restart_requested.emit("ghost")
     assert services.notifier.notices == []
+
+
+# ---------------------------------------------------------------- 免弹窗打点（托盘 / 全局快捷键）
+
+
+def _feedback(presenter):
+    received = []
+    presenter.quick_marker_feedback.connect(lambda *args: received.append(args))
+    return received
+
+
+def test_quick_marker_without_tasks_reports_none(presenter, manager):
+    received = _feedback(presenter)
+    assert presenter.quick_marker() == []
+    assert received == [(QUICK_MARKER_NONE, "没有可打点的任务", "请先在监控页开始监控")]
+    assert manager.commands == []
+
+
+def test_quick_marker_single_task_uses_default_label_and_now(presenter, manager, services):
+    task_id = _add_task(manager, pid=1001)
+    received = _feedback(presenter)
+
+    markers = presenter.quick_marker()
+
+    assert [(m.label, m.kind) for m in markers] == [(BASELINE_LABEL, "baseline")]
+    assert ("marker", task_id, BASELINE_LABEL, DEFAULT_FAKE_NOW, "baseline") in manager.commands
+    clock = DEFAULT_FAKE_NOW.strftime("%H:%M:%S")
+    assert received == [(QUICK_MARKER_OK, f"已打点：基线 {clock}", "demo.exe · PID 1001")]
+    # 不弹任何对话框
+    assert presenter.services.dialogs.methods_called() == []
+
+    presenter.quick_marker()
+    assert received[-1][1] == f"已打点：第 1 轮 {clock}"
+
+
+def test_quick_marker_all_tasks_share_one_moment(presenter, manager):
+    first = _add_task(manager, pid=1001)
+    second = _add_task(manager, pid=1002, name="beta.exe")
+    received = _feedback(presenter)
+
+    markers = presenter.quick_marker()
+
+    assert {m.task_id for m in markers} == {first, second}
+    assert {m.timestamp for m in markers} == {DEFAULT_FAKE_NOW}
+    assert received[-1][0] == QUICK_MARKER_OK
+    assert received[-1][1].startswith("已打点：2 个任务")
+
+
+def test_quick_marker_one_task_from_tray_submenu(presenter, manager):
+    _add_task(manager, pid=1001)
+    second = _add_task(manager, pid=1002, name="beta.exe")
+    markers = presenter.quick_marker(second)
+    assert [m.task_id for m in markers] == [second]
+
+
+def test_quick_marker_skips_finished_tasks(presenter, manager):
+    task_id = _add_task(manager)
+    manager.task_stopped.emit(task_id, StopReason.USER)
+    received = _feedback(presenter)
+    assert presenter.quick_marker() == []
+    assert received[-1][0] == QUICK_MARKER_NONE
+    assert presenter.marker_targets() == []
+
+
+def test_quick_marker_failure_reported(presenter, manager):
+    _add_task(manager)
+    manager.marker_ok = False
+    received = _feedback(presenter)
+    assert presenter.quick_marker() == []
+    assert received[-1][0] == QUICK_MARKER_FAILED
+
+
+def test_marker_targets_label_process_and_pid(presenter, manager):
+    task_id = _add_task(manager, pid=1001)
+    assert presenter.marker_targets() == [(task_id, "demo.exe · PID 1001")]
+
+
+def test_clear_finished_removes_only_finished(presenter, manager, board, form):
+    done = _add_task(manager, pid=1001)
+    alive = _add_task(manager, pid=1002)
+    manager.task_stopped.emit(done, StopReason.USER)
+
+    board.clear_finished_requested.emit()
+
+    assert list(board.cards) == [alive]
+    assert presenter.task_ids() == [alive]

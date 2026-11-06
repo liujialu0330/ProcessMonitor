@@ -1,7 +1,7 @@
 """
-历史页视图模型（无控件）
+历史数据视图模型（无控件；分析页视图模型 AnalysisViewModel 的基类）
 
-持有历史页的业务状态：任务列表、当前任务/指标/时间范围、是否自动选中、可否删除、
+持有单指标历史查询的业务状态：任务列表、当前任务/指标/时间范围、是否自动选中、可否删除、
 加载中；对外只发信号，不持有任何控件、不弹任何提示——页面据信号刷新控件、决定提示。
 
 两条约束：
@@ -93,7 +93,7 @@ def _defer_to_event_loop(fn: Callable[[], None]) -> None:
 
 
 class HistoryViewModel(QObject):
-    """历史页视图模型。
+    """历史数据视图模型（分析页视图模型的基类）。
 
     信号：
     - tasks_changed(list, set, object)：任务列表（最新在前）重建；运行中任务 ID 集合；now
@@ -239,7 +239,7 @@ class HistoryViewModel(QObject):
         try:
             tasks = self._db.tasks.list_with_data()
         except StorageError as exc:
-            logger.error("历史页读取任务列表失败", exc_info=True)
+            logger.error("分析页读取任务列表失败", exc_info=True)
             tasks, load_error = [], str(exc) or type(exc).__name__
 
         now = self._services.clock.now()
@@ -505,7 +505,7 @@ class HistoryViewModel(QObject):
         if snapshot.error is not None:
             if auto:
                 # 定时刷新失败：保持已显示的数据；存储故障让用户知道，但连续失败只提示一次
-                logger.warning("历史页自动刷新失败，保持当前显示: %s", snapshot.error)
+                logger.warning("分析页自动刷新失败，保持当前显示: %s", snapshot.error)
                 if snapshot.storage_error and not self._refresh_error_notified:
                     self._refresh_error_notified = True
                     self.error.emit(ERROR_LOAD_FAILED, snapshot.error)
@@ -537,10 +537,14 @@ class HistoryViewModel(QObject):
             self._show_empty(*(EMPTY_NO_DATA_IN_RANGE if self.range_key != 'all'
                                else EMPTY_NO_DATA))
             return
-        self.last_snapshot = snapshot
-        self.snapshot_ready.emit(snapshot)
+        self._emit_snapshot(snapshot)
 
     # ========== 输出 ==========
+
+    def _emit_snapshot(self, snapshot: HistorySnapshot) -> None:
+        """可显示的快照：记下并通知页面（子类可在此之前补发自己的信号）。"""
+        self.last_snapshot = snapshot
+        self.snapshot_ready.emit(snapshot)
 
     def _set_has_baseline(self, value: bool) -> None:
         self.has_baseline = value

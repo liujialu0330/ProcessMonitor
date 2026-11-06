@@ -2,19 +2,24 @@
 进程选择器
 
 一个搜索框兼管"按名搜索"和"直接输入 PID"：输入纯数字即视为 PID，不再另设 PID
-快捷框（两个入口要双向同步，容易互相覆盖）。右侧是刷新进程列表按钮，下方是字段
-级的校验错误文字。
+快捷框（两个入口要双向同步，容易互相覆盖）。下方是字段级的校验错误文字，以及搜索
+无结果时可点击的"未找到，点击刷新"。
+
+进程列表自动刷新：展开下拉、输入框获得焦点（页面另在窗口激活/显示时调用
+refresh_if_stale）时重新读取，两秒内不重复读取——被测程序往往是刚启动的，
+不该让用户先想起去点刷新。
 
 resolve() 只给出"要监控谁"或"为什么不行"（错误类型），中文文案由页面/Presenter 映射。
 """
 import re
+import time
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Callable, Optional, Union
 
-from PyQt5.QtCore import pyqtSignal
+from PyQt5.QtCore import QEvent, Qt, pyqtSignal
 from PyQt5.QtGui import QColor
-from PyQt5.QtWidgets import QHBoxLayout, QVBoxLayout, QWidget
-from qfluentwidgets import CaptionLabel, FluentIcon, PushButton
+from PyQt5.QtWidgets import QVBoxLayout, QWidget
+from qfluentwidgets import CaptionLabel
 
 from ui.services.process_query import ProcessQuery
 from ui.widgets.searchable_combo import SearchableCombo
@@ -31,7 +36,33 @@ ERROR_EMPTY = 'empty'                  # 什么都没输入
 ERROR_NO_MATCH = 'no_match'            # 文本与进程列表任何一项都不一致
 ERROR_NOT_A_NUMBER = 'not_a_number'    # 形似数字但不是合法 PID
 ERROR_NOT_FOUND = 'not_found'          # 输入的 PID 对应的进程不存在或无权访问
-ERROR_KINDS = (ERROR_EMPTY, ERROR_NO_MATCH, ERROR_NOT_A_NUMBER, ERROR_NOT_FOUND)
+ERROR_WAIT_NEEDS_NAME = 'wait_needs_name'   # 等待进程启动只能按进程名（空或纯数字）
+ERROR_KINDS = (ERROR_EMPTY, ERROR_NO_MATCH, ERROR_NOT_A_NUMBER, ERROR_NOT_FOUND,
+               ERROR_WAIT_NEEDS_NAME)
+
+# 自动刷新的节流间隔（秒）：展开下拉、获得焦点、窗口激活可能接连发生，只读一次
+REFRESH_THROTTLE_SECONDS = 2.0
+
+
+def no_match_text(text: str) -> str:
+    """搜索无结果时的可点击提示。"""
+    return f"未找到“{text}”，点击刷新"
+
+
+class LinkLabel(CaptionLabel):
+    """可点击的说明文字（链接色、手形光标），点击发出 clicked。"""
+
+    clicked = pyqtSignal()
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setTextColor(QColor(0, 95, 184), QColor(153, 235, 255))
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        if event.button() == Qt.LeftButton and self.rect().contains(event.pos()):
+            self.clicked.emit()
 
 
 @dataclass(frozen=True)
@@ -57,7 +88,7 @@ def item_text(target: Target) -> str:
 
 
 class ProcessPicker(QWidget):
-    """进程选择器（搜索框 + 刷新按钮 + 字段错误）。
+    """进程选择器（搜索框 + 字段错误 + 无结果提示）。
 
     信号：
         selected(object): 用户选中了列表中的某个进程（Target）
@@ -67,27 +98,31 @@ class ProcessPicker(QWidget):
     selected = pyqtSignal(object)
     edited = pyqtSignal()
 
-    def __init__(self, process_query: ProcessQuery, parent=None):
+    def __init__(self, process_query: ProcessQuery, parent=None, *,
+                 monotonic: Callable[[], float] = time.monotonic):
+        """
+        Args:
+            process_query: 进程查询服务
+            parent: 父控件
+            monotonic: 单调时钟（秒），用于自动刷新节流；测试可注入
+        """
         super().__init__(parent)
         self._query = process_query
+        self._monotonic = monotonic
+        self._last_refresh: Optional[float] = None
+        self._no_match_enabled = True
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
 
-        row = QHBoxLayout()
-        row.setSpacing(8)
         self.combo = SearchableCombo(
-            self, placeholder="搜索进程名或输入 PID",
+            self, placeholder="搜索进程名或输入 PID（Ctrl+F）",
             number_matcher=lambda target, pid: target.pid == pid)
-        row.addWidget(self.combo, 1)
-
-        self.refresh_button = PushButton("刷新", self, FluentIcon.SYNC)
-        self.refresh_button.setToolTip("重新读取进程列表")
-        self.refresh_button.setFixedWidth(80)
-        self.refresh_button.clicked.connect(self.refresh)
-        row.addWidget(self.refresh_button)
-        layout.addLayout(row)
+        layout.addWidget(self.combo)
+        # 展开下拉之前先刷新（pressed 早于库连接的 clicked → 弹出菜单）；获得焦点时也刷新
+        self.combo.line_edit.dropButton.pressed.connect(self._on_drop_pressed)
+        self.combo.line_edit.installEventFilter(self)
 
         # 校验错误就近显示在搜索框下方，内容一改即清除；不用页面顶部提示，
         # 避免一闪即逝或与运行期提示混在一起
@@ -97,6 +132,13 @@ class ProcessPicker(QWidget):
         self.error_label.hide()
         layout.addWidget(self.error_label)
 
+        # 搜索无结果："未找到"xxx"，点击刷新"——被测程序多半是刚启动、列表还没读到
+        self.no_match_label = LinkLabel(self)
+        self.no_match_label.setToolTip("重新读取进程列表")
+        self.no_match_label.hide()
+        self.no_match_label.clicked.connect(self._on_no_match_clicked)
+        layout.addWidget(self.no_match_label)
+
         self.combo.selected.connect(self.selected)
         self.combo.text_changed.connect(self._on_text_changed)
 
@@ -105,6 +147,7 @@ class ProcessPicker(QWidget):
     def refresh(self) -> None:
         """重新读取进程列表：仍在的已选进程保持选中；没有选中项时保留手输文本。
         刷新后不会自动选中任何进程（避免误监控列表第一个进程）。"""
+        self._last_refresh = self._monotonic()
         keep = self.combo.current_data()
         typed = self.combo.text() if keep is None else ""
         targets = [Target(pid, name, create_time)
@@ -112,6 +155,27 @@ class ProcessPicker(QWidget):
         self.combo.set_items([(item_text(t), t) for t in targets], keep=keep)
         if typed and self.combo.current_data() is None:
             self.combo.set_text(typed)
+        self._update_no_match()
+
+    def refresh_if_stale(self) -> bool:
+        """距上次读取已超过节流间隔时刷新；返回是否真的刷新了。"""
+        if (self._last_refresh is not None
+                and self._monotonic() - self._last_refresh < REFRESH_THROTTLE_SECONDS):
+            return False
+        self.refresh()
+        return True
+
+    def _on_drop_pressed(self) -> None:
+        # 下拉已展开时这次点击是收起，不刷新
+        if not self.combo.line_edit.dropMenu:
+            self.refresh_if_stale()
+
+    def eventFilter(self, obj, event):
+        # 弹出补全菜单抢走又还回焦点（PopupFocusReason）不算用户回到输入框
+        if (obj is self.combo.line_edit and event.type() == QEvent.FocusIn
+                and event.reason() != Qt.PopupFocusReason):
+            self.refresh_if_stale()
+        return super().eventFilter(obj, event)
 
     def targets(self):
         """当前进程列表（Target 列表，按显示顺序）。"""
@@ -137,6 +201,17 @@ class ProcessPicker(QWidget):
         if _NUMBER_LIKE.fullmatch(text):
             return ResolveError(ERROR_NOT_A_NUMBER, text)
         return ResolveError(ERROR_NO_MATCH, text)
+
+    def resolve_name(self) -> Union[str, ResolveError]:
+        """等待进程启动用的进程名：选中项取其进程名，否则取输入文本；
+        空或纯数字（PID 等不到"启动"）给出 ERROR_WAIT_NEEDS_NAME。"""
+        target = self.combo.current_data()
+        if target is not None:
+            return target.name
+        text = self.combo.text().strip()
+        if not text or text.isdigit():
+            return ResolveError(ERROR_WAIT_NEEDS_NAME, text)
+        return text
 
     def current_pid(self) -> Optional[int]:
         """输入当前指向的 PID（选中项或纯数字输入），都不是时为 None；不查询进程。"""
@@ -182,7 +257,34 @@ class ProcessPicker(QWidget):
         """当前显示的错误文字（未显示时为空）。"""
         return "" if self.error_label.isHidden() else self.error_label.text()
 
+    # ========== 搜索无结果 ==========
+
+    def set_no_match_hint_enabled(self, enabled: bool) -> None:
+        """是否在搜索无结果时提示"未找到，点击刷新"（等待进程启动时关闭：
+        此时进程本来就不在列表里）。"""
+        self._no_match_enabled = enabled
+        self._update_no_match()
+
+    def no_match_visible(self) -> bool:
+        return not self.no_match_label.isHidden()
+
+    def _has_match(self, text: str) -> bool:
+        needle = text.casefold()
+        return any(needle in item.casefold() for item, _data in self.combo.items())
+
+    def _update_no_match(self) -> None:
+        text = self.combo.text().strip()
+        show = (self._no_match_enabled and bool(text) and not text.isdigit()
+                and self.combo.current_data() is None and not self._has_match(text))
+        if show:
+            self.no_match_label.setText(no_match_text(text))
+        self.no_match_label.setVisible(show)
+
+    def _on_no_match_clicked(self) -> None:
+        self.refresh()
+
     def _on_text_changed(self, _text: str) -> None:
         # 输入一改，之前的校验错误就不再对应当前内容
         self.clear_error()
+        self._update_no_match()
         self.edited.emit()

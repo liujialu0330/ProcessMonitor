@@ -54,7 +54,7 @@ class MetricSelectorDialog(MessageBoxBase):
         # 一键勾选"泄漏排查"预设；悬停每个指标可看含义与适用场景
         preset_row = QHBoxLayout()
         preset_row.setSpacing(12)
-        self.preset_button = PushButton("泄漏排查预设", self, FluentIcon.CHECKBOX)
+        self.preset_button = PushButton("应用预设：泄漏排查", self, FluentIcon.FLAG)
         self.preset_button.setToolTip(
             "私有字节、句柄数、GDI对象数、USER对象数、线程数：判断内存/句柄/界面资源泄漏的最小指标集")
         self.preset_button.clicked.connect(self.select_leak_check_preset)

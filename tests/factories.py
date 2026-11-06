@@ -6,8 +6,8 @@ make_services(**overrides) 组装一份全替身的 UiServices，可按名字替
 services.threads.entries() 断言页面登记了哪些后台线程。
 
 页面工厂按"页面构造函数必填注入"之后的签名编写：
-    MonitorPage / HistoryPage / ExportPage / SettingPage(db, manager, services, parent=None)
-    AboutPage(services, parent=None)
+    MonitorPage / AnalysisPage / SettingPage(db, manager, services, parent=None)
+    AboutUpdateGroup(services, parent=None)
     MainWindow(db, manager, services)
 
 页面工厂未给 services 时用 make_services() 的替身，但任务状态绑定到传入的真实
@@ -53,20 +53,14 @@ def make_monitor_page(db, manager, services: Optional[UiServices] = None, parent
     return MonitorPage(db, manager, _services_for(manager, services), parent=parent)
 
 
-def make_history_page(db, manager, services: Optional[UiServices] = None, parent=None,
-                      worker_runner=None, defer=None, **vm_options):
-    """构造历史页。worker_runner / defer / vm_options（table_limit、max_buckets）透传给
-    HistoryViewModel：测试注入 SyncHistoryRunner 与立即执行的 defer 即可同步观察结果；
-    不给时与生产一致（后台线程查询、下一轮事件循环发出）。"""
-    from ui.pages.history_page import HistoryPage
-    return HistoryPage(db, manager, _services_for(manager, services), parent=parent,
-                       worker_runner=worker_runner, defer=defer, **vm_options)
-
-
-def make_export_page(db, manager, services: Optional[UiServices] = None, parent=None):
-    """构造导出页。"""
-    from ui.pages.export_page import ExportPage
-    return ExportPage(db, manager, _services_for(manager, services), parent=parent)
+def make_analysis_page(db, manager, services: Optional[UiServices] = None, parent=None,
+                       worker_runner=None, defer=None, **vm_options):
+    """构造分析页。worker_runner / defer / vm_options（table_limit、max_buckets 等）透传给
+    AnalysisViewModel：测试注入同步 runner 与立即执行的 defer 即可同步观察结果；不给时
+    与生产一致（后台线程查询、下一轮事件循环发出）。"""
+    from ui.pages.analysis_page import AnalysisPage
+    return AnalysisPage(db, manager, _services_for(manager, services), parent=parent,
+                        worker_runner=worker_runner, defer=defer, **vm_options)
 
 
 def make_setting_page(db, manager, services: Optional[UiServices] = None, parent=None):
@@ -75,10 +69,10 @@ def make_setting_page(db, manager, services: Optional[UiServices] = None, parent
     return SettingPage(db, manager, _services_for(manager, services), parent=parent)
 
 
-def make_about_page(services: Optional[UiServices] = None, parent=None):
-    """构造关于页。"""
-    from ui.pages.about_page import AboutPage
-    return AboutPage(services if services is not None else make_services(), parent=parent)
+def make_about_update_group(services: Optional[UiServices] = None, parent=None):
+    """构造"关于与更新"分组（设置页的一部分，可脱离设置页单独测更新流程）。"""
+    from ui.pages.about_update import AboutUpdateGroup
+    return AboutUpdateGroup(services if services is not None else make_services(), parent=parent)
 
 
 def make_main_window(db, manager, services: Optional[UiServices] = None):

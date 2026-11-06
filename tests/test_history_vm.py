@@ -1,8 +1,8 @@
 """
-历史页视图模型（HistoryViewModel / HistoryAutoRefresh）：无控件单元测试。
+历史数据视图模型（HistoryViewModel，分析页视图模型的基类 / HistoryAutoRefresh）：无控件单元测试。
 
 用临时库 + 查询执行器替身（同步执行 / 手动放行）驱动，按信号断言行为：
-选择语义（与旧页面 test_safety_net_history / test_history_page_flow 的选择用例同口径）、
+选择语义（与 test_safety_net_history 的选择用例同口径）、
 导航跳转只查一次、删除、范围与指标切换、锚点缓存、空状态与读取失败、加载态顺序、
 过期结果丢弃、自动刷新的跳过/单飞/任务结束重载/失败提示去重、间隔分档；
 基线存在性与"自基线"范围回落、打点变化（manager.markers_changed）后的静默重查；
@@ -27,7 +27,7 @@ from tests.factories import make_services
 from tests.helpers import (
     ManualDefer, ManualHistoryRunner, SyncHistoryRunner, poll_until,
 )
-from tests.test_safety_net_history import _seed_query_dataset
+from tests.history_dataset import _seed_query_dataset
 from ui.viewmodels import (
     AUTO_REFRESH_INTERVAL_MS, HistoryAutoRefresh, HistoryViewModel,
     auto_refresh_interval_for,

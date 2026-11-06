@@ -1,17 +1,17 @@
 """
-阶段 0 安全网（特性测试）：历史页与导出页的任务下拉同口径。
+安全网（特性测试）：分析页任务下拉 ↔ TaskOptionsModel 直接输出同口径。
 
-锁住的现有行为（重构为共用的 TaskOptionsModel + TaskSelector 时任何漂移都应变红）：
-- 同一任务集合（运行中、已停止、带长备注、跨年、无数据）下，两页下拉的选项顺序
-  与 itemData（task_id）一致：只列有数据的任务，按开始时间倒序；
-- 选项文本只差日期格式：历史页 format_task_option_text(full_date=False)，
-  导出页 full_date=True（"07-16 20:00" 对 "2026-07-16 20:00"），其余逐字相同；
-- 运行中任务的时长原地刷新后两页仍一致；任务结束后两页都改为最终时长；
-- 首次载入默认都选最新（第 0 项）；用户手动选中的任务在重新载入后两页都保持。
+历史页与导出页合并为分析页后，下拉只剩一个消费者；这里锁住"页面看到的选项就是
+TaskOptionsModel 对同一批任务、同一运行中集合、同一时刻的输出"，任何在页面或视图
+模型里另行拼文案、改顺序、改运行中判定的漂移都应变红：
+- 同一任务集合（运行中、已结束、带长备注、跨年、无数据）下，选项顺序与 task_id 一致：
+  只列有数据的任务，按开始时间倒序；文本与 tooltip 逐字等于模型输出（具体文案钉死）；
+- 运行中任务的时长原地刷新后仍与模型一致；任务结束后改为最终时长，之后不再变化；
+- 首次载入默认选最新（第 0 项）；用户手动选中的任务在重新载入后保持；
+- 对比任务下拉同口径（候选 = 除当前任务外的全部任务）。
 
-两页共用同一份服务替身：同一个 FakeClock 决定"现在几点"，同一个 FakeTaskStatus
-决定"哪些任务仍在运行"（两页的"运行中"都以任务状态服务为准，与数据库 status 列
-无关），这里让它与数据库状态一致后只比较文案口径。
+"运行中"以任务状态服务为准（FakeTaskStatus），与数据库 status 列无关；这里让它与
+数据库状态一致后只比较文案口径。
 """
 import uuid
 from datetime import datetime, timedelta
@@ -22,9 +22,10 @@ import pytest
 from core.monitor_manager import MonitorManager
 from data.models import DataPoint, MonitorTask
 from tests.doubles import FakeClock, FakeTaskStatus
-from tests.factories import make_export_page, make_history_page, make_services
+from tests.factories import make_analysis_page, make_services
 from tests.helpers import SyncHistoryRunner
-from ui.formatting import format_task_option_text, format_task_tooltip
+from ui.formatting import format_task_tooltip
+from ui.models.task_options import TaskOptionsModel
 from utils.metrics import MetricType
 
 BASE = datetime(2026, 7, 16, 20, 0, 0)
@@ -46,7 +47,6 @@ def _seed(db, name, start, status="stopped", note="", samples=3, end=None):
 
 @pytest.fixture
 def clock():
-    """两页共用的时钟"""
     return FakeClock(BASE + timedelta(hours=3, minutes=5))
 
 
@@ -55,9 +55,9 @@ def tasks(db):
     """
     任务集合（按开始时间倒序即期望的下拉顺序）：
     - running：最新的有数据任务，运行中（数据库 status=running、无结束时间）；
-    - noted：已停止，带超长备注（下拉截断、tooltip 完整）；
-    - plain：已停止，去年开始（跨年，日期格式差异最明显）；
-    - nodata：比所有任务都新但没有采样，两页都不应列出，也不应被默认选中。
+    - noted：已结束，带超长备注（下拉截断、tooltip 完整）；
+    - plain：已结束，去年开始（跨年）；
+    - nodata：比所有任务都新但没有采样，不应列出，也不应被默认选中。
     """
     nodata = _seed(db, "nodata.exe", BASE + timedelta(hours=4), samples=0)
     running = _seed(db, "running.exe", BASE + timedelta(hours=3), status="running")
@@ -70,156 +70,104 @@ def tasks(db):
 
 @pytest.fixture
 def task_status(tasks):
-    """任务状态服务视角下的运行中任务（与数据库 status 保持一致）"""
     return FakeTaskStatus({tasks.running.task_id})
 
 
 @pytest.fixture
 def running_ids(task_status):
-    """运行中任务 ID 集合：就是 task_status 内部的集合，增删即同时影响两页"""
+    """运行中任务 ID 集合：就是 task_status 内部的集合，增删即影响页面视角"""
     return task_status.running
 
 
 @pytest.fixture
-def services(clock, task_status):
-    return make_services(clock=clock, task_status=task_status)
-
-
-@pytest.fixture
-def manager(db):
-    return MonitorManager(db=db)
-
-
-@pytest.fixture
-def history(qapp, db, manager, services):
-    # 查询同步执行、加载请求立即发出；与导出页一样构造时不载入，生产路径由 showEvent 触发
-    widget = make_history_page(db, manager, services,
-                               worker_runner=SyncHistoryRunner(db), defer=lambda fn: fn())
+def analysis(qapp, db, clock, task_status):
+    services = make_services(clock=clock, task_status=task_status)
+    widget = make_analysis_page(db, MonitorManager(db=db), services,
+                                worker_runner=SyncHistoryRunner(db), defer=lambda fn: fn())
     widget.vm.reload_tasks()
     yield widget
     widget.auto_refresh.stop()
     widget.close()
 
 
-@pytest.fixture
-def export(qapp, db, manager, services, tmp_path):
-    widget = make_export_page(db, manager, services)
-    widget.last_dir = str(tmp_path)
-    widget.reload_tasks()   # 导出页构造时不载入，生产路径由 showEvent 触发
-    yield widget
-    widget.running_timer.stop()
-    widget.close()
+def _page_options(selector):
+    """下拉项 (task_id, 显示文本)：经 TaskSelector 公开接口读。"""
+    return [(selector.task_id_at(i), selector.item_text(i)) for i in range(selector.count())]
 
 
-def _options(page):
-    """下拉项 (task_id, 显示文本)：两页都经 TaskSelector 公开接口读。"""
-    selector = page.task_selector
-    return [(selector.task_id_at(i), selector.item_text(i))
-            for i in range(selector.count())]
+def _model_options(db, task_ids, running_ids, now):
+    """同一批任务（取库里最新记录）交给 TaskOptionsModel 的直接输出。"""
+    model = TaskOptionsModel()
+    return model.rebuild([db.get_task(tid) for tid in task_ids], set(running_ids), now)
 
 
-def _tick_history(history):
-    """历史页定时刷新到点（页面可见时由 HistoryAutoRefresh 的定时器触发）。"""
-    history.auto_refresh.tick()
+def _assert_same_as_model(db, page, running_ids, now):
+    shown = _page_options(page.task_selector)
+    expected = _model_options(db, [tid for tid, _ in shown], running_ids, now)
+    assert shown == [(o.task_id, o.text) for o in expected]
+    return shown
 
 
-def _short_to_full(text, task):
-    """把历史页文本里的开始时间换成导出页的完整日期格式（只替换一次）。"""
-    return text.replace(task.start_time.strftime('%m-%d %H:%M'),
-                        task.start_time.strftime('%Y-%m-%d %H:%M'), 1)
-
-
-def _assert_same_options(db, history, export, running_ids, now):
-    """两页选项：顺序/ID 一致；文本分别等于两种 full_date 调用，且只差日期格式。"""
-    hist = _options(history)
-    exp = _options(export)
-    assert [tid for tid, _ in hist] == [tid for tid, _ in exp]
-    for (tid, hist_text), (_, exp_text) in zip(hist, exp):
-        task = db.get_task(tid)
-        running = tid in running_ids
-        assert hist_text == format_task_option_text(task, running, now)
-        assert exp_text == format_task_option_text(task, running, now, full_date=True)
-        assert exp_text == _short_to_full(hist_text, task)
-        assert exp_text != hist_text
-        assert ("运行中" in hist_text) == ("运行中" in exp_text) == running
-    return hist, exp
-
-
-def test_options_order_ids_and_text_match(
-        db, tasks, history, export, running_ids, clock):
-    """首次载入：两页列同一批任务、同一顺序，文本只差日期格式，具体文案钉死。"""
-    hist, exp = _assert_same_options(db, history, export, running_ids, clock.now())
-
-    assert [tid for tid, _ in hist] == tasks.order
-    assert tasks.nodata.task_id not in [tid for tid, _ in exp]
-
-    assert [text for _, text in hist] == [
+def test_options_order_ids_and_text_match_model(db, tasks, analysis, running_ids, clock):
+    """首次载入：只列有数据的任务、开始时间倒序，文本逐字等于模型输出（文案钉死）。"""
+    shown = _assert_same_as_model(db, analysis, running_ids, clock.now())
+    assert [tid for tid, _ in shown] == tasks.order
+    assert tasks.nodata.task_id not in [tid for tid, _ in shown]
+    assert [text for _, text in shown] == [
         "running.exe · PID 1011 · 07-16 23:00 · 运行中 5分钟",
         "noted.exe · PID 1009 · 07-16 21:00 · 42分钟 · 建模 200 次回归测试，连续运…",
         "plain.exe · PID 1009 · 12-31 23:30 · 2小时15分",
     ]
-    assert [text for _, text in exp] == [
-        "running.exe · PID 1011 · 2026-07-16 23:00 · 运行中 5分钟",
-        "noted.exe · PID 1009 · 2026-07-16 21:00 · 42分钟 · 建模 200 次回归测试，连续运…",
-        "plain.exe · PID 1009 · 2025-12-31 23:30 · 2小时15分",
-    ]
 
 
-def test_default_selection_is_newest_on_both_pages(db, tasks, history, export, clock):
-    """首次载入两页都默认选中第 0 项（最新的有数据任务），而不是更新但无数据的任务。"""
-    assert history.task_selector.current_index() == export.task_selector.current_index() == 0
-    assert history.current_task_id == export.current_task_id == tasks.running.task_id
-    # 当前项的完整信息放在下拉框 tooltip 上（两页都由 TaskSelector 同步，另见 test_task_selector）
-    assert history.task_selector.tooltip() == export.task_selector.tooltip() == format_task_tooltip(
+def test_default_selection_and_tooltip(db, tasks, analysis, clock):
+    """默认选中第 0 项（最新的有数据任务），tooltip 是该任务的完整信息。"""
+    assert analysis.task_selector.current_index() == 0
+    assert analysis.current_task_id == tasks.running.task_id
+    assert analysis.task_selector.tooltip() == format_task_tooltip(
         db.get_task(tasks.running.task_id), True, clock.now())
 
 
-def test_running_duration_refresh_keeps_pages_in_sync(
-        db, tasks, history, export, running_ids, clock):
-    """
-    运行中任务的时长随时钟原地刷新（不重建列表、不改选择），两页保持同口径；
-    任务结束后两页都换成最终时长、去掉"运行中"。
-    """
-    before_ids = [tid for tid, _ in _options(history)]
+def test_running_duration_refresh_matches_model(db, tasks, analysis, running_ids, clock):
+    """运行中时长随时钟原地刷新（不重建列表、不改选择）；结束后换成最终时长且不再变化。"""
+    before_ids = [tid for tid, _ in _page_options(analysis.task_selector)]
 
     clock.set(BASE + timedelta(hours=3, minutes=30))
-    _tick_history(history)
-    export.refresh_running_tasks()
-    hist, exp = _assert_same_options(db, history, export, running_ids, clock.now())
-    assert hist[0][1].endswith("运行中 30分钟")
-    assert exp[0][1].endswith("运行中 30分钟")
-    assert [tid for tid, _ in hist] == before_ids
-    assert history.current_task_id == export.current_task_id == tasks.running.task_id
+    analysis.auto_refresh.tick()
+    shown = _assert_same_as_model(db, analysis, running_ids, clock.now())
+    assert shown[0][1].endswith("运行中 30分钟")
+    assert [tid for tid, _ in shown] == before_ids
+    assert analysis.current_task_id == tasks.running.task_id
 
-    # 任务结束：数据库写入结束时间，任务状态服务也不再视其为运行中
     db.update_task_status(tasks.running.task_id, "stopped",
                           BASE + timedelta(hours=3, minutes=40))
     running_ids.clear()
     clock.set(BASE + timedelta(hours=6))
-    _tick_history(history)
-    export.refresh_running_tasks()
-    hist, exp = _assert_same_options(db, history, export, running_ids, clock.now())
-    assert hist[0][1] == "running.exe · PID 1011 · 07-16 23:00 · 40分钟"
-    assert exp[0][1] == "running.exe · PID 1011 · 2026-07-16 23:00 · 40分钟"
+    analysis.auto_refresh.tick()
+    shown = _assert_same_as_model(db, analysis, running_ids, clock.now())
+    assert shown[0][1] == "running.exe · PID 1011 · 07-16 23:00 · 40分钟"
 
-    # 结束后再推进时钟：两页的最终时长都不再变化
     clock.set(BASE + timedelta(hours=9))
-    _tick_history(history)
-    export.refresh_running_tasks()
-    assert _options(history) == hist
-    assert _options(export) == exp
+    analysis.auto_refresh.tick()
+    assert _page_options(analysis.task_selector) == shown
 
 
-def test_user_choice_survives_reload_on_both_pages(
-        db, tasks, history, export, running_ids, clock):
-    """用户在两页都手动选中第 3 项（plain）后重新载入列表：两页都保持该选择，文案仍同口径。"""
-    history.task_selector.combo.setCurrentIndex(2)   # 等同用户在下拉里点选第 3 项
-    export.task_selector.combo.setCurrentIndex(2)
-    assert history.current_task_id == export.current_task_id == tasks.plain.task_id
+def test_user_choice_survives_reload(db, tasks, analysis, running_ids, clock):
+    """用户手动选中第 3 项（plain）后重新载入列表：保持该选择，文案仍与模型一致。"""
+    analysis.task_selector.combo.setCurrentIndex(2)
+    assert analysis.current_task_id == tasks.plain.task_id
 
-    history.vm.reload_tasks()
-    export.reload_tasks()
+    analysis.vm.reload_tasks()
 
-    assert history.current_task_id == export.current_task_id == tasks.plain.task_id
-    assert history.task_selector.current_index() == export.task_selector.current_index() == 2
-    _assert_same_options(db, history, export, running_ids, clock.now())
+    assert analysis.current_task_id == tasks.plain.task_id
+    assert analysis.task_selector.current_index() == 2
+    _assert_same_as_model(db, analysis, running_ids, clock.now())
+
+
+def test_compare_options_match_model(db, tasks, analysis, running_ids, clock):
+    """对比任务下拉：候选为除当前任务外的全部任务，文本同样是模型的直接输出。"""
+    analysis.toolbar.compare_button.setChecked(True)
+    shown = _page_options(analysis.compare_panel.selector)
+    expected = _model_options(db, [tasks.noted.task_id, tasks.plain.task_id],
+                              running_ids, clock.now())
+    assert shown == [(o.task_id, o.text) for o in expected]

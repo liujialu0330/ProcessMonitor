@@ -1,24 +1,24 @@
 """
 界面文案纯函数
-不依赖任何 Qt 控件，集中放置历史页/导出页/监控页共用的文本拼装与简单计算，
+不依赖任何 Qt 控件，集中放置分析页/监控页/报告共用的文本拼装与简单计算，
 便于脱离 GUI 直接单测。
 """
 import bisect
 import math
-import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, List, Optional, Sequence
 
 from core.analysis.intervals import mean_round_delta
 from core.analysis.trend import (
-    MIN_POINTS, Judgement, RateText, Verdict, min_span_for, rate_unit_for_span)
+    MIN_POINTS, Judgement, RateText, Verdict, min_span_for)
 from core.contracts import StopReason, UnavailableReason
 from data.models import MonitorTask
 from utils.metrics import (
     KB_UNIT_DIVISORS, VALUE_CLASS_PEAK, VALUE_CLASS_RATE, display_unit_for,
-    format_metric_delta, format_metric_value, get_metric_unit, is_kb_metric,
-    object_count_limit,
+    format_metric_delta, format_metric_rate, format_metric_value,
+    get_metric_description, get_metric_display_name, get_metric_unit, is_kb_metric,
+    object_count_limit, value_class,
 )
 
 if TYPE_CHECKING:
@@ -56,9 +56,22 @@ def unavailable_reason_text(reason: UnavailableReason) -> str:
     return _UNAVAILABLE_REASON_TEXTS[reason]
 
 
-def task_status_text(running: bool) -> str:
-    """任务运行状态文案（下拉 tooltip、导出页摘要共用）。"""
-    return "运行中" if running else "已停止"
+def is_abnormal_stop(reason: Optional[StopReason]) -> bool:
+    """停止原因是否算"异常结束"：只有用户自己停止（含退出程序）是正常结束。"""
+    return reason is not None and reason is not StopReason.USER
+
+
+def task_status_text(
+        running: bool, *, paused: bool = False, abnormal: bool = False) -> str:
+    """任务状态文案，全应用统一四个词：运行中 / 已暂停 / 已结束 / 异常结束。
+
+    running 对应 TaskStatus.RUNNING（含暂停中）；paused 只在运行中有意义，
+    abnormal 只在已结束时有意义（由 is_abnormal_stop(StopReason) 推导）。
+    库里不保存停止原因，从库读出的已结束任务一律按"已结束"显示。
+    """
+    if running:
+        return "已暂停" if paused else "运行中"
+    return "异常结束" if abnormal else "已结束"
 
 
 def format_count(number: int) -> str:
@@ -88,7 +101,7 @@ def truncate_text(text: str, max_chars: int) -> str:
 
 def task_duration_seconds(
         task: MonitorTask, running: bool, now: datetime) -> float:
-    """任务时长：运行中取到 now；已停止取到结束时间，缺失时退回最后采样时间。
+    """任务时长：运行中取到 now；已结束取到结束时间，缺失时退回最后采样时间。
 
     now 由调用方传入（本模块不取系统时间），同一次刷新的多个下拉项共用一个时刻。
     """
@@ -133,7 +146,7 @@ def format_task_tooltip(
     return "\n".join(lines)
 
 
-# ---------- 趋势判定与增速文案（历史页统计条、后续的判定摘要表共用） ----------
+# ---------- 趋势判定与增速文案（判定摘要表、打点区间表与报告共用） ----------
 
 _VERDICT_TEXTS = {
     Verdict.RISING: "持续上涨",
@@ -253,42 +266,9 @@ def marker_badge(number: int) -> str:
     return f"({number})"
 
 
-# ---------- 历史页统计条（六格） ----------
+# ---------- 判定摘要表与报告共用：统计依据 ----------
 
-# 六个格位：标题随指标类别变化，格位不变（列数与排版只看格位）
-STAT_SLOTS = ("start", "current", "delta", "rate", "low", "high")
 STAT_EMPTY = "--"
-_DEFAULT_TITLES = {
-    "start": "开始值", "current": "当前值", "delta": "变化量",
-    "rate": "每小时增长", "low": "最小", "high": "最大",
-}
-_DEFAULT_TOOLTIPS = {
-    "start": "统计范围内最早一次采集的值；存在基线时改为基线值",
-    "current": "统计范围内最新一次采集的值",
-    "delta": "当前值相对开始值（或基线值）的变化量（绝对值与百分比）",
-    "rate": "对统计范围内全部数据做线性回归得到的增长速度",
-    "low": "统计范围内的最小值",
-    "high": "统计范围内的最大值",
-}
-
-
-@dataclass(frozen=True)
-class StatCell:
-    """统计条的一格：标题、主值、值下方的小字说明、tooltip、是否置灰、判定胶囊。"""
-    slot: str
-    title: str
-    value: str = STAT_EMPTY
-    note: str = ""
-    tooltip: str = ""
-    dimmed: bool = False
-    pill: str = ""
-    pill_tooltip: str = ""
-
-
-def empty_stat_cells() -> List[StatCell]:
-    """无数据时的六格（默认标题，值为 "--"）。"""
-    return [StatCell(slot, _DEFAULT_TITLES[slot], tooltip=_DEFAULT_TOOLTIPS[slot])
-            for slot in STAT_SLOTS]
 
 
 def _baseline_in_use(snapshot: "HistorySnapshot") -> bool:
@@ -312,125 +292,6 @@ def basis_text(snapshot: "HistorySnapshot") -> str:
     return " · ".join(parts)
 
 
-def _based_on(stats: dict) -> str:
-    return f"基于 {format_duration(stats['span_seconds'])} / {stats['count']:,} 点"
-
-
-def _level_rate_cell(snapshot: "HistorySnapshot", metric: str, basis: str) -> StatCell:
-    stats = snapshot.stats
-    suffix = snapshot.fit_unit or rate_unit_for_span(stats['span_seconds'])[0]
-    title = "每分钟增长" if suffix == "/分" else "每小时增长"
-    judgement = snapshot.judgement
-    pill = verdict_text(judgement.verdict) if judgement else ""
-    pill_tip = judgement_reason_text(judgement) if judgement else ""
-    if snapshot.rate is not None:
-        rate_line = f"增速 {format_rate_text(metric, snapshot.rate)}（± 为 95% 置信区间）"
-    else:
-        rate_line = insufficient_hint(snapshot.interval_seconds)
-
-    mean = mean_round_delta(snapshot.rounds)
-    if mean is not None:
-        counted = [r for r in snapshot.rounds if r.delta is not None]
-        lines = [f"{r.label}：{format_metric_delta(metric, r.delta)}" for r in counted]
-        return StatCell(
-            "rate", "每轮增长", format_metric_delta(metric, mean),
-            note=f"{len(counted)} 轮均值",
-            tooltip="\n".join(["各轮增量（打点后 5 个样本中位数之差）：", *lines,
-                               rate_line, basis]),
-            pill=pill, pill_tooltip=pill_tip)
-    if snapshot.rate is None:
-        return StatCell(
-            "rate", title,
-            insufficient_text(stats['span_seconds'], stats['count'], snapshot.interval_seconds),
-            tooltip=f"{rate_line}\n{basis}", dimmed=True, pill=pill, pill_tooltip=pill_tip)
-    return StatCell(
-        "rate", title, format_rate_text(metric, snapshot.rate), note=_based_on(stats),
-        tooltip=f"对统计范围内全部数据做线性回归的斜率，± 为 95% 置信区间\n{basis}",
-        pill=pill, pill_tooltip=pill_tip)
-
-
-def build_stat_cells(snapshot: Optional["HistorySnapshot"],
-                     display_unit: str = "") -> List[StatCell]:
-    """
-    按快照生成统计条六格（格位顺序见 STAT_SLOTS）。
-
-    - 存在基线（且统计只用基线之后的数据）时首格为"基线值"，变化量相对基线值；
-    - 水位量：第四格为增速（门槛未过置灰"数据不足"）或有 ≥2 个用户打点时的"每轮增长"，
-      并带判定胶囊；GDI/USER 对象数在当前值下注明配额占用；
-    - 累计量：第四至六格为平均速率 / 峰值速率 / 数据跨度（不外推增速）；
-    - 峰值类：第四格为"峰值抬升 N 次，共 +X"。
-    数值格与图表同一显示单位（display_unit）；变化量与速率按自身量级自适应单位。
-    """
-    if snapshot is None or not snapshot.request.metric or not snapshot.stats:
-        return empty_stat_cells()
-    metric = snapshot.request.metric
-    stats = snapshot.stats
-    use_baseline = _baseline_in_use(snapshot)
-    start = snapshot.baseline.value if use_baseline else stats['first']
-    last = stats['last']
-    basis = basis_text(snapshot)
-
-    def fmt(value: float) -> str:
-        return format_metric_value(metric, value, display_unit=display_unit)
-
-    cells = {}
-    if use_baseline:
-        baseline = snapshot.baseline
-        stamp = baseline.timestamp.strftime('%H:%M:%S')
-        cells["start"] = StatCell(
-            "start", "基线值", fmt(start), note=f"基线 {stamp}",
-            tooltip=(f"基线打点「{baseline.marker.label}」"
-                     f"{baseline.timestamp.strftime('%Y-%m-%d %H:%M:%S')} 之后 "
-                     f"{baseline.sample_count} 个样本的中位数；统计、回归与判定只用基线之后的数据"))
-    else:
-        cells["start"] = StatCell("start", "开始值", fmt(start),
-                                  tooltip="统计范围内最早一次采集的值")
-    cells["current"] = StatCell(
-        "current", "当前值", fmt(last), note=object_usage_text(metric, last),
-        tooltip="统计范围内最新一次采集的值")
-
-    delta = last - start
-    change = format_metric_delta(metric, delta)
-    if change != "±0" and start:
-        change = f"{change} ({delta / abs(start) * 100:+.1f}%)"
-    reference = "基线值" if use_baseline else "开始值"
-    cells["delta"] = StatCell("delta", "变化量", change,
-                              tooltip=f"当前值相对{reference}的变化量（绝对值与百分比）")
-
-    low = StatCell("low", "最小", fmt(stats['min']), tooltip=_DEFAULT_TOOLTIPS["low"])
-    high = StatCell("high", "最大", fmt(stats['max']), tooltip=_DEFAULT_TOOLTIPS["high"])
-
-    if snapshot.value_class == VALUE_CLASS_RATE:
-        rates = snapshot.rate_stats
-        average = rates.average_per_second if rates else None
-        peak = rates.peak_per_second if rates else None
-        cells["rate"] = StatCell(
-            "rate", "平均速率", format_per_second(metric, average), note=_based_on(stats),
-            tooltip=f"累计量的平均每秒增量：（当前值 - 开始值）/ 时长\n{basis}")
-        low = StatCell(
-            "low", "峰值速率", format_per_second(metric, peak),
-            tooltip="图表速率曲线的最大值：相邻采集点之差 / 间隔，跨空洞的一段不计；"
-                    "数据量大时按图表分桶点计算")
-        high = StatCell("high", "数据跨度", format_duration(stats['span_seconds']),
-                        note=f"{stats['count']:,} 点", tooltip=basis)
-    elif snapshot.value_class == VALUE_CLASS_PEAK:
-        rises = snapshot.peak_rises
-        if rises is None:
-            text = STAT_EMPTY
-        elif rises.count == 0:
-            text = "未抬升"
-        else:
-            text = f"{rises.count} 次，共 {format_metric_delta(metric, rises.total)}"
-        cells["rate"] = StatCell(
-            "rate", "峰值抬升", text,
-            tooltip="统计范围内峰值上升的次数与总幅度（按图表采样点统计，同一分桶内的"
-                    f"多次抬升计为一次）；峰值只增不减，不计算增速\n{basis}")
-    else:
-        cells["rate"] = _level_rate_cell(snapshot, metric, basis)
-    cells["low"], cells["high"] = low, high
-    return [cells[slot] for slot in STAT_SLOTS]
-
-
 def marker_context(
         marker_times: Sequence[float], marker_labels: Sequence[str],
         x: float) -> Optional[str]:
@@ -451,18 +312,151 @@ def marker_context(
     return f"打点「{marker_labels[index]}」后 {elapsed}"
 
 
-_INVALID_FILENAME_CHARS = re.compile(r'[\/:*?"<>|\r\n\t]+')
+# ---------- 分析页：判定摘要表、打点区间表、相对时间 ----------
+
+SUMMARY_COLUMNS = ("metric", "baseline", "current", "delta", "per_round", "rate",
+                   "tail", "verdict", "usage")
+SUMMARY_HEADERS = {
+    "metric": "指标", "baseline": "基线", "current": "当前", "delta": "较基线",
+    "per_round": "每轮均增", "rate": "增速 · R²", "tail": "末段趋势",
+    "verdict": "判定", "usage": "上限占比",
+}
 
 
-def sanitize_filename(text: str) -> str:
-    """去掉 Windows 文件名非法字符。"""
-    return _INVALID_FILENAME_CHARS.sub('_', text or '').strip(' .') or 'task'
+@dataclass(frozen=True)
+class SummaryRow:
+    """判定摘要表的一行：各列文本（键见 SUMMARY_COLUMNS）、各列 tooltip、是否置灰。"""
+    metric: str
+    texts: dict
+    tooltips: dict
+    dimmed: bool = False
+
+    def text(self, column: str) -> str:
+        return self.texts.get(column, STAT_EMPTY)
 
 
-def default_export_filename(task: MonitorTask) -> str:
-    """默认导出文件名：进程名_PID_开始时间.csv（去掉 .exe 后缀与非法字符）。"""
-    name = task.process_name
-    if name.lower().endswith('.exe'):
-        name = name[:-4]
-    stamp = task.start_time.strftime('%Y%m%d_%H%M%S')
-    return f"{sanitize_filename(name)}_{task.pid}_{stamp}.csv"
+def _arrow(delta: Optional[float], text: str) -> str:
+    """增长方向只用箭头表达（不着色）。"""
+    if delta is None or text in ("±0", STAT_EMPTY):
+        return "→"
+    return "↑" if delta > 0 else "↓"
+
+
+def percent_change(value: float, reference: Optional[float]) -> Optional[float]:
+    """相对参考值的百分比变化；参考值缺失或为 0 时为 None。"""
+    if reference is None or reference == 0:
+        return None
+    return (value - reference) / abs(reference) * 100.0
+
+
+def build_summary_row(metric: str, snapshot: Optional["HistorySnapshot"]) -> SummaryRow:
+    """
+    判定摘要表一行：基线（无基线时为开始值）/ 当前 / 较基线（Δ 与 %）/ 每轮均增 /
+    增速 ±CI · R²（累计量为平均速率、峰值类为抬升次数）/ 末段趋势（最后一个打点之后）/
+    判定 / 上限占比（GDI/USER）。样本不足（无统计或判定为数据不足）时整行置灰。
+    """
+    name = get_metric_display_name(metric)
+    texts = {column: STAT_EMPTY for column in SUMMARY_COLUMNS}
+    texts["metric"], texts["usage"] = name, ""
+    tips = {"metric": get_metric_description(metric)}
+    if snapshot is None or not snapshot.stats:
+        return SummaryRow(metric, texts, tips, dimmed=True)
+
+    stats = snapshot.stats
+    use_baseline = _baseline_in_use(snapshot)
+    start = snapshot.baseline.value if use_baseline else stats['first']
+    last = stats['last']
+    unit = display_unit_for(metric, max(abs(start), abs(last))) if is_kb_metric(metric) else None
+    texts["baseline"] = format_metric_value(metric, start, display_unit=unit)
+    tips["baseline"] = ("基线打点之后 5 个样本的中位数" if use_baseline
+                        else "统计范围内最早一次采集的值（尚无基线）")
+    texts["current"] = format_metric_value(metric, last, display_unit=unit)
+    delta = last - start
+    change = format_metric_delta(metric, delta)
+    pct = percent_change(last, start)
+    texts["delta"] = change if change == "±0" or pct is None else f"{change} ({pct:+.1f}%)"
+
+    mean = mean_round_delta(snapshot.rounds)
+    if mean is not None:
+        counted = [r for r in snapshot.rounds if r.delta is not None]
+        texts["per_round"] = format_metric_delta(metric, mean)
+        tips["per_round"] = "\n".join(
+            [f"{len(counted)} 轮均值："] + [f"{r.label}：{format_metric_delta(metric, r.delta)}"
+                                         for r in counted])
+
+    dimmed = False
+    judgement = snapshot.judgement
+    if snapshot.value_class == VALUE_CLASS_RATE:
+        rates = snapshot.rate_stats
+        texts["rate"] = "平均 " + format_per_second(metric, rates.average_per_second if rates else None)
+        tips["rate"] = "累计量不外推增速，显示平均每秒增量"
+        texts["verdict"] = "累计量"
+    elif snapshot.value_class == VALUE_CLASS_PEAK:
+        rises = snapshot.peak_rises
+        texts["rate"] = ("未抬升" if rises is not None and rises.count == 0 else
+                         f"抬升 {rises.count} 次" if rises is not None else STAT_EMPTY)
+        texts["verdict"] = "峰值"
+    elif snapshot.rate is not None and judgement is not None and judgement.fit is not None:
+        texts["rate"] = f"{format_rate_text(metric, snapshot.rate)} · R² {judgement.fit.r2:.2f}"
+        tips["rate"] = "对统计范围内全部数据做线性回归的斜率，± 为 95% 置信区间"
+    else:
+        texts["rate"] = insufficient_text(
+            stats['span_seconds'], stats['count'], snapshot.interval_seconds)
+        tips["rate"] = insufficient_hint(snapshot.interval_seconds)
+        dimmed = True
+    if judgement is not None:
+        texts["verdict"] = verdict_text(judgement.verdict)
+        tips["verdict"] = judgement_reason_text(judgement)
+        dimmed = dimmed or judgement.verdict == Verdict.INSUFFICIENT
+
+    if snapshot.intervals:
+        tail = snapshot.intervals[-1]
+        if tail.delta is not None:
+            tail_text = format_metric_delta(metric, tail.delta)
+            texts["tail"] = f"{_arrow(tail.delta, tail_text)} {tail_text}"
+            tips["tail"] = (f"最后一段（{format_duration(tail.duration_seconds)}）的变化量；"
+                            "有打点时为最后一个打点之后")
+    # 表格列窄：单元格只放占比与上限，完整说明放 tooltip
+    limit = object_count_limit(metric)
+    if limit is not None and last is not None:
+        texts["usage"] = f"{last / limit * 100:.1f}% / {limit}"
+        tips["usage"] = object_usage_text(metric, last) + "；超过上限后进程创建该类对象会失败"
+    return SummaryRow(metric, texts, tips, dimmed=dimmed)
+
+
+INTERVAL_COLUMNS = ("span", "duration", "start", "end", "delta", "rate", "peak", "vs_prev")
+INTERVAL_HEADERS = ("区间", "时长", "起值", "终值", "Δ", "速率", "峰值", "与上轮差")
+
+
+def interval_row_texts(metric: str, item, span: Sequence[str],
+                       display_unit: Optional[str] = None) -> List[str]:
+    """打点区间表一行文本（列顺序见 INTERVAL_HEADERS）；span 为 (左标签, 右标签)。"""
+    def value(v: Optional[float]) -> str:
+        return format_metric_value(metric, v, display_unit=display_unit) if v is not None else STAT_EMPTY
+
+    if item.rate_per_hour is None:
+        rate = STAT_EMPTY
+    elif value_class(metric) == VALUE_CLASS_RATE:
+        rate = format_per_second(metric, item.rate_per_hour / 3600.0)
+    else:
+        rate = format_metric_rate(metric, item.rate_per_hour)
+    return [
+        f"{span[0]} → {span[1]}",
+        format_duration(item.duration_seconds),
+        value(item.start_value), value(item.end_value),
+        format_metric_delta(metric, item.delta),
+        rate,
+        value(item.peak),
+        format_metric_delta(metric, item.delta_vs_previous),
+    ]
+
+
+def format_relative(seconds: float) -> str:
+    """相对时间：T+mm:ss；满 1 小时为 T+h:mm:ss；负数为 T-…。"""
+    sign = "-" if seconds < 0 else "+"
+    total = int(round(abs(seconds)))
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"T{sign}{hours}:{minutes:02d}:{secs:02d}"
+    return f"T{sign}{minutes:02d}:{secs:02d}"

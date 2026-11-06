@@ -16,7 +16,7 @@ from qfluentwidgets import Theme, qconfig
 from core.history_query import build_request, run_history_query
 from data.models import DataPoint
 from tests.test_history_query import _seed_series
-from tests.test_safety_net_history import (
+from tests.history_dataset import (
     BASE, MARKER_LINES, MAX_BUCKETS, MEM, QUERY_CASES, TABLE_LIMIT, THREADS,
     _seed_baseline_dataset, _seed_query_dataset)
 from ui.components.sparkline import compute_y_range
@@ -67,11 +67,11 @@ def _marker(seconds, label, kind='user'):
 
 
 @pytest.mark.parametrize(
-    "metric, range_key, since_minutes, rows, count, buckets, markers, stat_texts",
+    "metric, range_key, since_minutes, rows, count, buckets, markers, _current",
     QUERY_CASES, ids=[f"{m}-{r}" for m, r, *_ in QUERY_CASES])
 def test_render_matches_history_safety_net(
         chart, db, metric, range_key, since_minutes, rows, count, buckets,
-        markers, stat_texts):
+        markers, _current):
     task = _seed_query_dataset(db)
     snapshot = _snapshot(db, task.task_id, metric, range_key)
 
@@ -236,7 +236,7 @@ def test_cumulative_metric_draws_rate_series(chart, db):
 
     assert chart.is_rate is True
     assert chart.y_values == pytest.approx([102.4] * len(snapshot.rate_series))
-    assert chart.axis_title() == "每秒IO读取字节（KB）"
+    assert chart.axis_title() == "每秒I/O 读取字节（KB）"
     assert chart.value_axis.integer_only is False
     assert chart.connect_array().count(False) == 1
     chart.show_hover_at(chart.x_values[0])
@@ -244,7 +244,7 @@ def test_cumulative_metric_draws_rate_series(chart, db):
 
 
 def test_rate_axis_title_and_count_metric_not_integer(chart):
-    assert value_axis_title(MetricType.IO_READ_COUNT, "次", rate=True) == "每秒IO读取次数（次）"
+    assert value_axis_title(MetricType.IO_READ_COUNT, "次", rate=True) == "每秒I/O 读取次数（次）"
     points = [DataPoint("t", FLOW_BASE + timedelta(seconds=i), 0.5, MetricType.IO_READ_COUNT)
               for i in range(3)]
     chart.set_series(points, MetricType.IO_READ_COUNT, rate=True)
@@ -305,6 +305,25 @@ def test_flat_series_gets_minimum_y_span(chart, monkeypatch):
     ranges.clear()
     chart.set_series(_flow_points(), MEM)
     assert ranges == []
+
+
+def test_constant_rate_series_gets_relative_y_span(chart, monkeypatch):
+    """累计量的恒定速率（每秒 1000 KB）：纵轴跨度扩到参考值的 5%（975–1025），
+    不再被拉伸成 999.6–1000.4 这类无意义刻度；速率为 0 时至少跨 1 个单位/秒。"""
+    ranges = []
+    monkeypatch.setattr(chart.chart_widget, 'setYRange',
+                        lambda low, high, padding=None: ranges.append((low, high, padding)))
+    flat = [DataPoint("t", FLOW_BASE + timedelta(seconds=i), 1000.0, MetricType.IO_READ_BYTES)
+            for i in range(5)]
+    chart.set_series(flat, MetricType.IO_READ_BYTES, rate=True)
+    assert ranges == [(pytest.approx(975.0), pytest.approx(1025.0), 0.05)]
+
+    ranges.clear()
+    zero = [DataPoint("t", FLOW_BASE + timedelta(seconds=i), 0.0, MetricType.IO_READ_COUNT)
+            for i in range(5)]
+    chart.set_series(zero, MetricType.IO_READ_COUNT, rate=True)
+    assert ranges == [(pytest.approx(-0.5), pytest.approx(0.5), 0.05)]
+    assert compute_y_range([0.0, 0.0], MetricType.IO_READ_COUNT, rate=True) == (-0.5, 0.5)
 
 
 def test_theme_switch_recolors_and_keeps_data(chart):

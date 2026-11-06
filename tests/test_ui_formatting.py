@@ -1,6 +1,6 @@
 """
-ui/formatting.py 纯函数：时长、任务下拉文案、统计条六格与判定/增速文案、打点区间与
-编号徽标、默认导出文件名。
+ui/formatting.py 纯函数：时长、任务下拉文案、状态词、判定摘要行与判定/增速文案、
+打点区间与编号徽标。
 """
 import math
 from datetime import datetime, timedelta
@@ -14,17 +14,16 @@ from core.history_query import (
     BaselineInfo, HistorySnapshot, PeakRises, RateStats, build_request)
 from data.models import Marker, MonitorTask
 from ui.formatting import (
-    STAT_SLOTS, build_stat_cells, default_export_filename, empty_stat_cells,
-    format_count, format_duration, format_per_second, format_rate_text,
+    basis_text, build_summary_row, format_count, format_duration, format_per_second, format_rate_text,
     format_task_option_text, format_task_tooltip, insufficient_text,
     judgement_reason_text, marker_badge, marker_context, object_usage_text,
-    sanitize_filename, stop_reason_text, task_duration_seconds, task_status_text,
+    is_abnormal_stop, stop_reason_text, task_duration_seconds, task_status_text,
     truncate_text, unavailable_reason_text, verdict_text
 )
 from utils.metrics import (
     VALUE_CLASS_PEAK, VALUE_CLASS_RATE, MetricType)
 
-# 已停止任务的时长不看 now；随便给一个远离起止时间的时刻，证明确实没被用到
+# 已结束任务的时长不看 now；随便给一个远离起止时间的时刻，证明确实没被用到
 FAR_NOW = datetime(2030, 1, 1)
 
 
@@ -96,8 +95,13 @@ def test_task_tooltip_status_text():
     running = format_task_tooltip(
         _task(end_time=None, status="running"), True, datetime(2026, 7, 16, 21, 0))
     assert "状态：运行中" in running and "时长：5分钟" in running
-    assert "状态：已停止" in format_task_tooltip(_task(), False, FAR_NOW)
-    assert task_status_text(True) == "运行中" and task_status_text(False) == "已停止"
+    assert "状态：已结束" in format_task_tooltip(_task(), False, FAR_NOW)
+    assert task_status_text(True) == "运行中" and task_status_text(False) == "已结束"
+    assert task_status_text(True, paused=True) == "已暂停"
+    assert task_status_text(False, abnormal=True) == "异常结束"
+    # paused 只在运行中有意义，abnormal 只在已结束时有意义
+    assert task_status_text(False, paused=True) == "已结束"
+    assert task_status_text(True, abnormal=True) == "运行中"
 
 
 @pytest.mark.parametrize("reason, text", [
@@ -190,7 +194,7 @@ def test_marker_badge():
     assert marker_badge(21) == "(21)"
 
 
-# ---------- 统计条六格 ----------
+# ---------- 判定摘要行 ----------
 
 T0 = datetime(2026, 7, 16, 8, 0, 0)
 
@@ -208,55 +212,48 @@ def _snapshot(metric, stats, **fields):
                            interval_seconds=fields.pop('interval_seconds', 60.0), **fields)
 
 
-def _texts(cells):
-    return {cell.title: cell.value for cell in cells}
+def _row(snapshot, metric=None):
+    metric = metric or snapshot.request.metric
+    return build_summary_row(metric, snapshot)
 
 
-def test_empty_cells_for_missing_stats_or_metric():
-    cells = empty_stat_cells()
-    assert [c.slot for c in cells] == list(STAT_SLOTS)
-    assert _texts(cells) == {"开始值": "--", "当前值": "--", "变化量": "--",
-                             "每小时增长": "--", "最小": "--", "最大": "--"}
-    assert build_stat_cells(None) == cells
-    assert build_stat_cells(_snapshot(MetricType.NUM_THREADS, None)) == cells
-    assert build_stat_cells(_snapshot(None, _stats(1, 2))) == cells
+def test_summary_row_without_stats_is_dimmed_placeholders():
+    row = _row(_snapshot(MetricType.NUM_THREADS, None))
+    assert row.dimmed
+    assert row.text("metric") == "线程数"
+    assert [row.text(c) for c in ("baseline", "current", "delta", "rate", "verdict")] ==         ["--"] * 5
+    assert build_summary_row(MetricType.NUM_THREADS, None).dimmed
 
 
-def test_level_cells_with_rate_and_verdict():
+def test_summary_row_level_rate_and_verdict():
     fit = LinearFit(1.0, 0.0, 0.95, 0.01)
     snapshot = _snapshot(
         MetricType.MEMORY_PRIVATE, _stats(100 * 1024.0, 150 * 1024.0, count=8100, span=8100),
         judgement=Judgement(Verdict.RISING, fit, 'rising', 0.9),
         rate=RateText(1024 * 12.0, 1024 * 0.4, '/小时', 3600.0), fit_unit='/小时')
-    cells = build_stat_cells(snapshot, "MB")
-    assert _texts(cells) == {
-        "开始值": "100 MB", "当前值": "150 MB", "变化量": "+50 MB (+50.0%)",
-        "每小时增长": "+12 ±0.4 MB/小时", "最小": "100 MB", "最大": "150 MB"}
-    rate = cells[3]
-    assert rate.note == "基于 2小时15分 / 8,100 点"
-    assert rate.pill == "持续上涨" and "R² 0.95" in rate.pill_tooltip
-    assert not rate.dimmed
-    assert rate.tooltip.endswith("2小时15分 · 8,100 点")
+    row = _row(snapshot)
+    assert [row.text(c) for c in ("baseline", "current", "delta", "rate", "verdict")] == [
+        "100 MB", "150 MB", "+50 MB (+50.0%)", "+12 ±0.4 MB/小时 · R² 0.95", "持续上涨"]
+    assert not row.dimmed
+    assert "R² 0.95" in row.tooltips["verdict"]
 
 
-def test_level_cells_insufficient_is_dimmed_per_minute():
+def test_summary_row_insufficient_is_dimmed():
     snapshot = _snapshot(
         MetricType.NUM_THREADS, _stats(10.0, 10.0, count=12, span=11),
         judgement=Judgement(Verdict.INSUFFICIENT, None, 'few_points', 0.0),
         fit_unit='/分', interval_seconds=1.0)
-    cells = build_stat_cells(snapshot)
-    rate = cells[3]
-    assert (rate.title, rate.value, rate.dimmed) == ("每分钟增长", "数据不足（已采 11秒）", True)
-    assert rate.pill == "数据不足"
-    assert cells[2].value == "±0"
+    row = _row(snapshot)
+    assert (row.text("rate"), row.text("verdict"), row.dimmed) == (
+        "数据不足（已采 11秒）", "数据不足", True)
+    assert row.text("delta") == "±0"
 
 
-def test_zero_start_has_no_percent():
-    cells = build_stat_cells(_snapshot(MetricType.NUM_HANDLES, _stats(0.0, 5.0)))
-    assert cells[2].value == "+5 个"
+def test_summary_row_zero_start_has_no_percent():
+    assert _row(_snapshot(MetricType.NUM_HANDLES, _stats(0.0, 5.0))).text("delta") == "+5 个"
 
 
-def test_baseline_cells_and_rounds():
+def test_summary_row_baseline_and_rounds():
     marker = Marker("t", T0 + timedelta(minutes=20), "基线", kind='baseline')
     rounds = [RoundDelta(0, "第1轮", T0, T0, 0.0, 15 * 1024.0, 15 * 1024.0),
               RoundDelta(1, "第2轮", T0, T0, 0.0, 25 * 1024.0, 25 * 1024.0),
@@ -266,50 +263,46 @@ def test_baseline_cells_and_rounds():
         baseline=BaselineInfo(marker, 141 * 1024.0, 5), stats_since=marker.timestamp,
         rounds=rounds, judgement=Judgement(Verdict.RISING, LinearFit(1, 0, 1.0, 0), 'rising', 1),
         rate=RateText(1024 * 0.5, 0.0, '/小时', 3600.0), fit_unit='/小时')
-    cells = build_stat_cells(snapshot, "MB")
-    assert _texts(cells)["基线值"] == "141 MB"
-    assert cells[0].note == "基线 08:20:00"
-    assert "5 个样本的中位数" in cells[0].tooltip
-    assert cells[2].value == "+49 MB (+34.8%)"
-    rate = cells[3]
-    assert (rate.title, rate.value, rate.note) == ("每轮增长", "+20 MB", "2 轮均值")
-    assert "第1轮：+15 MB" in rate.tooltip and "第2轮：+25 MB" in rate.tooltip
-    assert "基线 08:20:00 起 · 1小时40分 · 86 点" in rate.tooltip
+    row = _row(snapshot)
+    assert row.text("baseline") == "141 MB"
+    assert "5 个样本的中位数" in row.tooltips["baseline"]
+    assert row.text("delta") == "+49 MB (+34.8%)"
+    assert row.text("per_round") == "+20 MB"
+    assert "第1轮：+15 MB" in row.tooltips["per_round"]
+    assert "第2轮：+25 MB" in row.tooltips["per_round"]
+    assert basis_text(snapshot) == "基线 08:20:00 起 · 1小时40分 · 86 点"
 
 
-def test_baseline_only_off_shows_start_value():
+def test_summary_row_baseline_only_off_shows_start_value():
     marker = Marker("t", T0, "基线", kind='baseline')
     snapshot = HistorySnapshot(
         request=build_request("t", MetricType.NUM_HANDLES, 'all', baseline_only=False),
         stats=_stats(10.0, 20.0), baseline=BaselineInfo(marker, 12.0, 5))
-    assert _texts(build_stat_cells(snapshot))["开始值"] == "10 个"
+    assert _row(snapshot).text("baseline") == "10 个"
 
 
-def test_gdi_current_value_notes_quota():
-    cells = build_stat_cells(_snapshot(MetricType.NUM_GDI_OBJECTS, _stats(100.0, 3750.0)))
-    assert cells[1].note == "已用 37.5%（上限 10000）"
+def test_summary_row_gdi_usage():
+    row = _row(_snapshot(MetricType.NUM_GDI_OBJECTS, _stats(100.0, 3750.0)))
+    assert row.text("usage") == "37.5% / 10000"
+    assert row.tooltips["usage"].startswith("已用 37.5%（上限 10000）")
 
 
-def test_cumulative_cells_show_rates_not_growth():
+def test_summary_row_cumulative_shows_average_rate_not_growth():
     snapshot = _snapshot(
         MetricType.IO_READ_BYTES, _stats(1024.0, 3072.0, count=10, span=600),
         value_class=VALUE_CLASS_RATE, rate_stats=RateStats(1024 / 600 * 2, 1024 * 1.5))
-    cells = build_stat_cells(snapshot, "MB")
-    assert _texts(cells) == {
-        "开始值": "1 MB", "当前值": "3 MB", "变化量": "+2 MB (+200.0%)",
-        "平均速率": "3.41 KB/秒", "峰值速率": "1.5 MB/秒", "数据跨度": "10分钟"}
-    assert cells[5].note == "10 点"
-    assert not any(cell.pill for cell in cells)
+    row = _row(snapshot)
+    assert (row.text("rate"), row.text("verdict")) == ("平均 3.41 KB/秒", "累计量")
 
 
-def test_peak_cells_show_rises():
+def test_summary_row_peak_shows_rises():
     snapshot = _snapshot(
         MetricType.MEMORY_PEAK_WSET, _stats(100.0, 180.0),
         value_class=VALUE_CLASS_PEAK, peak_rises=PeakRises(2, 80.0))
-    assert _texts(build_stat_cells(snapshot))["峰值抬升"] == "2 次，共 +80 KB"
+    assert (_row(snapshot).text("rate"), _row(snapshot).text("verdict")) == ("抬升 2 次", "峰值")
     none = _snapshot(MetricType.MEMORY_PEAK_WSET, _stats(100.0, 100.0),
                      value_class=VALUE_CLASS_PEAK, peak_rises=PeakRises(0, 0.0))
-    assert _texts(build_stat_cells(none))["峰值抬升"] == "未抬升"
+    assert _row(none).text("rate") == "未抬升"
 
 
 def test_marker_context_locates_interval():
@@ -321,8 +314,11 @@ def test_marker_context_locates_interval():
     assert marker_context(times, labels, 9999.0).startswith("打点「第2轮」后")
 
 
-def test_default_export_filename():
-    assert default_export_filename(_task()) == "MPrintExp_1234_20260716_205451.csv"
-    weird = _task(process_name='a:b*c?.EXE')
-    assert default_export_filename(weird) == "a_b_c__1234_20260716_205451.csv"
-    assert sanitize_filename('  ') == 'task'
+def test_abnormal_stop_only_excludes_user():
+    """只有用户停止算正常结束；进程退出、内部错误等都显示"异常结束"。"""
+    assert is_abnormal_stop(None) is False
+    assert is_abnormal_stop(StopReason.USER) is False
+    for reason in StopReason:
+        if reason is not StopReason.USER:
+            assert is_abnormal_stop(reason) is True
+            assert task_status_text(False, abnormal=is_abnormal_stop(reason)) == "异常结束"

@@ -1,25 +1,27 @@
 """
 任务面板
 
-监控页下半部分：配额标题（"监控任务 · n/5 运行中 · k 个已结束"）、空状态、
-运行中的任务卡片，以及下方的"已结束"分组。卡片按钮的信号统一由面板转发，
+监控页下半部分：空状态三步引导、等待进程启动的占位卡、运行中的任务卡片，以及
+下方的"已结束（N）"分组（单行卡片 + [清除全部]）。卡片按钮的信号统一由面板转发，
 Presenter 只连面板，不必逐张卡片连接。
+
+配额摘要（"运行中 2/5 · 已结束 1"）由面板算好，经 summary_changed 交给页头显示。
 """
 from datetime import datetime
 from typing import Dict, Optional
 
 from PyQt5.QtCore import pyqtSignal
-from PyQt5.QtWidgets import QSizePolicy, QVBoxLayout, QWidget
-from qfluentwidgets import CaptionLabel, FluentIcon, StrongBodyLabel
+from PyQt5.QtWidgets import QHBoxLayout, QSizePolicy, QVBoxLayout, QWidget
+from qfluentwidgets import FluentIcon, StrongBodyLabel, TransparentPushButton
 
 from core.contracts import StopReason, TaskInfo
 from ui.components.task_card import TaskCard
-from ui.widgets.empty_state import EmptyStateCard
+from ui.widgets.monitor.empty_guide import EmptyGuideCard
+from ui.widgets.monitor.waiting_card import WaitingCard
 
 CARD_SPACING = 12
-
-EMPTY_TITLE = "暂无监控任务"
-EMPTY_HINT = "在上方选择被测进程开始记录；每轮操作后点\"打点\"，即可量化每轮的增长"
+# 已结束的单行卡片排得更紧凑
+FINISHED_SPACING = 8
 
 # 卡片信号名 -> 面板信号名
 _FORWARDED = (
@@ -33,18 +35,31 @@ _FORWARDED = (
 )
 
 
-def _column(parent: QWidget) -> QVBoxLayout:
+def _column(parent: QWidget, spacing: int = CARD_SPACING) -> QVBoxLayout:
     layout = QVBoxLayout(parent)
     layout.setContentsMargins(0, 0, 0, 0)
-    layout.setSpacing(CARD_SPACING)
+    layout.setSpacing(spacing)
     return layout
+
+
+def summary_text(running: int, limit: int, finished: int, waiting: int = 0) -> str:
+    """页头摘要："运行中 2/5 · 已结束 1"（有等待中的进程时再加"等待启动 1"）。"""
+    parts = [f"运行中 {running}/{limit}"]
+    if waiting:
+        parts.append(f"等待启动 {waiting}")
+    if finished:
+        parts.append(f"已结束 {finished}")
+    return " · ".join(parts)
 
 
 class TaskBoard(QWidget):
     """任务卡片容器。
 
     信号（参数均为 task_id）：stop_requested / pause_requested / resume_requested /
-    marker_requested / history_requested / restart_requested / close_requested。
+    marker_requested / history_requested / restart_requested / close_requested；
+    clear_finished_requested()：点"清除全部"；
+    wait_cancel_requested(str)：占位卡的"取消等待"，参数为等待 ID；
+    summary_changed(str)：配额摘要变了。
     """
 
     stop_requested = pyqtSignal(str)
@@ -54,33 +69,51 @@ class TaskBoard(QWidget):
     history_requested = pyqtSignal(str)
     restart_requested = pyqtSignal(str)
     close_requested = pyqtSignal(str)
+    clear_finished_requested = pyqtSignal()
+    wait_cancel_requested = pyqtSignal(str)
+    summary_changed = pyqtSignal(str)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, hotkey_text: str = ''):
         super().__init__(parent)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
         self._cards: Dict[str, TaskCard] = {}
+        self._waiting: Dict[str, WaitingCard] = {}
         self._running = 0
         self._limit = 0
+        self._summary = ""
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(CARD_SPACING)
 
-        self.count_label = StrongBodyLabel(self)
-        layout.addWidget(self.count_label)
-
-        self.empty_state = EmptyStateCard(
-            FluentIcon.SPEED_HIGH, EMPTY_TITLE, EMPTY_HINT, parent=self)
+        self.empty_state = EmptyGuideCard(hotkey_text, parent=self)
         layout.addWidget(self.empty_state)
+
+        self._waiting_box = QWidget(self)
+        self._waiting_layout = _column(self._waiting_box)
+        layout.addWidget(self._waiting_box)
 
         self._running_box = QWidget(self)
         self._running_layout = _column(self._running_box)
         layout.addWidget(self._running_box)
 
-        self.finished_label = CaptionLabel("已结束", self)
-        layout.addWidget(self.finished_label)
+        # 已结束（N） ........ [清除全部]
+        self.finished_header = QWidget(self)
+        header_layout = QHBoxLayout(self.finished_header)
+        header_layout.setContentsMargins(0, 8, 0, 0)
+        header_layout.setSpacing(8)
+        self.finished_label = StrongBodyLabel("已结束", self.finished_header)
+        header_layout.addWidget(self.finished_label)
+        header_layout.addStretch(1)
+        self.clear_finished_button = TransparentPushButton(
+            "清除全部", self.finished_header, FluentIcon.BROOM)
+        self.clear_finished_button.setToolTip("从列表移除全部已结束的卡片（数据仍保留，可在分析页查看）")
+        self.clear_finished_button.clicked.connect(self.clear_finished_requested)
+        header_layout.addWidget(self.clear_finished_button)
+        layout.addWidget(self.finished_header)
+
         self._finished_box = QWidget(self)
-        self._finished_layout = _column(self._finished_box)
+        self._finished_layout = _column(self._finished_box, FINISHED_SPACING)
         layout.addWidget(self._finished_box)
 
         self._refresh()
@@ -131,6 +164,10 @@ class TaskBoard(QWidget):
         """全部卡片 {task_id: 卡片}（副本，按加入顺序）。"""
         return dict(self._cards)
 
+    def finished_ids(self):
+        """已结束卡片的任务 ID（按加入顺序）。"""
+        return [task_id for task_id, card in self._cards.items() if card.is_finished]
+
     def finish_card(self, task_id: str, reason: StopReason, end_time: datetime) -> None:
         """卡片转为"已结束"并移到下方分组（最近结束的在最上面）。"""
         card = self._cards.get(task_id)
@@ -140,6 +177,33 @@ class TaskBoard(QWidget):
         self._running_layout.removeWidget(card)
         self._finished_layout.insertWidget(0, card)
         self._refresh()
+
+    # ========== 等待进程启动的占位卡 ==========
+
+    def add_waiting(self, wait_id: str, process_name: str, detail: str = '') -> WaitingCard:
+        """加入一张"等待 xxx.exe 启动…"占位卡。"""
+        self.remove_waiting(wait_id)
+        card = WaitingCard(wait_id, process_name, detail, parent=self)
+        card.cancel_requested.connect(self.wait_cancel_requested)
+        self._waiting[wait_id] = card
+        self._waiting_layout.addWidget(card)
+        self._refresh()
+        return card
+
+    def remove_waiting(self, wait_id: str) -> None:
+        card = self._waiting.pop(wait_id, None)
+        if card is None:
+            return
+        self._waiting_layout.removeWidget(card)
+        card.hide()
+        card.deleteLater()
+        self._refresh()
+
+    def waiting_card(self, wait_id: str) -> Optional[WaitingCard]:
+        return self._waiting.get(wait_id)
+
+    def waiting_ids(self):
+        return list(self._waiting)
 
     # ========== 计数 ==========
 
@@ -151,13 +215,25 @@ class TaskBoard(QWidget):
     def finished_count(self) -> int:
         return sum(1 for card in self._cards.values() if card.is_finished)
 
+    def summary(self) -> str:
+        """当前的配额摘要文案（与 summary_changed 发出的一致）。"""
+        return self._summary
+
+    def set_hotkey_text(self, hotkey_text: str) -> None:
+        """空状态引导里提到的打点快捷键（为空表示不可用）。"""
+        self.empty_state.set_hotkey_text(hotkey_text)
+
     def _refresh(self) -> None:
         finished = self.finished_count()
-        text = f"监控任务 · {self._running}/{self._limit} 运行中"
-        if finished:
-            text += f" · {finished} 个已结束"
-        self.count_label.setText(text)
-        self.empty_state.setVisible(not self._cards)
-        self._running_box.setVisible(len(self._cards) > finished)
-        self.finished_label.setVisible(finished > 0)
+        running_cards = len(self._cards) - finished
+        self.empty_state.setVisible(not self._cards and not self._waiting)
+        self._waiting_box.setVisible(bool(self._waiting))
+        self._running_box.setVisible(running_cards > 0)
+        self.finished_label.setText(f"已结束（{finished}）")
+        self.finished_header.setVisible(finished > 0)
         self._finished_box.setVisible(finished > 0)
+
+        summary = summary_text(self._running, self._limit, finished, len(self._waiting))
+        if summary != self._summary:
+            self._summary = summary
+            self.summary_changed.emit(summary)

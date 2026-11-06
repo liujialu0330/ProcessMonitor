@@ -7,7 +7,7 @@ import pytest
 from tests.doubles import FakeProcessQuery
 from ui.widgets.monitor.process_picker import (
     ERROR_EMPTY, ERROR_NO_MATCH, ERROR_NOT_A_NUMBER, ERROR_NOT_FOUND,
-    ProcessPicker, ResolveError, Target,
+    REFRESH_THROTTLE_SECONDS, ProcessPicker, ResolveError, Target, no_match_text,
 )
 
 PROCESSES = [(1001, "alpha.exe", 1001.5), (1002, "beta.exe", 1002.5),
@@ -127,3 +127,69 @@ def test_no_separate_pid_box(picker):
     from qfluentwidgets import EditableComboBox
     edits = [w for w in picker.findChildren(LineEdit) if not isinstance(w, EditableComboBox)]
     assert edits == []
+
+
+# ---------- 自动刷新与"未找到，点击刷新" ----------
+
+class _Clock:
+    def __init__(self):
+        self.now = 100.0
+
+    def __call__(self):
+        return self.now
+
+
+@pytest.fixture
+def timed_picker(qapp, query):
+    clock = _Clock()
+    widget = ProcessPicker(query, monotonic=clock)
+    widget.refresh()
+    yield widget, clock
+    widget.close()
+
+
+def _list_calls(query):
+    return sum(1 for name, _ in query.calls if name == 'list_processes')
+
+
+def test_refresh_if_stale_is_throttled_to_two_seconds(timed_picker, query):
+    picker, clock = timed_picker
+    before = _list_calls(query)
+    clock.now += 1.0
+    assert picker.refresh_if_stale() is False
+    clock.now += REFRESH_THROTTLE_SECONDS
+    assert picker.refresh_if_stale() is True
+    assert _list_calls(query) == before + 1
+
+
+def test_drop_button_press_refreshes_before_popup(timed_picker, query):
+    picker, clock = timed_picker
+    query.processes.append((1004, "gamma.exe", 1004.5))
+    clock.now += REFRESH_THROTTLE_SECONDS + 1
+    picker.combo.line_edit.dropButton.pressed.emit()
+    assert Target(1004, "gamma.exe", 1004.5) in picker.targets()
+
+
+def test_no_match_hint_click_refreshes(picker, query):
+    picker.set_text("gamma")
+    assert picker.no_match_visible()
+    assert picker.no_match_label.text() == no_match_text("gamma") == "未找到“gamma”，点击刷新"
+
+    query.processes.append((1004, "gamma.exe", 1004.5))
+    picker.no_match_label.clicked.emit()
+    assert not picker.no_match_visible()
+    assert picker.text() == "gamma"
+
+
+def test_no_match_hint_not_for_pid_or_matching_text(picker):
+    picker.set_text("1234")
+    assert not picker.no_match_visible()
+    picker.set_text("alp")
+    assert not picker.no_match_visible()
+    picker.set_no_match_hint_enabled(False)
+    picker.set_text("gamma")
+    assert not picker.no_match_visible()
+
+
+def test_search_placeholder_mentions_shortcut(picker):
+    assert "Ctrl+F" in picker.combo.line_edit.placeholderText()

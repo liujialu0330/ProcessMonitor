@@ -39,6 +39,8 @@ class TypeScale:
     BODY = 14
     CAPTION = 12
     STAT_VALUE = 18
+    # 任务卡片指标格的实时值（设计规范 Subtitle：20px Semibold，关键数值）
+    METRIC_VALUE = 20
     CHART_TICK = 12
 
 
@@ -105,6 +107,14 @@ class DataCaptionLabel(CaptionLabel):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.setFont(data_font(TypeScale.CAPTION))
+
+
+class MetricValueLabel(DataLabel):
+    """任务卡片指标格的实时值：20px Semibold，扫一眼就能比较各指标。"""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setFont(ui_font(TypeScale.METRIC_VALUE, QFont.DemiBold))
 
 
 class StatValueLabel(DataLabel):

@@ -1,6 +1,11 @@
 """
 主窗口
-使用FluentWindow创建带有Fluent UI风格的主界面
+
+FluentWindow 外壳：侧栏 监控 / 分析 / 设置（底部），窗口宽度 ≥ 1200 时侧栏展开显示文字。
+主窗口只做页面之间、页面与托盘/全局快捷键之间的中转，不承担业务流程：
+- 监控卡片"分析"→ 切到分析页并选中该任务；
+- 托盘菜单"打点"、全局快捷键 → 监控页的快速打点，结果用托盘气泡确认；
+- 静默检查到新版本 → 非模态提示，"查看"跳到设置页"关于与更新"。
 """
 import logging
 import os
@@ -14,11 +19,11 @@ from qfluentwidgets import (
 )
 
 from core.shutdown import ShutdownCoordinator
+from ui.hotkey import MarkerHotkey
+from ui.pages.analysis_page import AnalysisPage
 from ui.pages.monitor_page import MonitorPage
-from ui.pages.history_page import HistoryPage
-from ui.pages.export_page import ExportPage
-from ui.pages.about_page import AboutPage
 from ui.pages.setting_page import SettingPage
+from ui.presenters.monitor_presenter import QUICK_MARKER_OK
 from ui.services import CLOSE_ACTION_CANCEL, CLOSE_ACTION_TRAY, UiServices
 from ui.tray import TrayController
 from core.monitor_manager import MonitorManager
@@ -28,11 +33,16 @@ import config
 
 logger = logging.getLogger(__name__)
 
+# 窗口宽度达到该值时侧栏展开显示文字，窄于它时收成图标栏
+NAV_EXPAND_MIN_WIDTH = 1200
+NAV_EXPAND_WIDTH = 150
+
 
 class MainWindow(FluentWindow):
     """主窗口类"""
 
-    def __init__(self, db: Database, manager: MonitorManager, services: UiServices):
+    def __init__(self, db: Database, manager: MonitorManager, services: UiServices, *,
+                 hotkey: Optional[MarkerHotkey] = None):
         """初始化主窗口
 
         三项依赖都由组合根（app.bootstrap）构造后注入，主窗口不再自建；测试注入隔离的
@@ -42,15 +52,18 @@ class MainWindow(FluentWindow):
             db: 唯一数据库实例，向下分发给各页面（manager 也应持有同一实例）
             manager: 监控管理器
             services: 界面服务（提示、对话框、时钟、进程查询、任务状态、用户偏好）
+            hotkey: 全局打点快捷键（组合根创建、安装并绑定）；为 None 时不接全局快捷键，
+                设置页显示"快捷键不可用"——测试默认如此，绝不在桌面上注册真实热键
         """
         super().__init__()
 
         self.db = db
         self.monitor_manager = manager
         self.services = services
+        self.hotkey = hotkey
 
         # 托盘驻留相关状态：必须在 _init_tray()/closeEvent 用到之前初始化完毕。
-        # - _really_quit：托盘菜单"退出"、关于页"立即安装"与会话结束会置 True，
+        # - _really_quit：托盘菜单"退出"、设置页"立即安装"与会话结束会置 True，
         #   closeEvent 据此跳过隐藏分支与关窗确认、直接走真退出路径。
         # - _session_ending：本次 _really_quit 是否只由会话结束（注销/关机）置位。
         #   会话结束可能被系统或其他程序取消，窗口随后重新显示时据此复位，避免之后
@@ -73,6 +86,7 @@ class MainWindow(FluentWindow):
         self._init_window()
         self._init_navigation()
         self._init_tray()
+        self._init_hotkey()
 
         # 注销/关机：系统会话结束时 closeEvent 的三选确认对话框会阻塞关机，
         # 这里在会话结束时置真退出标志并直接 close()，跳过确认走真退出流程。
@@ -82,15 +96,15 @@ class MainWindow(FluentWindow):
             app.commitDataRequest.connect(
                 self._on_commit_data_request, Qt.DirectConnection)
 
-        # 非模态更新提醒：静默检查发现新版本时不由 about_page 直接弹模态对话框，
-        # 而是发信号，这里统一处理为非模态提示（必须在 self.about_page 创建
+        # 非模态更新提醒：静默检查发现新版本时不由"关于与更新"分组直接弹模态对话框，
+        # 而是发信号，这里统一处理为非模态提示（必须在 self.about_group 创建
         # 之后连接，故放在 _init_navigation 之后）
-        self.about_page.update_available_silent.connect(self._on_update_available_silent)
-        # 关于页"立即安装"：安装向导已启动，主程序必须真退出释放文件占用
-        self.about_page.install_requested.connect(self.quit_for_install)
+        self.about_group.update_available_silent.connect(self._on_update_available_silent)
+        # "立即安装"：安装向导已启动，主程序必须真退出释放文件占用
+        self.about_group.install_requested.connect(self.quit_for_install)
 
         # 启动3秒后静默检查更新（对齐参考实现，避免阻塞启动）
-        QTimer.singleShot(3000, lambda: self.about_page.check_update(silent=True))
+        QTimer.singleShot(3000, lambda: self.about_group.check_update(silent=True))
 
         # 数据库迁移三态提示（延迟到窗口显示后弹出，三态互斥，按严重程度顺序判断）
         db = self.db
@@ -140,84 +154,110 @@ class MainWindow(FluentWindow):
         # 设置窗口背景为透明，让Fluent Design的背景效果生效
         self.setStyleSheet("MainWindow{background: transparent}")
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._sync_navigation_expand(event.oldSize().width(), event.size().width())
+
+    def _sync_navigation_expand(self, old_width: int, new_width: int) -> None:
+        """宽度跨过 1200 时展开侧栏（窄于阈值时 qfluentwidgets 自己会收起）。
+
+        只在"跨过"时动作：用户在宽窗口里手动收起侧栏后，单纯拖动窗口不会又被展开。
+        """
+        nav = getattr(self, 'navigationInterface', None)
+        if nav is None:
+            return
+        panel = nav.panel
+        if new_width >= NAV_EXPAND_MIN_WIDTH > old_width and panel.isCollapsed():
+            panel.expand(useAni=False)
+
     def _init_navigation(self):
         """初始化导航栏和页面"""
-        # 设置导航栏宽度（减少一半）
-        self.navigationInterface.setExpandWidth(150)  # 默认是250，现在设置为150
+        nav = self.navigationInterface
+        nav.setExpandWidth(NAV_EXPAND_WIDTH)
+        # 只有三个一级页面，没有可返回的层级
+        nav.setReturnButtonVisible(False)
+        nav.setMinimumExpandWidth(NAV_EXPAND_MIN_WIDTH)
 
+        hotkey_text = self.hotkey.active_text() if self.hotkey is not None else ''
         # 创建页面实例：统一注入同一数据库、监控管理器与服务集合
-        # （about_page 不涉及数据库与任务，只注入服务）
         self.monitor_page = MonitorPage(
-            self.db, self.monitor_manager, self.services, parent=self)
-        self.history_page = HistoryPage(
-            self.db, self.monitor_manager, self.services, parent=self)
-        # 导出页需要 manager 登记导出，与设置页的清理/压缩数据库互斥
-        self.export_page = ExportPage(
+            self.db, self.monitor_manager, self.services, parent=self,
+            hotkey_text=hotkey_text)
+        # 分析页（历史数据 + 导出合并）：只读库，打点编辑与导出登记经 manager
+        self.analysis_page = AnalysisPage(
             self.db, self.monitor_manager, self.services, parent=self)
         # 设置页数据管理卡片需要 db（查询占用/清理压缩）与 manager（维护锁、
-        # 是否有运行中任务决定清理按钮是否可用）
+        # 是否有运行中任务决定清理按钮是否可用）；快捷键卡片需要快捷键服务
         self.setting_page = SettingPage(
-            self.db, self.monitor_manager, self.services, parent=self)
-        self.about_page = AboutPage(self.services, parent=self)
+            self.db, self.monitor_manager, self.services, parent=self,
+            hotkey=self.hotkey)
+        # 原"关于"页已并入设置页；about_group 指向该分组（更新流程的入口都在它上面）
+        self.about_group = self.setting_page.about_group
 
-        # 默认采集周期联动：设置页改动"默认采集周期"后，实时同步到监控页
-        # 采集周期输入框的默认显示值（不影响已创建任务，只影响下一次新建）
+        # 默认采集间隔联动：设置页改动后实时同步到新建表单的默认值
+        # （不影响已创建任务，只影响下一次新建）
         cfg.default_interval.valueChanged.connect(self.monitor_page.set_default_interval)
 
-        # 监控页的页面间请求由主窗口中转：查看历史 / 被测进程异常结束时的托盘提醒
+        # 监控页的页面间请求由主窗口中转：去分析 / 被测进程异常结束时的托盘提醒 /
+        # 快速打点的结果反馈
         self.monitor_page.history_requested.connect(self._show_history_for_task)
         self.monitor_page.task_ended_abnormally.connect(
             self._on_task_ended_abnormally)
-
-        # 添加子界面到导航栏
-        self.addSubInterface(
-            self.monitor_page,
-            FluentIcon.SPEED_HIGH,
-            '实时监控',
-            NavigationItemPosition.TOP
-        )
+        self.monitor_page.presenter.quick_marker_feedback.connect(
+            self._on_quick_marker_feedback)
 
         self.addSubInterface(
-            self.history_page,
-            FluentIcon.HISTORY,
-            '历史数据',
-            NavigationItemPosition.TOP
-        )
-
+            self.monitor_page, FluentIcon.SPEED_HIGH, '监控', NavigationItemPosition.TOP)
         self.addSubInterface(
-            self.export_page,
-            FluentIcon.DOWNLOAD,
-            '导出数据',
-            NavigationItemPosition.TOP
-        )
-
-        # 设置与关于同处底部区域；NavigationPanel 按 addSubInterface 调用顺序
-        # 依次向下追加（insertWidget(-1, ...)，先调用者排在更上方），故设置页
-        # 的 addSubInterface 必须写在关于页之前，才能实现"设置在上、关于在下"
+            self.analysis_page, FluentIcon.MARKET, '分析', NavigationItemPosition.TOP)
         self.addSubInterface(
-            self.setting_page,
-            FluentIcon.SETTING,
-            '设置',
-            NavigationItemPosition.BOTTOM
-        )
+            self.setting_page, FluentIcon.SETTING, '设置', NavigationItemPosition.BOTTOM)
 
-        self.addSubInterface(
-            self.about_page,
-            FluentIcon.INFO,
-            '关于',
-            NavigationItemPosition.BOTTOM
-        )
-
-        # 默认显示实时监控页面
+        # 默认显示监控页面
         self.switchTo(self.monitor_page)
 
     def _init_tray(self) -> None:
         """创建托盘控制器（图标常驻；托盘不可用时 is_available() 为 False）"""
         icon_path = config.get_icon_path()
         icon = QIcon(icon_path) if os.path.exists(icon_path) else self.windowIcon()
-        self.tray = TrayController(self, icon, config.APP_NAME)
+        self.tray = TrayController(
+            self, icon, config.APP_NAME,
+            marker_targets=self.monitor_page.presenter.marker_targets)
         self.tray.show_requested.connect(self._show_from_tray)
         self.tray.quit_requested.connect(self._quit_from_tray)
+        self.tray.marker_requested.connect(self._on_tray_marker_requested)
+
+    def _init_hotkey(self) -> None:
+        """全局打点快捷键：按下即为全部运行中的任务打点；改键/失效时同步监控页引导文案。"""
+        if self.hotkey is None:
+            return
+        self.hotkey.triggered.connect(self.quick_marker)
+        self.hotkey.status_changed.connect(self._on_hotkey_status_changed)
+
+    def _on_hotkey_status_changed(self) -> None:
+        self.monitor_page.set_hotkey_text(self.hotkey.active_text())
+
+    # ========== 快速打点（托盘 / 全局快捷键） ==========
+
+    def quick_marker(self, task_id: Optional[str] = None) -> None:
+        """不弹窗打点：task_id 为空表示全部运行中的任务。"""
+        self.monitor_page.presenter.quick_marker(task_id or None)
+
+    def _on_tray_marker_requested(self, task_id: str) -> None:
+        self.quick_marker(task_id or None)
+
+    def _on_quick_marker_feedback(self, kind: str, title: str, content: str) -> None:
+        """快速打点的结果：用户此时多半在被测程序里，托盘气泡是不抢焦点的确认方式；
+        没有托盘时退回窗口内提示。"""
+        if self._tray_available():
+            self.tray.show_message(
+                title, content, 'info' if kind == QUICK_MARKER_OK else 'warning')
+            return
+        notifier = self.services.notifier
+        if kind == QUICK_MARKER_OK:
+            notifier.success(self, title, content, duration=2000)
+        else:
+            notifier.warning(self, title, content, duration=3000)
 
     @property
     def tray_icon(self) -> Optional[QSystemTrayIcon]:
@@ -252,7 +292,7 @@ class MainWindow(FluentWindow):
         self.close()
 
     def quit_for_install(self) -> None:
-        """更新安装流程（关于页 install_requested）：无论"关闭时最小化到托盘"是否
+        """更新安装流程（install_requested）：无论"关闭时最小化到托盘"是否
         开启，都必须走真退出路径——否则该开关开启时，安装向导已经启动，主程序却被
         closeEvent 的隐藏分支拦截、常驻托盘继续占用文件，导致覆盖安装因文件占用而失败。"""
         self._really_quit = True
@@ -272,9 +312,9 @@ class MainWindow(FluentWindow):
         self.close()
 
     def _on_update_available_silent(self, info: dict) -> None:
-        """静默检查更新发现新版本：不由 about_page 直接弹出模态对话框打断用户，
-        改为顶部非模态提示+「查看」按钮，点击后切到关于页并弹出与
-        手动检查一致的确认对话框。
+        """静默检查更新发现新版本：不直接弹出模态对话框打断用户，改为顶部非模态
+        提示+「查看」按钮，点击后切到设置页"关于与更新"并弹出与手动检查一致的
+        确认对话框。
 
         若此时主窗口处于托盘隐藏态，提示条挂在隐藏窗口上不会被用户看到，
         需额外补一条托盘气泡。
@@ -290,14 +330,15 @@ class MainWindow(FluentWindow):
                 f"发现新版本 {info['version']}", "打开主界面查看", 'info')
 
     def _show_update_detail(self, info: dict) -> None:
-        """更新提示条「查看」按钮点击：切到关于页并弹出更新确认对话框"""
-        self.switchTo(self.about_page)
-        self.about_page.show_update_dialog_for(info)
+        """更新提示条「查看」按钮点击：切到设置页"关于与更新"并弹出更新确认对话框"""
+        self.switchTo(self.setting_page)
+        self.setting_page.scroll_to_about()
+        self.about_group.show_update_dialog_for(info)
 
     def _show_history_for_task(self, task_id: str) -> None:
-        """监控页已结束卡片的"查看历史"：切到历史页并选中该任务"""
-        self.switchTo(self.history_page)
-        self.history_page.select_task(task_id)
+        """监控卡片的"分析"/"查看分析"：切到分析页并选中该任务"""
+        self.switchTo(self.analysis_page)
+        self.analysis_page.select_task(task_id)
 
     def _on_task_ended_abnormally(self, title: str, content: str) -> None:
         """被测进程自行结束（不是用户点停止）：主窗口隐藏或不在前台时补一条托盘气泡
@@ -361,7 +402,7 @@ class MainWindow(FluentWindow):
 
         退出路径不变式（绝不破坏）：
         ① 默认配置（close_to_tray=False）且无运行中任务时直接走真退出；
-        ② 托盘"退出"、关于页"立即安装"与会话结束都置 _really_quit=True，绕开
+        ② 托盘"退出"、设置页"立即安装"与会话结束都置 _really_quit=True，绕开
            隐藏分支与关窗确认，走同一条真退出路径（会话结束直接 close()，托盘隐藏
            时也进协调器；被取消后窗口重新显示即复位它置的标志）；
         ③ 隐藏到托盘不停止任务、不做任何清理；
@@ -407,4 +448,10 @@ class MainWindow(FluentWindow):
                     self.tray.hide()
                 except Exception:
                     logger.warning("隐藏托盘图标失败", exc_info=True)
+            # 进程结束时系统也会回收热键；主动注销让收尾顺序可预期
+            if self.hotkey is not None:
+                try:
+                    self.hotkey.unbind()
+                except Exception:
+                    logger.warning("注销全局快捷键失败", exc_info=True)
             QApplication.quit()

@@ -10,7 +10,7 @@ from PyQt5.QtCore import Qt
 
 from data.models import DataPoint
 from tests.helpers import fetch_history_render_inputs
-from tests.test_safety_net_history import (
+from tests.history_dataset import (
     BASE, MAX_BUCKETS, QUERY_CASES, TABLE_LIMIT, _seed_query_dataset)
 from ui.typography import TypeScale
 from ui.widgets.history.chart_view import chart_display_unit
@@ -31,11 +31,11 @@ def table(qapp):
 
 
 @pytest.mark.parametrize(
-    "metric, range_key, since_minutes, rows, count, buckets, markers, stat_texts",
+    "metric, range_key, since_minutes, rows, count, buckets, markers, current",
     QUERY_CASES, ids=[f"{m}-{r}" for m, r, *_ in QUERY_CASES])
 def test_rows_and_hint_match_history_safety_net(
         table, db, metric, range_key, since_minutes, rows, count, buckets,
-        markers, stat_texts):
+        markers, current):
     task = _seed_query_dataset(db)
     since = None if since_minutes is None else BASE + timedelta(minutes=since_minutes)
     table_points, stats, chart_points, _markers = fetch_history_render_inputs(
@@ -54,7 +54,7 @@ def test_rows_and_hint_match_history_safety_net(
     assert texts[-1][0] == oldest.timestamp.strftime('%m-%d %H:%M:%S')
     assert texts[0][RAW_VALUE_COLUMN] == f"{newest.value:.4f}"
     # 数值列与统计条"当前值"同单位、同格式
-    assert texts[0][1] == stat_texts["当前值"]
+    assert texts[0][1] == current
     # 最早一行没有上一条可比；无基线时"较基线"为 "--"
     assert texts[-1][2] == "--"
     assert {row[3] for row in texts} == {"--"}

@@ -11,20 +11,20 @@ from types import SimpleNamespace
 import pytest
 from PyQt5.QtCore import Qt
 from PyQt5.QtTest import QTest
-from PyQt5.QtWidgets import QApplication
+from PyQt5.QtWidgets import QApplication, QWidget
 
 from qfluentwidgets import qconfig
 
 import config
-import ui.pages.about_page as about_module
+import ui.pages.about_update as about_module
 from app_config import cfg
 from core.contracts import StopReason
 from core.monitor_manager import MonitorManager
 from core.update_checker import MSG_CANNOT_VERIFY
 from tests.doubles import FakePreferences, RecordingNotifier, ScriptedDialogs
-from tests.factories import make_about_page, make_services, make_setting_page
+from tests.factories import make_about_update_group, make_services, make_setting_page
 from tests.helpers import poll_until
-from ui.pages.about_page import MSG_NO_DIGEST
+from ui.pages.about_update import MSG_NO_DIGEST
 from ui.services import ManagerTaskStatus, QtDialogs
 
 
@@ -74,10 +74,10 @@ def test_setting_page_requires_db_manager_and_services(qapp):
         SettingPage()
 
 
-def test_about_page_requires_services(qapp):
-    from ui.pages.about_page import AboutPage
+def test_about_update_group_requires_services(qapp):
+    from ui.pages.about_update import AboutUpdateGroup
     with pytest.raises(TypeError):
-        AboutPage()
+        AboutUpdateGroup()
 
 
 # ---------- 开关文案 ----------
@@ -395,7 +395,7 @@ def about_services(notifier, dialogs):
 
 @pytest.fixture
 def about(qapp, about_services):
-    page = make_about_page(about_services)
+    page = make_about_update_group(about_services)
     yield page
     page.close()
 
@@ -593,9 +593,10 @@ def test_update_checker_registered_and_reference_released(about, monkeypatch):
     assert [(e.name, e.thread, e.cancel, e.timeout_ms) for e in entries] == [
         ("检查更新", checker, None, 1000)]
 
+    # 引用在结果槽里清空，登记表在 QThread.finished 时注销：两者先后不定，都要等到
     assert poll_until(lambda: (QApplication.processEvents() or True)
-                      and about._checker is None, timeout=10)
-    assert about.services.threads.entries() == []
+                      and about._checker is None
+                      and about.services.threads.entries() == [], timeout=10)
 
 
 def test_update_downloader_registered_with_cancel(about, monkeypatch):
@@ -610,6 +611,78 @@ def test_update_downloader_registered_with_cancel(about, monkeypatch):
     assert [(e.name, e.thread, e.cancel, e.timeout_ms) for e in entries] == [
         ("更新下载", downloader, downloader.cancel, 2000)]
 
+    # 引用在结果槽里清空，登记表在 QThread.finished 时注销：两者先后不定，都要等到
     assert poll_until(lambda: (QApplication.processEvents() or True)
-                      and about._downloader is None, timeout=10)
-    assert about.services.threads.entries() == []
+                      and about._downloader is None
+                      and about.services.threads.entries() == [], timeout=10)
+
+
+# ---------- 分组与文案（常规 / 数据 / 关于与更新） ----------
+
+def test_three_groups_in_order(setting):
+    from qfluentwidgets import SettingCardGroup
+    groups = [w for w in setting.scroll_widget.children() if isinstance(w, SettingCardGroup)]
+    assert [g.titleLabel.text() for g in groups] == ["常规", "数据", "关于与更新"]
+    assert setting.about_group is groups[2]
+    general = [setting.theme_card, setting.default_interval_card,
+               setting.close_to_tray_card, setting.hotkey_card]
+    assert all(card.parent() is not None for card in general)
+    assert setting.default_interval_card.titleLabel.text() == "默认采集间隔"
+    assert setting.hotkey_card.titleLabel.text() == "打点快捷键"
+
+
+def test_maintenance_button_text_follows_retention(setting, prefs):
+    from ui.pages.setting_page import maintenance_button_text
+    assert maintenance_button_text(0) == "压缩数据库"
+    assert maintenance_button_text(30) == "清理并压缩"
+    assert setting.cleanup_card.button.text() == "清理并压缩"
+    prefs.retention = 0
+    setting._refresh_data_management_state()
+    assert setting.cleanup_card.button.text() == "压缩数据库"
+
+
+def test_compact_only_confirm_uses_compact_wording(setting, dialogs):
+    dialogs.always("confirm", False)
+    setting._confirm_cleanup(0)
+    call = dialogs.last_call("confirm")
+    assert call["title"] == "压缩数据库" and call["confirm_text"] == "压缩"
+
+
+def test_scroll_to_about_does_not_raise(setting):
+    setting.resize(800, 400)
+    setting.show()
+    setting.scroll_to_about()
+    assert setting.verticalScrollBar().value() <= setting.about_group.y()
+
+
+def test_about_group_status_shows_last_check_time(about):
+    from ui.pages.about_update import APP_TAGLINE, up_to_date_text
+    from qfluentwidgets import PrimaryPushButton
+    assert about.about_card.contentLabel.text() == APP_TAGLINE \
+        == "面向测试的内存 / 句柄 / GDI 泄漏排查工具"
+    # 低频操作用普通按钮
+    assert about.check_button.text() == "检查更新"
+    assert not isinstance(about.check_button, PrimaryPushButton)
+
+    about._on_check_finished({'has_update': False}, silent=False)
+    checked_at = about.services.clock.now().strftime('%H:%M')
+    assert about.status_label.text() == up_to_date_text(checked_at)
+    assert about.status_label.text().startswith("已是最新版本")
+    assert about.status_label.text().endswith(f" · 上次检查 {checked_at}")
+
+
+def test_install_confirm_defaults_to_later(qapp):
+    """回车 = 安全操作：安装确认框显示后焦点在"稍后" """
+    from ui.pages.about_update import InstallConfirmDialog
+    host = QWidget()
+    host.resize(600, 400)
+    host.show()
+    try:
+        dialog = InstallConfirmDialog(host, "9.9.9")
+        dialog.show()
+        QApplication.processEvents()
+        assert dialog.cancelButton.hasFocus() or host.window().focusWidget() is dialog.cancelButton \
+            or dialog.focusWidget() is dialog.cancelButton
+        dialog.close()
+    finally:
+        host.close()

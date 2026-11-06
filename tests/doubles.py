@@ -424,3 +424,16 @@ class FakePreferences:
 
     def retention_options(self) -> List[int]:
         return list(self.retention_choices)
+
+    # 全局打点快捷键：属性 hotkey 可直接改写；set_marker_hotkey 的历次调用记在 hotkeys_set
+    hotkey = "Ctrl+Alt+M"
+    hotkeys_set: List[str]
+
+    def marker_hotkey(self) -> str:
+        return self.hotkey
+
+    def set_marker_hotkey(self, text: str) -> None:
+        if not hasattr(self, 'hotkeys_set'):
+            self.hotkeys_set = []
+        self.hotkeys_set.append(text)
+        self.hotkey = text

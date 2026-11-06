@@ -26,18 +26,18 @@ class MetricType:
     # 因此旧版本的"虚拟内存""提交大小"已合并到这一项。
     MEMORY_PRIVATE = "memory_private"
     MEMORY_PEAK_PAGEFILE = "memory_peak_pagefile"   # 私有字节峰值
-    MEMORY_PAGED_POOL = "memory_paged_pool"         # 分页池
-    MEMORY_PEAK_PAGED_POOL = "memory_peak_paged_pool"   # 分页池峰值
-    MEMORY_NONPAGED_POOL = "memory_nonpaged_pool"       # 非分页池
-    MEMORY_PEAK_NONPAGED_POOL = "memory_peak_nonpaged_pool"  # 非分页池峰值
+    MEMORY_PAGED_POOL = "memory_paged_pool"         # 分页缓冲池
+    MEMORY_PEAK_PAGED_POOL = "memory_peak_paged_pool"   # 分页缓冲池峰值
+    MEMORY_NONPAGED_POOL = "memory_nonpaged_pool"       # 非分页缓冲池
+    MEMORY_PEAK_NONPAGED_POOL = "memory_peak_nonpaged_pool"  # 非分页缓冲池峰值
     MEMORY_NUM_PAGE_FAULTS = "memory_num_page_faults"   # 页面错误
-    MEMORY_USS = "memory_uss"                   # 唯一集大小
+    MEMORY_USS = "memory_uss"                   # 独占物理内存（USS）
 
     # CPU相关
     CPU_PERCENT = "cpu_percent"         # CPU使用率
     CPU_USER_TIME = "cpu_user_time"     # CPU用户时间
     CPU_SYSTEM_TIME = "cpu_system_time" # CPU系统时间
-    CPU_PRIORITY = "cpu_priority"       # 进程优先级
+    CPU_PRIORITY = "cpu_priority"       # 基本优先级
 
     # 线程和句柄
     NUM_THREADS = "num_threads"         # 线程数
@@ -127,32 +127,33 @@ _SPECS = (
     # 已提交私有内存的当前水位，泄漏主指标
     MetricSpec(
         MetricType.MEMORY_PRIVATE, "私有字节", "KB", "内存", MetricKind.BYTES_KB,
-        "进程独占的已提交内存（Private Bytes），持续上涨是内存泄漏的主要信号",
+        "进程独占的已提交内存（Private Bytes，即任务管理器“详细信息”里的“提交大小”），"
+        "持续上涨是内存泄漏的主要信号",
         requires='windows', in_leak_preset=True, leak_preset_rank=1),
     # 私有字节的历史最大值，只增不减
     MetricSpec(
         MetricType.MEMORY_PEAK_PAGEFILE, "私有字节峰值", "KB", "内存", MetricKind.PEAK,
         "私有字节的历史峰值，只增不减，适合查看某次操作期间的内存冲高",
         requires='windows'),
-    # 内核分页池的当前占用，可升可降
+    # 内核分页缓冲池的当前占用，可升可降
     MetricSpec(
-        MetricType.MEMORY_PAGED_POOL, "分页池", "KB", "内存", MetricKind.BYTES_KB,
-        "进程占用的内核分页池，持续上涨多见于驱动或系统对象（如文件、注册表句柄）泄漏",
+        MetricType.MEMORY_PAGED_POOL, "分页缓冲池", "KB", "内存", MetricKind.BYTES_KB,
+        "进程占用的内核分页缓冲池（任务管理器同名列），持续上涨多见于驱动或系统对象（如文件、注册表句柄）泄漏",
         requires='windows'),
-    # 分页池的历史最大值，只增不减
+    # 分页缓冲池的历史最大值，只增不减
     MetricSpec(
-        MetricType.MEMORY_PEAK_PAGED_POOL, "分页池峰值", "KB", "内存", MetricKind.PEAK,
-        "分页池的历史峰值，只增不减，适合排查内核资源的瞬时冲高",
+        MetricType.MEMORY_PEAK_PAGED_POOL, "分页缓冲池峰值", "KB", "内存", MetricKind.PEAK,
+        "分页缓冲池的历史峰值，只增不减，适合排查内核资源的瞬时冲高",
         requires='windows'),
-    # 内核非分页池的当前占用，可升可降
+    # 内核非分页缓冲池的当前占用，可升可降
     MetricSpec(
-        MetricType.MEMORY_NONPAGED_POOL, "非分页池", "KB", "内存", MetricKind.BYTES_KB,
-        "进程占用的内核非分页池（常驻物理内存），持续上涨多见于驱动、设备或句柄泄漏",
+        MetricType.MEMORY_NONPAGED_POOL, "非分页缓冲池", "KB", "内存", MetricKind.BYTES_KB,
+        "进程占用的内核非分页缓冲池（常驻物理内存，任务管理器同名列），持续上涨多见于驱动、设备或句柄泄漏",
         requires='windows'),
-    # 非分页池的历史最大值，只增不减
+    # 非分页缓冲池的历史最大值，只增不减
     MetricSpec(
-        MetricType.MEMORY_PEAK_NONPAGED_POOL, "非分页池峰值", "KB", "内存", MetricKind.PEAK,
-        "非分页池的历史峰值，只增不减，适合排查内核资源的瞬时冲高",
+        MetricType.MEMORY_PEAK_NONPAGED_POOL, "非分页缓冲池峰值", "KB", "内存", MetricKind.PEAK,
+        "非分页缓冲池的历史峰值，只增不减，适合排查内核资源的瞬时冲高",
         requires='windows'),
     # 进程启动以来的缺页总次数，只增不减
     MetricSpec(
@@ -162,8 +163,8 @@ _SPECS = (
         requires='windows'),
     # 独占物理内存的当前水位；memory_full_info 需要较高的进程访问权限
     MetricSpec(
-        MetricType.MEMORY_USS, "唯一集大小", "KB", "内存", MetricKind.BYTES_KB,
-        "进程独占的物理内存（不含共享页），比工作集更接近真实占用；"
+        MetricType.MEMORY_USS, "独占物理内存（USS）", "KB", "内存", MetricKind.BYTES_KB,
+        "进程独占的物理内存（Unique Set Size，不含共享页），比工作集更接近真实占用；"
         "读取开销较大，且对更高权限进程可能因权限不足而不可用",
         requires='admin'),
 
@@ -183,8 +184,8 @@ _SPECS = (
         "累计在内核态运行的 CPU 时间，偏高多见于大量系统调用或 I/O"),
     # 调度优先级是可被改回的整数状态值，不是累计量；无单位
     MetricSpec(
-        MetricType.CPU_PRIORITY, "优先级", "", "CPU", MetricKind.COUNT,
-        "进程调度优先级，用于确认被测程序的优先级是否被改动"),
+        MetricType.CPU_PRIORITY, "基本优先级", "", "CPU", MetricKind.COUNT,
+        "进程的基本调度优先级（任务管理器同名列），用于确认被测程序的优先级是否被改动"),
 
     # ---------- 系统资源 ----------
     # 线程/句柄/GDI/USER 都是"当前持有数"，资源释放后会下降，是水位量
@@ -220,27 +221,27 @@ _SPECS = (
         "累计非自愿上下文切换次数（时间片用完被抢占）；已废弃：Windows 上无法采集，恒为 0",
         deprecated=True),
 
-    # ---------- IO操作 ----------
+    # ---------- I/O ----------
     # psutil.io_counters 的字节与次数都是进程启动以来的累计值，只增不减
     MetricSpec(
-        MetricType.IO_READ_BYTES, "IO读取字节", "KB", "IO操作", MetricKind.CUMULATIVE_BYTES,
+        MetricType.IO_READ_BYTES, "I/O 读取字节", "KB", "I/O", MetricKind.CUMULATIVE_BYTES,
         "累计读取字节数，适合发现异常的磁盘或网络读取量"),
     MetricSpec(
-        MetricType.IO_WRITE_BYTES, "IO写入字节", "KB", "IO操作", MetricKind.CUMULATIVE_BYTES,
+        MetricType.IO_WRITE_BYTES, "I/O 写入字节", "KB", "I/O", MetricKind.CUMULATIVE_BYTES,
         "累计写入字节数，适合发现日志刷屏或临时文件持续增长"),
     MetricSpec(
-        MetricType.IO_READ_COUNT, "IO读取次数", "次", "IO操作", MetricKind.CUMULATIVE_COUNT,
+        MetricType.IO_READ_COUNT, "I/O 读取次数", "次", "I/O", MetricKind.CUMULATIVE_COUNT,
         "累计读取操作次数，适合发现高频小块读取"),
     MetricSpec(
-        MetricType.IO_WRITE_COUNT, "IO写入次数", "次", "IO操作", MetricKind.CUMULATIVE_COUNT,
+        MetricType.IO_WRITE_COUNT, "I/O 写入次数", "次", "I/O", MetricKind.CUMULATIVE_COUNT,
         "累计写入操作次数，适合发现高频小块写入"),
     # "其他 I/O" 字段只有 Windows 版 psutil 提供
     MetricSpec(
-        MetricType.IO_OTHER_BYTES, "IO其他字节", "KB", "IO操作", MetricKind.CUMULATIVE_BYTES,
+        MetricType.IO_OTHER_BYTES, "I/O 其他字节", "KB", "I/O", MetricKind.CUMULATIVE_BYTES,
         "累计其他 I/O（非读写，如设备控制）传输的字节数",
         requires='windows'),
     MetricSpec(
-        MetricType.IO_OTHER_COUNT, "IO其他次数", "次", "IO操作", MetricKind.CUMULATIVE_COUNT,
+        MetricType.IO_OTHER_COUNT, "I/O 其他次数", "次", "I/O", MetricKind.CUMULATIVE_COUNT,
         "累计其他 I/O（非读写，如设备控制）操作次数",
         requires='windows'),
 )
@@ -263,6 +264,11 @@ MIN_SPAN_BYTES_KB = 64.0
 MIN_SPAN_BYTES_RATIO = 0.01
 MIN_SPAN_COUNT = 4.0
 MIN_SPAN_PERCENT = 1.0
+
+# 速率序列（累计量的每秒增量）纵轴最小跨度：参考值的 5%，且不少于 1 个单位/秒
+# （字节类 1 KB/秒、计数类 1 次/秒）；恒定速率不会被拉伸出 999.6–1000.4 这类无意义刻度
+MIN_SPAN_RATE_RATIO = 0.05
+MIN_SPAN_RATE_FLOOR = 1.0
 
 # 累计类指标的"增速"不适用时的文本（与表示"无数据"的 "--" 区分开）
 RATE_NOT_APPLICABLE = "—"
@@ -395,7 +401,7 @@ def is_cumulative_metric(metric_type: str) -> bool:
     """该指标是否单调不减（累计次数/累计字节/CPU 累计时间/历史峰值）。
 
     这类指标不是水位量：回归斜率只反映累计速率，不能当"增速"外推，也不能据此
-    判断泄漏；历史页统计条与任务卡片应隐藏它们的增速。未知键返回 False。
+    判断泄漏；判定摘要表与任务卡片应隐藏它们的增速。未知键返回 False。
     """
     return _kind_of(metric_type) in _CUMULATIVE_KINDS
 
@@ -434,6 +440,17 @@ def min_span_for(metric_type: Optional[str], reference: float) -> float:
     return abs(reference) * MIN_SPAN_BYTES_RATIO
 
 
+def rate_min_span_for(metric_type: Optional[str], reference: float) -> float:
+    """每秒速率序列的纵轴最小跨度（原始单位/秒）：max(参考值 5%, 1)。
+
+    水位量的跨度下限（min_span_for）按数值本身的量级定，不适用于速率；
+    metric_type 为 None 表示不设下限（返回 0）。
+    """
+    if metric_type is None:
+        return 0.0
+    return max(abs(reference) * MIN_SPAN_RATE_RATIO, MIN_SPAN_RATE_FLOOR)
+
+
 def _compact_number(number: float, decimals: int = 2) -> str:
     """添加千分位并去掉无信息量的尾随零。"""
     return f"{number:,.{decimals}f}".rstrip("0").rstrip(".")
@@ -445,7 +462,7 @@ def format_metric_value(
     kind = _kind_of(metric_type)
     unit = get_metric_unit(metric_type)
 
-    # 字节类自动选择 KB/MB/GB/TB；历史页可显式传 display_unit，
+    # 字节类自动选择 KB/MB/GB/TB；分析页可显式传 display_unit，
     # 让同一图表里的统计、悬停、表格与坐标轴始终使用同一个单位。
     if kind in _KB_KINDS:
         unit = display_unit or display_unit_for(metric_type, value)

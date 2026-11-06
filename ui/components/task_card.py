@@ -1,7 +1,8 @@
 """
 监控任务卡片
 实时显示单个任务各指标的当前值、较基线（无基线时比开始时）的变化量与趋势；任务
-结束后卡片保留，切换为"已结束"形态，供用户回看最后的值并一键跳转分析或重新监控。
+结束后卡片保留并收成一行（进程名 · PID · 结束原因 · 结束时间 · 已记录 N 次），
+供用户一键跳转分析或同配置再测。
 
 卡片只负责显示：基线值由 MonitorPresenter 按"基线打点之后 5 个样本的中位数"
 算好后交给卡片；"现在几点"也由 Presenter 经注入的时钟传入，卡片不自己读系统时间。
@@ -10,22 +11,25 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, Iterable, List, Optional, Set
 
-from PyQt5.QtCore import Qt, pyqtSignal
-from PyQt5.QtGui import QColor, QIcon
+from PyQt5.QtCore import QRectF, Qt, pyqtSignal
+from PyQt5.QtGui import QColor, QIcon, QPainter
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                              QGridLayout, QSizePolicy)
 from qfluentwidgets import (
     PushButton, CardWidget, FluentIcon, CaptionLabel, StrongBodyLabel, Theme,
-    TransparentToolButton, isDarkTheme
+    TransparentToolButton, isDarkTheme, themeColor
 )
 from qfluentwidgets.common.icon import FluentIconBase, SvgIconEngine, drawSvgIcon
 
 from core.contracts import StopReason, UnavailableReason
 from ui.components.sparkline import SparklineWidget
-from ui.formatting import stop_reason_text, truncate_text, unavailable_reason_text
-from ui.typography import DataCaptionLabel, DataLabel
+from ui.formatting import (
+    is_abnormal_stop, stop_reason_text, task_status_text, truncate_text, unavailable_reason_text,
+)
+from ui.typography import DataCaptionLabel, MetricValueLabel
 from utils.metrics import (
-    format_metric_delta, format_metric_value, get_metric_display_name
+    format_metric_delta, format_metric_value, get_metric_description,
+    get_metric_display_name
 )
 
 # 状态胶囊：(文案, 浅色主题色, 深色主题色)。CaptionLabel.setTextColor 只需设置一次
@@ -39,18 +43,31 @@ STATUS_ABNORMAL = 'abnormal'      # 被测进程退出、内部错误等（异�
 _TERTIARY_LIGHT = QColor("#8D8D8D")
 _TERTIARY_DARK = QColor("#9E9E9E")
 STATUS_STYLES = {
-    STATUS_RUNNING: ("运行中", QColor("#0F7B0F"), QColor("#6CCB5F")),
-    STATUS_PAUSED: ("已暂停", QColor("#9D5D00"), QColor("#FCE100")),
+    STATUS_RUNNING: (task_status_text(True), QColor("#0F7B0F"), QColor("#6CCB5F")),
+    STATUS_PAUSED: (task_status_text(True, paused=True), QColor("#9D5D00"), QColor("#FCE100")),
     STATUS_STOPPING: ("正在停止…", _TERTIARY_LIGHT, _TERTIARY_DARK),
-    STATUS_FINISHED: ("已结束", _TERTIARY_LIGHT, _TERTIARY_DARK),
-    STATUS_ABNORMAL: ("异常结束", QColor("#C42B1C"), QColor("#FF99A4")),
+    STATUS_FINISHED: (task_status_text(False), _TERTIARY_LIGHT, _TERTIARY_DARK),
+    STATUS_ABNORMAL: (task_status_text(False, abnormal=True), QColor("#C42B1C"), QColor("#FF99A4")),
 }
 
 # 卡片身份行里备注的最大显示字数（完整内容放 tooltip）
 NOTE_DISPLAY_CHARS = 40
 
 BASELINE_SAMPLING_TEXT = "基线采样中"
-STOP_TOOLTIP = "停止后不能继续记录到这个任务；要继续请“重新监控”"
+# 6 列时指标格最窄："比开始时（12 分钟前）+85.23 MB"会被截断，改为"较开始 +85.23 MB"
+COMPACT_START_PREFIX = "较开始"
+STOP_TOOLTIP = "停止后不能继续记录到这个任务；要继续请用“同配置再测”"
+PAUSE_TOOLTIP = "暂停采集（会记一个暂停打点），恢复后继续记录到这个任务"
+MARKER_TOOLTIP = "记下当前时刻（默认名称依次为：基线、第 1 轮、第 2 轮…）"
+ANALYSIS_TOOLTIP = "查看本任务的趋势与各轮增量"
+RESTART_TOOLTIP = "按进程名查找进程，并以相同的指标、间隔和备注新建任务"
+
+# 指标格列数随卡片宽度在 [MIN, MAX] 之间自适应；每格至少 CELL_MIN_WIDTH 宽
+MIN_VALUE_COLUMNS = 3
+MAX_VALUE_COLUMNS = 6
+CELL_MIN_WIDTH = 150
+CELL_SPACING = 16
+CARD_PADDING = 16
 
 # 停止图标：16px 实心圆角方块（媒体播放器通行的"停止"）。FluentIcon 里没有合适的：
 # CANCEL 是撤销箭头、CLOSE 是关闭叉号，都会被误读成"取消/关掉卡片"
@@ -116,11 +133,100 @@ def format_interval(interval: Optional[float]) -> str:
     return f"每 {interval:g} 秒"
 
 
+def format_end_time(end: datetime, now: Optional[datetime] = None) -> str:
+    """结束时间：当天只写 HH:mm:ss，跨天写 MM-DD HH:mm（完整年份放 tooltip）。"""
+    if now is None or now.date() == end.date():
+        return end.strftime('%H:%M:%S')
+    return end.strftime('%m-%d %H:%M')
+
+
+def value_columns_for(width: int, metric_count: int) -> int:
+    """指标格列数：按可用宽度在 3–6 之间取，指标少时不留多余的空列。"""
+    available = max(0, width - 2 * CARD_PADDING)
+    columns = (available + CELL_SPACING) // (CELL_MIN_WIDTH + CELL_SPACING)
+    columns = max(MIN_VALUE_COLUMNS, min(MAX_VALUE_COLUMNS, columns))
+    return min(columns, max(metric_count, MIN_VALUE_COLUMNS))
+
+
 @dataclass
 class CardBaseline:
     """卡片上的基线：基线打点时刻与各指标基线值（尚在采样的指标不在 values 里）。"""
     timestamp: datetime
     values: Dict[str, float] = field(default_factory=dict)
+
+
+class MetricCell(QWidget):
+    """指标格：名 / 值（20px Semibold）/ 较基线变化。点击即把迷你趋势图切到该指标。"""
+
+    clicked = pyqtSignal(str)
+
+    def __init__(self, metric_type: str, parent=None):
+        super().__init__(parent)
+        self.metric_type = metric_type
+        self._selected = False
+        self._hover = False
+        self.setCursor(Qt.PointingHandCursor)
+        self.setAttribute(Qt.WA_Hover, True)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 4, 8, 4)
+        layout.setSpacing(2)
+
+        display_name = get_metric_display_name(metric_type)
+        description = get_metric_description(metric_type)
+        tooltip = f"{display_name}：{description}" if description else display_name
+        self.setToolTip(f"{tooltip}\n点击在下方趋势图查看它的走势")
+
+        self.name_label = CaptionLabel(display_name, self)
+        self.name_label.setMinimumWidth(1)
+        self.name_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.value_label = MetricValueLabel("--", self)
+        self.value_label.setMinimumWidth(1)
+        self.value_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.delta_label = DataCaptionLabel("", self)
+        self.delta_label.setMinimumWidth(1)
+        self.delta_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        layout.addWidget(self.name_label)
+        layout.addWidget(self.value_label)
+        layout.addWidget(self.delta_label)
+
+    def is_selected(self) -> bool:
+        return self._selected
+
+    def set_selected(self, selected: bool) -> None:
+        if selected != self._selected:
+            self._selected = selected
+            self.update()
+
+    def enterEvent(self, event):
+        self._hover = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hover = False
+        self.update()
+        super().leaveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        if event.button() == Qt.LeftButton and self.rect().contains(event.pos()):
+            self.clicked.emit(self.metric_type)
+
+    def paintEvent(self, event):
+        if not (self._selected or self._hover):
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(Qt.NoPen)
+        fill = QColor(255, 255, 255, 13) if isDarkTheme() else QColor(0, 0, 0, 8)
+        painter.setBrush(fill)
+        painter.drawRoundedRect(QRectF(self.rect()), 4, 4)
+        if self._selected:
+            # 选中态：左缘强调色竖条（强调色只用于选中态与主按钮）
+            painter.setBrush(themeColor())
+            painter.drawRoundedRect(QRectF(0, 6, 3, max(0, self.height() - 12)), 1.5, 1.5)
+        painter.end()
 
 
 class TaskCard(CardWidget):
@@ -133,12 +239,9 @@ class TaskCard(CardWidget):
     pause_requested = pyqtSignal(str)
     resume_requested = pyqtSignal(str)
     marker_requested = pyqtSignal(str)
-    history_requested = pyqtSignal(str)    # "分析"（运行中与已结束卡片都有）
-    restart_requested = pyqtSignal(str)    # 已结束卡片："重新监控"
-    close_requested = pyqtSignal(str)      # 已结束卡片：右上角 ✕（从列表移除）
-
-    # 指标值网格每行列数
-    VALUE_COLUMNS = 3
+    history_requested = pyqtSignal(str)    # "分析"/"查看分析"（运行中与已结束卡片都有）
+    restart_requested = pyqtSignal(str)    # 已结束卡片："同配置再测"
+    close_requested = pyqtSignal(str)      # 已结束卡片：行尾 ✕（从列表移除）
 
     def __init__(self, task_id: str, process_name: str, pid: int,
                  metric_types: List[str], parent=None, *,
@@ -152,7 +255,7 @@ class TaskCard(CardWidget):
             pid: 进程ID
             metric_types: 监控指标类型列表
             parent: 父窗口
-            interval: 采集间隔（秒），用于身份行显示与"重新监控"时沿用
+            interval: 采集间隔（秒），用于身份行显示与"同配置再测"时沿用
             note: 测试备注
         """
         super().__init__(parent)
@@ -164,9 +267,11 @@ class TaskCard(CardWidget):
         self.interval = interval
         self.note = note or ''
 
-        # 指标值标签与变化量标签 {指标类型: 标签}
+        # 指标格与其中的值/变化量标签 {指标类型: 控件}
+        self.cells: Dict[str, MetricCell] = {}
         self.value_labels: Dict[str, QLabel] = {}
         self.delta_labels: Dict[str, QLabel] = {}
+        self._columns = 0
 
         # 本任务各指标首个有效值（"比开始时"的参照）与最新值 {指标类型: 值}
         self.start_values: Dict[str, float] = {}
@@ -182,6 +287,7 @@ class TaskCard(CardWidget):
         self.first_sample_at: Optional[datetime] = None
         self.now: Optional[datetime] = None
         self.finished_at: Optional[datetime] = None
+        self.stop_reason: Optional[StopReason] = None
 
         # 采集次数：UI 内存计数，卡片创建时置 0，每次收到 data_updated 加 1，
         # 不查库（当前没有"重启后恢复运行中任务"的路径）
@@ -191,6 +297,9 @@ class TaskCard(CardWidget):
         self.is_paused = False
         self.is_finished = False
         self.status = STATUS_RUNNING
+
+        # 迷你趋势图当前显示的指标（默认首指标，点击指标格切换）
+        self.trend_metric: Optional[str] = self.metric_types[0] if self.metric_types else None
 
         self._init_ui()
         self._apply_status(STATUS_RUNNING)
@@ -206,52 +315,44 @@ class TaskCard(CardWidget):
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setContentsMargins(CARD_PADDING, CARD_PADDING, CARD_PADDING, CARD_PADDING)
         layout.setSpacing(12)
 
-        # 顶部：身份行（进程名 ●状态 · PID · 每 N 秒 · 已运行 · 备注）与操作按钮
+        # 顶部一行：身份（进程名 ●状态 · PID · 每 N 秒 · 已运行 · 备注）与操作按钮；
+        # 结束后这一行就是整张卡片（· 结束原因 · 结束时间 · 已记录 N 次）
         header_layout = QHBoxLayout()
-        header_layout.setSpacing(12)
+        header_layout.setSpacing(8)
 
-        identity_layout = QVBoxLayout()
-        identity_layout.setSpacing(3)
-
-        title_row = QHBoxLayout()
-        title_row.setSpacing(8)
         self.title_label = StrongBodyLabel(self.process_name)
         self.title_label.setToolTip(self.process_name)
         # 长进程名允许被压缩，不与右侧操作按钮共同撑宽卡片
         self.title_label.setMinimumWidth(1)
         self.title_label.setMaximumWidth(260)
-        title_row.addWidget(self.title_label)
+        header_layout.addWidget(self.title_label)
 
         self.status_label = CaptionLabel("")
-        title_row.addWidget(self.status_label)
+        header_layout.addWidget(self.status_label)
 
         self.meta_label = DataCaptionLabel("")
         self.meta_label.setMinimumWidth(1)
-        title_row.addWidget(self.meta_label)
+        header_layout.addWidget(self.meta_label)
 
-        # 测试备注（可选）：只在有备注时显示，排在身份行最后
+        # 结束原因 · 结束时间 · 已记录 N 次：任务结束后才显示
+        self.finished_detail_label = CaptionLabel("")
+        self.finished_detail_label.setMinimumWidth(1)
+        self.finished_detail_label.setVisible(False)
+        header_layout.addWidget(self.finished_detail_label)
+
+        # 测试备注（可选）：只在有备注时显示，排在身份行最后，空间不够时先被压缩
         self.note_label = CaptionLabel(
             f"· {truncate_text(self.note, NOTE_DISPLAY_CHARS)}")
         self.note_label.setToolTip(f"备注：{self.note}")
         self.note_label.setMinimumWidth(1)
         self.note_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.note_label.setVisible(bool(self.note))
-        title_row.addWidget(self.note_label, 1)
+        header_layout.addWidget(self.note_label, 1)
         if not self.note:
-            title_row.addStretch(1)
-        identity_layout.addLayout(title_row)
-
-        # 结束原因与时间：任务结束后才显示
-        self.finished_detail_label = CaptionLabel("")
-        self.finished_detail_label.setMinimumWidth(1)
-        self.finished_detail_label.setSizePolicy(
-            QSizePolicy.Ignored, QSizePolicy.Preferred)
-        self.finished_detail_label.setVisible(False)
-        identity_layout.addWidget(self.finished_detail_label)
-        header_layout.addLayout(identity_layout, 1)
+            header_layout.addStretch(1)
 
         # 运行中的操作：打点 / 分析 / 暂停 | 停止。停止是不可逆操作，与暂停拉开间距
         self.running_actions = QWidget(self)
@@ -260,48 +361,48 @@ class TaskCard(CardWidget):
         running_layout.setSpacing(8)
 
         self.marker_button = PushButton("打点", self, FluentIcon.TAG)
-        self.marker_button.setToolTip(
-            "记下当前时刻（默认名称依次为：基线、第 1 轮、第 2 轮…）")
+        self.marker_button.setToolTip(MARKER_TOOLTIP)
         self.marker_button.clicked.connect(
             lambda: self.marker_requested.emit(self.task_id))
         self.marker_button.setFixedWidth(88)
         running_layout.addWidget(self.marker_button)
 
-        self.analysis_button = PushButton("分析", self, FluentIcon.PIE_SINGLE)
-        self.analysis_button.setToolTip("查看本任务的趋势与各轮增量")
+        self.analysis_button = PushButton("分析", self, FluentIcon.MARKET)
+        self.analysis_button.setToolTip(ANALYSIS_TOOLTIP)
         self.analysis_button.clicked.connect(
             lambda: self.history_requested.emit(self.task_id))
         self.analysis_button.setFixedWidth(88)
         running_layout.addWidget(self.analysis_button)
 
         self.pause_button = PushButton("暂停", self, FluentIcon.PAUSE)
+        self.pause_button.setToolTip(PAUSE_TOOLTIP)
         self.pause_button.clicked.connect(self._on_pause_button_clicked)
         self.pause_button.setFixedWidth(88)
         running_layout.addWidget(self.pause_button)
 
-        running_layout.addSpacing(20)
+        running_layout.addSpacing(12)
 
         self.stop_button = PushButton("停止", self, StopIcon())
         self.stop_button.setToolTip(STOP_TOOLTIP)
         self.stop_button.clicked.connect(lambda: self.stop_requested.emit(self.task_id))
         self.stop_button.setFixedWidth(88)
         running_layout.addWidget(self.stop_button)
-        header_layout.addWidget(self.running_actions, 0, Qt.AlignRight | Qt.AlignTop)
+        header_layout.addWidget(self.running_actions, 0, Qt.AlignRight | Qt.AlignVCenter)
 
-        # 已结束后的操作：分析 / 重新监控 / 右上角 ✕
+        # 已结束后的操作：查看分析 / 同配置再测 / 行尾 ✕
         self.finished_actions = QWidget(self)
         finished_layout = QHBoxLayout(self.finished_actions)
         finished_layout.setContentsMargins(0, 0, 0, 0)
         finished_layout.setSpacing(8)
 
-        self.history_button = PushButton("分析", self, FluentIcon.PIE_SINGLE)
-        self.history_button.setToolTip("查看本任务的趋势与各轮增量")
+        self.history_button = PushButton("查看分析", self, FluentIcon.MARKET)
+        self.history_button.setToolTip(ANALYSIS_TOOLTIP)
         self.history_button.clicked.connect(
             lambda: self.history_requested.emit(self.task_id))
         finished_layout.addWidget(self.history_button)
 
-        self.restart_button = PushButton("重新监控", self, FluentIcon.PLAY)
-        self.restart_button.setToolTip("按进程名查找进程，并以相同的指标、间隔和备注新建任务")
+        self.restart_button = PushButton("同配置再测", self, FluentIcon.PLAY)
+        self.restart_button.setToolTip(RESTART_TOOLTIP)
         self.restart_button.clicked.connect(
             lambda: self.restart_requested.emit(self.task_id))
         finished_layout.addWidget(self.restart_button)
@@ -312,54 +413,32 @@ class TaskCard(CardWidget):
             lambda: self.close_requested.emit(self.task_id))
         finished_layout.addWidget(self.close_button)
         self.finished_actions.setVisible(False)
-        header_layout.addWidget(self.finished_actions, 0, Qt.AlignRight | Qt.AlignTop)
+        header_layout.addWidget(self.finished_actions, 0, Qt.AlignRight | Qt.AlignVCenter)
         layout.addLayout(header_layout)
 
-        # 中部：指标名、值与变化量分行，用等宽列增强快速比较能力
-        values_layout = QGridLayout()
-        values_layout.setHorizontalSpacing(20)
-        values_layout.setVerticalSpacing(8)
-        for i, metric_type in enumerate(self.metric_types):
-            metric_widget = QWidget(self)
-            metric_layout = QVBoxLayout(metric_widget)
-            metric_layout.setContentsMargins(0, 0, 0, 0)
-            metric_layout.setSpacing(2)
+        # 中部：指标格，列数随卡片宽度自适应（resizeEvent 里重排）
+        self.values_box = QWidget(self)
+        self.values_layout = QGridLayout(self.values_box)
+        self.values_layout.setContentsMargins(0, 0, 0, 0)
+        self.values_layout.setHorizontalSpacing(CELL_SPACING - 8)
+        self.values_layout.setVerticalSpacing(8)
+        for metric_type in self.metric_types:
+            cell = MetricCell(metric_type, self.values_box)
+            cell.clicked.connect(self.select_trend_metric)
+            self.cells[metric_type] = cell
+            self.value_labels[metric_type] = cell.value_label
+            self.delta_labels[metric_type] = cell.delta_label
+        self._relayout_cells(MIN_VALUE_COLUMNS)
+        layout.addWidget(self.values_box)
 
-            display_name = get_metric_display_name(metric_type)
-            metric_name = CaptionLabel(display_name)
-            metric_name.setToolTip(display_name)
-            metric_name.setMinimumWidth(1)
-            metric_name.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-            value_label = DataLabel("--")
-            value_label.setToolTip(display_name)
-            value_label.setMinimumWidth(1)
-            value_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-            delta_label = DataCaptionLabel("")
-            delta_label.setMinimumWidth(1)
-            delta_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-            metric_layout.addWidget(metric_name)
-            metric_layout.addWidget(value_label)
-            metric_layout.addWidget(delta_label)
-
-            self.value_labels[metric_type] = value_label
-            self.delta_labels[metric_type] = delta_label
-            values_layout.addWidget(
-                metric_widget, i // self.VALUE_COLUMNS, i % self.VALUE_COLUMNS)
-        for column in range(self.VALUE_COLUMNS):
-            values_layout.setColumnStretch(column, 1)
-        layout.addLayout(values_layout)
-
-        # 底部：在图表上方明示标注趋势对应的首指标及其变化量
+        # 底部：迷你趋势图（标题行注明对象、变化量与运行概况）
+        self.trend_box = QWidget(self)
+        trend_layout = QVBoxLayout(self.trend_box)
+        trend_layout.setContentsMargins(0, 0, 0, 0)
+        trend_layout.setSpacing(4)
         trend_header = QHBoxLayout()
         trend_header.setSpacing(8)
-        trend_metric_name = (
-            get_metric_display_name(self.metric_types[0])
-            if self.metric_types else "指标"
-        )
-        self.sparkline_label = CaptionLabel(f"{trend_metric_name} · 任务开始至今趋势")
-        self.sparkline_label.setToolTip(
-            f"{trend_metric_name}：从任务开始到现在的走势（点多时自动合并抽稀；"
-            "竖线为打点，实线是基线）")
+        self.sparkline_label = CaptionLabel("")
         self.sparkline_label.setMinimumWidth(1)
         self.sparkline_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         trend_header.addWidget(self.sparkline_label, 1)
@@ -371,14 +450,60 @@ class TaskCard(CardWidget):
         self.count_label = DataCaptionLabel("")
         self.count_label.setToolTip("采集次数为本次运行收到的采集周期数（非落库条数）")
         trend_header.addWidget(self.count_label)
-        layout.addLayout(trend_header)
+        trend_layout.addLayout(trend_header)
 
-        self.sparkline = SparklineWidget(
-            metric_type=self.metric_types[0] if self.metric_types else None)
-        if self.metric_types:
-            self.sparkline.setToolTip(
-                f"任务开始至今的趋势（{get_metric_display_name(self.metric_types[0])}）")
-        layout.addWidget(self.sparkline)
+        self.sparkline = SparklineWidget(metric_type=self.trend_metric)
+        trend_layout.addWidget(self.sparkline)
+        layout.addWidget(self.trend_box)
+        self._refresh_trend_header()
+
+    def _relayout_cells(self, columns: int) -> None:
+        """按给定列数重排指标格（列数不变时不动）。"""
+        if columns == self._columns:
+            return
+        was_compact = self._compact_deltas()
+        for cell in self.cells.values():
+            self.values_layout.removeWidget(cell)
+        for i, metric_type in enumerate(self.metric_types):
+            self.values_layout.addWidget(self.cells[metric_type], i // columns, i % columns)
+        for column in range(MAX_VALUE_COLUMNS):
+            self.values_layout.setColumnStretch(column, 1 if column < columns else 0)
+        self._columns = columns
+        # 列数跨过 6 列时变化量文案要在长短两种之间切换
+        if self._compact_deltas() != was_compact:
+            self._refresh_deltas()
+
+    def value_columns(self) -> int:
+        """指标格当前的列数。"""
+        return self._columns
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._relayout_cells(value_columns_for(event.size().width(), len(self.metric_types)))
+
+    # ========== 迷你趋势对象 ==========
+
+    def select_trend_metric(self, metric_type: str) -> None:
+        """把迷你趋势图切到某个指标（点击指标格时调用）；不是本卡片的指标时忽略。"""
+        if metric_type not in self.cells:
+            return
+        self.trend_metric = metric_type
+        self.sparkline.set_metric(metric_type)
+        self._refresh_trend_header()
+
+    def _refresh_trend_header(self) -> None:
+        for metric_type, cell in self.cells.items():
+            cell.set_selected(metric_type == self.trend_metric)
+        name = (get_metric_display_name(self.trend_metric)
+                if self.trend_metric else "指标")
+        self.sparkline_label.setText(f"{name} · 任务开始至今趋势")
+        self.sparkline_label.setToolTip(
+            f"{name}：从任务开始到现在的走势（点多时自动合并抽稀；竖线为打点，实线是基线）。"
+            "点击上方其他指标格可切换")
+        self.sparkline.setToolTip(f"任务开始至今的趋势（{name}）")
+        if self.trend_metric:
+            self.trend_delta_label.setText(self.delta_text(self.trend_metric))
+            self.trend_delta_label.setToolTip(self._delta_tooltip())
 
     # ========== 文案计算 ==========
 
@@ -397,9 +522,10 @@ class TaskCard(CardWidget):
             return ""
         return f"（{format_ago((self.now - self.first_sample_at).total_seconds())}）"
 
-    def delta_text(self, metric_type: str) -> str:
+    def delta_text(self, metric_type: str, compact: bool = False) -> str:
         """某指标的变化量文案：有基线时"较基线 +x"（基线值未采够时"基线采样中"），
-        无基线时"比开始时（12 分钟前）+x"。"""
+        无基线时"比开始时（12 分钟前）+x"；compact=True（6 列时格子窄）改短为
+        "较开始 +x"，完整文案放 tooltip。"""
         value = self.last_values.get(metric_type)
         available = value is not None and metric_type not in self._unavailable
         if self.baseline is not None:
@@ -410,8 +536,10 @@ class TaskCard(CardWidget):
                 return "较基线 --"
             return f"较基线 {format_metric_delta(metric_type, value - base)}"
         if not available:
-            return "比开始时 --"
+            return f"{COMPACT_START_PREFIX} --" if compact else "比开始时 --"
         delta = format_metric_delta(metric_type, value - self.start_values[metric_type])
+        if compact:
+            return f"{COMPACT_START_PREFIX} {delta}"
         ago = self._start_ago_text()
         # 全角括号自带间隔，括号后不再加空格："比开始时（12 分钟前）+85.23 MB"
         return f"比开始时{ago}{delta}" if ago else f"比开始时 {delta}"
@@ -422,25 +550,34 @@ class TaskCard(CardWidget):
                     "5 个样本的中位数）的变化量")
         return "相对本任务首个有效值的变化量"
 
+    def _compact_deltas(self) -> bool:
+        """指标格排到最多列时格子最窄，"比开始时（N 分钟前）"放不下，改用短文案。"""
+        return self._columns >= MAX_VALUE_COLUMNS
+
     def _refresh_deltas(self) -> None:
         tooltip = self._delta_tooltip()
+        compact = self._compact_deltas()
         for metric_type, label in self.delta_labels.items():
-            label.setText(self.delta_text(metric_type))
-            label.setToolTip(tooltip)
-        if self.metric_types:
-            self.trend_delta_label.setText(self.delta_text(self.metric_types[0]))
+            text = self.delta_text(metric_type, compact)
+            full = self.delta_text(metric_type)
+            label.setText(text)
+            label.setToolTip(tooltip if text == full else f"{full}\n{tooltip}")
+        if self.trend_metric:
+            self.trend_delta_label.setText(self.delta_text(self.trend_metric))
             self.trend_delta_label.setToolTip(tooltip)
 
     def _refresh_running_texts(self) -> None:
-        """身份行"PID · 每 N 秒 · 已运行 hh:mm:ss"与底部"已运行 · 每 N 秒 · N 次采集"。"""
+        """身份行"PID · 每 N 秒 · 已运行 hh:mm:ss"与底部"已运行 · 每 N 秒 · N 次采集"；
+        结束后身份行只留 PID，其余信息放进结束说明。"""
         seconds = self.running_seconds()
         interval_text = format_interval(self.interval)
 
         meta = [f"PID {self.pid}"]
-        if interval_text:
-            meta.append(interval_text)
-        if seconds is not None:
-            meta.append(f"已运行 {format_clock(seconds)}")
+        if not self.is_finished:
+            if interval_text:
+                meta.append(interval_text)
+            if seconds is not None:
+                meta.append(f"已运行 {format_clock(seconds)}")
         self.meta_label.setText("· " + " · ".join(meta))
 
         footer = []
@@ -450,6 +587,26 @@ class TaskCard(CardWidget):
             footer.append(interval_text)
         footer.append(f"{self.count} 次采集")
         self.count_label.setText(" · ".join(footer))
+
+        if self.is_finished:
+            self._refresh_finished_detail()
+
+    def _refresh_finished_detail(self) -> None:
+        reason = stop_reason_text(self.stop_reason) if self.stop_reason is not None else ""
+        end = self.finished_at
+        parts = [p for p in (reason, format_end_time(end, self.now) if end else "") if p]
+        parts.append(f"已记录 {self.count} 次")
+        self.finished_detail_label.setText("· " + " · ".join(parts))
+        tips = []
+        if end is not None:
+            tips.append(f"结束于 {end.strftime('%Y-%m-%d %H:%M:%S')}")
+        seconds = self.running_seconds()
+        if seconds is not None:
+            tips.append(f"已运行 {format_clock(seconds)}")
+        interval_text = format_interval(self.interval)
+        if interval_text:
+            tips.append(interval_text)
+        self.finished_detail_label.setToolTip(" · ".join(tips))
 
     def _apply_status(self, status: str) -> None:
         text, light, dark = STATUS_STYLES[status]
@@ -461,7 +618,8 @@ class TaskCard(CardWidget):
 
     def update_values(self, values: dict, now: Optional[datetime] = None):
         """
-        批量更新指标显示值与变化量，并在包含首指标时向趋势图追加一点
+        批量更新指标显示值与变化量，并把这批值追加到迷你趋势图（每个指标各一条曲线，
+        显示的是当前选中的那条）
 
         Args:
             values: 指标值字典 {指标类型: 指标值}
@@ -474,10 +632,12 @@ class TaskCard(CardWidget):
                 self.first_sample_at = now
             if self.started_at is None:
                 self.started_at = now
+        own = {}
         for metric_type, value in values.items():
             value_label = self.value_labels.get(metric_type)
             if value_label is None:
                 continue
+            own[metric_type] = value
             self.start_values.setdefault(metric_type, value)
             self.last_values[metric_type] = value
             self._unavailable.discard(metric_type)
@@ -487,12 +647,10 @@ class TaskCard(CardWidget):
             value_label.setToolTip(
                 f"{get_metric_display_name(metric_type)}：{formatted_value}")
 
-        # 趋势图只跟踪首指标。暂停期间 core 不采集、不 emit data_updated，本方法
-        # 根本不会被调用，趋势图自然随之静止，无需额外判断暂停状态
-        if self.metric_types:
-            first_metric = self.metric_types[0]
-            if first_metric in values:
-                self.sparkline.append(values[first_metric], now)
+        # 暂停期间 core 不采集、不 emit data_updated，本方法根本不会被调用，
+        # 趋势图自然随之静止，无需额外判断暂停状态
+        if own:
+            self.sparkline.append_values(own, now)
         self._refresh_deltas()
         self._refresh_running_texts()
 
@@ -590,9 +748,11 @@ class TaskCard(CardWidget):
         if is_paused:
             self.pause_button.setText("恢复")
             self.pause_button.setIcon(FluentIcon.PLAY)
+            self.pause_button.setToolTip("恢复采集，继续记录到这个任务")
         else:
             self.pause_button.setText("暂停")
             self.pause_button.setIcon(FluentIcon.PAUSE)
+            self.pause_button.setToolTip(PAUSE_TOOLTIP)
         self._apply_status(STATUS_PAUSED if is_paused else STATUS_RUNNING)
 
     def set_stopping(self) -> None:
@@ -604,8 +764,9 @@ class TaskCard(CardWidget):
 
     def set_finished(self, reason: StopReason, end_time: datetime) -> None:
         """
-        切换为"已结束"形态：隐藏运行中操作，显示结束原因与时间和后续操作按钮。
-        各指标的最后值、变化量与趋势图原样保留；已运行时长定格在结束时刻。
+        切换为"已结束"形态：收成一行（进程名 ●状态 · PID · 结束原因 · 结束时间 ·
+        已记录 N 次 [查看分析][同配置再测] ✕）。各指标的最后值与趋势仍保存在卡片里，
+        只是不再显示；已运行时长定格在结束时刻。
 
         Args:
             reason: 任务停止原因
@@ -613,14 +774,13 @@ class TaskCard(CardWidget):
         """
         self.is_finished = True
         self.finished_at = end_time
-        self._apply_status(STATUS_FINISHED if reason is StopReason.USER
-                           else STATUS_ABNORMAL)
+        self.stop_reason = reason
+        self._apply_status(STATUS_ABNORMAL if is_abnormal_stop(reason)
+                           else STATUS_FINISHED)
 
-        self.finished_detail_label.setText(
-            f"结束原因：{stop_reason_text(reason)} · "
-            f"{end_time.strftime('%Y-%m-%d %H:%M:%S')}")
         self.finished_detail_label.setVisible(True)
-
+        self.values_box.setVisible(False)
+        self.trend_box.setVisible(False)
         self.running_actions.setVisible(False)
         self.finished_actions.setVisible(True)
         self._refresh_running_texts()
