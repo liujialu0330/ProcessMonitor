@@ -2,7 +2,7 @@
 历史查询（core.history_query）：请求组装、锚点与起点口径、查询编排、基线与统计起点、
 判定/增速/每轮、空洞与累计量速率、失败归类。
 
-起点/锚点的期望值取自旧页面 HistoryPage._compute_since 的实际输出（锚点为任务最后
+起点/锚点的期望值取自重构前页面里 _compute_since 的实际输出（锚点为任务最后
 一次采样 BASE+4s；last_sample_at 为空时回退 MAX(timestamp) 结果相同；任务无数据点
 或选"全部"/未知范围时不过滤），写死在 SINCE_CASES 里逐一对照。
 """
@@ -19,8 +19,8 @@ from core.history_query import (
 )
 from data.errors import StorageError
 from data.models import DataPoint, MonitorTask
-from tests.test_history_page_flow import BASE, _seed_task
-from tests.test_safety_net_history import (
+from tests.history_dataset import SIMPLE_BASE as BASE, _seed_task
+from tests.history_dataset import (
     BASE as NET_BASE, MAX_BUCKETS as NET_BUCKETS, QUERY_CASES,
     TABLE_LIMIT as NET_LIMIT, _expected_calls, _record_db_queries, _seed_query_dataset,
 )

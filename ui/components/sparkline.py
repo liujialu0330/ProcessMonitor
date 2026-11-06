@@ -1,6 +1,7 @@
 """
 迷你趋势图组件（Sparkline）
-无坐标轴、无文字的极简折线图，用于任务卡片内联展示首指标从任务开始至今的走势。
+无坐标轴、无文字的极简折线图，用于任务卡片内联展示某个指标从任务开始至今的走势。
+每个指标各有一条抽稀缓冲区，切换显示对象时直接换用对应缓冲区，曲线不必从头积累。
 
 长时间监控的点数会远超控件像素宽度，因此缓冲区超过上限时把相邻点成对合并
 （取平均）并让后续每个点覆盖两倍的采集次数：点数始终有界，而曲线覆盖的时间
@@ -10,7 +11,7 @@
 """
 from bisect import bisect_right
 from datetime import datetime
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 from PyQt5.QtCore import Qt, QPointF
 from PyQt5.QtGui import QPainter, QPen, QColor, QPolygonF
@@ -21,7 +22,7 @@ from qfluentwidgets import isDarkTheme
 # 最小跨度规则按指标 kind 定义在 utils.metrics；常量在此再导出，保持原有导入路径可用
 from utils.metrics import (  # noqa: F401
     MIN_SPAN_BYTES_KB, MIN_SPAN_BYTES_RATIO, MIN_SPAN_COUNT, MIN_SPAN_PERCENT,
-    min_span_for
+    min_span_for, rate_min_span_for
 )
 
 # 固定高度（像素），横向随父布局拉伸
@@ -32,7 +33,7 @@ DEFAULT_MAX_POINTS = 240
 
 # 折线取色：在 paintEvent 内动态调用 isDarkTheme()，不连接 qconfig.themeChanged——
 # 任务卡片随监控任务动态创建/销毁，这样实现不必在卡片销毁时手动断开主题信号连接，
-# 零信号残留。颜色自含常量，不依赖历史页的 ui/chart_theme.py。
+# 零信号残留。颜色自含常量，不依赖分析页的 ui/chart_theme.py。
 _LIGHT_COLOR = QColor("#0A8F8F")
 _DARK_COLOR = QColor("#44D7D1")
 # 打点刻度用注意色（与历史图表的打点竖线同色）
@@ -46,7 +47,7 @@ TICK_KINDS = ('baseline', 'user')
 def merge_pairs(values: Sequence[float]) -> List[float]:
     """相邻两点取平均成对合并（点数减半）。
 
-    选平均而不是最大值：趋势图表达的是走势而非尖峰（尖峰在历史页图表里看），
+    选平均而不是最大值：趋势图表达的是走势而非尖峰（尖峰在分析页图表里看），
     取平均让缓慢上涨的曲线在多次合并后依然保持平滑单调。
     元素个数为奇数时末尾落单的点原样保留。
     """
@@ -135,11 +136,16 @@ def min_span(metric_type: Optional[str], reference: float) -> float:
 
 
 def compute_y_range(
-        values: Sequence[float], metric_type: Optional[str]) -> Tuple[float, float]:
-    """按数据 min-max 求纵轴范围；跨度小于下限时围绕数据中点扩展到下限。"""
+        values: Sequence[float], metric_type: Optional[str], *,
+        rate: bool = False) -> Tuple[float, float]:
+    """按数据 min-max 求纵轴范围；跨度小于下限时围绕数据中点扩展到下限。
+
+    rate=True 表示 values 是累计量的每秒速率，跨度下限按 rate_min_span_for。
+    """
     low = min(values)
     high = max(values)
-    required = min_span(metric_type, values[-1])
+    required = (rate_min_span_for(metric_type, values[-1]) if rate
+                else min_span(metric_type, values[-1]))
     if high - low < required:
         middle = (high + low) / 2.0
         low = middle - required / 2.0
@@ -159,22 +165,49 @@ class SparklineWidget(QWidget):
             parent: 父窗口
         """
         super().__init__(parent)
+        self._max_points = max_points
         self._metric_type = metric_type
-        self._sampler = TrendDownsampler(max_points)
+        # 每个指标一条缓冲区（键为指标类型；未指定指标时键为 None）
+        self._samplers: Dict[Optional[str], TrendDownsampler] = {}
+        self._sampler = self._sampler_for(metric_type)
         # 打点刻度 [(时间, kind)]，只保留 TICK_KINDS
         self._markers: List[Tuple[datetime, str]] = []
 
         self.setFixedHeight(FIXED_HEIGHT)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
+    def _sampler_for(self, metric_type: Optional[str]) -> TrendDownsampler:
+        sampler = self._samplers.get(metric_type)
+        if sampler is None:
+            sampler = self._samplers[metric_type] = TrendDownsampler(self._max_points)
+        return sampler
+
     def append(self, value: float, timestamp: Optional[datetime] = None) -> None:
-        """追加一个采集点并触发重绘；timestamp 为采集时间（画打点刻度要用）"""
+        """向当前显示的指标追加一个采集点并触发重绘；timestamp 为采集时间（画打点刻度要用）"""
         self._sampler.append(value, timestamp)
         self.update()
 
+    def append_values(self, values: Mapping[str, float],
+                      timestamp: Optional[datetime] = None) -> None:
+        """一批采集值分别追加到各指标的缓冲区（之后切换显示对象时曲线已是完整的）。"""
+        for metric_type, value in values.items():
+            self._sampler_for(metric_type).append(value, timestamp)
+        self.update()
+
+    def metric_type(self) -> Optional[str]:
+        """当前显示的指标。"""
+        return self._metric_type
+
+    def set_metric(self, metric_type: Optional[str]) -> None:
+        """切换显示的指标（纵轴最小跨度随之切换）。"""
+        self._metric_type = metric_type
+        self._sampler = self._sampler_for(metric_type)
+        self.update()
+
     def clear(self) -> None:
-        """清空缓冲区并触发重绘"""
-        self._sampler.clear()
+        """清空全部缓冲区并触发重绘"""
+        for sampler in self._samplers.values():
+            sampler.clear()
         self.update()
 
     def series(self) -> List[float]:

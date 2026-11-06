@@ -1,5 +1,5 @@
 """
-历史趋势图卡片：真实时间轴曲线、空洞断开与阴影、打点编号竖线、悬停十字线与读数、
+趋势图卡片（分析页小倍数的单张图）：真实时间轴曲线、空洞断开与阴影、打点编号竖线、悬停十字线与读数、
 主题配色、导出图片。
 
 - 空洞（相邻采样间隔 > 2.5 × 周期）：曲线在空洞处断开（pyqtgraph connect 数组），
@@ -7,6 +7,11 @@
 - 打点：用户打点画注意色虚线、顶部横排编号徽标 ①②③，基线画注意色实线、徽标"基"，
   标签放在 tooltip 与悬停读数里；暂停/恢复是系统打点，画在底部的浅色短竖线、不编号；
 - 累计类指标由调用方传入每秒速率序列（rate=True），纵轴标题为"每秒 X"。
+
+分析页用到的扩展点：标题（小倍数各图的指标名）、隐藏保存/复制
+图标、可调最小高度、min/max 带（set_band，按时间分桶，空洞处断开）、相对时间横轴
+（set_relative_origin）、跨图联动十字线（hover_moved / set_crosshair）、右键菜单请求
+（enable_context_menu 后发 context_menu_requested(x, 附近打点或 None, 屏幕坐标)）。
 
 绘图 x 数据统一用 epoch float（timestamp.timestamp()），仅用于绘图与悬停吸附，
 严禁回流作为 SQL 查询参数（查询参数全链路走 datetime / ISO 字符串）。
@@ -21,14 +26,16 @@ from pyqtgraph import exporters
 from PyQt5.QtCore import QEvent, Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QPixmap
 from PyQt5.QtWidgets import QHBoxLayout, QSizePolicy, QVBoxLayout
-from qfluentwidgets import CardWidget, FluentIcon, TransparentToolButton, qconfig
+from qfluentwidgets import (CardWidget, FluentIcon, StrongBodyLabel, TransparentToolButton,
+                            qconfig)
 
 from core.analysis.series import connect_mask
-from ui.chart_theme import chart_colors
+from ui.chart_theme import BAND_ALPHA, chart_colors
 from ui.components.chart_axes import ContextDateAxisItem, MetricAxisItem
 from ui.components.sparkline import compute_y_range
 from ui.formatting import (
-    BADGE_BASELINE, format_duration, format_per_second, marker_badge, marker_context)
+    BADGE_BASELINE, format_duration, format_per_second, format_relative, marker_badge,
+    marker_context)
 from ui.typography import DataCaptionLabel, TypeScale, data_font, ui_font
 from ui.widgets.history.common import CARD_PADDING_H, DETAIL_TIME_FORMAT
 from utils.metrics import (
@@ -49,6 +56,9 @@ CONTENT_SPACING = 8
 
 DEFAULT_VALUE_AXIS_TITLE = '值'
 TIME_AXIS_TITLE = '时间'
+RELATIVE_TIME_AXIS_TITLE = '相对时间'
+# 右键时离打点竖线多少像素以内算"点在打点上"
+MARKER_HIT_PX = 8
 
 # 打点类型（与 data.models.MARKER_KINDS 一致）
 MARKER_USER = 'user'
@@ -127,9 +137,18 @@ class ChartView(CardWidget):
 
     save_requested = pyqtSignal()
     copy_requested = pyqtSignal()
+    # 悬停位置变化：吸附后的 x（epoch 秒），离开图表时为 None（供多图联动十字线）
+    hover_moved = pyqtSignal(object)
+    # 右键：(x epoch 秒, 附近的打点或 None, 屏幕坐标 QPoint)；需先 enable_context_menu
+    context_menu_requested = pyqtSignal(float, object, object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        # min/max 带 [(epoch 秒, 下沿, 上沿)]，与空洞一起决定分段
+        self._band: List[Tuple[float, float, float]] = []
+        self._band_items: list = []
+        self._relative_origin: Optional[float] = None
+        self._context_menu = False
 
         # 绘图缓存：悬停吸附与主题重绘复用，不重新查库
         self._x: List[float] = []
@@ -184,6 +203,9 @@ class ChartView(CardWidget):
 
         # 工具行只保留当前读数和图片快捷操作；透明图标是低强调入口
         toolbar = QHBoxLayout()
+        self.title_label = StrongBodyLabel("", self)
+        self.title_label.setVisible(False)
+        toolbar.addWidget(self.title_label)
         self.hover_label = DataCaptionLabel("", self)
         toolbar.addWidget(self.hover_label)
         toolbar.addStretch()
@@ -252,6 +274,19 @@ class ChartView(CardWidget):
         """本次绘制的空洞阴影：[(LinearRegionItem, 说明文本)]。"""
         return list(self._gap_items)
 
+    @property
+    def band(self) -> List[Tuple[float, float, float]]:
+        """当前 min/max 带 [(epoch 秒, 下沿, 上沿)]。"""
+        return self._band
+
+    def band_items(self) -> list:
+        """本次绘制的带状填充（每个连续段一个 FillBetweenItem）。"""
+        return list(self._band_items)
+
+    @property
+    def relative_origin(self) -> Optional[float]:
+        return self._relative_origin
+
     def connect_array(self) -> List[bool]:
         """当前曲线的连线掩码（第 i 项为 False 表示第 i 点与下一点之间断开）。"""
         return connect_mask(self._x, self._gaps)
@@ -313,6 +348,69 @@ class ChartView(CardWidget):
         if not keep_view:
             self.reset_view()
 
+    def set_band(self, buckets: Optional[Sequence]) -> None:
+        """设置 min/max 带（需有 start / end / min / max 的时间桶，按时间升序；None 或空
+        清除）。每桶在其首末点之间画平台，空洞处断开。"""
+        self._band = []
+        for bucket in buckets or ():
+            stamps = ((bucket.start, bucket.end) if bucket.end != bucket.start
+                      else (bucket.start,))
+            for ts in stamps:
+                self._band.append((ts.timestamp(), bucket.min, bucket.max))
+        self._redraw()
+
+    def set_title(self, text: str) -> None:
+        """卡片左上角标题（小倍数图的指标名）；空串隐藏。"""
+        self.title_label.setText(text)
+        self.title_label.setVisible(bool(text))
+
+    def set_tools_visible(self, visible: bool) -> None:
+        """显示/隐藏保存、复制图标（小倍数图由页面统一导出）。"""
+        self.save_png_button.setVisible(visible)
+        self.copy_chart_button.setVisible(visible)
+
+    def set_chart_min_height(self, height: int) -> None:
+        self.chart_widget.setMinimumHeight(height)
+
+    def set_relative_origin(self, origin: Optional[float]) -> None:
+        """横轴改为相对 origin（epoch 秒）的 T+mm:ss；None 恢复绝对时间。"""
+        self._relative_origin = origin
+        self.time_axis.set_relative_origin(origin)
+        self.chart_widget.setLabel(
+            'bottom', TIME_AXIS_TITLE if origin is None else RELATIVE_TIME_AXIS_TITLE)
+
+    def enable_context_menu(self) -> None:
+        """改用自己的右键菜单：关掉 pyqtgraph 自带菜单，右键时发 context_menu_requested。"""
+        if self._context_menu:
+            return
+        self._context_menu = True
+        self.chart_widget.getPlotItem().setMenuEnabled(False)
+        self.chart_widget.scene().sigMouseClicked.connect(self._on_scene_clicked)
+
+    def marker_near(self, x: float, tolerance_px: float = MARKER_HIT_PX):
+        """横向距 x 在 tolerance_px 像素以内、最近的用户打点或基线；没有返回 None。"""
+        pixel = self.chart_widget.getPlotItem().vb.viewPixelSize()[0] or 0.0
+        best, best_dist = None, None
+        for marker in self._markers:
+            if getattr(marker, 'kind', MARKER_USER) in SYSTEM_MARKER_KINDS:
+                continue
+            dist = abs(marker.timestamp.timestamp() - x)
+            if dist <= tolerance_px * pixel and (best_dist is None or dist < best_dist):
+                best, best_dist = marker, dist
+        return best
+
+    def _on_scene_clicked(self, event) -> None:
+        if event.button() != Qt.RightButton:
+            return
+        plot_item = self.chart_widget.getPlotItem()
+        pos = event.scenePos()
+        if not plot_item.vb.sceneBoundingRect().contains(pos):
+            return
+        x = plot_item.vb.mapSceneToView(pos).x()
+        event.accept()
+        self.context_menu_requested.emit(
+            float(x), self.marker_near(x), event.screenPos().toPoint())
+
     def set_markers(self, markers: Sequence) -> None:
         """替换打点并重绘（曲线数据不变）。"""
         self._markers = list(markers)
@@ -327,6 +425,7 @@ class ChartView(CardWidget):
         self._markers = []
         self._gaps = []
         self._rate = False
+        self._band = []
         self.value_axis.set_display_unit('')
         self._redraw()
 
@@ -338,10 +437,10 @@ class ChartView(CardWidget):
     def _apply_min_y_span(self) -> None:
         """数据几乎是平线时，纵轴跨度扩到下限（与迷你趋势图同一规则），
         避免把几字节的抖动放大成满幅、刻度出现多位小数。跨度足够时保持自动范围。
-        速率序列不套用指标的跨度下限（下限是按水位量定的）。"""
+        速率序列另用速率的跨度下限（参考值 5%，至少 1 个单位/秒），水位量的下限不适用。"""
         if not self._y:
             return
-        low, high = compute_y_range(self._y, None if self._rate else self._metric_type)
+        low, high = compute_y_range(self._y, self._metric_type, rate=self._rate)
         if high - low > max(self._y) - min(self._y):
             self.chart_widget.setYRange(low, high, padding=0.05)
 
@@ -350,6 +449,7 @@ class ChartView(CardWidget):
         self.chart_widget.clear()
         self._marker_items = []
         self._gap_items = []
+        self._band_items = []
         self.chart_widget.addItem(self.crosshair_line, ignoreBounds=True)
         self.hide_hover()
 
@@ -358,6 +458,7 @@ class ChartView(CardWidget):
 
         colors = chart_colors()
         self._draw_gaps(colors)
+        self._draw_band(colors)
         pen = pg.mkPen(color=colors['curve'], width=2)
         extra = {'connect': np.array(self.connect_array(), dtype=bool)} if self._gaps else {}
         self.chart_widget.plot(self._x, self._y, pen=pen, **extra)
@@ -380,6 +481,43 @@ class ChartView(CardWidget):
             region.setToolTip(text)
             self.chart_widget.addItem(region, ignoreBounds=True)
             self._gap_items.append((region, text))
+
+    def _band_segments(self) -> List[List[Tuple[float, float, float]]]:
+        """把带按空洞切成连续段（跨空洞的相邻两点不相连）。"""
+        mask = connect_mask([t for t, _lo, _hi in self._band], self._gaps)
+        segments, current = [], []
+        for item, linked in zip(self._band, mask):
+            current.append(item)
+            if not linked:
+                segments.append(current)
+                current = []
+        if current:
+            segments.append(current)
+        return segments
+
+    def _draw_band(self, colors: dict) -> None:
+        """min/max 带：半透明填充，空洞处断开。"""
+        if not self._band:
+            return
+        fill = QColor(colors['curve'])
+        fill.setAlpha(BAND_ALPHA)
+        no_pen = pg.mkPen(None)
+        for segment in self._band_segments():
+            xs = [t for t, _lo, _hi in segment]
+            low = pg.PlotDataItem(xs, [lo for _t, lo, _hi in segment], pen=no_pen)
+            high = pg.PlotDataItem(xs, [hi for _t, _lo, hi in segment], pen=no_pen)
+            item = pg.FillBetweenItem(low, high, brush=pg.mkBrush(fill))
+            item.setZValue(-5)
+            for curve in (low, high, item):
+                self.chart_widget.addItem(curve)
+            self._band_items.append(item)
+
+    def band_range_at(self, x: float) -> Optional[Tuple[float, float]]:
+        """x 处最近的带点的 (min, max)；没有带时为 None。"""
+        if not self._band:
+            return None
+        _t, low, high = self._band[nearest_index([t for t, _lo, _hi in self._band], x)]
+        return low, high
 
     def _draw_markers(self, colors: dict) -> None:
         """打点竖线：用户打点虚线 + 编号徽标，基线实线 + "基"，暂停/恢复底部浅色短线。"""
@@ -416,13 +554,21 @@ class ChartView(CardWidget):
     def hover_text(self, index: int) -> str:
         """第 index 个绘制点的悬停读数：时间 · 值 · 所处打点区间（若有，带编号徽标）。"""
         x_val = self._x[index]
-        time_str = datetime.fromtimestamp(x_val).strftime(DETAIL_TIME_FORMAT)
+        if self._relative_origin is not None:
+            time_str = format_relative(x_val - self._relative_origin)
+        else:
+            time_str = datetime.fromtimestamp(x_val).strftime(DETAIL_TIME_FORMAT)
         if self._rate:
             formatted_value = format_per_second(self._metric_type, self._y[index])
         else:
             formatted_value = format_metric_value(
                 self._metric_type, self._y[index], display_unit=self._display_unit)
         text = f"{time_str} · {formatted_value}"
+        band = self.band_range_at(x_val)
+        if band is not None and not self._rate:
+            low, high = (format_metric_value(self._metric_type, v, display_unit=self._display_unit)
+                         for v in band)
+            text += f"（{low} – {high}）"
         # 区间说明只看用户打点与基线（暂停/恢复不是一轮操作的边界）
         labelled = [(m, badge) for m, badge in zip(self._markers, marker_badges(self._markers))
                     if badge is not None]
@@ -437,18 +583,30 @@ class ChartView(CardWidget):
         """把十字线吸附到与 x（epoch 秒）最近的绘制点并显示读数；无数据返回 None。"""
         if not self._x:
             return None
+        idx = self.set_crosshair(x)
+        self._update_interaction()
+        self.hover_moved.emit(self._x[idx])
+        return idx
+
+    def set_crosshair(self, x: Optional[float]) -> Optional[int]:
+        """只移动十字线与读数（联动其他图时用，不发 hover_moved）；x 为 None 时隐藏。"""
+        if x is None or not self._x:
+            self.crosshair_line.setVisible(False)
+            self.hover_label.setText("")
+            return None
         idx = nearest_index(self._x, x)
         self.crosshair_line.setPos(self._x[idx])
         self.crosshair_line.setVisible(True)
         self.hover_label.setText(self.hover_text(idx))
-        self._update_interaction()
         return idx
 
     def hide_hover(self) -> None:
         """隐藏十字线并清空读数。"""
-        self.crosshair_line.setVisible(False)
-        self.hover_label.setText("")
+        was_visible = self.crosshair_line.isVisible()
+        self.set_crosshair(None)
         self._update_interaction()
+        if was_visible:
+            self.hover_moved.emit(None)
 
     def _on_mouse_moved(self, evt) -> None:
         """SignalProxy 回调（evt 是单元素元组）：鼠标在绘图区内时吸附，离开时隐藏。"""

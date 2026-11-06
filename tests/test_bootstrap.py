@@ -224,10 +224,14 @@ def run_env(monkeypatch, app_paths):
                           reconcile=ReconcileResult(0, 0, 0))
 
     monkeypatch.setattr(bootstrap, 'build_context', fake_build_context)
+    # 绝不在测试机桌面上注册真实全局热键
+    monkeypatch.setattr(bootstrap, '_create_marker_hotkey',
+                        lambda app, services: events.append('hotkey') or 'hotkey')
 
     class FakeWindow:
-        def __init__(self, db, manager, services):
+        def __init__(self, db, manager, services, *, hotkey=None):
             events.append(('window', manager, services))
+            assert hotkey == 'hotkey'
 
         def show(self):
             events.append('window.show')
@@ -244,7 +248,8 @@ def test_run_fixed_order(run_env):
     assert code == 3
     assert events == [
         ('logging', paths.log_dir), 'excepthook', 'qapplication', 'single_instance', 'listen',
-        'preferences', 'build_context', ('window', 'manager', 'services'), 'window.show',
+        'preferences', 'build_context', 'hotkey', ('window', 'manager', 'services'),
+        'window.show',
         'activation_connected', 'exec', ('exit', 3),
     ]
     # 数据库只由主窗口的退出协调器关闭，组合根不再重复关闭

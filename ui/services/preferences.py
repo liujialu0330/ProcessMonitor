@@ -1,8 +1,8 @@
 """
 用户偏好读取（MonitorPreferences）
 
-页面需要的用户偏好（上次选择的指标、默认采集周期、保留天数、关窗到托盘）及其
-取值范围（采集周期范围、保留天数可选值）统一
+页面需要的用户偏好（上次选择的指标、默认采集间隔、保留天数、关窗到托盘、打点
+快捷键）及其取值范围（采集间隔范围、保留天数可选值）统一
 经由注入的 MonitorPreferences 读取：测试可以给出固定偏好，不必改动全局 cfg 单例。
 
 设置页上直接绑定 ConfigItem 的设置卡片不经过本服务：那是 qfluentwidgets 设置卡
@@ -46,6 +46,14 @@ class MonitorPreferences(Protocol):
         """历史数据保留天数的可选值（0 = 永久保留），顺序即设置页选项顺序。"""
         ...
 
+    def marker_hotkey(self) -> str:
+        """全局打点快捷键（如 "Ctrl+Alt+M"；空串表示不使用）。"""
+        ...
+
+    def set_marker_hotkey(self, text: str) -> None:
+        """记住新的全局打点快捷键。"""
+        ...
+
 
 class ConfigPreferences:
     """生产实现：读写 app_config 的全局 cfg 单例。"""
@@ -77,3 +85,11 @@ class ConfigPreferences:
     def retention_options(self) -> List[int]:
         """保留天数可选值：委托 app_config.retention_options（来自 ConfigItem 校验器）。"""
         return app_config.retention_options()
+
+    def marker_hotkey(self) -> str:
+        """全局打点快捷键：委托 app_config.get_marker_hotkey。"""
+        return app_config.get_marker_hotkey()
+
+    def set_marker_hotkey(self, text: str) -> None:
+        """记住全局打点快捷键：委托 app_config.set_marker_hotkey（按需落盘）。"""
+        app_config.set_marker_hotkey(text)

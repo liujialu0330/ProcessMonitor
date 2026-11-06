@@ -94,7 +94,7 @@ def test_startup_lists_processes_selects_none_and_form_is_expanded(page):
     assert picker.text() == "" and picker.combo.current_data() is None
     assert page.form.details.isVisible() and not page.form.expand_button.isVisible()
     assert page.board.empty_state.isVisible()
-    assert "0/5 运行中" in page.board.count_label.text()
+    assert page.summary_label.text() == "运行中 0/5"
 
 
 def test_default_metrics_is_leak_check_preset(page):
@@ -317,11 +317,12 @@ def test_stopped_card_is_kept_in_finished_group(page, manager, monkeypatch):
     assert manager.get_task_info(task_id) is None
     assert card.value_labels[MetricType.MEMORY_PRIVATE].text() == "2 MB"
     assert "用户停止" in card.finished_detail_label.text()
-    assert DEFAULT_FAKE_NOW.strftime("%Y-%m-%d %H:%M:%S") in card.finished_detail_label.text()
+    # 结束时间：同一天只写时分秒，完整日期在悬停提示里
+    assert DEFAULT_FAKE_NOW.strftime("%H:%M:%S") in card.finished_detail_label.text()
+    assert DEFAULT_FAKE_NOW.strftime("%Y-%m-%d %H:%M:%S") in card.finished_detail_label.toolTip()
     assert card.running_actions.isHidden() and not card.finished_actions.isHidden()
     # 配额只计运行中；已结束的单独计数并归入下方分组
-    text = page.board.count_label.text()
-    assert "1/5 运行中" in text and "1 个已结束" in text
+    assert page.summary_label.text() == "运行中 1/5 · 已结束 1"
     assert page.board.finished_label.isVisible()
     assert other_id in page.board.cards()
 
@@ -444,3 +445,59 @@ def test_repeated_task_error_dedup_works_with_real_infobar(qapp, db, manager):
         assert len(page.presenter.shown_errors()) == 1
     finally:
         page.close()
+
+
+# ---------- 页头、快捷键与自动刷新 ----------
+
+def test_header_title_subtitle_summary_and_refresh(page, services):
+    from ui.pages.monitor_page import PAGE_SUBTITLE, PAGE_TITLE, REFRESH_TEXT
+    assert (PAGE_TITLE, REFRESH_TEXT) == ("监控", "刷新进程")
+    assert PAGE_SUBTITLE == "选择被测进程开始记录；每轮操作后点“打点”即可量化泄漏"
+    assert page.refresh_button.text() == REFRESH_TEXT
+    query = services.process_query
+    before = sum(1 for name, _ in query.calls if name == 'list_processes')
+    page.refresh_button.click()
+    assert sum(1 for name, _ in query.calls if name == 'list_processes') == before + 1
+
+
+def test_summary_follows_tasks(page, manager):
+    task_id = _add_card(manager)
+    assert page.summary_label.text() == "运行中 0/5"
+    manager.task_stopped.emit(task_id, StopReason.USER)
+    assert page.summary_label.text() == "运行中 0/5 · 已结束 1"
+
+
+def test_shortcuts_only_while_visible(page, services):
+    assert page.shortcut_keys() == ["F5", "Ctrl+F"]
+    assert all(s.isEnabled() for s in page._shortcuts)
+    page.hide()
+    assert not any(s.isEnabled() for s in page._shortcuts)
+    page.show()
+    query = services.process_query
+    before = sum(1 for name, _ in query.calls if name == 'list_processes')
+    page._shortcuts[0].activated.emit()
+    assert sum(1 for name, _ in query.calls if name == 'list_processes') == before + 1
+
+
+def test_ctrl_f_focuses_search(page):
+    page.activateWindow()
+    page._shortcuts[1].activated.emit()
+    assert page.form.picker.combo.line_edit.hasFocus() or \
+        QWidget.focusWidget(page) is page.form.picker.combo.line_edit
+
+
+def test_clear_all_finished_removes_only_finished_cards(page, manager):
+    done = _add_card(manager)
+    alive = _add_card(manager, pid=1001, name="alpha.exe")
+    manager.task_stopped.emit(done, StopReason.USER)
+    page.board.clear_finished_button.click()
+    assert list(page.board.cards()) == [alive]
+    assert page.summary_label.text() == "运行中 0/5"
+
+
+def test_card_analysis_button_requests_analysis(page, manager):
+    task_id = _add_card(manager)
+    requested = []
+    page.history_requested.connect(requested.append)
+    page.board.cards()[task_id].analysis_button.click()
+    assert requested == [task_id]

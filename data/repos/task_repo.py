@@ -103,7 +103,7 @@ class TaskRepo:
         至少采样过一次的任务（sample_count > 0），按开始时间倒序，单条 SQL。
 
         库仍停留在旧版本（迁移失败、tasks 缺 sample_count 列）时回退为按 data_points
-        是否存在判断，而不是让历史页/导出页整体变空。
+        是否存在判断，而不是让分析页整体变空。
         """
         with storage_errors("读取有数据的任务"):
             with self._factory.connect() as conn:

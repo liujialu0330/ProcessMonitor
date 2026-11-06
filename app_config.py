@@ -68,6 +68,21 @@ class MetricListValidator(ConfigValidator):
         return normalize_metrics(value)
 
 
+# 默认打点快捷键（与 ui/hotkey.DEFAULT_MARKER_HOTKEY 一致；本模块不依赖界面层）
+DEFAULT_MARKER_HOTKEY = "Ctrl+Alt+M"
+MARKER_HOTKEY_MAX_LENGTH = 40
+
+
+class MarkerHotkeyValidator(ConfigValidator):
+    """打点快捷键校验器：非字符串或过长时回落到默认值（写法由界面层再判断）。"""
+
+    def validate(self, value) -> bool:
+        return isinstance(value, str) and len(value) <= MARKER_HOTKEY_MAX_LENGTH
+
+    def correct(self, value) -> str:
+        return value.strip() if self.validate(value) else DEFAULT_MARKER_HOTKEY
+
+
 class AppConfig(QConfig):
     """应用级用户偏好配置"""
 
@@ -93,6 +108,11 @@ class AppConfig(QConfig):
     # 用户在更新提示里选择"跳过"的版本号（空串 = 未跳过任何版本）；
     # 旧版单独存于 update_prefs.json，load_app_config 首次运行时导入并删除旧文件
     skipped_version = ConfigItem("Update", "SkippedVersion", "")
+
+    # 全局打点快捷键（任何程序里按下即为运行中的任务打点，不弹窗）；空串 = 不使用。
+    # 写法是否合法、能否注册由 ui/hotkey 判断，这里只保证是不太长的字符串
+    marker_hotkey = ConfigItem(
+        "Behavior", "MarkerHotkey", DEFAULT_MARKER_HOTKEY, MarkerHotkeyValidator())
 
 
 # 全局单例：进程内所有代码统一通过该实例读写配置（不要自行 AppConfig() 构造新实例
@@ -181,6 +201,16 @@ def set_skipped_version(version: str) -> None:
     与 remember_last_metrics 相同：配置未被 load_app_config() 接管时只改内存值。
     """
     qconfig.set(cfg.skipped_version, str(version or ''), save=_is_loaded())
+
+
+def get_marker_hotkey() -> str:
+    """全局打点快捷键（空串表示不使用）"""
+    return str(cfg.get(cfg.marker_hotkey) or '')
+
+
+def set_marker_hotkey(text: str) -> None:
+    """记录全局打点快捷键；与 set_skipped_version 相同，配置未接管时只改内存值。"""
+    qconfig.set(cfg.marker_hotkey, str(text or '').strip(), save=_is_loaded())
 
 
 def interval_range() -> Tuple[int, int]:

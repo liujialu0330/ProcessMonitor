@@ -415,7 +415,7 @@ class AnalyticsRepo:
                 return row['cnt'] if row else 0
 
     def last_point_timestamp(self, task_id: str) -> Optional[datetime]:
-        """任务全部指标里最新数据点的时间（历史页时间范围的锚点）；无数据点返回 None"""
+        """任务全部指标里最新数据点的时间（分析页时间范围的锚点）；无数据点返回 None"""
         with self._connect('读取最新数据点时间') as conn:
             row = conn.execute(
                 'SELECT MAX(timestamp) AS latest FROM data_points WHERE task_id = ?',

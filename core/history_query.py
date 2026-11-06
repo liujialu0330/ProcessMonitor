@@ -1,7 +1,7 @@
 """
-历史页数据查询：请求 → 快照
+历史数据查询：请求 → 快照
 
-历史页的一次加载（用户切任务/指标/范围、进入页面、自动刷新）都归结为同一组只读
+分析页每个指标的一次加载（用户切任务/范围、进入页面、自动刷新）都归结为同一组只读
 查询：锚点、打点、表格最近 N 条、聚合与判定、空洞、分桶降采样。这里把查询条件定型为
 HistoryRequest、把结果定型为 HistorySnapshot，由 run_history_query 同步执行；
 后台线程（core.history_refresh_worker.HistoryRefreshWorker）只是它的线程外壳。
@@ -10,7 +10,8 @@ HistoryRequest、把结果定型为 HistorySnapshot，由 run_history_query 同�
 时间范围的语义：锚定该任务最后一次采样的时间，而非当前时刻——停止已久的任务选
 "最近1小时"仍应能看到其最后一小时的数据。锚点优先取 tasks.last_sample_at（主键
 查询，随数据点写入同事务维护），仅其为空（旧数据/维护缺失）时才回退 MAX(timestamp)。
-"自基线"范围从基线打点时刻起；任务没有基线时等同"全部"。
+"自基线"范围从基线打点时刻起；任务没有基线时等同"全部"。"自定义"范围（分析页刷选）
+由调用方直接给出起止时刻，只有它允许 until。
 
 两个起点：显示起点（since，图表与明细用）由范围决定；统计起点（stats_since，统计条、
 回归、判定用）在存在基线时取 max(显示起点, 基线时刻)——基线之前的预热段不算进"泄漏"。
@@ -23,15 +24,16 @@ HistoryRequest、把结果定型为 HistorySnapshot，由 run_history_query 同�
 import logging
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
-from core.analysis.intervals import Boundary, RoundDelta, round_deltas
+from core.analysis.intervals import Boundary, IntervalStats, RoundDelta, round_deltas
 from core.analysis.series import count_rises, per_second_rates
 from core.analysis.trend import (
     Judgement, RateText, fit_input_from_aggregates, judge, linear_fit,
     rate_display, rate_unit_for_span)
 from data.errors import StorageError
 from data.models import DataPoint, Marker
+from data.repos.analytics_repo import Bucket
 from data.repos.point_repo import PointQuery
 from utils.metrics import (
     VALUE_CLASS_LEVEL, VALUE_CLASS_PEAK, VALUE_CLASS_RATE, spec, value_class)
@@ -52,6 +54,10 @@ TIME_RANGE_SECONDS = {
 RANGE_KEYS = (BASELINE_RANGE_KEY, *TIME_RANGE_SECONDS)
 # 默认看全部数据：泄漏判断要看从开始至今的整体趋势，而不是最近一小时的局部
 DEFAULT_RANGE_KEY = 'all'
+# "自定义"范围键（分析页刷选）：起止时刻由请求直接给出，不随锚点换算
+CUSTOM_RANGE_KEY = 'custom'
+# 分析页可用的全部范围键（预设 + 自定义）
+ANALYSIS_RANGE_KEYS = (*RANGE_KEYS, CUSTOM_RANGE_KEY)
 
 # 表格取数上限：只取最近 N 条采集，避免大数据量下界面卡顿
 TABLE_POINT_LIMIT = 2000
@@ -61,9 +67,14 @@ CHART_MAX_BUCKETS = 2000
 BASELINE_SAMPLES = 5
 # "每轮 +X"至少需要的用户打点数（两个打点才围出一轮完整的操作）
 MIN_ROUND_MARKERS = 2
+# 分析页 min/max 带的分桶上限：小倍数图宽度有限，每桶约 1–2 像素已足够
+BAND_MAX_BUCKETS = 800
 
 MARKER_KIND_BASELINE = 'baseline'
 MARKER_KIND_USER = 'user'
+# 打点区间表补齐的首末段标签
+INTERVAL_FIRST_LABEL = '开始'
+INTERVAL_LAST_LABEL = '结束'
 
 
 @dataclass(frozen=True)
@@ -77,7 +88,8 @@ class HistoryRequest:
     - request_seq：LatestRequestGate 发的序号，结果回来时据此判断是否过期；
     - auto_refresh：是否为运行中任务的定时刷新（界面据此保留用户的缩放/平移）；
     - baseline_only：存在基线时统计、回归、判定只用基线之后的数据（产品规则，默认开）；
-      关掉后统计起点与显示起点相同，基线值仍作为参考给出。
+      关掉后统计起点与显示起点相同，基线值仍作为参考给出；
+    - analysis：分析页用，额外查 min/max 带（按时间等宽分桶、不跨空洞）与打点区间统计。
     """
     task_id: str
     metric: Optional[str]
@@ -90,6 +102,7 @@ class HistoryRequest:
     request_seq: int
     auto_refresh: bool = False
     baseline_only: bool = True
+    analysis: bool = False
 
 
 @dataclass(frozen=True)
@@ -139,7 +152,9 @@ class HistorySnapshot:
     - gaps：显示范围内的空洞 (空洞前最后一点, 空洞后第一点)；
     - judgement / rate / fit_unit：水位量的趋势判定、增速显示量与其时间单位后缀；
     - rounds：统计范围内相邻打点（基线 + 用户打点）围出的各轮增量；
-    - value_class：指标显示类别（utils.metrics.VALUE_CLASS_*）。
+    - value_class：指标显示类别（utils.metrics.VALUE_CLASS_*）；
+    - band / intervals：仅 request.analysis 时有：显示范围的时间分桶（min/max/avg）与
+      按打点（基线 + 用户打点）切出的区间统计（左闭右开，最后一段闭区间）。
     """
     request: HistoryRequest
     points: List[DataPoint] = field(default_factory=list)
@@ -164,6 +179,8 @@ class HistorySnapshot:
     rounds: List[RoundDelta] = field(default_factory=list)
     value_class: str = VALUE_CLASS_LEVEL
     interval_seconds: float = 0.0
+    band: List[Bucket] = field(default_factory=list)
+    intervals: List[IntervalStats] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -182,7 +199,8 @@ def compute_since(range_key: str, anchor: Optional[datetime],
 
     - "自基线"：基线打点时刻；没有基线（baseline_at 为空）时不过滤；
     - 时钟预设：锚点往前推范围秒数；
-    - 选中"全部"（或未知的范围键）、或该任务尚无数据点（锚点为空）时返回 None，即不过滤。
+    - 选中"全部"（或未知的范围键，含"自定义"——其起点由请求直接给出）、或该任务尚无
+      数据点（锚点为空）时返回 None，即不过滤。
     """
     if range_key == BASELINE_RANGE_KEY:
         return baseline_at
@@ -215,19 +233,27 @@ def build_request(task_id: str, metric: Optional[str], range_key: str, *,
                   table_limit: int = TABLE_POINT_LIMIT,
                   max_buckets: int = CHART_MAX_BUCKETS,
                   seq: int = 0, auto_refresh: bool = False,
-                  baseline_only: bool = True) -> HistoryRequest:
+                  baseline_only: bool = True, analysis: bool = False,
+                  since: Optional[datetime] = None,
+                  until: Optional[datetime] = None) -> HistoryRequest:
     """组装查询条件。
 
     anchor 给出时（调用方缓存了锚点）直接算出 since；为空时 since 留空，由
     run_history_query 在执行时现取锚点再算——锚点查询因此也落在执行查询的线程里。
     "自基线"范围的起点依赖打点，一律由 run_history_query 现算。
+    since / until 只对"自定义"范围有效（刷选的起止时刻），其余范围忽略。
     """
+    if range_key == CUSTOM_RANGE_KEY:
+        if since is None or until is None or until < since:
+            raise ValueError("自定义范围需要 since <= until")
+    else:
+        since, until = compute_since(range_key, anchor), None
     return HistoryRequest(
         task_id=task_id, metric=metric, range_key=range_key,
-        since=compute_since(range_key, anchor), until=None,
+        since=since, until=until,
         table_limit=table_limit, max_buckets=max_buckets,
         anchor=anchor, request_seq=seq, auto_refresh=auto_refresh,
-        baseline_only=baseline_only)
+        baseline_only=baseline_only, analysis=analysis)
 
 
 def _stats_dict(agg, fit) -> dict:
@@ -302,8 +328,9 @@ def run_history_query(db, request: HistoryRequest) -> HistorySnapshot:
     存储故障（StorageError）转成快照的 error/storage_error，不向外抛；其他异常
     （编程错误）照常抛出，由调用方（后台线程外壳）记录并打包。
     """
-    if request.until is not None:
-        raise ValueError("历史查询暂不支持终点（统计与分桶查询没有 until 条件）")
+    custom = request.range_key == CUSTOM_RANGE_KEY
+    if request.until is not None and not custom:
+        raise ValueError("只有自定义范围支持终点 until")
     try:
         task_info = db.tasks.get(request.task_id)
         if task_info is None:
@@ -312,8 +339,8 @@ def run_history_query(db, request: HistoryRequest) -> HistorySnapshot:
         anchor = request.anchor
         if anchor is None:
             anchor = resolve_anchor(db, task_info)
-            request = replace(request, anchor=anchor,
-                              since=compute_since(request.range_key, anchor))
+            request = replace(request, anchor=anchor, since=(
+                request.since if custom else compute_since(request.range_key, anchor)))
 
         markers = db.markers.list(request.task_id)
         baseline_marker = find_baseline(markers)
@@ -330,19 +357,23 @@ def run_history_query(db, request: HistoryRequest) -> HistorySnapshot:
 
 def _query_data(db, request: HistoryRequest, task_info, anchor: Optional[datetime],
                 markers: List[Marker], baseline_marker: Optional[Marker]) -> HistorySnapshot:
-    task_id, metric, since = request.task_id, request.metric, request.since
+    task_id, metric, since, until = (
+        request.task_id, request.metric, request.since, request.until)
     interval = float(task_info.interval or 0.0)
     base = dict(request=request, markers=markers, task_last_at=anchor,
                 interval_seconds=interval,
                 value_class=value_class(metric) if metric else VALUE_CLASS_LEVEL)
 
-    points = db.points.fetch(PointQuery(task_id, metric, since=since, limit=request.table_limit))
+    points = db.points.fetch(PointQuery(
+        task_id, metric, since=since, until=until, limit=request.table_limit))
     if not points:
         baseline = BaselineInfo(baseline_marker, None, 0) if baseline_marker else None
         return HistorySnapshot(points=points, baseline=baseline, **base)
 
     if not metric:
         buckets = db.analytics.legacy_buckets(task_id, None, request.max_buckets, since=since)
+        if until is not None:
+            buckets = [p for p in buckets if p.timestamp <= until]
         baseline = BaselineInfo(baseline_marker, None, 0) if baseline_marker else None
         return HistorySnapshot(points=points, buckets=buckets, total_count=len(points),
                                baseline=baseline, stats_since=since, **base)
@@ -351,10 +382,14 @@ def _query_data(db, request: HistoryRequest, task_info, anchor: Optional[datetim
     if request.baseline_only and baseline_marker is not None:
         stats_since = (baseline_marker.timestamp if since is None
                        else max(since, baseline_marker.timestamp))
+        # 基线落在自定义范围之后：这段数据没有"基线之后"，统计退回整个显示范围
+        if until is not None and stats_since > until:
+            stats_since = since
 
-    agg = db.analytics.aggregates(task_id, metric, since=stats_since)
-    total_count = (agg.count if stats_since == since
-                   else db.analytics.aggregates(task_id, metric, since=since).count)
+    agg = db.analytics.aggregates(task_id, metric, since=stats_since, until=until)
+    display_agg = (agg if stats_since == since
+                   else db.analytics.aggregates(task_id, metric, since=since, until=until))
+    total_count = display_agg.count
     fit_input = fit_input_from_aggregates(agg)
 
     baseline = None
@@ -374,9 +409,9 @@ def _query_data(db, request: HistoryRequest, task_info, anchor: Optional[datetim
             rate = rate_display(judgement.fit, agg.span_seconds, kind)
         rounds = _rounds(db, task_id, metric, markers, baseline, stats_since, agg.last_ts)
 
-    gaps = (db.analytics.gaps(task_id, interval, since=since, metric=metric)
+    gaps = (db.analytics.gaps(task_id, interval, since=since, until=until, metric=metric)
             if interval > 0 else [])
-    buckets = db.analytics.legacy_buckets(task_id, metric, request.max_buckets, since=since)
+    buckets = _chart_points(db, request, total_count)
 
     rate_series: List[DataPoint] = []
     rate_stats = peak_rises = None
@@ -395,11 +430,113 @@ def _query_data(db, request: HistoryRequest, task_info, anchor: Optional[datetim
                                    and request.baseline_only) else agg.first_value
         peak_rises = PeakRises(count_rises(values), agg.last_value - start)
 
+    band: List[Bucket] = []
+    intervals: List[IntervalStats] = []
+    if request.analysis and display_agg.count:
+        band = db.analytics.buckets(
+            task_id, metric, min(BAND_MAX_BUCKETS, request.max_buckets),
+            since=since, until=until, interval_seconds=interval if interval > 0 else None)
+        intervals = _intervals(db, task_id, metric, markers,
+                               display_agg.first_ts, display_agg.last_ts)
+
     return HistorySnapshot(
         points=points, stats=stats, buckets=buckets, total_count=total_count,
         stats_since=stats_since, baseline=baseline, judgement=judgement, rate=rate,
         fit_unit=fit_unit, gaps=list(gaps), rate_series=rate_series,
-        rate_stats=rate_stats, peak_rises=peak_rises, rounds=rounds, **base)
+        rate_stats=rate_stats, peak_rises=peak_rises, rounds=rounds,
+        band=band, intervals=intervals, **base)
+
+
+def _chart_points(db, request: HistoryRequest, total_count: int) -> List[DataPoint]:
+    """图表用的降采样点（真实数据点）。有终点（自定义范围）时：范围内点数不多就直接取
+    原始点，否则按起点分桶后裁掉终点之后的部分（分桶查询没有终点条件）。"""
+    task_id, metric, since, until = (
+        request.task_id, request.metric, request.since, request.until)
+    if until is not None and total_count <= 2 * request.max_buckets:
+        return db.points.fetch(PointQuery(task_id, metric, since=since, until=until))
+    buckets = db.analytics.legacy_buckets(task_id, metric, request.max_buckets, since=since)
+    if until is not None:
+        buckets = [p for p in buckets if p.timestamp <= until]
+    return buckets
+
+
+def _intervals(db, task_id: str, metric: str, markers: List[Marker],
+               first_ts: datetime, last_ts: datetime) -> List[IntervalStats]:
+    """
+    按打点（基线 + 用户打点，暂停/恢复不算）把 [first_ts, last_ts] 切成相邻区间，
+    每段用一次聚合查询取起止值、峰值与点数（不把原始点读进内存）。
+
+    口径与 core.analysis.intervals.split_intervals 一致：左闭右开、最后一段闭区间；
+    首个打点晚于首点时补"开始"段，最后一个打点早于末点时补"结束"段；没有打点时整段
+    为一个区间。label 取右边界的标签。
+    """
+    edges = [Boundary(m.timestamp, m.label, m.kind) for m in markers
+             if m.kind in (MARKER_KIND_USER, MARKER_KIND_BASELINE)
+             and first_ts <= m.timestamp <= last_ts]
+    if not edges or edges[0].timestamp > first_ts:
+        edges.insert(0, Boundary(first_ts, INTERVAL_FIRST_LABEL, 'start'))
+    if edges[-1].timestamp < last_ts:
+        edges.append(Boundary(last_ts, INTERVAL_LAST_LABEL, 'end'))
+    if len(edges) < 2:
+        return []
+
+    result: List[IntervalStats] = []
+    prev_delta: Optional[float] = None
+    last_index = len(edges) - 2
+    for i in range(len(edges) - 1):
+        left, right = edges[i], edges[i + 1]
+        # 右开：终点退 1 微秒（ISO 串的字典序与时间序一致，无小数位的时刻排在带小数的之前）
+        end = right.timestamp if i == last_index else right.timestamp - timedelta(microseconds=1)
+        agg = (db.analytics.aggregates(task_id, metric, since=left.timestamp, until=end)
+               if end >= left.timestamp else None)
+        duration = (right.timestamp - left.timestamp).total_seconds()
+        if agg is not None and agg.count:
+            start_value, end_value = agg.first_value, agg.last_value
+            delta: Optional[float] = end_value - start_value
+            peak: Optional[float] = agg.max_value
+            rate = delta / duration * 3600.0 if duration > 0 else None
+            count = agg.count
+        else:
+            start_value = end_value = delta = peak = rate = None
+            count = 0
+        result.append(IntervalStats(
+            index=i, label=right.label, start=left.timestamp, end=right.timestamp,
+            duration_seconds=duration, start_value=start_value, end_value=end_value,
+            delta=delta, rate_per_hour=rate, peak=peak, sample_count=count,
+            delta_vs_previous=(delta - prev_delta
+                               if delta is not None and prev_delta is not None else None)))
+        prev_delta = delta
+    return result
+
+
+@dataclass(frozen=True)
+class TaskAnalysis:
+    """分析页一次加载的结果：同一任务、同一范围下每个指标各一份快照（按任务指标顺序）。
+
+    request_seq 是这一批查询共用的批次序号（视图模型判过期用），auto_refresh 同快照。
+    """
+    task_id: str
+    range_key: str
+    snapshots: Dict[str, HistorySnapshot]
+    request_seq: int = 0
+    auto_refresh: bool = False
+
+    @property
+    def metrics(self) -> List[str]:
+        return list(self.snapshots)
+
+    def snapshot(self, metric: Optional[str]) -> Optional[HistorySnapshot]:
+        return self.snapshots.get(metric) if metric else None
+
+    @property
+    def markers(self) -> List[Marker]:
+        """任务的全部打点（各快照相同，取第一份）"""
+        first = next(iter(self.snapshots.values()), None)
+        return list(first.markers) if first is not None else []
+
+    @property
+    def has_data(self) -> bool:
+        return any(s.points for s in self.snapshots.values())
 
 
 def _known(metric: str) -> bool:

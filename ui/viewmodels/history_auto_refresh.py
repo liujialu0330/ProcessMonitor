@@ -1,5 +1,5 @@
 """
-历史页运行中任务的自动刷新调度（无控件）
+分析页运行中任务的自动刷新调度（无控件）
 
 只管"什么时候刷新"：定时器、按数据量分档的间隔、"本次是否跳过"的判断；
 "刷新什么、怎么查、结果是否过期"都在 HistoryViewModel.on_tick 里（与用户操作的
@@ -32,7 +32,7 @@ def auto_refresh_interval_for(count: int) -> int:
 
 class HistoryAutoRefresh(QObject):
     """
-    历史页自动刷新定时器。
+    分析页自动刷新定时器。
 
     Args:
         vm: HistoryViewModel；每次到点调用 vm.on_tick()

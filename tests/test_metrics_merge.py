@@ -17,7 +17,7 @@ OLD_KEYS = ("memory_vms", "memory_pagefile")
 def test_available_metrics_total_and_groups():
     """可选共 26 项（内存 11 / CPU 4 / 系统资源 5 / IO 6），不含已合并的旧键与已废弃指标"""
     sizes = {group: len(items) for group, items in AVAILABLE_METRICS.items()}
-    assert sizes == {"内存": 11, "CPU": 4, "系统资源": 5, "IO操作": 6}
+    assert sizes == {"内存": 11, "CPU": 4, "系统资源": 5, "I/O": 6}
     all_metrics = [m for items in AVAILABLE_METRICS.values() for m in items]
     assert len(all_metrics) == 26
     assert len(set(all_metrics)) == 26

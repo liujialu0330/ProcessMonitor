@@ -9,7 +9,7 @@ from qfluentwidgets import FluentIcon
 
 from core.contracts import StopReason, TaskInfo, TaskStatus
 from ui.components.task_card import StopIcon, TaskCard
-from ui.widgets.monitor.task_board import TaskBoard
+from ui.widgets.monitor.task_board import TaskBoard, summary_text
 from utils.metrics import MetricType
 
 END = datetime(2026, 1, 1, 12, 30, 0)
@@ -34,7 +34,7 @@ def board(qapp):
 
 def test_empty_board_shows_empty_state(board):
     board.set_counts(0, 5)
-    assert board.count_label.text() == "监控任务 · 0/5 运行中"
+    assert board.summary() == "运行中 0/5"
     assert board.empty_state.isVisible()
     assert not board.finished_label.isVisible()
 
@@ -60,8 +60,9 @@ def test_finished_card_moves_to_finished_group(board):
 
     assert board.card("t1").is_finished
     assert board.finished_count() == 1
-    assert board.count_label.text() == "监控任务 · 1/5 运行中 · 1 个已结束"
+    assert board.summary() == "运行中 1/5 · 已结束 1"
     assert board.finished_label.isVisible()
+    assert board.finished_label.text() == "已结束（1）"
     # 卡片位于"已结束"分组标签之下，运行中的卡片在它之上
     assert board.card("t1").mapTo(board, board.card("t1").rect().topLeft()).y() \
         > board.finished_label.mapTo(board, board.finished_label.rect().topLeft()).y() \
@@ -129,3 +130,48 @@ def test_stop_button_uses_stop_icon_not_cancel(qapp):
     assert not icon.icon().isNull()
     assert not card.stop_button.icon().pixmap(16, 16).isNull()
     card.close()
+
+
+# ---------- 已结束分组与页头摘要 ----------
+
+def test_summary_text_variants():
+    assert summary_text(2, 5, 1) == "运行中 2/5 · 已结束 1"
+    assert summary_text(0, 5, 0) == "运行中 0/5"
+    assert summary_text(1, 5, 2, waiting=1) == "运行中 1/5 · 等待启动 1 · 已结束 2"
+
+
+def test_finished_header_clear_all_emits(board):
+    board.create_card(_info("t1"))
+    board.create_card(_info("t2"))
+    changes = []
+    board.summary_changed.connect(changes.append)
+    board.set_counts(0, 5)
+    board.finish_card("t1", StopReason.USER, END)
+    board.finish_card("t2", StopReason.PROCESS_EXITED, END)
+
+    assert board.finished_label.text() == "已结束（2）"
+    assert board.clear_finished_button.text() == "清除全部"
+    assert board.clear_finished_button.isVisible()
+    assert board.finished_ids() == ["t1", "t2"]
+    assert changes[-1] == "运行中 0/5 · 已结束 2"
+
+    hits = []
+    board.clear_finished_requested.connect(lambda: hits.append(1))
+    board.clear_finished_button.click()
+    assert hits == [1]
+
+
+def test_finished_header_hidden_without_finished_cards(board):
+    board.create_card(_info("t1"))
+    board.set_counts(1, 5)
+    assert not board.finished_header.isVisible()
+
+
+def test_empty_state_is_three_step_guide(board):
+    from ui.widgets.monitor.empty_guide import EMPTY_TITLE
+    board.set_counts(0, 5)
+    guide = board.empty_state
+    assert guide.title_label.text() == EMPTY_TITLE
+    assert len(guide.step_titles) == 3
+    board.set_hotkey_text("Ctrl+Alt+M")
+    assert any("Ctrl+Alt+M" in label.text() for label in guide.step_hints)

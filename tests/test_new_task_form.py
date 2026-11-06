@@ -110,3 +110,22 @@ def test_show_error_and_fill_search(form):
     assert form.picker.error_text() == "请输入进程名或 PID"
     form.fill_search("demo.exe")
     assert form.picker.text() == "demo.exe" and form.picker.error_text() == ""
+
+
+# ---------- 键盘顺序 ----------
+
+def test_tab_order_follows_visual_order(form):
+    chain = [form.picker.combo.line_edit, form.interval_spinbox, form.metric_button,
+             form.note_input, form.wait_checkbox, form.start_button]
+    for first, second in zip(chain, chain[1:]):
+        widget = first.nextInFocusChain()
+        # SpinBox 等复合控件内部可能还有子控件：沿焦点链找到下一个声明的控件
+        while widget is not second and widget is not first and widget.parent() is first:
+            widget = widget.nextInFocusChain()
+        assert widget is second, (first, second)
+
+
+def test_interval_label_says_interval(form):
+    from qfluentwidgets import CaptionLabel
+    texts = [label.text() for label in form.details.findChildren(CaptionLabel)]
+    assert "采集间隔（秒）" in texts

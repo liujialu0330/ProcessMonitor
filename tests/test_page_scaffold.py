@@ -81,16 +81,20 @@ def test_header_commands_and_sections_in_order(page):
     assert first.mapTo(page, first.rect().topLeft()).x() > page.title_label.x()
 
 
-def test_export_page_is_built_on_scaffold(qapp, db):
+def test_analysis_page_is_built_on_scaffold(qapp, db):
     from core.monitor_manager import MonitorManager
-    from tests.factories import make_export_page
-    export = make_export_page(db, MonitorManager(db=db))
+    from tests.factories import make_analysis_page
+    from tests.helpers import SyncHistoryRunner
+    page = make_analysis_page(db, MonitorManager(db=db), worker_runner=SyncHistoryRunner(db),
+                              defer=lambda fn: fn())
     try:
-        assert isinstance(export, PageScaffold)
-        assert export.title_label.text() == "导出数据"
-        assert export.command_layout.itemAt(0).widget() is export.refresh_button
+        assert isinstance(page, PageScaffold)
+        assert page.title_label.text() == "分析"
+        # 工具条是第一段内容，任务选择器嵌在工具条里
+        assert page.toolbar.isAncestorOf(page.task_selector)
     finally:
-        export.close()
+        page.auto_refresh.stop()
+        page.close()
 
 
 # ---------------------------------------------------------------- 空状态卡

@@ -4,14 +4,16 @@
 - MetricAxisItem：Y 轴。刻度间距按"显示单位"选取（先把可见范围换算到 KB/MB/GB/TB
   再交给 pyqtgraph 选"整洁"间距，最后换算回原始值），保证刻度在显示单位下等距且为
   1/2/5 的整洁倍数；计数类指标强制整数刻度（间距至少 1）。
-- ContextDateAxisItem：X 轴，亚分钟缩放下保留时分上下文。
+- ContextDateAxisItem：X 轴，亚分钟缩放下保留时分上下文；设了相对原点时改为
+  "T+mm:ss"相对时间刻度（刻度间距取 1/2/5/10/15/30 秒、1/2/5/10/15/30 分、1/2/3/6/12 小时）。
 """
 import math
 from datetime import datetime
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import pyqtgraph as pg
 
+from ui.formatting import format_relative
 from utils.metrics import KB_UNIT_DIVISORS
 
 # 指标原始值以 KB 存储；坐标轴只转换显示文本与刻度间距，不改动绘图数据与数据库语义。
@@ -86,10 +88,59 @@ class MetricAxisItem(pg.AxisItem):
         return [f"{value * scale / divisor:,.{decimals}f}" for value in values]
 
 
+# 相对时间刻度的候选间距（秒）
+RELATIVE_TICK_SPACINGS = (
+    1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800,
+    3600, 7200, 10800, 21600, 43200, 86400)
+# 相对时间刻度之间的最小像素距离
+RELATIVE_TICK_MIN_PX = 80
+
+
+def relative_tick_spacing(span_seconds: float, size_px: float) -> float:
+    """可见跨度与像素宽度下，相邻刻度至少相距 RELATIVE_TICK_MIN_PX 的最小候选间距。"""
+    if span_seconds <= 0 or size_px <= 0:
+        return RELATIVE_TICK_SPACINGS[0]
+    wanted = span_seconds * RELATIVE_TICK_MIN_PX / size_px
+    for spacing in RELATIVE_TICK_SPACINGS:
+        if spacing >= wanted:
+            return spacing
+    days = math.ceil(wanted / 86400)
+    return days * 86400
+
+
 class ContextDateAxisItem(pg.DateAxisItem):
-    """在亚分钟缩放下保留完整时间上下文的 DateAxisItem。"""
+    """在亚分钟缩放下保留完整时间上下文的 DateAxisItem；可切换为相对时间刻度。"""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # 相对时间原点（epoch 秒）；None 表示显示绝对时间
+        self.relative_origin: Optional[float] = None
+
+    def set_relative_origin(self, origin: Optional[float]) -> None:
+        """设置相对时间原点（None 恢复绝对时间），并使刻度缓存失效。"""
+        self.relative_origin = origin
+        self.picture = None
+        self.update()
+
+    def tickValues(self, minVal, maxVal, size):
+        origin = self.relative_origin
+        if origin is None:
+            return super().tickValues(minVal, maxVal, size)
+        spacing = relative_tick_spacing(maxVal - minVal, size)
+        first = math.ceil((minVal - origin) / spacing) * spacing
+        values = []
+        value = first
+        while value + origin <= maxVal and len(values) < 200:
+            values.append(value + origin)
+            value += spacing
+        return [(spacing, values)]
 
     def tickStrings(self, values, scale, spacing):
+        if self.relative_origin is not None:
+            return [format_relative(v - self.relative_origin) for v in values]
+        return self._absolute_tick_strings(values, scale, spacing)
+
+    def _absolute_tick_strings(self, values, scale, spacing):
         # DateAxisItem 在亚秒级默认只显示「36.500」一类秒数，
         # 对性能监控读图而言缺少时分上下文。其他尺度仍交还
         # pyqtgraph 的成熟自动分级逻辑。

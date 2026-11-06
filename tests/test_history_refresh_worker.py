@@ -1,6 +1,6 @@
 """
 历史数据查询后台线程（HistoryRefreshWorker）：外壳本身（execute 调 run_history_query、
-成功/存储故障/编程错误的打包），以及它在历史页上的生产装配：自动刷新结果在主线程
+成功/存储故障/编程错误的打包），以及它在分析页上的生产装配：自动刷新结果在主线程
 应用且不重置视图、页面隐藏后结果丢弃、线程结束后被释放、退出时带超时 join。
 过期丢弃、单飞、失败提示去重等调度规则见 tests/test_history_vm.py。
 不依赖固定 sleep：一律轮询等待（tests/helpers.poll_until）。
@@ -15,9 +15,9 @@ from PyQt5.QtWidgets import QApplication
 from core.monitor_manager import MonitorManager
 from data.models import DataPoint
 from tests.doubles import FakeClock
-from tests.factories import make_history_page, make_main_window, make_services
+from tests.factories import make_analysis_page, make_main_window, make_services
 from tests.helpers import poll_until
-from tests.test_history_page_flow import BASE, _seed_task
+from tests.history_dataset import SIMPLE_BASE as BASE, _seed_task
 from utils.metrics import MetricType
 from utils.thread_utils import shutdown_thread
 
@@ -48,8 +48,8 @@ def services():
 
 @pytest.fixture
 def page(qapp, db, manager, services):
-    """生产装配的历史页（每个请求一个后台线程、加载推迟到下一轮事件循环）"""
-    widget = make_history_page(db, manager, services)
+    """生产装配的分析页（每个指标一个后台查询线程、加载推迟到下一轮事件循环）"""
+    widget = make_analysis_page(db, manager, services)
     widget.resize(1200, 800)
     widget.release = None   # 测试可置入阻塞闸，teardown 统一放行
     yield widget
@@ -62,7 +62,7 @@ def page(qapp, db, manager, services):
 
 @pytest.fixture
 def shown(page, db, services):
-    """已显示、已选中一个 20 点任务的页面；该任务视为运行中，定时刷新会发起后台查询"""
+    """已显示、已选中一个 20 点单指标任务的页面；该任务视为运行中，定时刷新会发起后台查询"""
     task = _seed_task(db, samples=20, status="running")
     services.task_status.set_running(task.task_id)
     page.show()
@@ -105,13 +105,13 @@ def _query_thread(services):
 
 def test_auto_refresh_result_updates_page_and_keeps_view(shown, db, monkeypatch):
     page = shown
-    chart = page.chart_view
+    chart = page.trend_panel.charts()[METRIC]
     points_before = len(chart.x_values)
     rows_before = page.sample_table.data_table.rowCount()
 
     # 模拟用户缩放：自动刷新不得重置视图
-    page.chart_view.chart_widget.setXRange(chart.x_values[2], chart.x_values[8], padding=0)
-    x_range_before = page.chart_view.chart_widget.viewRange()[0]   # 只比 X（Y 轴自适应是既有行为）
+    chart.chart_widget.setXRange(chart.x_values[2], chart.x_values[8], padding=0)
+    x_range_before = chart.chart_widget.viewRange()[0]   # 只比 X（Y 轴自适应是既有行为）
     resets = []
     monkeypatch.setattr(chart, 'reset_view', lambda: resets.append(1))
 
@@ -121,9 +121,9 @@ def test_auto_refresh_result_updates_page_and_keeps_view(shown, db, monkeypatch)
 
     assert page.sample_table.data_table.rowCount() == rows_before + 15
     assert "共 35 条" in page.sample_table.table_hint_label.text()
-    assert page.stats_strip.texts()["当前值"] != "--"
+    assert page.summary_table.row_texts()[0][2] == "134 MB"   # 当前值随新数据更新
     assert resets == []
-    assert page.chart_view.chart_widget.viewRange()[0] == x_range_before
+    assert chart.chart_widget.viewRange()[0] == x_range_before
 
 
 def test_result_dropped_after_page_hidden(shown, db, services, monkeypatch):
@@ -191,7 +191,7 @@ def test_main_window_close_joins_history_refresh_worker(qapp, tmp_path, monkeypa
     db = Database(str(tmp_path / "close_join.db"))
     manager = MonitorManager(db=db)
     win = make_main_window(db, manager)
-    win.about_page.check_update = lambda *args, **kwargs: None
+    win.about_group.check_update = lambda *args, **kwargs: None
     monkeypatch.setattr(QApplication, 'quit', MagicMock())
     worker = _SlowRefresh()
     win.services.threads.register(worker, name="历史自动刷新", timeout_ms=3000)

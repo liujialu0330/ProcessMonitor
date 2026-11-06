@@ -130,6 +130,22 @@ def _apply_preferences(app, paths: AppPaths) -> None:
     setTheme(cfg.get(cfg.themeMode))
 
 
+def _create_marker_hotkey(app, services):
+    """全局打点快捷键：装到 QApplication 的原生事件过滤器上，按用户偏好注册。
+
+    注册失败（被其他程序占用、非 Windows）只记日志，设置页显示"快捷键不可用"，
+    不影响启动。
+    """
+    from ui.hotkey import MarkerHotkey
+
+    hotkey = MarkerHotkey()
+    hotkey.install(app)
+    hotkey.bind(services.preferences.marker_hotkey())
+    if not hotkey.is_active():
+        logger.info("全局打点快捷键未启用：%s", hotkey.status_text())
+    return hotkey
+
+
 def run(argv: List[str], *, exit_process: Callable[[int], None] = os._exit) -> int:
     """
     应用入口：按模块说明的固定顺序启动，返回进程退出码。
@@ -164,7 +180,8 @@ def run(argv: List[str], *, exit_process: Callable[[int], None] = os._exit) -> i
     ctx = build_context(paths)
 
     from ui.main_window import MainWindow
-    window = MainWindow(ctx.db, ctx.manager, ctx.services)
+    hotkey = _create_marker_hotkey(app, ctx.services)
+    window = MainWindow(ctx.db, ctx.manager, ctx.services, hotkey=hotkey)
     ctx.window = window
     window.show()
     guard.activation_requested.connect(lambda: activate_main_window(window))

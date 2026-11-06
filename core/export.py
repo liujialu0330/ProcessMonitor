@@ -1,9 +1,10 @@
 """
 导出逻辑纯函数模块
-从 ui/pages/export_page.py 中抽出的表头生成与数据透视逻辑，
-不依赖 UI/数据库，便于单元测试与流式导出复用。
+CSV 表头生成与数据透视（同一时刻多指标合并为一行、打点列），不依赖 UI/数据库，
+便于单元测试与流式导出复用；分析页报告导出（core/report.py）经 pivot_timed_rows 使用。
 """
-from typing import Iterator, Iterable, List, Optional
+from datetime import datetime
+from typing import Iterator, Iterable, List, Optional, Tuple
 
 from data.models import MonitorTask, DataPoint, Marker
 from utils.metrics import get_metric_display_name, get_metric_unit, is_integer_metric
@@ -68,6 +69,15 @@ def pivot_rows(task: MonitorTask, data_point_iter: Iterable[DataPoint],
     Yields:
         list: [时间字符串, 进程名称, PID, <各指标值或空串>..., [打点标签]]
     """
+    for _timestamp, row in pivot_timed_rows(task, data_point_iter, markers):
+        yield row
+
+
+def pivot_timed_rows(task: MonitorTask, data_point_iter: Iterable[DataPoint],
+                     markers: Optional[Iterable[Marker]] = None
+                     ) -> Iterator[Tuple[datetime, list]]:
+    """与 pivot_rows 相同，但每行同时给出该行的采集时刻 (timestamp, row)，
+    供报告 CSV 计算"已运行(秒)"与识别空洞。"""
     metrics = task.metric_types
     first_metric = metrics[0] if metrics else ''
 
@@ -95,7 +105,7 @@ def pivot_rows(task: MonitorTask, data_point_iter: Iterable[DataPoint],
                 labels.append(pending_markers[marker_index].label)
                 marker_index += 1
             row.append(MARKER_LABEL_SEPARATOR.join(labels))
-        return row
+        return current_timestamp, row
 
     for dp in data_point_iter:
         # metric_type 为 NULL/空串的旧数据兜底归入首指标

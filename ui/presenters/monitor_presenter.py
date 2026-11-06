@@ -1,9 +1,9 @@
 """
 监控页 Presenter
 
-开始 / 停止 / 暂停 / 恢复 / 打点 / 重新监控 / 分析 / 关闭卡片的业务流程，以及
-manager 各信号（任务添加、启动、停止、数据更新、打点变化、指标不可用、错误、达到上限）
-的界面响应。卡片上的"较基线"由这里维护：基线值 = 基线打点之后前 5 个样本的中位数，
+开始 / 等待进程启动 / 停止 / 暂停 / 恢复 / 打点（含托盘与全局快捷键的免弹窗打点）/
+同配置再测 / 分析 / 关闭卡片与清除已结束的业务流程，以及 manager 各信号（任务添加、
+启动、停止、数据更新、打点变化、指标不可用、错误、达到上限）的界面响应。卡片上的"较基线"由这里维护：基线值 = 基线打点之后前 5 个样本的中位数，
 打点/换基线时先从库里取已有样本，不足部分随 data_updated 累积。依赖：
 - manager：只用命令与只读快照接口，不接触任务线程对象；
 - services：process_query / dialogs / notifier / clock / preferences；
@@ -13,6 +13,7 @@ manager 各信号（任务添加、启动、停止、数据更新、打点变化
 
 中文文案（表单错误、提示）集中在这里；控件只发信号、显示给定内容。
 """
+import itertools
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -23,11 +24,12 @@ from PyQt5.QtWidgets import QWidget
 import config
 from core.contracts import StopReason, UnavailableReason
 from core.monitor_manager import BASELINE_SAMPLE_COUNT, default_marker_kind, median_of
-from ui.formatting import stop_reason_text, unavailable_reason_text
+from ui.formatting import stop_reason_text, truncate_text, unavailable_reason_text
 from ui.services import UiServices
-from ui.widgets.monitor.new_task_form import TaskRequest
+from ui.widgets.monitor.new_task_form import TaskRequest, WaitRequest
 from ui.widgets.monitor.process_picker import (
-    ERROR_EMPTY, ERROR_NO_MATCH, ERROR_NOT_A_NUMBER, ERROR_NOT_FOUND, ResolveError,
+    ERROR_EMPTY, ERROR_NO_MATCH, ERROR_NOT_A_NUMBER, ERROR_NOT_FOUND,
+    ERROR_WAIT_NEEDS_NAME, ResolveError,
 )
 from utils.metrics import get_metric_display_name
 
@@ -35,12 +37,21 @@ from utils.metrics import get_metric_display_name
 # 不能像普通提示那样两秒就消失
 ABNORMAL_STOP_INFOBAR_MS = 15000
 UNAVAILABLE_INFOBAR_MS = 10000
-TASK_STARTED_INFOBAR_MS = 1000
 RESTART_HINT_INFOBAR_MS = 5000
 # 卡片"已运行"与"（N 分钟前）"的刷新间隔（毫秒）
 TICK_INTERVAL_MS = 1000
+# 等待进程启动的轮询间隔（毫秒）
+WAIT_POLL_INTERVAL_MS = 1000
 
-STOP_CONFIRM_HINT = "停止后不能继续记录到这个任务；要继续请“重新监控”。已采集的数据会保留。"
+STOP_CONFIRM_HINT = "停止后不能继续记录到这个任务；要继续请用“同配置再测”。已采集的数据会保留。"
+
+# 免弹窗打点（托盘菜单 / 全局快捷键）的反馈种类
+QUICK_MARKER_OK = 'ok'
+QUICK_MARKER_NONE = 'none'          # 没有可打点的任务
+QUICK_MARKER_FAILED = 'failed'      # 写库失败
+
+# 托盘菜单里任务名的最大显示字数
+TARGET_NOTE_CHARS = 16
 
 
 def resolve_error_text(error: ResolveError) -> str:
@@ -53,6 +64,8 @@ def resolve_error_text(error: ResolveError) -> str:
         return "输入的内容与进程列表不匹配，请从下拉列表中选择，或直接输入 PID"
     if error.kind == ERROR_EMPTY:
         return "请输入进程名或 PID，或从列表中选择进程"
+    if error.kind == ERROR_WAIT_NEEDS_NAME:
+        return "等待进程启动需要填写进程名（如 notepad.exe），不能用 PID"
     raise ValueError(f"未知的进程选择错误：{error.kind!r}")
 
 
@@ -76,24 +89,56 @@ class _TaskEntry:
     interval: Optional[float]
     note: str
     finished: bool = False
+    # 已发出停止请求、等待收尾：不再接受打点
+    stopping: bool = False
     baseline: Optional[_BaselineTracker] = None
 
     @property
     def display_name(self) -> str:
         return f"{self.process_name}（PID {self.pid}）"
 
+    @property
+    def active(self) -> bool:
+        """还能打点（运行中或已暂停，未结束、未在停止）。"""
+        return not self.finished and not self.stopping
+
+    def target_text(self) -> str:
+        """托盘菜单里的任务名："demo.exe · PID 1234 · 备注"。"""
+        text = f"{self.process_name} · PID {self.pid}"
+        if self.note:
+            text += f" · {truncate_text(self.note, TARGET_NOTE_CHARS)}"
+        return text
+
+
+@dataclass
+class _WaitEntry:
+    """一次"等待进程启动后自动开始"：按进程名轮询，出现即按 request 建任务。"""
+    wait_id: str
+    request: WaitRequest
+
+    def candidate_names(self) -> List[str]:
+        """要查找的进程名：没写扩展名时也试一下加 .exe（多数人只记得程序名）。"""
+        name = self.request.name
+        names = [name]
+        if '.' not in name:
+            names.append(f"{name}.exe")
+        return names
+
 
 class MonitorPresenter(QObject):
     """监控页业务流程。
 
     信号：
-        history_requested(str): 卡片"分析"：请求切到分析（历史）页并选中该任务（主窗口处理）
+        history_requested(str): 卡片"分析"：请求切到分析页并选中该任务（主窗口处理）
         task_ended_abnormally(str, str): 被测进程自行结束（不是用户停止）：(标题, 内容)，
             主窗口不在前台时据此弹托盘气泡
+        quick_marker_feedback(str, str, str): 免弹窗打点的结果 (种类, 标题, 内容)，
+            种类见 QUICK_MARKER_*；主窗口据此弹托盘气泡
     """
 
     history_requested = pyqtSignal(str)
     task_ended_abnormally = pyqtSignal(str, str)
+    quick_marker_feedback = pyqtSignal(str, str, str)
 
     def __init__(self, manager, services: UiServices, form, board, host: QWidget,
                  parent: Optional[QObject] = None, *,
@@ -107,6 +152,9 @@ class MonitorPresenter(QObject):
         self.task_limit = task_limit
 
         self._tasks: Dict[str, _TaskEntry] = {}
+        # 等待进程启动的请求 {等待 ID: 请求}
+        self._waits: Dict[str, _WaitEntry] = {}
+        self._wait_ids = itertools.count(1)
         # 当前显示中的错误提示 {(task_id, 内容): 提示对象}：错误提示不自动消失，
         # 同一任务同一错误重复上报时不再叠加
         self._error_bars: Dict[Tuple[str, str], Any] = {}
@@ -116,12 +164,18 @@ class MonitorPresenter(QObject):
         self._tick_timer.setInterval(TICK_INTERVAL_MS)
         self._tick_timer.timeout.connect(self.tick)
 
+        # 有等待中的进程时每秒查一次是否已启动
+        self._wait_timer = QTimer(self)
+        self._wait_timer.setInterval(WAIT_POLL_INTERVAL_MS)
+        self._wait_timer.timeout.connect(self.poll_waits)
+
         # 新建任务沿用上次选择的指标（默认"泄漏排查"预设）
         self.form.set_metrics_summary(self.services.preferences.last_metrics())
         self.form.set_collapsed(False)
         self._sync_counts()
 
         self.form.start_requested.connect(self.on_start_requested)
+        self.form.wait_requested.connect(self.on_wait_requested)
         self.form.target_invalid.connect(self.on_target_invalid)
         self.form.choose_metrics_requested.connect(self.on_choose_metrics)
 
@@ -132,6 +186,8 @@ class MonitorPresenter(QObject):
         self.board.history_requested.connect(self.history_requested)
         self.board.restart_requested.connect(self.on_restart)
         self.board.close_requested.connect(self.on_close)
+        self.board.clear_finished_requested.connect(self.on_clear_finished)
+        self.board.wait_cancel_requested.connect(self.on_wait_cancel)
 
         manager.task_added.connect(self.on_task_added)
         manager.task_started.connect(self.on_task_started)
@@ -152,6 +208,19 @@ class MonitorPresenter(QObject):
         """仍在显示中的错误提示键 (task_id, 内容)。"""
         return set(self._error_bars)
 
+    def active_task_ids(self) -> List[str]:
+        """还能打点的任务（运行中或已暂停），按加入顺序。"""
+        return [task_id for task_id, entry in self._tasks.items() if entry.active]
+
+    def marker_targets(self) -> List[Tuple[str, str]]:
+        """托盘"打点"菜单的候选任务 [(task_id, 显示名)]。"""
+        return [(task_id, self._tasks[task_id].target_text())
+                for task_id in self.active_task_ids()]
+
+    def wait_ids(self) -> List[str]:
+        """等待中的进程启动请求 ID（按加入顺序）。"""
+        return list(self._waits)
+
     def next_marker_label(self, task_id: str) -> Optional[str]:
         """下一个打点的默认名称（基线 / 第 N 轮）；面板上没有该任务时返回 None。"""
         if task_id not in self._tasks:
@@ -169,9 +238,13 @@ class MonitorPresenter(QObject):
     def _sync_counts(self) -> None:
         self.board.set_counts(self.manager.running_task_count(), self.task_limit)
 
+    def _has_items(self) -> bool:
+        return bool(self._tasks) or bool(self._waits)
+
     def _set_has_tasks(self, had_tasks: bool) -> None:
-        """面板从空到有卡片时折叠表单，从有到空时展开；其余时候不动用户的展开状态。"""
-        has_tasks = bool(self._tasks)
+        """面板从空到有卡片（含等待占位卡）时折叠表单，从有到空时展开；
+        其余时候不动用户的展开状态。"""
+        has_tasks = self._has_items()
         if has_tasks != had_tasks:
             self.form.set_collapsed(has_tasks)
         self._sync_tick_timer()
@@ -234,13 +307,68 @@ class MonitorPresenter(QObject):
             "仍要再创建一个吗？",
             "继续创建")
 
+    # ========== 等待进程启动 ==========
+
+    def on_wait_requested(self, request: WaitRequest) -> Optional[str]:
+        """登记一次等待：面板放占位卡，立刻查一次（进程已在运行就直接开始），
+        之后每秒查一次。返回等待 ID；没选指标时拒绝并返回 None。"""
+        if not request.metrics:
+            self._warn("请先选择要监控的指标")
+            return None
+        had_tasks = self._has_items()
+        wait_id = f"wait-{next(self._wait_ids)}"
+        self._waits[wait_id] = _WaitEntry(wait_id, request)
+        self.board.add_waiting(wait_id, request.name, request.note)
+        self._set_has_tasks(had_tasks)
+        self.poll_waits()
+        self._sync_wait_timer()
+        return wait_id
+
+    def on_wait_cancel(self, wait_id: str) -> None:
+        """占位卡的"取消等待"。"""
+        self._drop_wait(wait_id)
+
+    def _drop_wait(self, wait_id: str) -> None:
+        if self._waits.pop(wait_id, None) is None:
+            return
+        had_tasks = True
+        self.board.remove_waiting(wait_id)
+        self._set_has_tasks(had_tasks)
+        self._sync_wait_timer()
+
+    def _sync_wait_timer(self) -> None:
+        if self._waits and not self._wait_timer.isActive():
+            self._wait_timer.start()
+        elif not self._waits and self._wait_timer.isActive():
+            self._wait_timer.stop()
+
+    def poll_waits(self) -> None:
+        """查一遍各等待中的进程（定时器每秒调用；测试可直接调用）：出现即移除占位卡，
+        按请求参数建任务。同名进程有多个时取最新启动的那个。"""
+        query = self.services.process_query
+        for wait_id, entry in list(self._waits.items()):
+            if wait_id not in self._waits:
+                continue
+            for name in entry.candidate_names():
+                matches = query.find_pids_by_name(name)
+                if matches:
+                    break
+            else:
+                continue
+            pid, create_time = max(matches, key=lambda m: m[1] or 0.0)
+            request = entry.request
+            self._drop_wait(wait_id)
+            self.start_monitoring(TaskRequest(
+                pid=pid, name=name, create_time=create_time, metrics=request.metrics,
+                interval=request.interval, note=request.note))
+
     # ========== manager 信号 ==========
 
     def on_task_added(self, task_id: str) -> None:
         info = self.manager.get_task_info(task_id)
         if info is None:
             return
-        had_tasks = bool(self._tasks)
+        had_tasks = self._has_items()
         self._tasks[task_id] = _TaskEntry(
             task_id=task_id, pid=info.pid, process_name=info.process_name,
             metric_types=tuple(info.metric_types), interval=info.interval, note=info.note)
@@ -249,12 +377,11 @@ class MonitorPresenter(QObject):
         self._set_has_tasks(had_tasks)
 
     def on_task_started(self, task_id: str) -> None:
+        """卡片开始计时。不弹"已启动"提示：卡片就在眼前，结果直接可见。"""
         card = self.board.card(task_id)
         if card is not None:
             card.set_started_at(self.services.clock.now())
         self._sync_counts()
-        self.services.notifier.success(
-            self.host, "成功", "监控任务已启动", TASK_STARTED_INFOBAR_MS)
 
     def on_task_stopped(self, task_id: str, reason: StopReason) -> None:
         """卡片保留并转为"已结束"，同时请 manager 移除 core 侧任务。remove_task 不阻塞：
@@ -271,7 +398,7 @@ class MonitorPresenter(QObject):
 
         reason_text = stop_reason_text(reason)
         if reason is StopReason.USER:
-            self.services.notifier.info(self.host, "任务已停止", f"原因：{reason_text}", 2000)
+            # 用户自己点的停止：卡片当场转为已结束，不再弹提示
             return
 
         # 被测进程崩溃/退出等自行结束：提示要显眼且停留更久，并通知主窗口在后台时补托盘气泡
@@ -396,6 +523,7 @@ class MonitorPresenter(QObject):
         if not confirmed:
             return
         if self.manager.stop_task(task_id):
+            entry.stopping = True
             card = self.board.card(task_id)
             if card is not None:
                 card.set_stopping()
@@ -441,8 +569,54 @@ class MonitorPresenter(QObject):
             self.host, "已打点",
             f"{marker.label} · {marker.timestamp.strftime('%H:%M:%S')}", 2000)
 
+    # ========== 免弹窗打点（托盘菜单 / 全局快捷键） ==========
+
+    def quick_marker(self, task_id: Optional[str] = None) -> List[Any]:
+        """不弹窗，直接用默认名称（基线 / 第 N 轮）在当前时刻打点，返回写入的打点。
+
+        task_id 给出时只打这个任务（托盘子菜单）；为 None 时打全部运行中/已暂停的
+        任务（全局快捷键、只有一个任务时的托盘菜单）——同一轮操作对各被测进程是同一个
+        时刻。结果经 quick_marker_feedback 交给主窗口弹托盘气泡。
+        """
+        ids = self.active_task_ids()
+        if task_id is not None:
+            ids = [task_id] if task_id in ids else []
+        if not ids:
+            self.quick_marker_feedback.emit(
+                QUICK_MARKER_NONE, "没有可打点的任务", "请先在监控页开始监控")
+            return []
+
+        when = self.services.clock.now()
+        added: List[Tuple[_TaskEntry, Any]] = []
+        failed: List[_TaskEntry] = []
+        for tid in ids:
+            entry = self._tasks[tid]
+            label = self.manager.next_marker_label(tid)
+            marker = self.manager.add_marker(
+                tid, label, when, kind=default_marker_kind(label, label))
+            if marker is None:
+                failed.append(entry)
+            else:
+                added.append((entry, marker))
+
+        clock_text = when.strftime('%H:%M:%S')
+        if failed:
+            names = "、".join(entry.process_name for entry in failed)
+            self.quick_marker_feedback.emit(
+                QUICK_MARKER_FAILED, "打点失败", f"{names}：未能保存打点，请查看日志")
+        if len(added) == 1:
+            entry, marker = added[0]
+            self.quick_marker_feedback.emit(
+                QUICK_MARKER_OK, f"已打点：{marker.label} {clock_text}",
+                f"{entry.process_name} · PID {entry.pid}")
+        elif added:
+            self.quick_marker_feedback.emit(
+                QUICK_MARKER_OK, f"已打点：{len(added)} 个任务 {clock_text}",
+                "；".join(f"{entry.process_name}：{marker.label}" for entry, marker in added))
+        return [marker for _entry, marker in added]
+
     def on_restart(self, task_id: str) -> Optional[str]:
-        """已结束卡片的"重新监控"：按进程名找到唯一的运行进程时，以相同指标/间隔/
+        """已结束卡片的"同配置再测"：按进程名找到唯一的运行进程时，以相同指标/间隔/
         备注新建任务；找不到或有多个时把进程名填入搜索框，由用户自己选。"""
         entry = self._tasks.get(task_id)
         if entry is None:
@@ -466,14 +640,26 @@ class MonitorPresenter(QObject):
                 title="请选择进程", duration=RESTART_HINT_INFOBAR_MS)
         else:
             self._warn(
-                f"当前没有运行中的 {entry.process_name}，启动后点击刷新再选择",
+                f"当前没有运行中的 {entry.process_name}；可勾选“等待进程启动后自动开始”再点开始",
                 title="未找到进程", duration=RESTART_HINT_INFOBAR_MS)
         return None
 
     def on_close(self, task_id: str) -> None:
         """从列表移除卡片（历史数据仍保留）。"""
-        had_tasks = bool(self._tasks)
+        had_tasks = self._has_items()
         self._tasks.pop(task_id, None)
         self.board.remove_card(task_id)
+        self._sync_counts()
+        self._set_has_tasks(had_tasks)
+
+    def on_clear_finished(self) -> None:
+        """"已结束"分组的"清除全部"：移除全部已结束卡片（数据仍保留在分析页）。"""
+        finished = [task_id for task_id, entry in self._tasks.items() if entry.finished]
+        if not finished:
+            return
+        had_tasks = self._has_items()
+        for task_id in finished:
+            self._tasks.pop(task_id, None)
+            self.board.remove_card(task_id)
         self._sync_counts()
         self._set_has_tasks(had_tasks)

@@ -31,7 +31,7 @@ def test_build_csv_header_multi_metric():
     task = _make_task(["memory_rss", "cpu_percent", "cpu_priority"])
     header = build_csv_header(task)
     # cpu_priority 无单位，不应带括号
-    assert header == ['时间', '进程名称', 'PID', '工作集内存(KB)', 'CPU使用率(%)', '优先级']
+    assert header == ['时间', '进程名称', 'PID', '工作集内存(KB)', 'CPU使用率(%)', '基本优先级']
 
 
 def test_pivot_rows_multi_metric_alignment():
