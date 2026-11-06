@@ -78,9 +78,11 @@ def test_task_option_text_marks_running_and_uses_now_for_duration():
     assert text.count(" · ") == 3  # 无备注时不带备注段
 
 
-def test_task_option_text_full_date():
-    text = format_task_option_text(_task(), False, FAR_NOW, full_date=True)
-    assert "2026-07-16 20:54" in text
+def test_task_option_text_omits_year_and_tooltip_has_complete_date():
+    """下拉文本的开始时间不带年份，完整日期由 tooltip 给出"""
+    text = format_task_option_text(_task(), False, FAR_NOW)
+    assert "2026" not in text and "07-16 20:54" in text
+    assert "开始：2026-07-16 20:54" in format_task_tooltip(_task(), False, FAR_NOW)
 
 
 def test_task_duration_running_uses_given_now_only():

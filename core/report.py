@@ -10,7 +10,7 @@
   "#" 跳过；
 - <任务>_摘要.csv：指标 × 打点区间，每行一个指标的一个区间。
 
-这里不依赖 Qt 控件与数据库，便于直接单测；读库与写文件在 core.export_worker.ReportWorker。
+这里不依赖 Qt 控件与数据库，便于直接单测；读库与写文件在 core.report_worker.ReportWorker。
 """
 import os
 from dataclasses import dataclass

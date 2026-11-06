@@ -41,12 +41,8 @@ class TaskOptionsModel:
       换成最终时长并不再刷新；返回文本或提示有变化的下标，供控件原地更新。
     """
 
-    def __init__(self, *, full_date: bool = False):
-        """
-        Args:
-            full_date: 开始时间是否带年份（分析页下拉用 False，跨年时由 tooltip 给完整日期）
-        """
-        self._full_date = full_date
+    def __init__(self):
+        # 选项文本的开始时间不带年份，跨年时由 tooltip 给完整日期
         self._entries: List[_Entry] = []
         self._index: Dict[str, int] = {}
 
@@ -54,8 +50,7 @@ class TaskOptionsModel:
                      now: datetime) -> TaskOption:
         return TaskOption(
             task_id=task.task_id,
-            text=format_task_option_text(
-                task, running=running, now=now, full_date=self._full_date),
+            text=format_task_option_text(task, running=running, now=now),
             tooltip=format_task_tooltip(task, running, now),
             running=running,
         )

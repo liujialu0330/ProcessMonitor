@@ -25,7 +25,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from PyQt5.QtCore import pyqtSignal, pyqtSlot
 
-from core.export_worker import ReportJob, ReportResult, ReportWorker
+from core.report_worker import ReportJob, ReportResult, ReportWorker
 from core.history_query import (
     BASELINE_RANGE_KEY, CUSTOM_RANGE_KEY, DEFAULT_RANGE_KEY, RANGE_KEYS,
     HistorySnapshot, TaskAnalysis, build_request)
