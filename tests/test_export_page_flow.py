@@ -150,6 +150,29 @@ def test_no_overwrite_prompt_for_new_file(page, db, tmp_path, monkeypatch, silen
     assert page._export_worker is not None
 
 
+def test_export_worker_reuses_page_db(page, db, silent_infobar):
+    """导出线程复用页面持有的 Database 实例，不按路径另建"""
+    _seed_task(db)
+    page._load_tasks()
+    page._export_data()
+    assert page._export_worker is not None
+    assert page._export_worker.db is page.db
+
+
+# ---------- 错误提示 ----------
+
+def test_error_infobars_stay_until_closed(page, db, silent_infobar, monkeypatch):
+    """错误类提示不自动消失（duration=-1），需用户手动关闭"""
+    page._on_export_error("导出失败：磁盘已满")
+    assert silent_infobar[-1][0] == "error"
+    assert silent_infobar[-1][1]["duration"] == -1
+
+    monkeypatch.setattr(db, 'get_task', lambda task_id: None)
+    page._load_task_info("不存在的任务")
+    assert silent_infobar[-1][0] == "error"
+    assert silent_infobar[-1][1]["duration"] == -1
+
+
 # ---------- 千分位与任务来源 ----------
 
 def test_task_info_uses_thousands_separators(page, db):
@@ -272,3 +295,107 @@ def test_running_task_label_and_summary_refresh_while_visible(page, db, monkeypa
 
     page.hide()
     assert not page._running_refresh_timer.isActive()
+
+
+# ---------- 与清理数据库互斥 ----------
+
+@pytest.fixture
+def managed_page(qapp, db, tmp_path):
+    from core.monitor_manager import MonitorManager
+    manager = MonitorManager(db=db)
+    widget = ExportPage(db=db, manager=manager)
+    widget._last_dir = str(tmp_path)
+    widget.resize(900, 700)
+    yield widget, manager
+    worker = widget._export_worker
+    if worker is not None:
+        worker.cancel()
+        worker.wait(5000)
+    widget.close()
+
+
+def test_export_registers_with_manager_until_thread_finished(
+        managed_page, db, tmp_path, silent_infobar):
+    """开始导出即登记（此时不能开始清理数据库），线程结束后注销"""
+    page, manager = managed_page
+    _seed_task(db, samples=6)
+    page._load_tasks()
+    page.path_edit.setText(str(tmp_path / "out.csv"))
+
+    page._export_data()
+    assert page._export_worker is not None
+    assert manager.has_running_exports() is True
+    assert manager.begin_maintenance() is False
+
+    from PyQt5.QtWidgets import QApplication
+    assert poll_until(lambda: (QApplication.processEvents() or True)
+                      and page._export_worker is None, timeout=15)
+    assert manager.has_running_exports() is False
+    assert manager.begin_maintenance() is True
+    manager.end_maintenance()
+
+
+def test_export_unregisters_even_if_worker_reference_replaced(managed_page):
+    """旧 worker 的 finished 晚于新 worker 启动到达时也要注销自己那一次登记"""
+    page, manager = managed_page
+    assert manager.begin_export() is True
+    old_worker = object()
+    page._export_worker = newer = SimpleNamespace(isRunning=lambda: True)
+    try:
+        page._on_export_thread_finished(old_worker)
+
+        assert manager.has_running_exports() is False
+        assert page._export_worker is newer
+    finally:
+        page._export_worker = None
+
+
+def test_export_refused_during_maintenance(
+        managed_page, db, tmp_path, monkeypatch, silent_infobar):
+    """清理数据库进行中：不弹保存对话框、不启动导出线程，并提示稍后再导出"""
+    page, manager = managed_page
+    _seed_task(db)
+    page._load_tasks()
+    page.path_edit.setText("")
+    monkeypatch.setattr(
+        page, '_browse_save_path', lambda: pytest.fail("维护中不应弹保存对话框"))
+    assert manager.begin_maintenance() is True
+
+    page._export_data()
+
+    assert page._export_worker is None
+    assert manager.has_running_exports() is False
+    level, kwargs = silent_infobar[-1]
+    assert level == "warning"
+    assert kwargs["content"] == "正在清理数据库，请稍后再导出"
+    manager.end_maintenance()
+
+
+def test_export_refused_if_maintenance_starts_during_overwrite_confirm(
+        managed_page, db, tmp_path, monkeypatch, silent_infobar):
+    """覆盖确认框期间清理已开始：以登记结果为准，不启动导出线程"""
+    page, manager = managed_page
+    _seed_task(db)
+    page._load_tasks()
+    existing = tmp_path / "exists.csv"
+    existing.write_text("原有内容", encoding='utf-8')
+    page.path_edit.setText(str(existing))
+    monkeypatch.setattr(
+        page, '_confirm_overwrite', lambda path: manager.begin_maintenance())
+
+    page._export_data()
+
+    assert manager.is_maintenance_running() is True
+    assert page._export_worker is None
+    assert manager.has_running_exports() is False
+    assert silent_infobar[-1][1]["content"] == "正在清理数据库，请稍后再导出"
+    assert page.export_button.isEnabled()
+    manager.end_maintenance()
+
+
+def test_export_page_without_manager_skips_registration(page, db, silent_infobar):
+    """未注入 manager（兼容路径）时照常导出，不做登记"""
+    _seed_task(db)
+    page._load_tasks()
+    page._export_data()
+    assert page._export_worker is not None

@@ -80,6 +80,20 @@ class ProcessCollector:
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             return False
 
+    def get_create_time(self) -> Optional[float]:
+        """
+        读取采集器所绑定进程的创建时间（与 psutil.Process.create_time() 同口径）
+
+        Returns:
+            Optional[float]: 创建时间（epoch 秒）；进程不存在或无权限读取时返回None
+        """
+        try:
+            if self._process is None:
+                self._process = psutil.Process(self.pid)
+            return self._process.create_time()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            return None
+
     def get_process_name(self) -> Optional[str]:
         """
         获取进程名称
@@ -406,21 +420,25 @@ class ProcessCollector:
             return None
 
     @staticmethod
-    def get_all_processes() -> List[Tuple[int, str]]:
+    def get_all_processes() -> List[Tuple[int, str, Optional[float]]]:
         """
         获取系统中所有正在运行的进程列表
 
+        带上创建时间：列表可能已过期，从选中到真正开始采集之间 PID 可能被别的进程
+        复用，监控任务据此确认采到的仍是所选的那个进程。
+
         Returns:
-            List[Tuple[int, str]]: (pid, name)元组的列表
+            List[Tuple[int, str, Optional[float]]]: (pid, name, create_time)元组的列表；
+                create_time 读取失败时为None（调用方据此跳过身份比对）
         """
         processes = []
-        for proc in psutil.process_iter(['pid', 'name']):
+        for proc in psutil.process_iter(['pid', 'name', 'create_time']):
             try:
                 pid = proc.info['pid']
                 name = proc.info['name']
                 # 过滤掉进程名为空或None的进程
                 if name and name.strip():
-                    processes.append((pid, name))
+                    processes.append((pid, name, proc.info.get('create_time')))
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
 
@@ -490,7 +508,7 @@ if __name__ == "__main__":
     all_processes = ProcessCollector.get_all_processes()
     print(f"\n系统中共有 {len(all_processes)} 个进程")
     print("前5个进程:")
-    for pid, name in all_processes[:5]:
+    for pid, name, _create_time in all_processes[:5]:
         print(f"  PID: {pid}, Name: {name}")
 
     # 测试查找进程

@@ -15,7 +15,7 @@ from qfluentwidgets import setTheme
 
 from ui.main_window import MainWindow
 from ui.typography import configure_application_typography
-from utils.logger import setup_logging
+from utils.logger import get_log_dir, setup_logging
 from utils.crash_handler import install_excepthook
 from app_config import load_app_config, cfg
 import config
@@ -116,7 +116,8 @@ def activate_main_window(window):
 def main():
     """主函数"""
     # 日志与全局异常兜底须在入口最早处初始化，确保后续任何初始化异常都能被记录/兜底
-    log_dir = setup_logging()
+    # 日志目录由数据目录推导，设置了 PROCESS_MONITOR_DATA_DIR 时随之隔离
+    log_dir = setup_logging(get_log_dir())
     install_excepthook(log_dir)
 
     # 启用高DPI缩放

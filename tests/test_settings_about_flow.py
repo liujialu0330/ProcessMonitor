@@ -1,11 +1,13 @@
 """
-设置页：开关文案、清理数据库的维护状态与线程释放时机；
+设置页：开关文案、清理确认框、清理数据库的维护状态与线程释放时机；
 关于页：缺少校验摘要时的友好提示与发布页入口。
 """
 import sys
 from types import SimpleNamespace
 
 import pytest
+from PyQt5.QtCore import Qt
+from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QApplication
 
 from qfluentwidgets import qconfig
@@ -16,6 +18,7 @@ import ui.pages.setting_page as setting_module
 from core.monitor_manager import MonitorManager
 from core.update_checker import MSG_CANNOT_VERIFY
 from tests.helpers import poll_until
+from ui.components.confirm import DestructiveConfirmBox
 from ui.pages.about_page import MSG_NO_DIGEST, AboutPage
 from ui.pages.setting_page import SettingPage
 
@@ -74,6 +77,63 @@ def test_cleanup_refused_while_tasks_are_running(setting, manager, monkeypatch):
 
     assert setting._cleanup_worker is None
     assert calls and calls[-1][0] == "warning"
+
+
+def test_cleanup_refusal_reason_running_tasks(setting, manager, monkeypatch):
+    """有任务在监控时被拒：提示停止任务"""
+    calls = []
+    monkeypatch.setattr(setting_module, 'InfoBar', _silent_infobar(calls))
+    monkeypatch.setattr(manager, 'has_running_tasks', lambda: True)
+
+    setting._on_cleanup_clicked()
+
+    assert setting._cleanup_worker is None
+    assert manager.is_maintenance_running() is False
+    assert "监控任务" in calls[-1][1]["content"]
+
+
+def test_cleanup_refused_while_exporting(setting, manager, monkeypatch):
+    """导出进行中被拒：提示等导出完成，且不弹确认、不进入维护"""
+    calls = []
+    monkeypatch.setattr(setting_module, 'InfoBar', _silent_infobar(calls))
+    monkeypatch.setattr(
+        setting, '_confirm_cleanup', lambda days: pytest.fail("被拒绝时不应再弹确认"))
+    assert manager.begin_export() is True
+
+    setting._on_cleanup_clicked()
+
+    assert setting._cleanup_worker is None
+    assert manager.is_maintenance_running() is False
+    assert calls and calls[-1][0] == "warning"
+    assert "正在导出" in calls[-1][1]["content"]
+    manager.end_export()
+
+
+def test_cleanup_confirm_is_chinese_and_enter_cancels(setting, monkeypatch):
+    """真实确认框：按钮为"清理/取消"，显示后焦点在"取消"，回车即取消"""
+    setting.show()
+    seen = {}
+
+    class _Probe(DestructiveConfirmBox):
+        def exec(self):
+            # 不进模态循环：显示后记录状态，再向焦点控件按回车，模拟用户顺手回车
+            self.show()
+            QTest.qWait(300)  # 等淡入动画结束，避免动画回调落到后续用例里
+            seen.update(yes=self.yesButton.text(), cancel=self.cancelButton.text(),
+                        focus_is_cancel=self.focusWidget() is self.cancelButton)
+            accepted = []
+            self.yesSignal.connect(lambda: accepted.append(True))
+            QTest.keyClick(self.focusWidget(), Qt.Key_Return)
+            for _ in range(50):  # 等 100ms 淡出动画结束、对话框真正关闭
+                if not self.isVisible():
+                    break
+                QTest.qWait(20)
+            return bool(accepted)
+
+    monkeypatch.setattr(setting_module, 'DestructiveConfirmBox', _Probe)
+
+    assert setting._confirm_cleanup(30) is False
+    assert seen == {"yes": "清理", "cancel": "取消", "focus_is_cancel": True}
 
 
 def test_cancelled_confirmation_leaves_maintenance(setting, manager, monkeypatch):

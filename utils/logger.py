@@ -5,7 +5,7 @@
 import logging
 import logging.handlers
 import os
-import sys
+from typing import Optional
 
 import config
 
@@ -19,31 +19,36 @@ _configured = False
 
 def get_log_dir() -> str:
     """
-    获取日志目录
+    获取日志目录（由 config.get_data_dir() 推导，不再自行判断打包/开发环境）
 
     Returns:
         str: 日志目录路径
-            - 打包环境：%LOCALAPPDATA%\\<APP_NAME>\\logs
-            - 开发环境：项目根目录下的 logs\\（已加入 .gitignore）
+            - 设置了环境变量 PROCESS_MONITOR_DATA_DIR：<该目录>\\logs，日志随数据一起
+              隔离在指定目录内（测试/便携运行不会写到默认位置）
+            - 默认：与数据目录同级的 logs\\（打包为 %LOCALAPPDATA%\\<APP_NAME>\\logs，
+              开发环境为项目根目录下的 logs\\，已加入 .gitignore）
     """
-    if getattr(sys, 'frozen', False):
-        local_appdata = os.environ.get('LOCALAPPDATA', os.path.expanduser('~'))
-        return os.path.join(local_appdata, config.APP_NAME, "logs")
-    else:
-        return os.path.join(config.BASE_DIR, "logs")
+    data_dir = config.get_data_dir()
+    if os.environ.get(config.DATA_DIR_ENV):
+        return os.path.join(data_dir, "logs")
+    return os.path.join(os.path.dirname(data_dir), "logs")
 
 
-def setup_logging() -> str:
+def setup_logging(log_dir: Optional[str] = None) -> str:
     """
     初始化应用日志：RotatingFileHandler 挂到 root logger，各模块用
     `logging.getLogger(__name__)` 即可复用。应在 main.py 入口最早处调用一次。
+
+    Args:
+        log_dir: 日志目录；为 None 时按 get_log_dir() 推导
 
     Returns:
         str: 日志目录路径（供异常提示等场景显示给用户）
     """
     global _configured
 
-    log_dir = get_log_dir()
+    if log_dir is None:
+        log_dir = get_log_dir()
     os.makedirs(log_dir, exist_ok=True)
 
     if not _configured:

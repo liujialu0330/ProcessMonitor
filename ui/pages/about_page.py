@@ -23,6 +23,7 @@ from core.update_checker import (
     UpdateChecker, UpdateDownloader, MSG_CANNOT_VERIFY,
     get_skipped_version, set_skipped_version
 )
+from ui.thread_shutdown import BackgroundThread
 from ui.typography import DataCaptionLabel, PageTitleLabel
 
 
@@ -195,6 +196,20 @@ class AboutPage(QScrollArea):
         self.check_update(silent=False)
 
     # ========== 更新流程 ==========
+
+    def background_threads(self) -> list:
+        """退出时需要收尾的后台线程（由主窗口统一 shutdown）。
+
+        下载线程先置取消标志再等待；更新检查线程无取消机制，仅等待。
+        """
+        downloader = self._downloader
+        return [
+            BackgroundThread(
+                "更新下载", downloader,
+                cancel_fn=downloader.cancel if downloader is not None else None,
+                timeout_ms=2000),
+            BackgroundThread("检查更新", self._checker, timeout_ms=1000),
+        ]
 
     def check_update(self, silent: bool = False):
         """

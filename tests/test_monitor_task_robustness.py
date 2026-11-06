@@ -47,10 +47,12 @@ class _FakeCollector:
 def make_task(db, qapp):
     created = []
 
-    def _factory(collector, interval=0.1, task_db=None):
+    def _factory(collector, interval=0.1, task_db=None, metric_types=None,
+                 create_time=None):
         t = MonitorTask(pid=os.getpid(), process_name="fake.exe",
-                        metric_types=["memory_rss"], interval=interval,
-                        db=task_db if task_db is not None else db)
+                        metric_types=metric_types or ["memory_rss"], interval=interval,
+                        db=task_db if task_db is not None else db,
+                        create_time=create_time)
         t.collector = collector
         created.append(t)
         return t
@@ -318,3 +320,135 @@ def test_task_stops_when_pid_reused(make_task, monkeypatch):
     task.run()
 
     assert stopped == ["进程已终止"]
+
+
+# ========== CPU 预热后的首采时间 ==========
+
+class _PrimeRecordingCollector(_FakeCollector):
+    """记录 prime_cpu 的调用时间"""
+
+    def __init__(self):
+        super().__init__()
+        self.prime_times = []
+
+    def prime_cpu(self):
+        self.prime_times.append(time.monotonic())
+
+
+def test_first_collect_waits_one_interval_after_cpu_prime(make_task):
+    """含 CPU 指标：预热后隔满一个周期才首采，否则首个 CPU 样本统计窗口近乎为零"""
+    interval = 0.3
+    collector = _PrimeRecordingCollector()
+    task = make_task(collector, interval=interval,
+                     metric_types=["cpu_percent", "memory_rss"])
+
+    task.start()
+    assert poll_until(lambda: len(collector.call_times) >= 1, timeout=5)
+    task.stop()
+    assert task.wait(5000)
+
+    assert len(collector.prime_times) == 1
+    assert collector.call_times[0] - collector.prime_times[0] >= interval * 0.9
+
+
+def test_first_collect_is_immediate_without_cpu_metric(make_task):
+    """不含 CPU 指标：不预热，启动即采一次（不必白等一个周期）"""
+    interval = 5.0
+    collector = _PrimeRecordingCollector()
+    task = make_task(collector, interval=interval)
+
+    started_at = time.monotonic()
+    task.start()
+    assert poll_until(lambda: len(collector.call_times) >= 1, timeout=2)
+    task.stop()
+    assert task.wait(5000)
+
+    assert collector.prime_times == []
+    assert collector.call_times[0] - started_at < 1.0
+
+
+# ========== 开始前的进程身份校验（PID 复用） ==========
+
+class _IdentityCollector(_FakeCollector):
+    """可指定"该 PID 当前进程"创建时间的假采集器。采满 3 次后报告进程终止，
+    保证同线程直接 run() 的用例即使身份校验缺失也会结束（而不是挂住）"""
+
+    def __init__(self, actual_create_time):
+        super().__init__()
+        self.actual_create_time = actual_create_time
+
+    def get_create_time(self):
+        return self.actual_create_time
+
+    def collect_metrics(self, metric_types):
+        if len(self.call_times) >= 3:
+            return None
+        return super().collect_metrics(metric_types)
+
+
+def _run_inline(task):
+    stopped, errors = [], []
+    task.task_stopped.connect(lambda tid, r: stopped.append(r), Qt.DirectConnection)
+    task.error_occurred.connect(lambda tid, m: errors.append(m), Qt.DirectConnection)
+    return stopped, errors
+
+
+def test_create_time_mismatch_stops_before_collecting(make_task, db):
+    """所选进程已退出、PID 被新进程复用：任务以"进程已终止"结束，不写任何数据点"""
+    collector = _IdentityCollector(actual_create_time=2000.0)
+    task = make_task(collector, interval=0.05, create_time=1000.0)
+    stopped, errors = _run_inline(task)
+    task._running = True   # 同线程直接 run()，等价于 start() 置位运行标志
+
+    task.run()
+
+    assert stopped == ["进程已终止"]
+    assert len(errors) == 1 and "其他进程" in errors[0]
+    assert collector.call_times == []
+    assert db.get_sample_count(task.task_id) == 0
+    assert task.task_model.status == 'stopped'
+
+
+@pytest.mark.parametrize("expected, actual", [
+    (1000.0, 1000.0),    # 一致：正常采集
+    (None, 2000.0),      # 手动输入 PID，无创建时间：跳过比对
+    (1000.0, None),      # 读不到当前创建时间（如权限不足）：无法确认，不误停
+])
+def test_create_time_match_or_unknown_runs_normally(make_task, expected, actual):
+    collector = _IdentityCollector(actual_create_time=actual)
+    task = make_task(collector, interval=0.05, create_time=expected)
+    stopped, errors = _run_inline(task)
+
+    task.start()
+    assert poll_until(lambda: len(collector.call_times) >= 2)
+    task.stop()
+    assert task.wait(5000)
+
+    assert stopped == ["用户停止"] and errors == []
+
+
+def test_real_collector_detects_reused_pid_identity(make_task):
+    """真实采集器：传入与当前进程不符的创建时间，同样在首采前结束"""
+    collector = ProcessCollector(os.getpid())
+    real_create_time = psutil.Process(os.getpid()).create_time()
+    assert collector.get_create_time() == pytest.approx(real_create_time)
+
+    task = make_task(collector, interval=0.05, create_time=real_create_time - 3600)
+    stopped, _ = _run_inline(task)
+    samples = []
+    task.data_updated.connect(lambda tid, v: samples.append(v), Qt.DirectConnection)
+
+    task.start()
+    finished = task.wait(2000)
+    if not finished:   # 校验缺失时任务会一直采集当前进程，收尾后再断言失败
+        task.stop()
+        task.wait(5000)
+
+    assert finished and stopped == ["进程已终止"] and samples == []
+
+
+def test_get_all_processes_includes_create_time():
+    own = [p for p in ProcessCollector.get_all_processes() if p[0] == os.getpid()]
+    assert len(own) == 1
+    pid, name, create_time = own[0]
+    assert name and create_time == pytest.approx(psutil.Process(pid).create_time())

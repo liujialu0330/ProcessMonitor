@@ -37,7 +37,9 @@ class MetricType:
     NUM_GDI_OBJECTS = "num_gdi_objects"     # GDI对象数 (Windows)
     NUM_USER_OBJECTS = "num_user_objects"   # USER对象数 (Windows)
     NUM_CTX_SWITCHES_VOL = "num_ctx_switches_voluntary"     # 自愿上下文切换
-    NUM_CTX_SWITCHES_INVOL = "num_ctx_switches_involuntary" # 非自愿上下文切换
+    # 已废弃：psutil 在 Windows 上只能取到自愿上下文切换，非自愿项恒为 0。
+    # 不再出现在可选指标里，键与显示名、单位、格式化保留，供旧任务数据显示与导出。
+    NUM_CTX_SWITCHES_INVOL = "num_ctx_switches_involuntary" # 非自愿上下文切换（已废弃）
 
     # IO相关
     IO_READ_COUNT = "io_read_count"     # 读取次数
@@ -185,7 +187,6 @@ AVAILABLE_METRICS = {
         MetricType.NUM_GDI_OBJECTS,
         MetricType.NUM_USER_OBJECTS,
         MetricType.NUM_CTX_SWITCHES_VOL,
-        MetricType.NUM_CTX_SWITCHES_INVOL,
     ],
     "IO操作": [
         MetricType.IO_READ_BYTES,
@@ -196,6 +197,13 @@ AVAILABLE_METRICS = {
         MetricType.IO_OTHER_COUNT,
     ]
 }
+
+
+# 已废弃的指标：不在 AVAILABLE_METRICS（可选集合）里，但显示名、单位、说明与格式化
+# 仍保留，旧任务里已有的数据照常读取、显示与导出。
+DEPRECATED_METRICS = frozenset({
+    MetricType.NUM_CTX_SWITCHES_INVOL,
+})
 
 
 # "泄漏排查"预设：判断被测程序是否存在内存/句柄/GDI/USER 对象/线程泄漏时的一组
@@ -259,7 +267,7 @@ METRIC_DESCRIPTIONS = {
     MetricType.NUM_CTX_SWITCHES_VOL:
         "累计自愿上下文切换次数（线程主动等待让出 CPU），适合分析线程同步与阻塞",
     MetricType.NUM_CTX_SWITCHES_INVOL:
-        "累计非自愿上下文切换次数（时间片用完被抢占），偏高说明 CPU 竞争激烈",
+        "累计非自愿上下文切换次数（时间片用完被抢占）；已废弃：Windows 上无法采集，恒为 0",
     # I/O类
     MetricType.IO_READ_BYTES:
         "累计读取字节数，适合发现异常的磁盘或网络读取量",
@@ -282,7 +290,7 @@ def get_metric_description(metric_type: str) -> str:
 
 
 def all_metric_types() -> list:
-    """按分类顺序列出全部可监控指标键。"""
+    """按分类顺序列出全部可选（可新建监控）的指标键，不含已废弃指标。"""
     return [m for metrics in AVAILABLE_METRICS.values() for m in metrics]
 
 

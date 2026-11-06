@@ -257,6 +257,26 @@ def test_add_marker_returns_timestamp_and_persists(manager):
     manager.stop_all_tasks()
 
 
+def test_add_marker_uses_given_click_time(manager):
+    """界面传入点击时刻时按它落库，而不是调用（确认）时的当前时间"""
+    task_id = manager.create_task(os.getpid(), "x.exe", ["memory_rss"], 1.0)
+    clicked = datetime(2026, 11, 6, 10, 0, 0)
+
+    ts = manager.add_marker(task_id, "开始第 3 轮", clicked)
+
+    assert ts == clicked
+    assert [(m.label, m.timestamp) for m in manager.db.get_markers(task_id)] == [
+        ("开始第 3 轮", clicked)]
+
+
+def test_create_task_passes_create_time_to_task(manager):
+    with_ct = manager.create_task(os.getpid(), "x.exe", ["memory_rss"], 1.0,
+                                  create_time=1234.5)
+    without_ct = manager.create_task(os.getpid(), "x.exe", ["memory_rss"], 1.0)
+    assert manager.get_task(with_ct).expected_create_time == 1234.5
+    assert manager.get_task(without_ct).expected_create_time is None
+
+
 def test_add_marker_failures_return_none(manager):
     task_id = manager.create_task(os.getpid(), "x.exe", ["memory_rss"], 1.0)
     assert manager.add_marker("unknown-task", "x") is None
@@ -305,3 +325,42 @@ def test_monitor_task_constructor_keeps_keyword_compat(db):
     """旧的关键字/位置调用方式仍然可用（note 在末尾）"""
     t = MonitorTask(1, "a.exe", ["memory_rss"], 1.0, "tid-1", db)
     assert (t.task_id, t.db, t.note) == ("tid-1", db, '')
+
+
+# ========== 维护与导出互斥 ==========
+
+def test_begin_maintenance_refused_while_exporting(manager):
+    """导出线程长时间读库，进行中时不能开始清理/压缩数据库"""
+    assert manager.has_running_exports() is False
+    assert manager.begin_export() is True
+    assert manager.has_running_exports() is True
+
+    assert manager.begin_maintenance() is False
+    assert manager.is_maintenance_running() is False
+
+    manager.end_export()
+    assert manager.has_running_exports() is False
+    assert manager.begin_maintenance() is True
+    manager.end_maintenance()
+
+
+def test_export_count_tracks_concurrent_exports(manager):
+    assert manager.begin_export() is True
+    assert manager.begin_export() is True
+    manager.end_export()
+    assert manager.begin_maintenance() is False   # 还有一个导出未结束
+    manager.end_export()
+    manager.end_export()                          # 多余的注销不会把计数减成负数
+    assert manager.has_running_exports() is False
+    assert manager.begin_export() is True
+    assert manager.has_running_exports() is True
+    manager.end_export()
+
+
+def test_begin_export_refused_during_maintenance(manager):
+    assert manager.begin_maintenance() is True
+    assert manager.begin_export() is False
+    assert manager.has_running_exports() is False
+    manager.end_maintenance()
+    assert manager.begin_export() is True
+    manager.end_export()

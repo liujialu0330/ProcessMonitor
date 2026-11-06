@@ -48,7 +48,8 @@ class Database:
         """
         self.db_path = db_path or config.DB_PATH
         # 迁移三态标志（互斥，含义见 _migrate_if_needed 与 MainWindow 对应提示文案）：
-        # - migration_failed: 迁移两次尝试均失败，已还原旧数据，本次运行新数据无法保存
+        # - migration_failed: 迁移失败且未切到新库，本次运行新数据无法保存（通常已还原旧数据；
+        #   还原与改名损坏库都失败时则是旧库原样留在原路径，下次启动会重新迁移）
         # - data_reset: 还原备份也失败，损坏库已改名保留，应用以新建的空库运行
         # - backup_aborted: 迁移前备份失败，已中止迁移，旧库原样保留未做任何改动
         self.migration_failed: bool = False
@@ -185,7 +186,8 @@ class Database:
         检查 user_version，低于当前版本则按版本链式执行迁移（v0→v1→v2→v3，同一显式事务内）。
         迁移前先对旧库做 WAL checkpoint + 文件级备份，备份失败直接中止（backup_aborted）；
         备份成功后迁移失败，从备份还原后重试一次（应对磁盘满/文件锁等瞬时故障），仍失败则
-        置 migration_failed（还原成功）或 data_reset（还原也失败，_restore_from_backup 内部置位）。
+        置 migration_failed（还原成功）；还原失败时不再重试，由 _restore_from_backup 置
+        data_reset（损坏库已改名、原路径新建空库）或 migration_failed（改名也失败、旧库原样保留）。
         整个流程每进程只执行一次（_migration_attempted 类级 guard）。
         """
         with self._get_connection() as conn:
@@ -232,9 +234,12 @@ class Database:
                 return
             except Exception:
                 logger.error("数据库迁移失败（第%d次）", attempt, exc_info=True)
-                self._restore_from_backup(backup_path)
+                if not self._restore_from_backup(backup_path):
+                    # 没能还原出旧库（已重置为空库，或旧库原样留着）：原路径已不是
+                    # 迁移起点的那个旧库，不能再拿旧版本号重跑迁移链
+                    break
 
-        # 两次迁移均失败：还原成功则 migration_failed；还原也失败则 data_reset
+        # 两次迁移均失败：还原成功则 migration_failed；还原失败时的标志
         # 已在 _restore_from_backup 内部置位
         if not self.data_reset:
             self.migration_failed = True
@@ -431,23 +436,68 @@ class Database:
         # 步骤7
         cursor.execute('PRAGMA user_version = 3')
 
-    def _restore_from_backup(self, backup_path: str):
-        """迁移失败后从备份还原；还原也失败则将损坏库改名并新建空库（置 data_reset）"""
+    def _restore_from_backup(self, backup_path: str) -> bool:
+        """
+        迁移失败后从备份还原。
+
+        还原失败时把损坏库连同 -wal/-shm 改名保留，再在原路径新建空库（置 data_reset）。
+        改名也失败时绝不在原路径建表或写 user_version：否则旧表结构会被标成当前版本，
+        以后永不再迁移、新数据永久写不进去；此时原样留下旧库（置 migration_failed），
+        下次启动版本号仍是旧值，会重新尝试迁移。
+
+        Returns:
+            bool: True 表示已还原为迁移前的旧库，可以重试迁移；False 表示未还原，
+                  调用方不得再重试
+        """
         try:
             shutil.copy2(backup_path, self.db_path)
             logger.warning("已从备份还原数据库: %s", backup_path)
+            return True
         except Exception:
             logger.error("从备份还原失败", exc_info=True)
-            try:
-                broken_path = self.db_path + '.broken_' + datetime.now().strftime('%Y%m%d_%H%M%S')
-                os.replace(self.db_path, broken_path)
-                logger.warning("损坏的数据库已改名保留: %s", broken_path)
-            except Exception:
-                logger.error("保留损坏数据库失败", exc_info=True)
-            # 新建空库（当前结构）
-            with self._transaction() as cursor:
-                self._create_schema_current(cursor)
-            self.data_reset = True
+
+        if not self._move_aside_broken_db():
+            self.migration_failed = True
+            logger.error("损坏的数据库无法改名，保持原样不新建空库，本次运行新数据无法保存: %s",
+                         self.db_path)
+            return False
+
+        # 原路径已腾空，新建空库（当前结构）
+        with self._transaction() as cursor:
+            self._create_schema_current(cursor)
+        self.data_reset = True
+        return False
+
+    def _move_aside_broken_db(self) -> bool:
+        """
+        把损坏库连同 -wal/-shm 改名为 <库>.broken_<时间戳>[-wal|-shm] 保留。
+
+        伴随文件必须一起挪走：残留的旧 -wal 会被 SQLite 当成新建空库的日志回放。
+        先挪伴随文件、最后挪主库；主库挪不动时把已挪走的伴随文件放回，保持旧库原样。
+
+        Returns:
+            bool: 主库是否已挪走（原路径已腾空）
+        """
+        broken_path = self.db_path + '.broken_' + datetime.now().strftime('%Y%m%d_%H%M%S')
+        moved: List[str] = []
+        try:
+            for suffix in ('-wal', '-shm', ''):
+                src = self.db_path + suffix
+                if suffix and not os.path.exists(src):
+                    continue
+                os.replace(src, broken_path + suffix)
+                moved.append(suffix)
+        except Exception:
+            logger.error("保留损坏数据库失败", exc_info=True)
+            for suffix in moved:
+                try:
+                    os.replace(broken_path + suffix, self.db_path + suffix)
+                except Exception:
+                    logger.error("放回数据库伴随文件失败: %s", broken_path + suffix,
+                                 exc_info=True)
+            return False
+        logger.warning("损坏的数据库已改名保留: %s", broken_path)
+        return True
 
     # ========== 孤儿任务校正 ==========
 

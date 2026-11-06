@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import List, Optional, Tuple
 
 from PyQt5.QtCore import Qt, pyqtSignal, QStringListModel, QTimer
+from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QGridLayout,
                              QScrollArea, QSizePolicy, QCompleter)
 from qfluentwidgets import (
@@ -28,6 +29,13 @@ import config
 # 异常结束提示的显示时长（毫秒）：被测进程崩溃是测试里最需要被注意到的事件，
 # 不能像普通提示那样两秒就消失
 ABNORMAL_STOP_INFOBAR_MS = 15000
+
+# 错误类提示不自动消失（可手动关闭）：InfoBar.error 默认只停 1 秒，用户来不及看清
+ERROR_INFOBAR_DURATION = -1
+
+# 表单校验错误文字颜色（浅色 / 深色主题，取 Fluent 的错误色）
+FORM_ERROR_LIGHT = QColor(196, 43, 28)
+FORM_ERROR_DARK = QColor(255, 153, 164)
 
 
 class MonitorPage(QScrollArea):
@@ -60,6 +68,12 @@ class MonitorPage(QScrollArea):
 
         # 进程列表缓存 {pid: name}
         self.process_dict = {}
+        # 进程列表中各进程的创建时间 {pid: create_time}，开始监控时用于确认身份
+        self.process_create_times = {}
+
+        # 当前显示中的错误提示 {(task_id, 内容): InfoBar}：错误提示不自动消失，
+        # 同一任务同一错误重复上报时不再叠加
+        self._error_bars = {}
 
         # 已选监控指标：沿用上次选择，默认"泄漏排查"预设
         self.selected_metrics: List[str] = list(cfg.get(cfg.last_metrics))
@@ -172,22 +186,30 @@ class MonitorPage(QScrollArea):
         # 避免紧凑布局把内部数值编辑区压缩为 0。
         select_layout.addWidget(self.interval_spinbox, 2, 3)
 
+        # 表单校验错误（PID 无效/进程不存在）就近显示在输入框下方，内容一改即清除；
+        # 不用 InfoBar，避免一闪即逝或与运行期提示混在一起
+        self.form_error_label = CaptionLabel()
+        self.form_error_label.setTextColor(FORM_ERROR_LIGHT, FORM_ERROR_DARK)
+        self.form_error_label.setWordWrap(True)
+        self.form_error_label.hide()
+        select_layout.addWidget(self.form_error_label, 3, 1, 1, 3)
+
         # 测试备注：随任务落库，历史页/导出页用它区分各次测试
         note_label = CaptionLabel("测试备注")
-        select_layout.addWidget(note_label, 3, 0)
+        select_layout.addWidget(note_label, 4, 0)
         self.note_input = LineEdit()
         self.note_input.setPlaceholderText("测试备注（可选，如：建模 200 次）")
         self.note_input.setMaxLength(100)
         self.note_input.setClearButtonEnabled(True)
-        select_layout.addWidget(self.note_input, 3, 1, 1, 3)
+        select_layout.addWidget(self.note_input, 4, 1, 1, 3)
 
         # 监控指标选择（弹出多选对话框）
         self.metric_button = PushButton("选择指标", self, FluentIcon.CHECKBOX)
         self.metric_button.clicked.connect(self._on_select_metric_clicked)
         self.metric_button.setFixedWidth(112)
         self.metric_summary_label = CaptionLabel()
-        select_layout.addWidget(self.metric_button, 4, 0)
-        select_layout.addWidget(self.metric_summary_label, 4, 1, 1, 2)
+        select_layout.addWidget(self.metric_button, 5, 0)
+        select_layout.addWidget(self.metric_summary_label, 5, 1, 1, 2)
 
         # 初始化已选指标摘要
         self._update_metric_summary()
@@ -196,7 +218,7 @@ class MonitorPage(QScrollArea):
         self.start_button = PrimaryPushButton("开始监控", self, FluentIcon.PLAY)
         self.start_button.clicked.connect(self._on_start_clicked)
         self.start_button.setFixedWidth(116)
-        select_layout.addWidget(self.start_button, 4, 3)
+        select_layout.addWidget(self.start_button, 5, 3)
 
         main_layout.addWidget(select_card)
 
@@ -282,13 +304,15 @@ class MonitorPage(QScrollArea):
         self.process_combo.setCurrentIndex(-1)
         self.process_combo.setText("")
         self.process_dict.clear()
+        self.process_create_times.clear()
 
         # 4. 获取并添加进程
         processes = ProcessCollector.get_all_processes()
 
-        for pid, name in processes:
+        for pid, name, create_time in processes:
             # 保存到字典
             self.process_dict[pid] = name
+            self.process_create_times[pid] = create_time
             # 添加到ComboBox
             self.process_combo.addItem(f"{name} · PID {pid}")
             # 为最后添加的项设置userData
@@ -298,7 +322,7 @@ class MonitorPage(QScrollArea):
         # 4.1 重建 completer 子串搜索模型，文本需与上面的 items 保持一致，
         # 否则补全选中后回填的文本会在 process_combo.items 里找不到精确匹配
         self._process_completer_model.setStringList(
-            [f"{name} · PID {pid}" for pid, name in processes])
+            [f"{name} · PID {pid}" for pid, name, _create_time in processes])
 
         # 4.2 addItem 会让 Qt 自动选中第一项，这里撤销并清掉输入框，
         # 保证刷新后不选中任何进程（避免误监控列表第一个进程）
@@ -351,6 +375,7 @@ class MonitorPage(QScrollArea):
 
     def _on_pid_changed(self, text: str):
         """PID输入框内容变化"""
+        self._clear_form_error()
         if self._syncing:
             return
         self._pid_autofilled = False
@@ -393,6 +418,7 @@ class MonitorPage(QScrollArea):
     def _on_process_text_changed(self, _text: str):
         """下拉框文本变化：若 PID 框里是此前选择自动填入的，用户改为搜索其他进程
         时清掉它（精确选中某项时 currentIndexChanged 会紧接着重新填入）。"""
+        self._clear_form_error()
         if self._syncing or not self._pid_autofilled:
             return
         self._syncing = True
@@ -420,25 +446,39 @@ class MonitorPage(QScrollArea):
             title=title, content=content, parent=self,
             position=InfoBarPosition.TOP, duration=duration)
 
-    def _resolve_target(self) -> Optional[Tuple[int, str]]:
+    def _show_form_error(self, text: str) -> None:
+        """在新建任务表单的输入框下方显示校验错误"""
+        self.form_error_label.setText(text)
+        self.form_error_label.show()
+
+    def _clear_form_error(self) -> None:
+        """输入内容变化后，之前的校验错误已不再对应当前内容，清掉"""
+        if self.form_error_label.isHidden() and not self.form_error_label.text():
+            return
+        self.form_error_label.clear()
+        self.form_error_label.hide()
+
+    def _resolve_target(self) -> Optional[Tuple[int, str, Optional[float]]]:
         """确定要监控的进程：PID 输入框有值时以 PID 为准，否则取下拉框当前选中的
-        有效进程；两者都无效时提示并返回 None。"""
+        有效进程；两者都无效时提示并返回 None。
+
+        返回 (pid, 进程名, 创建时间)。创建时间来自进程列表，供任务启动时确认 PID
+        没有被别的进程复用；手动输入的 PID 没有可比对的列表信息，为 None。"""
         pid_text = self.pid_input.text().strip()
         if pid_text:
             try:
                 pid = int(pid_text)
             except ValueError:
-                InfoBar.error(
-                    title="错误", content="PID 必须是数字", parent=self,
-                    position=InfoBarPosition.TOP)
+                self._show_form_error("PID 必须是数字")
                 return None
             process_name = ProcessCollector(pid).get_process_name()
             if not process_name:
-                InfoBar.error(
-                    title="错误", content=f"进程 PID {pid} 不存在或无法访问",
-                    parent=self, position=InfoBarPosition.TOP)
+                self._show_form_error(f"进程 PID {pid} 不存在或无法访问")
                 return None
-            return pid, process_name
+            # PID 是从下拉框选择自动填入的：沿用列表里该进程的创建时间
+            create_time = (self.process_create_times.get(pid)
+                           if self._pid_autofilled else None)
+            return pid, process_name, create_time
 
         # 下拉框：当前文本必须正好对应某个列表项（手输不匹配的文本不算选中，
         # EditableComboBox 的回车还会把手输文本加成没有 itemData 的新项）
@@ -448,7 +488,7 @@ class MonitorPage(QScrollArea):
             if item_data and (self.process_combo.itemText(index)
                               == self.process_combo.currentText()):
                 pid, process_name = item_data
-                return pid, process_name
+                return pid, process_name, self.process_create_times.get(pid)
 
         if self.process_combo.currentText().strip():
             self._warn("输入的内容与进程列表不匹配，请从下拉列表中选择，或直接输入 PID")
@@ -461,7 +501,7 @@ class MonitorPage(QScrollArea):
         target = self._resolve_target()
         if target is None:
             return
-        pid, process_name = target
+        pid, process_name, create_time = target
 
         if not self.selected_metrics:
             self._warn("请先选择要监控的指标")
@@ -469,7 +509,8 @@ class MonitorPage(QScrollArea):
 
         self._start_monitoring(
             pid, process_name, list(self.selected_metrics),
-            float(self.interval_spinbox.value()), self.note_input.text().strip())
+            float(self.interval_spinbox.value()), self.note_input.text().strip(),
+            create_time=create_time)
 
     def _has_running_task_for_pid(self, pid: int) -> bool:
         """该 PID 是否已有运行中（未在停止）的任务"""
@@ -477,13 +518,15 @@ class MonitorPage(QScrollArea):
                    for task in self.manager.get_all_tasks())
 
     def _start_monitoring(self, pid: int, process_name: str, metrics: List[str],
-                          interval: float, note: str = '') -> Optional[str]:
+                          interval: float, note: str = '',
+                          create_time: Optional[float] = None) -> Optional[str]:
         """创建并启动任务；同一 PID 已有运行中任务时先确认。返回任务ID，
-        取消或创建失败返回 None。"""
+        取消或创建失败返回 None。create_time 为所选进程的创建时间（可为 None）。"""
         if (self._has_running_task_for_pid(pid)
                 and not self._confirm_duplicate_pid(pid, process_name)):
             return None
-        task_id = self.manager.create_task(pid, process_name, metrics, interval, note=note)
+        task_id = self.manager.create_task(
+            pid, process_name, metrics, interval, note=note, create_time=create_time)
         if task_id:
             self.manager.start_task(task_id)
         return task_id
@@ -511,20 +554,23 @@ class MonitorPage(QScrollArea):
         box.cancelButton.setText("取消")
         return bool(box.exec())
 
-    def _ask_marker_label(self, default_label: str) -> Optional[str]:
-        """弹出打点标签输入框；取消返回 None"""
-        dialog = MarkerDialog(default_label, self.window())
+    def _ask_marker_label(self, default_label: str,
+                          timestamp: datetime) -> Optional[str]:
+        """弹出打点标签输入框（显示点击时刻）；取消返回 None"""
+        dialog = MarkerDialog(default_label, self.window(), timestamp=timestamp)
         if dialog.exec():
             return dialog.get_label()
         return None
 
-    def _find_pids_by_name(self, process_name: str) -> List[int]:
-        """按进程名（不区分大小写）查找当前正在运行的进程 PID"""
+    def _find_processes_by_name(
+            self, process_name: str) -> List[Tuple[int, Optional[float]]]:
+        """按进程名（不区分大小写）查找当前正在运行的进程，返回 (pid, 创建时间) 列表"""
         wanted = process_name.lower()
         # 排除本程序自身：被测的同名进程（如 python.exe）退出后，"重新监控"
         # 不能因为只剩本程序同名而自动监控起自己
         own_pid = os.getpid()
-        return [pid for pid, name in ProcessCollector.get_all_processes()
+        return [(pid, create_time)
+                for pid, name, create_time in ProcessCollector.get_all_processes()
                 if name.lower() == wanted and pid != own_pid]
 
     # ========== 任务列表 ==========
@@ -659,14 +705,21 @@ class MonitorPage(QScrollArea):
         )
 
     def _on_error(self, task_id: str, error_msg: str):
-        """错误事件"""
-        InfoBar.error(
+        """错误事件：提示不自动消失；同一任务的同一错误仍在显示时不再叠加
+        （采集异常可能每个周期都上报一次）"""
+        key = (task_id, error_msg)
+        if key in self._error_bars:
+            return
+        bar = InfoBar.error(
             title="错误",
             content=error_msg,
             parent=self,
             position=InfoBarPosition.TOP,
-            duration=3000
+            duration=ERROR_INFOBAR_DURATION
         )
+        if bar is not None:
+            self._error_bars[key] = bar
+            bar.closedSignal.connect(lambda k=key: self._error_bars.pop(k, None))
 
     def _on_limit_reached(self):
         """任务数量达到上限"""
@@ -711,18 +764,22 @@ class MonitorPage(QScrollArea):
         card = self.task_cards.get(task_id)
         if card is None or card.is_finished:
             return
-        label = self._ask_marker_label(card.next_marker_label())
+        # 打点时间取点击按钮的这一刻：输入标签要花好几秒，按确认时刻记录会让
+        # 竖线落在事件之后，短周期下甚至把增长归到下一轮
+        clicked_at = datetime.now()
+        label = self._ask_marker_label(card.next_marker_label(), clicked_at)
         if label is None:
             return
         if not label.strip():
             self._warn("打点标签不能为空")
             return
 
-        timestamp = self.manager.add_marker(task_id, label)
+        timestamp = self.manager.add_marker(task_id, label, clicked_at)
         if timestamp is None:
             InfoBar.error(
                 title="打点失败", content="未能保存打点，请查看日志",
-                parent=self, position=InfoBarPosition.TOP, duration=3000)
+                parent=self, position=InfoBarPosition.TOP,
+                duration=ERROR_INFOBAR_DURATION)
             return
         card.note_marker_added()
         InfoBar.success(
@@ -741,20 +798,21 @@ class MonitorPage(QScrollArea):
         if card is None:
             return
 
-        pids = self._find_pids_by_name(card.process_name)
-        if len(pids) == 1:
+        matches = self._find_processes_by_name(card.process_name)
+        if len(matches) == 1:
+            pid, create_time = matches[0]
             interval = card.interval or float(self.interval_spinbox.value())
             self._start_monitoring(
-                pids[0], card.process_name, list(card.metric_types),
-                interval, card.note)
+                pid, card.process_name, list(card.metric_types),
+                interval, card.note, create_time=create_time)
             return
 
         self.pid_input.clear()
         self.process_combo.setText(card.process_name)
         self.process_combo.setFocus()
-        if pids:
+        if matches:
             self._warn(
-                f"找到 {len(pids)} 个 {card.process_name} 进程，"
+                f"找到 {len(matches)} 个 {card.process_name} 进程，"
                 "请在上方列表中选择要监控的一个", title="请选择进程", duration=5000)
         else:
             self._warn(

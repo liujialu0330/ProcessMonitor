@@ -18,7 +18,7 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
 from qfluentwidgets import (
     ComboBox, CardWidget, PushButton, FluentIcon,
     StrongBodyLabel, BodyLabel, CaptionLabel, InfoBar, InfoBarPosition,
-    TableWidget, MessageBox, SegmentedWidget, TransparentToolButton, qconfig,
+    TableWidget, SegmentedWidget, TransparentToolButton, qconfig,
     TransparentDropDownPushButton, RoundMenu, Action,
     IconWidget, setCustomStyleSheet
 )
@@ -30,7 +30,9 @@ from core.monitor_manager import MonitorManager
 from data.database import Database
 from ui.chart_theme import chart_colors
 from ui.components.chart_axes import ContextDateAxisItem, MetricAxisItem
+from ui.components.confirm import DestructiveConfirmBox
 from ui.components.sparkline import compute_y_range
+from ui.thread_shutdown import BackgroundThread
 from ui.formatting import (
     build_stat_texts, format_task_option_text, format_task_tooltip,
     marker_context
@@ -854,7 +856,8 @@ class HistoryPage(QScrollArea):
                 title="错误",
                 content="无法加载任务信息",
                 parent=self,
-                position=InfoBarPosition.TOP
+                position=InfoBarPosition.TOP,
+                duration=-1
             )
             return
 
@@ -1182,9 +1185,10 @@ class HistoryPage(QScrollArea):
         task = self.db.get_task(self.current_task_id)
         task_desc = f"{task.process_name} (PID: {task.pid})" if task else self.current_task_id
 
-        dialog = MessageBox(
+        dialog = DestructiveConfirmBox(
             "确认删除",
             f"确定要删除任务「{task_desc}」的全部历史数据吗？此操作不可恢复。",
+            "删除",
             self.window()
         )
         if not dialog.exec():
@@ -1205,7 +1209,7 @@ class HistoryPage(QScrollArea):
                 content="删除任务数据失败，请查看日志",
                 parent=self,
                 position=InfoBarPosition.TOP,
-                duration=3000
+                duration=-1
             )
 
     def _save_chart_as_png(self):
@@ -1241,7 +1245,7 @@ class HistoryPage(QScrollArea):
                 content="保存图表图片失败，请查看日志",
                 parent=self,
                 position=InfoBarPosition.TOP,
-                duration=3000
+                duration=-1
             )
             return
 
@@ -1275,7 +1279,7 @@ class HistoryPage(QScrollArea):
                 content="复制图表到剪贴板失败，请查看日志",
                 parent=self,
                 position=InfoBarPosition.TOP,
-                duration=2000
+                duration=-1
             )
             return
 
@@ -1391,6 +1395,11 @@ class HistoryPage(QScrollArea):
 
     # ========== 自动刷新：后台查询 + 主线程应用 ==========
 
+    def background_threads(self) -> list:
+        """退出时需要收尾的后台线程（由主窗口统一 shutdown）：自动刷新查询只读、
+        无取消机制，仅带超时等待，避免退出时线程仍在读库。"""
+        return [BackgroundThread("历史自动刷新", self._refresh_worker, timeout_ms=3000)]
+
     def _cancel_pending_refresh(self):
         """使在途的后台刷新结果过期（推进请求序号）；不等待线程，线程自行跑完。"""
         self._refresh_request_seq += 1
@@ -1413,8 +1422,8 @@ class HistoryPage(QScrollArea):
             self.current_range_key, TIME_RANGE_SECONDS.get(self.current_range_key),
             TABLE_POINT_LIMIT, CHART_MAX_BUCKETS)
         worker.result_ready.connect(self._on_refresh_result)
-        # 先清引用、再 deleteLater（同一信号按连接顺序执行）：保证主窗口 closeEvent
-        # 读到的 _refresh_worker 要么仍有效、要么已是 None，不会拿到已删除的对象
+        # 先清引用、再 deleteLater（同一信号按连接顺序执行）：保证 background_threads()
+        # 交给主窗口的 _refresh_worker 要么仍有效、要么已是 None，不会拿到已删除的对象
         worker.finished.connect(lambda w=worker: self._on_refresh_worker_finished(w))
         worker.finished.connect(worker.deleteLater)
         self._refresh_worker = worker

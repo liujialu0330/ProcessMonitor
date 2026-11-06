@@ -320,13 +320,58 @@ def test_close_action_dialog_tray_button_only_when_tray_available(qapp):
 
     with_tray = CloseActionDialog(2, can_tray=True, parent=host)
     assert with_tray.tray_button is not None
-    assert with_tray.choice == 'quit'
     with_tray.tray_button.click()
     assert with_tray.choice == 'tray'
+
+    quit_dialog = CloseActionDialog(2, can_tray=True, parent=host)
+    quit_dialog.quit_button.click()
+    assert quit_dialog.choice == 'quit'
 
     without_tray = CloseActionDialog(1, can_tray=False, parent=host)
     assert without_tray.tray_button is None
     host.close()
+
+
+@pytest.mark.parametrize("can_tray", [True, False])
+def test_close_action_dialog_default_is_never_destructive(qapp, can_tray):
+    """跑一整夜的测试不能被顺手一个回车全停：主按钮（强调色、默认焦点）不是
+    "停止监控并退出"，对话框弹出后直接回车也不会得到 'quit'"""
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtTest import QTest
+    from PyQt5.QtWidgets import QWidget
+    from qfluentwidgets import PrimaryPushButton
+
+    host = QWidget()
+    host.resize(800, 600)
+    host.show()
+    dialog = CloseActionDialog(2, can_tray=can_tray, parent=host)
+    accepted = []
+    dialog.accepted.connect(lambda: accepted.append(dialog.choice))
+    dialog.show()
+    qapp.processEvents()
+    try:
+        assert dialog.quit_button.text() == "停止监控并退出"
+        assert not isinstance(dialog.quit_button, PrimaryPushButton)
+        focused = dialog.focusWidget()
+        assert focused is not None and focused is not dialog.quit_button
+        if can_tray:
+            assert focused is dialog.tray_button is dialog.yesButton
+            assert dialog.yesButton.text() == "最小化到托盘"
+        else:
+            # 无托盘时隐藏主按钮，焦点落在"取消"
+            assert dialog.yesButton.isHidden()
+            assert focused is dialog.cancelButton
+
+        QTest.keyClick(focused, Qt.Key_Return)
+        # MaskDialogBase.done 带淡出动画，等动画结束后 accepted 才会发出
+        QTest.qWait(400)
+        assert dialog.choice != 'quit'
+        assert 'quit' not in accepted
+        if can_tray:
+            assert accepted == ['tray']
+    finally:
+        dialog.close()
+        host.close()
 
 
 def test_abnormal_end_bubble_only_when_window_not_in_front(window):
@@ -343,3 +388,134 @@ def test_abnormal_end_bubble_only_when_window_not_in_front(window):
     window.isActiveWindow = lambda: True
     window._on_task_ended_abnormally("任务已结束", "x")
     assert window.tray_icon.messages == []
+
+
+# ========== 退出时按页面登记收尾后台线程 ==========
+
+class _FakeThread:
+    """记录取消与等待调用的假线程：isRunning 在被 wait 之前恒为 True"""
+
+    def __init__(self, log, name):
+        self.log = log
+        self.name = name
+        self.waited_ms = None
+
+    def isRunning(self):
+        return self.waited_ms is None
+
+    def cancel(self):
+        self.log.append(("cancel", self.name))
+
+    def wait(self, timeout_ms):
+        self.log.append(("wait", self.name))
+        self.waited_ms = timeout_ms
+        return True
+
+
+def test_close_shuts_down_every_page_background_thread(window, monkeypatch):
+    """各页面现有的后台线程在真退出时都被收尾，取消语义与超时保持原值：
+    下载 2000 可取消、检查更新 1000、导出 2000 可取消、清理 5000 不取消、
+    历史自动刷新 3000"""
+    monkeypatch.setattr(QApplication, 'quit', MagicMock())
+    log = []
+    fakes = {name: _FakeThread(log, name) for name in
+             ("download", "check", "export", "cleanup", "refresh")}
+    window.about_page._downloader = fakes["download"]
+    window.about_page._checker = fakes["check"]
+    window.export_page._export_worker = fakes["export"]
+    window.setting_page._cleanup_worker = fakes["cleanup"]
+    window.history_page._refresh_worker = fakes["refresh"]
+    try:
+        window.closeEvent(_fake_event())
+    finally:
+        window.about_page._downloader = None
+        window.about_page._checker = None
+        window.export_page._export_worker = None
+        window.setting_page._cleanup_worker = None
+        window.history_page._refresh_worker = None
+
+    assert {name: fake.waited_ms for name, fake in fakes.items()} == {
+        "download": 2000, "check": 1000, "export": 2000,
+        "cleanup": 5000, "refresh": 3000}
+    cancelled = [name for action, name in log if action == "cancel"]
+    assert cancelled == ["download", "export"]
+    # 取消必须先于等待
+    assert log.index(("cancel", "download")) < log.index(("wait", "download"))
+    assert log.index(("cancel", "export")) < log.index(("wait", "export"))
+
+
+def test_close_uses_public_background_threads_not_private_names(window, monkeypatch):
+    """主窗口只认页面的 background_threads()：页面内部线程属性改名（这里私有属性
+    全为 None，线程只经公开方法给出）也不会漏收"""
+    from ui.thread_shutdown import BackgroundThread
+
+    monkeypatch.setattr(QApplication, 'quit', MagicMock())
+    log = []
+    owners = window._thread_owner_pages()
+    assert set(owners) == {window.about_page, window.export_page,
+                           window.setting_page, window.history_page}
+    fakes = []
+    for index, page in enumerate(owners):
+        fake = _FakeThread(log, f"renamed_{index}")
+        fakes.append(fake)
+        monkeypatch.setattr(
+            page, 'background_threads',
+            lambda fake=fake: [BackgroundThread(fake.name, fake,
+                                                cancel_fn=fake.cancel,
+                                                timeout_ms=1234)])
+
+    window.closeEvent(_fake_event())
+
+    assert [fake.waited_ms for fake in fakes] == [1234] * len(owners)
+    assert [name for action, name in log if action == "cancel"] == \
+        [fake.name for fake in fakes]
+
+
+def test_close_continues_when_one_page_fails_to_list_threads(window, monkeypatch):
+    """某一页取线程列表抛异常时，其余页面的线程照样收尾，quit 照常执行"""
+    from ui.thread_shutdown import BackgroundThread
+
+    quit_mock = MagicMock()
+    monkeypatch.setattr(QApplication, 'quit', quit_mock)
+    log = []
+    fake = _FakeThread(log, "history")
+    monkeypatch.setattr(
+        window.about_page, 'background_threads',
+        MagicMock(side_effect=RuntimeError("模拟页面异常")))
+    monkeypatch.setattr(
+        window.history_page, 'background_threads',
+        lambda: [BackgroundThread("history", fake, timeout_ms=3000)])
+
+    event = _fake_event()
+    window.closeEvent(event)
+
+    assert fake.waited_ms == 3000
+    quit_mock.assert_called_once()
+    event.accept.assert_called_once()
+
+
+def test_page_background_threads_are_none_when_idle(window):
+    """空闲时各页面登记项的线程为 None，收尾时直接跳过"""
+    for page in window._thread_owner_pages():
+        entries = page.background_threads()
+        assert entries
+        assert all(entry.thread is None for entry in entries)
+        assert all(entry.cancel_fn is None for entry in entries)
+
+
+def test_migration_failed_tip_holds_for_both_failure_cases(window, monkeypatch):
+    """migration_failed 既可能是"已从备份还原"，也可能是"还原与改名都失败、旧库
+    原样保留"：提示不能断言"已还原旧数据"，只说两种情况都成立的事实"""
+    import ui.main_window as main_window_module
+    shown = []
+    monkeypatch.setattr(
+        main_window_module.InfoBar, 'warning',
+        lambda **kwargs: shown.append(kwargs))
+
+    window._show_migration_failed_tip()
+
+    content = shown[-1]["content"]
+    assert "还原" not in content
+    assert "旧数据已保留" in content
+    assert "新数据无法保存" in content
+    assert shown[-1]["duration"] == -1

@@ -104,10 +104,11 @@ class MainWindow(FluentWindow):
             QTimer.singleShot(500, self._show_migration_failed_tip)
 
     def _show_migration_failed_tip(self):
-        """迁移两次尝试均失败，已还原旧数据：本次运行新数据无法保存"""
+        """迁移失败且旧数据仍在原库（已从备份还原，或还原与改名都失败而原样保留）：
+        本次运行新数据无法保存，下次启动会重新迁移"""
         InfoBar.warning(
             title="数据库升级失败",
-            content="数据库升级失败，已还原旧数据，本次运行新数据无法保存，请重启重试。",
+            content="数据库升级失败，本次运行新数据无法保存；旧数据已保留，请重启重试。",
             orient=Qt.Horizontal,
             isClosable=True,
             position=InfoBarPosition.TOP,
@@ -166,7 +167,8 @@ class MainWindow(FluentWindow):
             self, db=self.db, manager=self.monitor_manager)
         self.history_page = HistoryPage(
             self, db=self.db, manager=self.monitor_manager)
-        self.export_page = ExportPage(self, db=self.db)
+        # 导出页需要 manager 登记导出，与设置页的清理/压缩数据库互斥
+        self.export_page = ExportPage(self, db=self.db, manager=self.monitor_manager)
         # 设置页数据管理卡片需要 db（查询占用/清理压缩）与 manager（只读查询
         # 是否有运行中任务，决定清理按钮是否可用）两个依赖，均为可选注入
         self.setting_page = SettingPage(self, db=self.db, manager=self.monitor_manager)
@@ -359,6 +361,27 @@ class MainWindow(FluentWindow):
             self._tray_tip_shown = True
         event.ignore()
 
+    def _thread_owner_pages(self) -> tuple:
+        """有后台线程需要在退出时收尾的页面（各自实现 background_threads()）"""
+        return (self.about_page, self.export_page, self.setting_page, self.history_page)
+
+    def _shutdown_page_threads(self) -> None:
+        """逐页收尾后台线程：先取消（如有）再带超时等待，超时只记日志。
+
+        某一页取线程列表出错不影响其余页面——退出前漏收一个线程，main.py 的
+        os._exit 就会在它写库/写文件的中途把它掐断。
+        """
+        for page in self._thread_owner_pages():
+            try:
+                threads = page.background_threads()
+            except Exception:
+                logger.error("获取页面后台线程失败: %r", page, exc_info=True)
+                continue
+            for entry in threads:
+                if not shutdown_thread(entry.thread, cancel_fn=entry.cancel_fn,
+                                       timeout_ms=entry.timeout_ms):
+                    logger.error("退出时后台线程未在超时内结束: %s", entry.name)
+
     def closeEvent(self, event):
         """关闭窗口事件处理。
 
@@ -410,28 +433,9 @@ class MainWindow(FluentWindow):
                 if task.isRunning():
                     shutdown_thread(task, timeout_ms=3000)
 
-            # 2. 关于页的下载线程：先置取消标志，再等待结束（超时只记日志，不阻塞更久）
-            downloader = getattr(self.about_page, '_downloader', None)
-            shutdown_thread(downloader, cancel_fn=getattr(downloader, 'cancel', None), timeout_ms=2000)
-
-            # 3. 关于页的更新检查线程：无取消机制，仅等待
-            checker = getattr(self.about_page, '_checker', None)
-            shutdown_thread(checker, timeout_ms=1000)
-
-            # 4. 导出页的导出线程：先置取消标志（取消后会自行删除写了一半的CSV），再等待结束
-            export_worker = getattr(self.export_page, '_export_worker', None)
-            shutdown_thread(
-                export_worker, cancel_fn=getattr(export_worker, 'cancel', None), timeout_ms=2000)
-
-            # 5. 设置页的数据库清理线程：仅 join 兜底，无取消机制——清理动作本身
-            #    应尽快跑完，不强行中断以免 VACUUM 中途被打断导致数据库处于中间态
-            cleanup_worker = getattr(self.setting_page, '_cleanup_worker', None)
-            shutdown_thread(cleanup_worker, timeout_ms=5000)
-
-            # 6. 历史页的自动刷新查询线程：只读查询、无取消机制，仅带超时 join 兜底，
-            #    避免退出时线程仍在读库（超时只记日志，不阻塞更久）
-            refresh_worker = getattr(self.history_page, '_refresh_worker', None)
-            shutdown_thread(refresh_worker, timeout_ms=3000)
+            # 2. 各页面登记的后台线程（下载、检查更新、导出、清理数据库、历史自动
+            #    刷新）：取消语义与超时由页面的 background_threads() 给出
+            self._shutdown_page_threads()
 
             # 接受关闭事件（放 try 尾部：清理全部成功才显式 accept；异常路径下
             # QCloseEvent 默认已 accepted，且 finally 的 quit() 与 main.py 的
