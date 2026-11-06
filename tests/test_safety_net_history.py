@@ -4,7 +4,7 @@
 锁住的现有行为（重构 HistoryQuery / HistoryViewModel 时任何漂移都应让这里变红）：
 1. 手动加载（主线程 _load_task_data）与自动刷新（HistoryRefreshWorker 后台查询 +
    _on_refresh_result 应用）对同一任务、同一指标、同一时间范围：
-   - 发给数据库的 since_iso / limit / max_buckets 完全相同；
+   - 发给仓储的 since（datetime）/ limit / 分桶上限完全相同；
    - 交给 _apply_loaded_data 的明细点、统计、分桶点、打点逐项相等；
    - 渲染后的表格内容、表格提示、统计条文本、曲线点、打点竖线、纵轴标题完全相同；
    - 范围内无数据时两条路径显示同一空状态文案。
@@ -109,21 +109,28 @@ def page(qapp, db, manager, monkeypatch):
 
 
 def _record_db_queries(db, monkeypatch):
-    """包一层数据库只读查询，记录 (方法名, since_iso, 规模参数)；worker 线程里调用同样被记录。"""
+    """包一层仓储只读查询，记录 (查询名, since, 规模参数)；worker 线程里调用同样被记录。
+
+    since 一律是 datetime（仓储只收 datetime）：points.fetch 从 PointQuery 取，
+    其余从 since 关键字参数取。"""
     calls = []
 
-    def wrap(name, size_key):
-        real = getattr(db, name)
+    def wrap(repo, name, label, extract):
+        real = getattr(repo, name)
 
         def spy(*args, **kwargs):
-            calls.append((name, kwargs.get('since_iso'), kwargs.get(size_key)))
+            calls.append((label, *extract(args, kwargs)))
             return real(*args, **kwargs)
-        monkeypatch.setattr(db, name, spy)
+        monkeypatch.setattr(repo, name, spy)
 
-    wrap('get_task_data_points', 'limit')
-    wrap('get_metric_stats', None)
-    wrap('get_task_data_points_bucketed', 'max_buckets')
-    wrap('get_markers', None)
+    wrap(db.points, 'fetch', 'table',
+         lambda a, k: (a[0].since, a[0].limit))
+    wrap(db.analytics, 'legacy_stats', 'stats',
+         lambda a, k: (k.get('since'), None))
+    wrap(db.analytics, 'legacy_buckets', 'buckets',
+         lambda a, k: (k.get('since'), a[2]))
+    wrap(db.markers, 'list', 'markers',
+         lambda a, k: (k.get('since'), None))
     return calls
 
 
@@ -261,12 +268,12 @@ def test_manual_load_and_auto_refresh_are_identical(
 
     # 1) 查询参数：同一 since、同一 limit / 分桶上限、同样的查询集合与顺序
     expected_since = (None if since_minutes is None
-                      else (BASE + timedelta(minutes=since_minutes)).isoformat())
+                      else BASE + timedelta(minutes=since_minutes))
     expected_calls = [
-        ('get_task_data_points', expected_since, TABLE_LIMIT),
-        ('get_metric_stats', expected_since, None),
-        ('get_task_data_points_bucketed', expected_since, MAX_BUCKETS),
-        ('get_markers', expected_since, None),
+        ('table', expected_since, TABLE_LIMIT),
+        ('stats', expected_since, None),
+        ('buckets', expected_since, MAX_BUCKETS),
+        ('markers', expected_since, None),
     ]
     assert manual_calls == expected_calls
     assert auto_calls == expected_calls
@@ -313,7 +320,7 @@ def test_out_of_range_metric_shows_same_empty_state_on_both_paths(page, db, monk
     """
     task = _seed_query_dataset(db)
     _prepare(page, task, THREADS, '10m')
-    expected_since = (BASE + timedelta(minutes=110)).isoformat()
+    expected_since = BASE + timedelta(minutes=110)
 
     calls = _record_db_queries(db, monkeypatch)
     applied = _record_apply(page, monkeypatch)
@@ -332,7 +339,8 @@ def test_out_of_range_metric_shows_same_empty_state_on_both_paths(page, db, monk
     auto_view = _snapshot(page)
 
     assert applied == []
-    assert manual_calls == [('get_task_data_points', expected_since, TABLE_LIMIT)]
+    assert manual_calls == [('table', expected_since, TABLE_LIMIT)]
+    assert isinstance(manual_calls[0][1], datetime)
     assert auto_calls == manual_calls
     assert manual_view['content'] == auto_view['content'] == 'empty'
     assert manual_view['empty_title'] == auto_view['empty_title'] == "所选时间范围内暂无数据"

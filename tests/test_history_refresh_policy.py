@@ -40,7 +40,7 @@ def test_anchor_uses_last_sample_at_without_max_query(page, db, monkeypatch):
     task = _seed_task(db, samples=5)
     page.select_task(task.task_id)
     calls = []
-    monkeypatch.setattr(db, 'get_last_point_timestamp', lambda tid: calls.append(tid))
+    monkeypatch.setattr(db.analytics, 'last_point_timestamp', lambda tid: calls.append(tid))
     page._invalidate_last_dt_cache()
     page.current_range_key = '1h'
 
@@ -77,9 +77,9 @@ def test_load_task_data_updates_refresh_interval_from_stats(page, db, monkeypatc
     page.select_task(task.task_id)
     assert page._auto_refresh_timer.interval() == AUTO_REFRESH_INTERVAL_MS
 
-    real = db.get_metric_stats
+    real = db.analytics.legacy_stats
     monkeypatch.setattr(
-        db, 'get_metric_stats', lambda *a, **k: {**real(*a, **k), 'count': 300_000})
+        db.analytics, 'legacy_stats', lambda *a, **k: {**real(*a, **k), 'count': 300_000})
     page._load_task_data(task.task_id, MetricType.MEMORY_PRIVATE)
     assert page._auto_refresh_timer.interval() == 15000
 

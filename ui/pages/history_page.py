@@ -25,7 +25,9 @@ import pyqtgraph as pg
 from pyqtgraph import exporters
 
 from core.contracts import TaskStatus
-from core.history_refresh_worker import HistoryRefreshResult, HistoryRefreshWorker
+from core.history_refresh_worker import (
+    HistoryRefreshResult, HistoryRefreshWorker, query_history_data)
+from data.errors import StorageError
 from ui.chart_theme import chart_colors
 from ui.components.chart_axes import ContextDateAxisItem, MetricAxisItem
 from ui.components.sparkline import compute_y_range
@@ -56,7 +58,7 @@ TABLE_POINT_LIMIT = 2000
 CHART_MAX_BUCKETS = 2000
 
 # 时间范围选项：(SegmentedWidget routeKey, 显示文本, 范围秒数)；
-# 秒数为 None 表示"全部"（不做时间过滤）。语义锚点见 _compute_since_iso：
+# 秒数为 None 表示"全部"（不做时间过滤）。语义锚点见 _compute_since：
 # 锚定该任务最后一个数据点的时间，而非当前时刻——停止已久的任务选"最近1小时"
 # 仍应能看到其最后一小时的数据。
 TIME_RANGE_OPTIONS = [
@@ -168,6 +170,8 @@ class HistoryPage(QScrollArea):
         # 单调递增，任何"用户主动加载/整体重载/页面隐藏"都会推进它，使在途结果过期被丢弃
         self._refresh_worker: Optional[HistoryRefreshWorker] = None
         self._refresh_request_seq = 0
+        # 自动刷新连续读库失败时只提示一次；成功应用一次结果后复位
+        self._refresh_error_notified = False
 
         # 初始化UI
         self._init_ui()
@@ -587,13 +591,22 @@ class HistoryPage(QScrollArea):
         self.task_combo.setToolTip("")
 
         # 单条查询取出"至少有一次采样"的任务（与导出页口径一致，不再逐任务 COUNT）
-        tasks = self.db.get_tasks_with_data()
+        # 读库失败要与"没有任务"区分开：显示"读取数据失败"而非"暂无历史数据"
+        load_error = None
+        try:
+            tasks = self.db.tasks.list_with_data()
+        except StorageError as e:
+            logger.error("历史页读取任务列表失败", exc_info=True)
+            tasks, load_error = [], str(e)
 
         if not tasks:
             # 清空显示和当前任务ID、指标
-            self._clear_display(
-                "暂无历史数据",
-                "完成一次监控后，数据会显示在这里")
+            if load_error is not None:
+                self._show_load_failed(load_error)
+            else:
+                self._clear_display(
+                    "暂无历史数据",
+                    "完成一次监控后，数据会显示在这里")
             self._clear_metric_combo()
             self.current_task_id = None
             self.current_metric = None
@@ -784,7 +797,7 @@ class HistoryPage(QScrollArea):
     def _get_cached_last_dt(self, task_id: str, task_info=None) -> Optional[datetime]:
         """
         按任务缓存 last_dt：切范围/切指标复用缓存值；缓存在刷新、重载任务列表与
-        自动刷新时失效（_invalidate_last_dt_cache）。
+        自动刷新时失效（_invalidate_last_dt_cache）。读库失败抛 StorageError。
 
         Args:
             task_id: 任务ID
@@ -794,25 +807,24 @@ class HistoryPage(QScrollArea):
             # 优先读 tasks.last_sample_at（主键查询，随数据点写入同事务维护），
             # 不再对大表执行 MAX(timestamp)；仅其为空（旧数据/维护缺失）时才回退旧查询
             if task_info is None:
-                task_info = self.db.get_task(task_id)
+                task_info = self.db.tasks.get(task_id)
             last_dt = task_info.last_sample_at if task_info else None
             if last_dt is None:
-                last_dt = self.db.get_last_point_timestamp(task_id)
+                last_dt = self.db.analytics.last_point_timestamp(task_id)
             self._last_dt_cache_value = last_dt
             self._last_dt_cache_task_id = task_id
         return self._last_dt_cache_value
 
-    def _compute_since_iso(self, task_id: str, task_info=None) -> Optional[str]:
+    def _compute_since(self, task_id: str, task_info=None) -> Optional[datetime]:
         """
-        把当前选中的时间范围换算成 SQL 过滤用的 ISO 字符串。
+        把当前选中的时间范围换算成查询起点（datetime，仓储只收 datetime）。
 
-        SQL 过滤参数全链路用 ISO 字符串，与绘图用的 epoch float 严禁混用。锚点为
-        该任务最后一个数据点的时间（tasks.last_sample_at，为空才回退
-        get_last_point_timestamp），而非当前时刻——停止已久的任务选"最近1小时"
-        仍应能看到其最后一小时的数据。
+        锚点为该任务最后一个数据点的时间（tasks.last_sample_at，为空才回退
+        analytics.last_point_timestamp），而非当前时刻——停止已久的任务选"最近1小时"
+        仍应能看到其最后一小时的数据。绘图用的 epoch float 不得回流到这里。
 
         Returns:
-            Optional[str]: 选中"全部"或该任务尚无数据点时返回 None（不过滤）
+            Optional[datetime]: 选中"全部"或该任务尚无数据点时返回 None（不过滤）
         """
         range_seconds = TIME_RANGE_SECONDS.get(self.current_range_key)
         if range_seconds is None:
@@ -820,55 +832,51 @@ class HistoryPage(QScrollArea):
         last_dt = self._get_cached_last_dt(task_id, task_info)
         if last_dt is None:
             return None
-        since_dt = last_dt - timedelta(seconds=range_seconds)
-        return since_dt.isoformat()
+        return last_dt - timedelta(seconds=range_seconds)
 
     def _load_task_data(self, task_id: str, metric_type: str = None,
                         keep_view: bool = False):
         """
         加载任务指定指标的数据并显示：表格与图表均按当前选中的时间范围过滤、限流
         查询，避免大数据量任务把整张表拖进内存/渲染导致界面卡顿；统计条统一取自
-        get_metric_stats（覆盖所选范围内全部数据）；导出页仍走全量数据。
+        legacy_stats（覆盖所选范围内全部数据）；导出页仍走全量数据。
+        查询与自动刷新共用 query_history_data，保证同口径。
+
+        读库失败（StorageError）显示"读取数据失败"并弹错误提示，而不是"暂无数据"。
 
         Args:
             task_id: 任务ID
-            metric_type: 指标类型（首指标查询自动包含metric_type为NULL的旧数据）
+            metric_type: 指标类型
             keep_view: True 时保留用户当前的缩放/平移（自动刷新用）；False 时让图表
                 重新自适应范围，避免切指标后曲线跑出视野
         """
         # 同步加载比在途的后台刷新更新：让在途结果过期，避免它回来覆盖本次显示
         self._cancel_pending_refresh()
 
-        # 获取任务信息
-        task_info = self.db.get_task(task_id)
-        if not task_info:
-            self.services.notifier.error(self, "错误", "无法加载任务信息")
+        try:
+            task_info = self.db.tasks.get(task_id)
+            if not task_info:
+                self.services.notifier.error(self, "错误", "无法加载任务信息")
+                return
+            since = self._compute_since(task_id, task_info)
+            table_points, stats, chart_points, markers = query_history_data(
+                self.db, task_id, metric_type, since, TABLE_POINT_LIMIT, CHART_MAX_BUCKETS)
+        except StorageError as e:
+            logger.error("历史页读取数据失败: task_id=%s", task_id, exc_info=True)
+            self._show_load_failed(str(e))
             return
-
-        since_iso = self._compute_since_iso(task_id, task_info)
-
-        # 表格：所选范围内最近 TABLE_POINT_LIMIT 条，子查询已按时间升序返回
-        table_points = self.db.get_task_data_points(
-            task_id, metric_type=metric_type, limit=TABLE_POINT_LIMIT, since_iso=since_iso)
 
         if not table_points:
             self._show_no_data()
             return
 
-        # 统计：与图表/表格同一时间范围，口径统一（起点、当前、增速都来自它）
-        stats = (self.db.get_metric_stats(task_id, metric_type, since_iso=since_iso)
-                 if metric_type else None)
-
-        # 图表：SQL 分桶降采样（每桶 MIN/MAX 两点，保留尖峰），按时间升序返回，
-        # 同样按当前范围过滤
-        chart_points = self.db.get_task_data_points_bucketed(
-            task_id, metric_type=metric_type, max_buckets=CHART_MAX_BUCKETS, since_iso=since_iso)
-
-        # 打点：先于绘图载入，_redraw_chart 会一并画出竖线
-        markers = self.db.get_markers(task_id, since_iso=since_iso)
-
         self._apply_loaded_data(
             metric_type, table_points, stats, chart_points, markers, keep_view)
+
+    def _show_load_failed(self, detail: str):
+        """读库失败：空状态显示"读取数据失败"（区别于"暂无数据"），并弹错误提示。"""
+        self._clear_display("读取数据失败", "数据库读取出错，可稍后点击刷新重试")
+        self.services.notifier.error(self, "读取数据失败", detail)
 
     def _show_no_data(self):
         """所选范围内没有数据点：按当前所选范围判断提示文案（而不是与默认范围比较）。"""
@@ -1048,7 +1056,7 @@ class HistoryPage(QScrollArea):
         更新统计条：起点、当前、变化量、增速、最小、最大。
 
         Args:
-            stats: Database.get_metric_stats 的结果（覆盖所选范围内全部数据）；
+            stats: analytics.legacy_stats 的结果（覆盖所选范围内全部数据）；
                 None 时全部显示 "--"
             metric_type: 指标类型
         """
@@ -1383,7 +1391,13 @@ class HistoryPage(QScrollArea):
             return
         if result.error is not None:
             logger.warning("历史页自动刷新失败，保持当前显示: %s", result.error)
+            # 存储故障：保持已显示的数据，但让用户知道读取失败；连续失败只提示一次，
+            # 避免每个刷新周期弹一条
+            if result.storage_error and not self._refresh_error_notified:
+                self._refresh_error_notified = True
+                self.services.notifier.error(self, "读取数据失败", result.error)
             return
+        self._refresh_error_notified = False
         if result.task_missing:
             return
         if self._should_skip_auto_refresh():

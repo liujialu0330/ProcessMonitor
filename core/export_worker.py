@@ -1,6 +1,6 @@
 """
 导出工作线程
-在后台 QThread 内经 Database.iter_data_points 分批读取数据点，配合 core/export.py 的
+在后台 QThread 内经 db.points.iter_batches 分批读取数据点，配合 core/export.py 的
 pivot_rows 生成器流式写 CSV（同一时间戳跨批次由生成器天然处理），避免大数据量
 导出时一次性 fetchall 占用大量内存、也避免长时间同步写文件阻塞 GUI 主线程。
 
@@ -46,7 +46,7 @@ class ExportWorker(QThread):
         Args:
             db: 调用方已有的 Database 实例。线程内不再新建实例：Database 构造时会开
                 BEGIN IMMEDIATE 写事务，会和"清理并压缩数据库"抢写锁；而这里用到的
-                iter_data_points / get_markers 每次调用都自建连接，跨线程共用是安全的
+                points.iter_batches / markers.list 每次调用都自建连接，跨线程共用是安全的
             task: 待导出的任务（提供表头与透视所需的 process_name/pid/metric_types）
             save_path: CSV 保存路径
             metric_type: 指标类型过滤（None 表示导出任务全部指标：宽表每次采集一行，
@@ -85,9 +85,10 @@ class ExportWorker(QThread):
         processed = 0
         batches = None
         try:
-            batches = self.db.iter_data_points(self.task.task_id, FETCH_BATCH_SIZE)
+            # 仓储接口：读取失败抛 StorageError，由下面的 except 走导出失败路径
+            batches = self.db.points.iter_batches(self.task.task_id, FETCH_BATCH_SIZE)
             # 打点随宽表导出：写在"时间不早于打点时刻的第一行"的"打点"列
-            markers = self.db.get_markers(self.task.task_id)
+            markers = self.db.markers.list(self.task.task_id)
             header = build_csv_header(self.task, include_markers=True)
 
             def _counted_iter():

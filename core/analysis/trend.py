@@ -9,7 +9,10 @@
 import math
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from data.repos.analytics_repo import MetricAggregates
 
 # 判定门槛默认值（judge 的同名参数可覆盖）
 MIN_SPAN_FLOOR_SECONDS = 600.0      # 跨度下限：10 分钟
@@ -50,6 +53,28 @@ class FitInput:
     @property
     def value_range(self) -> float:
         return self.max_value - self.min_value
+
+
+def fit_input_from_aggregates(agg: 'MetricAggregates') -> Optional[FitInput]:
+    """
+    数据层聚合结果（AnalyticsRepo.aggregates 返回的 MetricAggregates）→ 拟合输入；
+    范围内没有点（count < 1）时返回 None。依赖方向是 core → data，数据层不反向依赖本模块。
+    """
+    if agg.count < 1:
+        return None
+    return FitInput(
+        count=agg.count,
+        sum_x=agg.sum_x,
+        sum_y=agg.sum_y,
+        sum_xx=agg.sum_xx,
+        sum_xy=agg.sum_xy,
+        sum_yy=agg.sum_yy,
+        span_seconds=agg.span_seconds,
+        first_value=agg.first_value,
+        last_value=agg.last_value,
+        min_value=agg.min_value,
+        max_value=agg.max_value,
+    )
 
 
 @dataclass(frozen=True)

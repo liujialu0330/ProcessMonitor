@@ -8,8 +8,12 @@ import json
 import os
 import sqlite3
 
-from data.database import Database, SCHEMA_VERSION
-from tests.test_migration import _create_v0_db, _get_user_version
+from data.database import Database
+from data.db.migrations.runner import MigrationOutcome
+from data.db.schema import SCHEMA_VERSION
+from tests.test_migration import (
+    _create_v0_db, _get_user_version, patched_migrations, run_migration,
+)
 
 
 def _create_v1_db(path: str, tasks: dict, rows: list):
@@ -84,6 +88,8 @@ def test_v1_to_v2_merges_duplicate_memory_metrics(db_path):
     assert _get_user_version(db_path) == SCHEMA_VERSION
     assert os.path.exists(db_path + '.bak_v1')
     assert db.migration_failed is False
+    assert db.migration_report.outcome is MigrationOutcome.MIGRATED
+    assert db.migration_report.from_version == 1
     assert db.get_task('t1').metric_types == ['memory_rss', 'memory_private']
     assert _raw_points(db_path, 't1') == [
         ('2026-01-01T00:00:01', 'memory_private', 500.0),
@@ -130,12 +136,14 @@ def test_v0_db_upgrades_all_the_way_to_current(db_path):
 
 def test_new_db_is_created_at_current_version(db_path):
     """新库直接置为当前版本，不产生备份"""
-    Database(db_path)
+    db = Database(db_path)
+    assert db.migration_report.outcome is MigrationOutcome.UP_TO_DATE
+    assert db.migration_report.created is True
     assert _get_user_version(db_path) == SCHEMA_VERSION
     assert not os.path.exists(db_path + '.bak_v1')
 
 
-def test_v1_to_v2_failure_rolls_back_and_restores(db_path, monkeypatch):
+def test_v1_to_v2_failure_rolls_back_and_restores(db_path):
     """v2 步骤抛异常：整条链回滚并从备份还原，库仍是 v1 且数据未变"""
     rows = [('t1', '2026-01-01T00:00:01', 1.0, 'memory_vms')]
     _create_v1_db(db_path, {'t1': ['memory_vms']}, rows)
@@ -144,11 +152,10 @@ def test_v1_to_v2_failure_rolls_back_and_restores(db_path, monkeypatch):
         cursor.execute("UPDATE tasks SET metric_type = 'x'")  # 先写点东西再失败
         raise RuntimeError("模拟迁移失败")
 
-    monkeypatch.setattr(Database, '_migrate_v1_to_v2', staticmethod(_boom))
+    report = run_migration(db_path, patched_migrations(2, _boom))
 
-    db = Database(db_path)
-
-    assert db.migration_failed is True
+    assert report.outcome is MigrationOutcome.FAILED_RESTORED
+    assert (report.from_version, report.to_version) == (1, 1)
     assert _get_user_version(db_path) == 1
     conn = sqlite3.connect(db_path)
     try:

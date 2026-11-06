@@ -1,7 +1,8 @@
 """
 分析纯函数
 趋势拟合与判定（trend）、按打点边界的区间统计（intervals）。
-只依赖标准库，不碰 Qt 与数据库：输入由数据层的查询结果组装，输出交给 UI 层映射文案。
+只依赖标准库，不碰 Qt、不查数据库：输入由数据层的查询结果组装（fit_input_from_aggregates
+只读取数据层聚合结果的字段，类型注解仅用于静态检查），输出交给 UI 层映射文案。
 """
 from core.analysis.intervals import (
     Boundary,
@@ -15,6 +16,7 @@ from core.analysis.trend import (
     Judgement,
     LinearFit,
     Verdict,
+    fit_input_from_aggregates,
     judge,
     linear_fit,
     min_span_for,
@@ -28,6 +30,7 @@ __all__ = [
     'LinearFit',
     'Verdict',
     'baseline_delta',
+    'fit_input_from_aggregates',
     'judge',
     'linear_fit',
     'min_span_for',
