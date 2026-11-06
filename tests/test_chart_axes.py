@@ -6,8 +6,10 @@ import math
 import pytest
 
 from ui.components.chart_axes import (
-    MetricAxisItem, convert_tick_levels, decimals_for_spacing, display_divisor
+    DISPLAY_UNIT_DIVISORS, MetricAxisItem, convert_tick_levels, decimals_for_spacing,
+    display_divisor
 )
+from utils.metrics import KB_UNIT_DIVISORS
 
 MB = 1024.0
 GB = 1024.0 ** 2
@@ -27,6 +29,12 @@ def test_display_divisor():
     assert display_divisor('GB') == 1024.0 ** 2
     assert display_divisor('') == 1.0
     assert display_divisor('个') == 1.0
+    assert display_divisor('TB') == 1024.0 ** 3
+
+
+def test_display_unit_divisors_come_from_metrics_module():
+    """坐标轴不再自带 KB 换算表，与格式化共用 utils.metrics 的同一张表"""
+    assert DISPLAY_UNIT_DIVISORS is KB_UNIT_DIVISORS
 
 
 def test_convert_tick_levels_scales_back_to_raw_values():

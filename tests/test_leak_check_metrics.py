@@ -10,8 +10,8 @@ import app_config
 from app_config import cfg, normalize_metrics, remember_last_metrics
 from utils.metrics import (
     AVAILABLE_METRICS, LEAK_CHECK_PRESET, METRIC_DESCRIPTIONS,
-    METRIC_DISPLAY_NAMES, MetricType, format_metric_delta, format_metric_rate,
-    get_metric_description
+    METRIC_DISPLAY_NAMES, RATE_NOT_APPLICABLE, MetricType, format_metric_delta,
+    format_metric_rate, get_metric_description
 )
 
 
@@ -139,6 +139,16 @@ def test_format_metric_rate_bytes_and_counts():
     assert format_metric_rate(MetricType.NUM_HANDLES, 0.0) == "±0/小时"
     assert format_metric_rate(MetricType.NUM_HANDLES, 0.01) == "±0/小时"
     assert format_metric_rate(MetricType.MEMORY_PRIVATE, None) == "--"
+
+
+def test_format_metric_rate_not_applicable_for_cumulative_metrics():
+    """累计次数/累计字节/CPU 时间/峰值单调不减，增速不能外推，统一显示为不适用"""
+    for metric in (MetricType.IO_READ_BYTES, MetricType.IO_WRITE_COUNT,
+                   MetricType.MEMORY_NUM_PAGE_FAULTS, MetricType.CPU_USER_TIME,
+                   MetricType.MEMORY_PEAK_PAGEFILE, MetricType.NUM_CTX_SWITCHES_VOL):
+        assert format_metric_rate(metric, 1024.0) == RATE_NOT_APPLICABLE
+    # 变化量仍按原规则显示
+    assert format_metric_delta(MetricType.IO_READ_BYTES, 2048.0) == "+2 MB"
 
 
 def test_app_config_module_exports_are_consistent():

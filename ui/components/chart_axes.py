@@ -12,13 +12,11 @@ from typing import List, Tuple
 
 import pyqtgraph as pg
 
+from utils.metrics import KB_UNIT_DIVISORS
+
 # 指标原始值以 KB 存储；坐标轴只转换显示文本与刻度间距，不改动绘图数据与数据库语义。
-DISPLAY_UNIT_DIVISORS = {
-    'KB': 1.0,
-    'MB': 1024.0,
-    'GB': 1024.0 ** 2,
-    'TB': 1024.0 ** 3,
-}
+# 换算表的唯一来源是 utils.metrics，这里保留旧名供调用方使用。
+DISPLAY_UNIT_DIVISORS = KB_UNIT_DIVISORS
 
 TickLevels = List[Tuple[float, float]]
 

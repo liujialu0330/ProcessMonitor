@@ -7,7 +7,7 @@ import logging
 import sys
 from ctypes import wintypes
 import psutil
-from typing import Any, Optional, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from core import process_catalog
 from core.contracts import UnavailableReason
 from utils.metrics import MetricType
@@ -52,6 +52,125 @@ def _init_win32():
 
     _win32_funcs = (kernel32, user32)
     return _win32_funcs
+
+
+def _gui_resource(pid: int, flag: int) -> float:
+    """
+    读取进程的 GDI 或 USER 对象数（user32.GetGuiResources）
+
+    Args:
+        pid: 进程ID
+        flag: GR_GDIOBJECTS(0) 或 GR_USEROBJECTS(1)
+
+    Returns:
+        float: 对象数
+
+    Raises:
+        psutil.NoSuchProcess: 进程已不存在
+        psutil.AccessDenied: 无权限打开进程，或调用失败
+        MetricNotSupported: 非 Windows，或进程不在当前会话（如 session 0 的系统服务）
+    """
+    if sys.platform != "win32":
+        raise MetricNotSupported(UnavailableReason.NOT_SUPPORTED)
+
+    kernel32, user32 = _init_win32()
+    handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        if not psutil.pid_exists(pid):
+            raise psutil.NoSuchProcess(pid)
+        raise psutil.AccessDenied(pid)
+    try:
+        ctypes.set_last_error(0)
+        count = user32.GetGuiResources(handle, flag)
+        if count == 0:
+            error = ctypes.get_last_error()
+            if error == _ERROR_INVALID_PARAMETER:
+                # 其他会话的进程（如 session 0 的系统服务）返回 0 且 LastError=87；
+                # 这类进程不在当前桌面会话，提权也无法采集，不能提示"权限不足"
+                raise MetricNotSupported(UnavailableReason.NOT_IN_SESSION)
+            if error != 0:
+                raise psutil.AccessDenied(pid)
+        return float(count)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+# ---------- 采样函数表 ----------
+# 每个指标一个采样函数：入参是 psutil.Process，返回已换算到存储单位的 float
+# （字节类存 KB，时间类存秒，计数原样）。采样函数不捕获 psutil 异常，
+# 由 ProcessCollector.collect_metrics 统一归类为不可用原因。
+# 键必须与 utils.metrics 的指标注册表一致（含已废弃项，旧任务"重新监控"仍要能采）。
+
+Sampler = Callable[[psutil.Process], float]
+
+
+def _kb(num_bytes: float) -> float:
+    """字节换算为 KB（数据库与 CSV 的字节类指标统一按 KB 存储）"""
+    return num_bytes / 1024
+
+
+def _mem_kb(field: str) -> Sampler:
+    """memory_info() 某个字节字段，换算为 KB"""
+    return lambda p: _kb(getattr(p.memory_info(), field))
+
+
+def _io_kb(field: str) -> Sampler:
+    """io_counters() 某个字节字段，换算为 KB"""
+    return lambda p: _kb(getattr(p.io_counters(), field))
+
+
+def _io_count(field: str) -> Sampler:
+    """io_counters() 某个次数字段，原样返回"""
+    return lambda p: float(getattr(p.io_counters(), field))
+
+
+def _num_handles(p: psutil.Process) -> float:
+    """句柄数；非 Windows 没有 num_handles，退回文件描述符数量"""
+    try:
+        return float(p.num_handles())
+    except AttributeError:
+        return float(p.num_fds())
+
+
+def _gui_objects(flag: int) -> Sampler:
+    return lambda p: _gui_resource(p.pid, flag)
+
+
+SAMPLERS: Dict[str, Sampler] = {
+    # 内存类。私有字节 = PrivateUsage = 任务管理器"提交大小"；
+    # psutil 的 vms/pagefile/private 数值相同，只采 private
+    MetricType.MEMORY_RSS: _mem_kb("rss"),
+    MetricType.MEMORY_PERCENT: lambda p: float(p.memory_percent()),
+    MetricType.MEMORY_PEAK_WSET: _mem_kb("peak_wset"),
+    MetricType.MEMORY_PRIVATE: _mem_kb("private"),
+    MetricType.MEMORY_PEAK_PAGEFILE: _mem_kb("peak_pagefile"),
+    MetricType.MEMORY_PAGED_POOL: _mem_kb("paged_pool"),
+    MetricType.MEMORY_PEAK_PAGED_POOL: _mem_kb("peak_paged_pool"),
+    MetricType.MEMORY_NONPAGED_POOL: _mem_kb("nonpaged_pool"),
+    MetricType.MEMORY_PEAK_NONPAGED_POOL: _mem_kb("peak_nonpaged_pool"),
+    MetricType.MEMORY_NUM_PAGE_FAULTS: lambda p: float(p.memory_info().num_page_faults),
+    MetricType.MEMORY_USS: lambda p: _kb(p.memory_full_info().uss),
+    # CPU 类。cpu_percent(interval=None) 非阻塞、基于上次调用以来的增量，
+    # 首次调用固定返回 0，所以任务开始前要先 prime_cpu()
+    MetricType.CPU_PERCENT: lambda p: float(p.cpu_percent(interval=None)),
+    MetricType.CPU_USER_TIME: lambda p: float(p.cpu_times().user),
+    MetricType.CPU_SYSTEM_TIME: lambda p: float(p.cpu_times().system),
+    MetricType.CPU_PRIORITY: lambda p: float(p.nice()),
+    # 系统资源类
+    MetricType.NUM_THREADS: lambda p: float(p.num_threads()),
+    MetricType.NUM_HANDLES: _num_handles,
+    MetricType.NUM_GDI_OBJECTS: _gui_objects(GR_GDIOBJECTS),
+    MetricType.NUM_USER_OBJECTS: _gui_objects(GR_USEROBJECTS),
+    MetricType.NUM_CTX_SWITCHES_VOL: lambda p: float(p.num_ctx_switches().voluntary),
+    MetricType.NUM_CTX_SWITCHES_INVOL: lambda p: float(p.num_ctx_switches().involuntary),
+    # IO 类
+    MetricType.IO_READ_COUNT: _io_count("read_count"),
+    MetricType.IO_WRITE_COUNT: _io_count("write_count"),
+    MetricType.IO_OTHER_COUNT: _io_count("other_count"),
+    MetricType.IO_READ_BYTES: _io_kb("read_bytes"),
+    MetricType.IO_WRITE_BYTES: _io_kb("write_bytes"),
+    MetricType.IO_OTHER_BYTES: _io_kb("other_bytes"),
+}
 
 
 class ProcessCollector:
@@ -114,46 +233,6 @@ class ProcessCollector:
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             return None
 
-    def _get_gui_resource(self, flag: int) -> float:
-        """
-        读取进程的 GDI 或 USER 对象数（user32.GetGuiResources）
-
-        Args:
-            flag: GR_GDIOBJECTS(0) 或 GR_USEROBJECTS(1)
-
-        Returns:
-            float: 对象数
-
-        Raises:
-            psutil.NoSuchProcess: 进程已不存在
-            psutil.AccessDenied: 无权限打开进程，或调用失败
-            MetricNotSupported: 非 Windows，或进程不在当前会话（如 session 0 的系统服务）
-        """
-        if sys.platform != "win32":
-            raise MetricNotSupported(UnavailableReason.NOT_SUPPORTED)
-
-        kernel32, user32 = _init_win32()
-        handle = kernel32.OpenProcess(
-            _PROCESS_QUERY_LIMITED_INFORMATION, False, self.pid)
-        if not handle:
-            if not psutil.pid_exists(self.pid):
-                raise psutil.NoSuchProcess(self.pid)
-            raise psutil.AccessDenied(self.pid)
-        try:
-            ctypes.set_last_error(0)
-            count = user32.GetGuiResources(handle, flag)
-            if count == 0:
-                error = ctypes.get_last_error()
-                if error == _ERROR_INVALID_PARAMETER:
-                    # 其他会话的进程（如 session 0 的系统服务）返回 0 且 LastError=87；
-                    # 这类进程不在当前桌面会话，提权也无法采集，不能提示"权限不足"
-                    raise MetricNotSupported(UnavailableReason.NOT_IN_SESSION)
-                if error != 0:
-                    raise psutil.AccessDenied(self.pid)
-            return float(count)
-        finally:
-            kernel32.CloseHandle(handle)
-
     def _collect_one(self, metric_type: str) -> Optional[float]:
         """
         采集单个性能指标（内部方法，不捕获psutil异常，由调用方统一处理）
@@ -166,133 +245,11 @@ class ProcessCollector:
         """
         if self._process is None:
             self._process = psutil.Process(self.pid)
-
-        # 根据不同类型采集数据
-        if metric_type == MetricType.MEMORY_RSS:
-            # 工作集内存（RSS），转换为KB
-            return self._process.memory_info().rss / 1024
-
-        elif metric_type == MetricType.MEMORY_PERCENT:
-            # 内存使用百分比
-            return self._process.memory_percent()
-
-        elif metric_type == MetricType.CPU_PERCENT:
-            # CPU使用率（interval=None非阻塞，基于上次调用以来的增量计算）
-            # 首次调用返回0，需先调用prime_cpu()预热
-            return self._process.cpu_percent(interval=None)
-
-        elif metric_type == MetricType.NUM_THREADS:
-            # 线程数
-            return float(self._process.num_threads())
-
-        elif metric_type == MetricType.NUM_HANDLES:
-            # 句柄数（仅Windows）
-            try:
-                return float(self._process.num_handles())
-            except AttributeError:
-                # 非Windows系统返回文件描述符数量
-                return float(self._process.num_fds())
-
-        elif metric_type == MetricType.IO_READ_BYTES:
-            # IO读取字节数，转换为KB
-            io_counters = self._process.io_counters()
-            return io_counters.read_bytes / 1024
-
-        elif metric_type == MetricType.IO_WRITE_BYTES:
-            # IO写入字节数，转换为KB
-            io_counters = self._process.io_counters()
-            return io_counters.write_bytes / 1024
-
-        elif metric_type == MetricType.IO_READ_COUNT:
-            # IO读取次数
-            io_counters = self._process.io_counters()
-            return float(io_counters.read_count)
-
-        elif metric_type == MetricType.IO_WRITE_COUNT:
-            # IO写入次数
-            io_counters = self._process.io_counters()
-            return float(io_counters.write_count)
-
-        elif metric_type == MetricType.IO_OTHER_COUNT:
-            # IO其他次数
-            io_counters = self._process.io_counters()
-            return float(io_counters.other_count)
-
-        elif metric_type == MetricType.IO_OTHER_BYTES:
-            # IO其他字节数，转换为KB
-            io_counters = self._process.io_counters()
-            return io_counters.other_bytes / 1024
-
-        # ========== 扩展内存指标 ==========
-        elif metric_type == MetricType.MEMORY_PEAK_WSET:
-            # 工作集峰值，转换为KB
-            return self._process.memory_info().peak_wset / 1024
-
-        elif metric_type == MetricType.MEMORY_PRIVATE:
-            # 私有字节（Private Bytes，= PrivateUsage = 任务管理器"提交大小"），
-            # 转换为KB。psutil 的 vms/pagefile/private 数值相同，只采这一个
-            return self._process.memory_info().private / 1024
-
-        elif metric_type == MetricType.MEMORY_PEAK_PAGEFILE:
-            # 私有字节峰值（PeakPagefileUsage），转换为KB
-            return self._process.memory_info().peak_pagefile / 1024
-
-        elif metric_type == MetricType.MEMORY_PAGED_POOL:
-            # 分页池，转换为KB
-            return self._process.memory_info().paged_pool / 1024
-
-        elif metric_type == MetricType.MEMORY_PEAK_PAGED_POOL:
-            # 分页池峰值，转换为KB
-            return self._process.memory_info().peak_paged_pool / 1024
-
-        elif metric_type == MetricType.MEMORY_NONPAGED_POOL:
-            # 非分页池，转换为KB
-            return self._process.memory_info().nonpaged_pool / 1024
-
-        elif metric_type == MetricType.MEMORY_PEAK_NONPAGED_POOL:
-            # 非分页池峰值，转换为KB
-            return self._process.memory_info().peak_nonpaged_pool / 1024
-
-        elif metric_type == MetricType.MEMORY_NUM_PAGE_FAULTS:
-            # 页面错误次数
-            return float(self._process.memory_info().num_page_faults)
-
-        elif metric_type == MetricType.MEMORY_USS:
-            # 唯一集大小，转换为KB
-            return self._process.memory_full_info().uss / 1024
-
-        # ========== GDI/USER 对象数 ==========
-        elif metric_type == MetricType.NUM_GDI_OBJECTS:
-            return self._get_gui_resource(GR_GDIOBJECTS)
-
-        elif metric_type == MetricType.NUM_USER_OBJECTS:
-            return self._get_gui_resource(GR_USEROBJECTS)
-
-        # ========== CPU扩展指标 ==========
-        elif metric_type == MetricType.CPU_USER_TIME:
-            # CPU用户时间（秒）
-            return self._process.cpu_times().user
-
-        elif metric_type == MetricType.CPU_SYSTEM_TIME:
-            # CPU系统时间（秒）
-            return self._process.cpu_times().system
-
-        elif metric_type == MetricType.CPU_PRIORITY:
-            # 进程优先级
-            return float(self._process.nice())
-
-        # ========== 上下文切换 ==========
-        elif metric_type == MetricType.NUM_CTX_SWITCHES_VOL:
-            # 自愿上下文切换
-            return float(self._process.num_ctx_switches().voluntary)
-
-        elif metric_type == MetricType.NUM_CTX_SWITCHES_INVOL:
-            # 非自愿上下文切换
-            return float(self._process.num_ctx_switches().involuntary)
-
-        else:
-            # 未知指标类型
+        sampler = SAMPLERS.get(metric_type)
+        if sampler is None:
+            # 未知指标类型（如更高版本写入的键）：跳过，不写入结果
             return None
+        return sampler(self._process)
 
     def prime_cpu(self):
         """

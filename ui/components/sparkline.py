@@ -15,8 +15,10 @@ from PyQt5.QtWidgets import QWidget, QSizePolicy
 
 from qfluentwidgets import isDarkTheme
 
-from utils.metrics import (
-    MetricType, canonical_metric_type, is_integer_metric, is_kb_metric
+# 最小跨度规则按指标 kind 定义在 utils.metrics；常量在此再导出，保持原有导入路径可用
+from utils.metrics import (  # noqa: F401
+    MIN_SPAN_BYTES_KB, MIN_SPAN_BYTES_RATIO, MIN_SPAN_COUNT, MIN_SPAN_PERCENT,
+    min_span_for
 )
 
 # 固定高度（像素），横向随父布局拉伸
@@ -24,12 +26,6 @@ FIXED_HEIGHT = 36
 
 # 缓冲区点数上限（必须为偶数，保证成对合并后没有落单点）
 DEFAULT_MAX_POINTS = 240
-
-# 纵轴最小跨度：字节类 max(当前值 1%, 64 KB)；计数类至少 4；百分比至少 1 个百分点
-MIN_SPAN_BYTES_KB = 64.0
-MIN_SPAN_BYTES_RATIO = 0.01
-MIN_SPAN_COUNT = 4.0
-MIN_SPAN_PERCENT = 1.0
 
 # 折线取色：在 paintEvent 内动态调用 isDarkTheme()，不连接 qconfig.themeChanged——
 # 任务卡片随监控任务动态创建/销毁，这样实现不必在卡片销毁时手动断开主题信号连接，
@@ -90,16 +86,7 @@ class TrendDownsampler:
 
 def min_span(metric_type: Optional[str], reference: float) -> float:
     """纵轴最小跨度（原始单位）：低于该跨度的起伏不应被拉伸成满幅波动。"""
-    if metric_type is None:
-        return 0.0
-    metric_type = canonical_metric_type(metric_type)
-    if is_kb_metric(metric_type):
-        return max(abs(reference) * MIN_SPAN_BYTES_RATIO, MIN_SPAN_BYTES_KB)
-    if is_integer_metric(metric_type):
-        return MIN_SPAN_COUNT
-    if metric_type in (MetricType.MEMORY_PERCENT, MetricType.CPU_PERCENT):
-        return MIN_SPAN_PERCENT
-    return abs(reference) * MIN_SPAN_BYTES_RATIO
+    return min_span_for(metric_type, reference)
 
 
 def compute_y_range(
