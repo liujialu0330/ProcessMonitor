@@ -68,8 +68,13 @@ class InputDialogBase(MessageBoxBase):
         if widget is None:
             return
         widget.setFocus()
-        if self._select_all and hasattr(widget, "selectAll"):
-            widget.selectAll()
+        if self._select_all:
+            if hasattr(widget, "selectAll"):
+                widget.selectAll()
+        elif hasattr(widget, "deselect"):
+            # 焦点进入时 QLineEdit 在某些焦点原因/库版本下会自动全选，
+            # select_all=False 必须确定地表示"不选中"，所以显式清掉选区
+            widget.deselect()
 
 
 class CnSwitchSettingCard(SwitchSettingCard):
