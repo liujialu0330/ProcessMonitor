@@ -1,7 +1,8 @@
 """
-历史页自动刷新后台化：查询在 QThread 内执行，结果经信号回主线程应用。
-覆盖：过期结果丢弃、在途时跳过 tick、应用后统计/图表更新且不重置视图、
-worker 结束后被释放、失败/隐藏/同步加载下的丢弃、退出 join。
+历史数据查询后台线程（HistoryRefreshWorker）：外壳本身（execute 调 run_history_query、
+成功/存储故障/编程错误的打包），以及它在历史页上的生产装配：自动刷新结果在主线程
+应用且不重置视图、页面隐藏后结果丢弃、线程结束后被释放、退出时带超时 join。
+过期丢弃、单飞、失败提示去重等调度规则见 tests/test_history_vm.py。
 不依赖固定 sleep：一律轮询等待（tests/helpers.poll_until）。
 """
 import threading
@@ -11,7 +12,6 @@ import pytest
 from PyQt5.QtCore import QCoreApplication, QEvent, Qt
 from PyQt5.QtWidgets import QApplication
 
-from core.history_refresh_worker import HistoryRefreshResult
 from core.monitor_manager import MonitorManager
 from data.models import DataPoint
 from tests.doubles import FakeClock
@@ -48,29 +48,27 @@ def services():
 
 @pytest.fixture
 def page(qapp, db, manager, services):
+    """生产装配的历史页（每个请求一个后台线程、加载推迟到下一轮事件循环）"""
     widget = make_history_page(db, manager, services)
     widget.resize(1200, 800)
-    widget._gate = None   # 测试可置入阻塞闸，teardown 统一放行
+    widget.release = None   # 测试可置入阻塞闸，teardown 统一放行
     yield widget
-    if widget._gate is not None:
-        widget._gate.set()
-    widget._auto_refresh_timer.stop()
-    worker = widget._refresh_worker
-    if worker is not None:
-        worker.wait(10000)
-    _pump()
+    if widget.release is not None:
+        widget.release.set()
+    widget.auto_refresh.stop()
+    _wait(lambda: services.threads.entries() == [])
     widget.close()
 
 
 @pytest.fixture
 def shown(page, db, services):
-    """已显示、已选中一个 20 点任务的页面；该任务视为运行中，让 _on_auto_refresh
-    走后台刷新分支"""
+    """已显示、已选中一个 20 点任务的页面；该任务视为运行中，定时刷新会发起后台查询"""
     task = _seed_task(db, samples=20, status="running")
     services.task_status.set_running(task.task_id)
     page.show()
+    page.auto_refresh.stop()   # 只手动触发，避免定时器干扰
     page.select_task(task.task_id)
-    page._auto_refresh_timer.stop()   # 只手动触发，避免定时器干扰
+    assert _wait(lambda: not page.vm.has_pending_query)
     page.task = task
     return page
 
@@ -81,190 +79,74 @@ def _append_points(db, task, start_index, count):
         for i in range(start_index, start_index + count)])
 
 
-def _block_table_query(page, db):
-    """让工作线程内的表格查询阻塞到测试放行；返回 (entered 事件, 调用计数 list)"""
+def _block_table_query(page, db, monkeypatch):
+    """让工作线程内的表格查询阻塞到测试放行；返回 entered 事件"""
     gate = threading.Event()
     entered = threading.Event()
-    calls = []
     real = db.points.fetch
 
     def blocking(*a, **k):
-        # 只阻塞工作线程；主线程的同步加载（用户主动操作）不受影响
         if threading.current_thread() is not threading.main_thread():
-            calls.append(1)
             entered.set()
             gate.wait(10)
         return real(*a, **k)
 
-    db.points.fetch = blocking
-    page._gate = gate
-    return entered, calls
+    monkeypatch.setattr(db.points, 'fetch', blocking)
+    page.release = gate
+    return entered
 
 
-def _spy_apply(page, monkeypatch):
-    applied = []
-    real = page._apply_loaded_data
-
-    def spy(*a, **k):
-        applied.append(k.get('keep_view', a[-1] if a else None))
-        return real(*a, **k)
-
-    monkeypatch.setattr(page, '_apply_loaded_data', spy)
-    return applied
+def _query_thread(services):
+    entry, = services.threads.entries()
+    return entry.thread
 
 
-# ---------- 结果应用 ----------
+# ---------- 页面上的后台刷新（真实线程） ----------
 
-def test_result_applied_updates_stats_chart_and_keeps_view(shown, db, monkeypatch):
+def test_auto_refresh_result_updates_page_and_keeps_view(shown, db, monkeypatch):
     page = shown
-    task = page.task
-    assert len(page._chart_x) > 0
-    points_before = len(page._chart_x)
-    rows_before = page.data_table.rowCount()
+    chart = page.chart_view
+    points_before = len(chart.x_values)
+    rows_before = page.sample_table.data_table.rowCount()
 
     # 模拟用户缩放：自动刷新不得重置视图
-    page.chart_widget.setXRange(page._chart_x[2], page._chart_x[8], padding=0)
-    x_range_before = page.chart_widget.viewRange()[0]   # 只比 X（Y 轴自适应是既有行为）
-    auto_range_calls = []
-    monkeypatch.setattr(
-        page.chart_widget, 'enableAutoRange', lambda *a, **k: auto_range_calls.append(1))
+    page.chart_view.chart_widget.setXRange(chart.x_values[2], chart.x_values[8], padding=0)
+    x_range_before = page.chart_view.chart_widget.viewRange()[0]   # 只比 X（Y 轴自适应是既有行为）
+    resets = []
+    monkeypatch.setattr(chart, 'reset_view', lambda: resets.append(1))
 
-    _append_points(db, task, 20, 15)
-    page._on_auto_refresh()
-    assert _wait(lambda: len(page._chart_x) > points_before)
+    _append_points(db, page.task, 20, 15)
+    page.auto_refresh.tick()
+    assert _wait(lambda: len(chart.x_values) > points_before)
 
-    assert page.data_table.rowCount() == rows_before + 15
-    assert "35" in page.table_hint_label.text()          # 共 35 条
-    assert page.stat_value_labels["当前"].text() != "--"
-    assert auto_range_calls == []
-    assert page.chart_widget.viewRange()[0] == x_range_before
+    assert page.sample_table.data_table.rowCount() == rows_before + 15
+    assert "共 35 条" in page.sample_table.table_hint_label.text()
+    assert page.stats_strip.texts()["当前"] != "--"
+    assert resets == []
+    assert page.chart_view.chart_widget.viewRange()[0] == x_range_before
 
 
-def test_refresh_query_runs_off_main_thread(shown, db):
-    """查询在工作线程执行，而不是主线程"""
+def test_result_dropped_after_page_hidden(shown, db, services, monkeypatch):
     page = shown
-    threads = []
-    real = db.points.fetch
-
-    def spy(*a, **k):
-        threads.append(threading.current_thread())
-        return real(*a, **k)
-
-    db.points.fetch = spy
-    page._on_auto_refresh()
-    assert _wait(lambda: page._refresh_worker is None and threads)
-    assert threads[0] is not threading.main_thread()
-
-
-# ---------- 过期结果丢弃 ----------
-
-def _result(page, **overrides):
-    base = dict(
-        request_id=page._refresh_gate.current, task_id=page.current_task_id,
-        metric_type=page.current_metric, range_key=page.current_range_key,
-        last_dt=BASE, table_points=[DataPoint(page.current_task_id, BASE, 1.0, METRIC)],
-        stats=None, chart_points=[DataPoint(page.current_task_id, BASE, 1.0, METRIC)])
-    base.update(overrides)
-    return HistoryRefreshResult(**base)
-
-
-def test_stale_results_are_discarded(shown, monkeypatch):
-    page = shown
-    applied = _spy_apply(page, monkeypatch)
-
-    page._on_refresh_result(_result(page, request_id=page._refresh_gate.current - 1))
-    page._on_refresh_result(_result(page, task_id="other-task"))
-    page._on_refresh_result(_result(page, metric_type=MetricType.CPU_PERCENT))
-    page._on_refresh_result(_result(page, range_key="10m"))
-    page._on_refresh_result(_result(page, error="boom"))
-    page._on_refresh_result(_result(page, task_missing=True))
-    assert applied == []
-
-    # 标识全部匹配时才应用，且保持视图
-    page._on_refresh_result(_result(page))
-    assert applied == [True]
-
-
-def test_result_dropped_when_user_switches_range_while_in_flight(shown, db, monkeypatch):
-    page = shown
-    entered, _calls = _block_table_query(page, db)
-    page._on_auto_refresh()
+    entered = _block_table_query(page, db, monkeypatch)
+    page.auto_refresh.tick()
     assert entered.wait(10)
 
-    applied = _spy_apply(page, monkeypatch)
-    page._on_time_range_changed('10m')          # 用户主动操作：走同步加载
-    sync_applies = len(applied)
-    assert sync_applies == 1
-
-    page._gate.set()
-    assert _wait(lambda: page._refresh_worker is None)
-    assert len(applied) == sync_applies         # 在途结果已过期，未再应用
-
-
-def test_result_dropped_after_page_hidden(shown, db, monkeypatch):
-    page = shown
-    entered, _calls = _block_table_query(page, db)
-    page._on_auto_refresh()
-    assert entered.wait(10)
-
-    applied = _spy_apply(page, monkeypatch)
+    snapshots = []
+    page.vm.snapshot_ready.connect(snapshots.append)
     page.hide()                                  # 隐藏不阻塞等待，只让结果过期
-    page._gate.set()
-    assert _wait(lambda: page._refresh_worker is None)
-    assert applied == []
+    page.release.set()
+    assert _wait(lambda: services.threads.entries() == [])
+    assert snapshots == []
 
 
-def test_failed_query_keeps_current_display(shown, db, monkeypatch):
-    page = shown
-    rows = page.data_table.rowCount()
-    applied = _spy_apply(page, monkeypatch)
-
-    def boom(*a, **k):
-        raise RuntimeError("db locked")
-
-    db.points.fetch = boom
-    page._on_auto_refresh()
-    assert _wait(lambda: page._refresh_worker is None)
-    assert applied == []
-    assert page.data_table.rowCount() == rows
-
-
-# ---------- 单飞：在途时跳过 tick ----------
-
-def test_tick_skipped_while_worker_in_flight(shown, db):
-    page = shown
-    entered, calls = _block_table_query(page, db)
-
-    page._on_auto_refresh()
-    assert entered.wait(10)
-    first = page._refresh_worker
-    assert first is not None and first.isRunning()
-
-    page._on_auto_refresh()
-    page._on_auto_refresh()
-    assert page._refresh_worker is first
-    assert calls == [1]                          # 只有一次查询
-
-    page._gate.set()
-    assert _wait(lambda: page._refresh_worker is None)
-
-    # 上一个结束后，下一次 tick 才会启动新 worker
-    del db.points.fetch   # 撤销实例上的替身，恢复类方法
-    page._on_auto_refresh()
-    assert page._refresh_worker is not None and page._refresh_worker is not first
-    assert _wait(lambda: page._refresh_worker is None)
-
-
-# ---------- 生命周期 ----------
-
-def test_worker_released_after_finished(shown):
+def test_query_thread_released_after_finished(shown, services):
     from PyQt5 import sip
     page = shown
-    page._on_auto_refresh()
-    worker = page._refresh_worker
-    assert worker is not None
+    page.auto_refresh.tick()
+    worker = _query_thread(services)
 
-    assert _wait(lambda: page._refresh_worker is None)
+    assert _wait(lambda: services.threads.entries() == [])
 
     def deleted():
         QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
@@ -274,35 +156,18 @@ def test_worker_released_after_finished(shown):
     assert poll_until(deleted, timeout=10.0)
 
 
-def test_shutdown_thread_joins_refresh_worker_with_timeout(shown, db):
-    """退出路径：对在途 worker 做带超时 join，超时返回 False、放行后返回 True"""
+def test_shutdown_thread_joins_query_thread_with_timeout(shown, db, services, monkeypatch):
+    """退出路径：对在途查询线程做带超时 join，超时返回 False、放行后返回 True"""
     page = shown
-    entered, _calls = _block_table_query(page, db)
-    page._on_auto_refresh()
+    entered = _block_table_query(page, db, monkeypatch)
+    page.auto_refresh.tick()
     assert entered.wait(10)
 
-    worker = page._refresh_worker
+    worker = _query_thread(services)
     assert shutdown_thread(worker, timeout_ms=50) is False
-    page._gate.set()
+    page.release.set()
     assert shutdown_thread(worker, timeout_ms=10000) is True
-    assert _wait(lambda: page._refresh_worker is None)
-
-
-def test_refresh_worker_registered_with_thread_registry(shown, db, services):
-    """在途刷新线程登记到 services.threads（只读查询不可取消、3 秒超时）；
-    结束后自动注销"""
-    page = shown
-    entered, _calls = _block_table_query(page, db)
-    page._on_auto_refresh()
-    assert entered.wait(10)
-
-    worker = page._refresh_worker
-    entries = services.threads.entries()
-    assert [(e.name, e.thread, e.cancel, e.timeout_ms) for e in entries] == [
-        ("历史自动刷新", worker, None, 3000)]
-
-    page._gate.set()
-    assert _wait(lambda: page._refresh_worker is None and services.threads.entries() == [])
+    assert _wait(lambda: services.threads.entries() == [])
 
 
 def test_main_window_close_joins_history_refresh_worker(qapp, tmp_path, monkeypatch):
@@ -342,8 +207,38 @@ def test_main_window_close_joins_history_refresh_worker(qapp, tmp_path, monkeypa
 
 # ---------- 存储故障上报 ----------
 
+def _run_inline(worker):
+    """直接在当前线程执行 run，只验证结果打包；返回 (result_ready, result, failed) 记录"""
+    ready, results, failures = [], [], []
+    worker.result_ready.connect(ready.append, type=Qt.DirectConnection)
+    worker.result.connect(results.append, type=Qt.DirectConnection)
+    worker.failed.connect(failures.append, type=Qt.DirectConnection)
+    worker.run()
+    return ready, results, failures
+
+
+def test_shell_runs_history_query_and_emits_snapshot(db):
+    """线程外壳：execute 调 run_history_query，快照同时经 result_ready 与 result 发出"""
+    from core.history_query import HistorySnapshot, build_request
+    from core.history_refresh_worker import HistoryRefreshWorker
+    task = _seed_task(db, samples=5)
+    request = build_request(task.task_id, METRIC, '1h', seq=11, table_limit=3)
+
+    worker = HistoryRefreshWorker(db, request)
+    assert worker.request is request and worker.request_seq == 11
+    ready, results, failures = _run_inline(worker)
+
+    assert len(ready) == 1 and ready == results and failures == []
+    snapshot = ready[0]
+    assert isinstance(snapshot, HistorySnapshot)
+    assert snapshot.request.request_seq == 11
+    assert len(snapshot.points) == 3 and snapshot.stats['count'] == 5
+    assert snapshot.task_last_at == BASE + timedelta(seconds=4)
+
+
 def test_query_storage_error_is_reported_via_error_field(db):
-    """worker 内仓储抛 StorageError：结果的 error 非空且标记为存储故障"""
+    """仓储抛 StorageError：快照的 error 非空且标记为存储故障（不走 failed）"""
+    from core.history_query import build_request
     from core.history_refresh_worker import HistoryRefreshWorker
     from data.errors import StorageError
     task = _seed_task(db, samples=5)
@@ -352,34 +247,37 @@ def test_query_storage_error_is_reported_via_error_field(db):
         raise StorageError("读取数据点失败: disk I/O error")
 
     db.points.fetch = boom
-    worker = HistoryRefreshWorker(db, 7, task.task_id, METRIC, 'all', None, 50, 20)
-    results = []
-    worker.result_ready.connect(results.append, type=Qt.DirectConnection)
-    worker.run()   # 直接在当前线程执行 run，只验证结果打包
+    worker = HistoryRefreshWorker(db, build_request(task.task_id, METRIC, 'all', seq=7))
+    ready, _results, failures = _run_inline(worker)
 
-    assert len(results) == 1
-    assert results[0].request_id == 7
-    assert results[0].storage_error is True and "disk I/O error" in results[0].error
+    assert len(ready) == 1 and failures == []
+    assert ready[0].request.request_seq == 7
+    assert ready[0].storage_error is True and "disk I/O error" in ready[0].error
 
 
-def test_auto_refresh_storage_error_notifies_once_and_keeps_display(shown, services):
-    """自动刷新读库失败：保持当前显示；连续失败只弹一次"读取数据失败"，成功后复位"""
-    page = shown
-    rows = page.data_table.rowCount()
-    failing = _result(page, error="读取数据点失败: disk I/O error", storage_error=True)
+def test_unexpected_error_becomes_failed_snapshot(db):
+    """编程错误：记日志、发 failed，result_ready 仍送出 error 非空的快照"""
+    from core.history_query import build_request
+    from core.history_refresh_worker import HistoryRefreshWorker
+    task = _seed_task(db, samples=5)
 
-    page._on_refresh_result(failing)
-    page._on_refresh_result(_result(page, error="again", storage_error=True))
-    errors = services.notifier.messages("error")
-    assert [(n.title, n.content) for n in errors] == [
-        ("读取数据失败", "读取数据点失败: disk I/O error")]
-    assert page.data_table.rowCount() == rows
-    assert page.content_stack.currentWidget() is page.analysis_page
+    def boom(*a, **k):
+        raise RuntimeError("db locked")
 
-    page._on_refresh_result(_result(page))            # 成功一次后复位
-    page._on_refresh_result(_result(page, error="x", storage_error=True))
-    assert len(services.notifier.messages("error")) == 2
+    db.points.fetch = boom
+    worker = HistoryRefreshWorker(db, build_request(task.task_id, METRIC, 'all', seq=5))
+    ready, results, failures = _run_inline(worker)
 
-    # 非存储故障（编程错误等）只记日志，不弹提示
-    page._on_refresh_result(_result(page, error="boom"))
-    assert len(services.notifier.messages("error")) == 2
+    assert results == [] and failures == ["db locked"]
+    assert len(ready) == 1
+    assert ready[0].error == "db locked" and ready[0].storage_error is False
+    assert ready[0].request.request_seq == 5
+
+
+def test_bad_arguments_rejected(db):
+    from core.history_query import build_request
+    from core.history_refresh_worker import HistoryRefreshWorker
+    with pytest.raises(TypeError):
+        HistoryRefreshWorker(db, 7)
+    with pytest.raises(TypeError):
+        HistoryRefreshWorker(db, build_request("t", METRIC, 'all'), "extra")

@@ -75,17 +75,17 @@ def test_gui_smoke_full_lifecycle(qapp, e2e_db, tmp_path):
     _pause()
 
     try:
-        # ========== 1. 监控页：创建并启动监控任务（绕过进程下拉框与指标对话框） ==========
+        # ========== 1. 监控页：创建并启动监控任务（搜索框直接输入 PID，绕过指标对话框） ==========
         monitor_page = window.monitor_page
-        monitor_page.pid_input.setText(str(os.getpid()))
-        monitor_page.selected_metrics = [MetricType.MEMORY_RSS, MetricType.CPU_PERCENT]
-        monitor_page._update_metric_summary()
-        monitor_page.interval_spinbox.setValue(1)
-        monitor_page.start_button.click()
+        form = monitor_page.form
+        form.picker.set_text(str(os.getpid()))
+        form.set_metrics_summary([MetricType.MEMORY_RSS, MetricType.CPU_PERCENT])
+        form.interval_spinbox.setValue(1)
+        form.start_button.click()
 
-        assert len(monitor_page.task_cards) == 1, "启动后应有且仅有一张任务卡片"
-        task_id = next(iter(monitor_page.task_cards))
-        card = monitor_page.task_cards[task_id]
+        assert len(monitor_page.board.cards()) == 1, "启动后应有且仅有一张任务卡片"
+        task_id = next(iter(monitor_page.board.cards()))
+        card = monitor_page.board.cards()[task_id]
 
         _pause()
 
@@ -113,23 +113,25 @@ def test_gui_smoke_full_lifecycle(qapp, e2e_db, tmp_path):
         QTest.qWait(100)
 
         history_page = window.history_page
+        history_combo = history_page.filter_bar.task_selector().combo
+        data_table = history_page.sample_table.data_table
         found = False
-        for i in range(history_page.task_combo.count()):
-            if history_page.task_combo.itemData(i) == task_id:
-                history_page.task_combo.setCurrentIndex(i)
+        for i in range(history_combo.count()):
+            if history_combo.itemData(i) == task_id:
+                history_combo.setCurrentIndex(i)
                 found = True
                 break
         assert found, "历史页任务下拉框中应能找到刚创建的任务"
         QTest.qWait(100)
 
-        assert history_page.data_table.rowCount() >= 2, "历史页表格行数应 >= 2"
-        assert history_page.chart_widget.listDataItems(), "历史页图表应有绘制数据"
+        assert data_table.rowCount() >= 2, "历史页表格行数应 >= 2"
+        assert history_page.chart_view.chart_widget.listDataItems(), "历史页图表应有绘制数据"
 
         # 表格首行为最新时间戳（既有"倒序显示，最新的在前"契约）
         points = e2e_db.get_task_data_points(task_id, metric_type=history_page.current_metric)
         assert points, "查询到的数据点不应为空"
         latest_time_str = points[-1].timestamp.strftime('%m-%d %H:%M:%S')
-        first_row_time = history_page.data_table.item(0, 0).text()
+        first_row_time = data_table.item(0, 0).text()
         assert first_row_time == latest_time_str, (
             f"表格首行时间 {first_row_time} 应等于最新采集时间戳 {latest_time_str}")
 
@@ -141,9 +143,10 @@ def test_gui_smoke_full_lifecycle(qapp, e2e_db, tmp_path):
 
         export_page = window.export_page
         found = False
-        for i in range(export_page.task_combo.count()):
-            if export_page.task_combo.itemData(i) == task_id:
-                export_page.task_combo.setCurrentIndex(i)
+        export_combo = export_page.task_selector.combo
+        for i in range(export_combo.count()):
+            if export_combo.itemData(i) == task_id:
+                export_combo.setCurrentIndex(i)
                 found = True
                 break
         assert found, "导出页任务下拉框中应能找到刚创建的任务"

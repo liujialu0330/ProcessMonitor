@@ -10,7 +10,7 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QWidget
 from qfluentwidgets import (
     ScrollArea, ExpandLayout, SettingCardGroup, OptionsSettingCard,
-    PushSettingCard, SwitchSettingCard, StateToolTip,
+    PushSettingCard, StateToolTip,
     FluentIcon as FIF, setTheme, qconfig, Theme
 )
 
@@ -24,6 +24,7 @@ from data.database import Database
 from ui.components.spinbox_setting_card import SpinBoxSettingCard
 from ui.services import UiServices
 from ui.typography import PageTitleLabel
+from ui.widgets.qfw_compat import CnSwitchSettingCard
 import config
 
 if TYPE_CHECKING:
@@ -55,18 +56,6 @@ _BUSY_REASON_TEXTS = {
     BUSY_MAINTENANCE_RUNNING: "数据库正在清理中，请稍候",
 }
 _BUSY_FALLBACK_TEXT = "数据库正忙，请稍后再清理"
-
-
-class _CnSwitchSettingCard(SwitchSettingCard):
-    """开关文案为中文"开/关"的设置卡片。
-
-    库的 setValue 每次都会把文案重置为英文 On/Off（用户点击与配置值被外部改动
-    两条路径都会经过它），所以在 setValue 之后统一改回中文。
-    """
-
-    def setValue(self, isChecked: bool):
-        super().setValue(isChecked)
-        self.switchButton.setText("开" if isChecked else "关")
 
 
 class SettingPage(ScrollArea):
@@ -168,7 +157,7 @@ class SettingPage(ScrollArea):
     def _init_behavior_group(self):
         """常规分组：关闭窗口时是否最小化到系统托盘。"""
         self.behavior_group = self.general_group
-        self.close_to_tray_card = _CnSwitchSettingCard(
+        self.close_to_tray_card = CnSwitchSettingCard(
             FIF.MINIMIZE, "关闭到系统托盘",
             "关闭窗口后继续采集，可从托盘菜单退出",
             configItem=cfg.close_to_tray, parent=self.general_group)

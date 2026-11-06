@@ -9,11 +9,13 @@ from qfluentwidgets import (
     MessageBoxBase, SubtitleLabel, BodyLabel, CaptionLabel, LineEdit, PushButton
 )
 
+from ui.widgets.qfw_compat import InputDialogBase
+
 # 打点标签的最大长度（超出会被输入框截断，避免图表上的竖线标签过长）
 MARKER_LABEL_MAX_LENGTH = 40
 
 
-class MarkerDialog(MessageBoxBase):
+class MarkerDialog(InputDialogBase):
     """打点标签输入框：默认填入"标记 N"，确定后返回标签文本。
 
     打点时间是用户点"打点"按钮的时刻（由调用方传入并最终写库），不是点"添加"的
@@ -47,16 +49,11 @@ class MarkerDialog(MessageBoxBase):
         self._update_yes_enabled()
         # 回车直接确认
         self.label_edit.returnPressed.connect(self.yesButton.click)
+        # 弹出后焦点给输入框并全选默认标签：直接打字即覆盖（基类默认焦点在"添加"上）
+        self.set_focus_widget(self.label_edit)
 
     def _update_yes_enabled(self, *_args) -> None:
         self.yesButton.setEnabled(bool(self.label_edit.text().strip()))
-
-    def showEvent(self, event):
-        # MessageBoxBase 默认把焦点给"添加"按钮：用户直接打字会落空、回车按默认标签提交。
-        # 显示后把焦点交给输入框（默认标签已全选，打字即覆盖）
-        super().showEvent(event)
-        self.label_edit.setFocus()
-        self.label_edit.selectAll()
 
     def get_label(self) -> str:
         """输入的标签（已去除首尾空白）。"""

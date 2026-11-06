@@ -23,6 +23,7 @@ from core.monitor_manager import MonitorManager
 from data.models import DataPoint, MonitorTask
 from tests.doubles import FakeClock, FakeTaskStatus
 from tests.factories import make_export_page, make_history_page, make_services
+from tests.helpers import SyncHistoryRunner
 from ui.formatting import format_task_option_text, format_task_tooltip
 from utils.metrics import MetricType
 
@@ -91,26 +92,35 @@ def manager(db):
 
 @pytest.fixture
 def history(qapp, db, manager, services):
-    # 构造函数里就会 _load_tasks：任务状态与时钟须在构造前就绪（由 services 提供）
-    widget = make_history_page(db, manager, services)
+    # 查询同步执行、加载请求立即发出；与导出页一样构造时不载入，生产路径由 showEvent 触发
+    widget = make_history_page(db, manager, services,
+                               worker_runner=SyncHistoryRunner(db), defer=lambda fn: fn())
+    widget.vm.reload_tasks()
     yield widget
-    widget._auto_refresh_timer.stop()
+    widget.auto_refresh.stop()
     widget.close()
 
 
 @pytest.fixture
 def export(qapp, db, manager, services, tmp_path):
     widget = make_export_page(db, manager, services)
-    widget._last_dir = str(tmp_path)
-    widget._load_tasks()   # 导出页构造时不载入，生产路径由 showEvent 触发
+    widget.last_dir = str(tmp_path)
+    widget.reload_tasks()   # 导出页构造时不载入，生产路径由 showEvent 触发
     yield widget
-    widget._running_refresh_timer.stop()
+    widget.running_timer.stop()
     widget.close()
 
 
 def _options(page):
-    combo = page.task_combo
-    return [(combo.itemData(i), combo.itemText(i)) for i in range(combo.count())]
+    """下拉项 (task_id, 显示文本)：两页都经 TaskSelector 公开接口读。"""
+    selector = page.task_selector
+    return [(selector.task_id_at(i), selector.item_text(i))
+            for i in range(selector.count())]
+
+
+def _tick_history(history):
+    """历史页定时刷新到点（页面可见时由 HistoryAutoRefresh 的定时器触发）。"""
+    history.auto_refresh.tick()
 
 
 def _short_to_full(text, task):
@@ -157,10 +167,10 @@ def test_options_order_ids_and_text_match(
 
 def test_default_selection_is_newest_on_both_pages(db, tasks, history, export, clock):
     """首次载入两页都默认选中第 0 项（最新的有数据任务），而不是更新但无数据的任务。"""
-    assert history.task_combo.currentIndex() == export.task_combo.currentIndex() == 0
+    assert history.task_selector.current_index() == export.task_selector.current_index() == 0
     assert history.current_task_id == export.current_task_id == tasks.running.task_id
-    # 历史页把当前项的完整信息放在下拉框 tooltip 上（导出页没有这一项）
-    assert history.task_combo.toolTip() == format_task_tooltip(
+    # 当前项的完整信息放在下拉框 tooltip 上（两页都由 TaskSelector 同步，另见 test_task_selector）
+    assert history.task_selector.tooltip() == export.task_selector.tooltip() == format_task_tooltip(
         db.get_task(tasks.running.task_id), True, clock.now())
 
 
@@ -173,8 +183,8 @@ def test_running_duration_refresh_keeps_pages_in_sync(
     before_ids = [tid for tid, _ in _options(history)]
 
     clock.set(BASE + timedelta(hours=3, minutes=30))
-    history._refresh_task_option_texts()
-    export._refresh_running_tasks()
+    _tick_history(history)
+    export.refresh_running_tasks()
     hist, exp = _assert_same_options(db, history, export, running_ids, clock.now())
     assert hist[0][1].endswith("运行中 30分钟")
     assert exp[0][1].endswith("运行中 30分钟")
@@ -186,16 +196,16 @@ def test_running_duration_refresh_keeps_pages_in_sync(
                           BASE + timedelta(hours=3, minutes=40))
     running_ids.clear()
     clock.set(BASE + timedelta(hours=6))
-    history._refresh_task_option_texts()
-    export._refresh_running_tasks()
+    _tick_history(history)
+    export.refresh_running_tasks()
     hist, exp = _assert_same_options(db, history, export, running_ids, clock.now())
     assert hist[0][1] == "running.exe · PID 1011 · 07-16 23:00 · 40分钟"
     assert exp[0][1] == "running.exe · PID 1011 · 2026-07-16 23:00 · 40分钟"
 
     # 结束后再推进时钟：两页的最终时长都不再变化
     clock.set(BASE + timedelta(hours=9))
-    history._refresh_task_option_texts()
-    export._refresh_running_tasks()
+    _tick_history(history)
+    export.refresh_running_tasks()
     assert _options(history) == hist
     assert _options(export) == exp
 
@@ -203,13 +213,13 @@ def test_running_duration_refresh_keeps_pages_in_sync(
 def test_user_choice_survives_reload_on_both_pages(
         db, tasks, history, export, running_ids, clock):
     """用户在两页都手动选中第 3 项（plain）后重新载入列表：两页都保持该选择，文案仍同口径。"""
-    history.task_combo.setCurrentIndex(2)
-    export.task_combo.setCurrentIndex(2)
+    history.task_selector.combo.setCurrentIndex(2)   # 等同用户在下拉里点选第 3 项
+    export.task_selector.combo.setCurrentIndex(2)
     assert history.current_task_id == export.current_task_id == tasks.plain.task_id
 
-    history._load_tasks()
-    export._load_tasks()
+    history.vm.reload_tasks()
+    export.reload_tasks()
 
     assert history.current_task_id == export.current_task_id == tasks.plain.task_id
-    assert history.task_combo.currentIndex() == export.task_combo.currentIndex() == 2
+    assert history.task_selector.current_index() == export.task_selector.current_index() == 2
     _assert_same_options(db, history, export, running_ids, clock.now())

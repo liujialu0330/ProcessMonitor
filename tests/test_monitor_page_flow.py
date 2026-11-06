@@ -1,23 +1,21 @@
 """
-监控页交互：默认预设与记住选择、进程选择规则、备注、较开始变化量、打点、停止确认、
-任务结束后卡片保留、异常结束提醒。
+监控页组装与连线：控件信号 → Presenter → manager 命令，以及关键可见状态（进程列表、
+字段错误、卡片形态、配额标题、空状态、表单折叠、对外信号）。
 
-页面的外部依赖全部经 UiServices 注入：提示用 RecordingNotifier 断言，对话框选择用
-ScriptedDialogs 预设（不弹出模态框），时间用 FakeClock，进程表用 FakeProcessQuery，
-用户偏好用 FakePreferences；测试不替换页面模块里的任何名字。
+业务规则（重复 PID、停止确认文案、打点时刻、重新监控三种情况、错误去重等）的细节
+由 tests/test_monitor_presenter.py 用假视图覆盖；本文件只验证真实控件连起来后走得通。
+页面依赖全部经 UiServices 注入，manager 用真实 MonitorManager（不启动采集线程）。
 """
 import os
-from datetime import datetime, timedelta
 
 import pytest
 from PyQt5.QtCore import Qt
+from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QWidget
 
 from core.contracts import StopReason, UnavailableReason
 from core.monitor_manager import MonitorManager
-from tests.doubles import (
-    DEFAULT_FAKE_NOW, FakeClock, FakePreferences, FakeProcessQuery, ScriptedDialogs,
-)
+from tests.doubles import DEFAULT_FAKE_NOW, FakePreferences, FakeProcessQuery
 from tests.factories import make_monitor_page, make_services
 from tests.helpers import stop_and_join
 from ui.components.metric_selector import MetricSelectorDialog
@@ -39,40 +37,39 @@ def manager(db):
 
 
 @pytest.fixture
+def started(manager, monkeypatch):
+    """记录 start_task 调用而不真的启动采集线程"""
+    calls = []
+    monkeypatch.setattr(manager, "start_task", lambda tid: calls.append(tid) or True)
+    return calls
+
+
+@pytest.fixture
 def services():
     return make_services(process_query=FakeProcessQuery(FAKE_PROCESSES))
 
 
 @pytest.fixture
-def notifier(services):
-    return services.notifier
-
-
-@pytest.fixture
-def dialogs(services):
-    return services.dialogs
-
-
-@pytest.fixture
-def query(services):
-    return services.process_query
-
-
-@pytest.fixture
-def page(qapp, db, manager, services):
+def page(qapp, db, manager, services, started):
     widget = make_monitor_page(db, manager, services)
     widget.resize(900, 700)
+    widget.show()
     yield widget
     widget.close()
 
 
-def _add_card(page, manager, metrics=None, note="", pid=None):
-    """创建（不启动）一个任务并取回页面上对应的卡片"""
+def _add_card(manager, metrics=None, note="", pid=None, name="demo.exe"):
+    """经 manager 创建（不启动）任务：task_added 信号驱动页面建卡"""
     task_id = manager.create_task(
-        pid or os.getpid(), "demo.exe",
+        pid or os.getpid(), name,
         metrics or [MetricType.MEMORY_PRIVATE, MetricType.NUM_GDI_OBJECTS], 1.0, note=note)
     assert task_id
-    return task_id, page.task_cards[task_id]
+    return task_id
+
+
+def _select(page, pid):
+    picker = page.form.picker
+    assert picker.combo.select_data(next(t for t in picker.targets() if t.pid == pid))
 
 
 # ---------- 依赖注入与默认值 ----------
@@ -81,6 +78,7 @@ def test_page_uses_injected_dependencies(page, db, manager, services):
     assert page.manager is manager
     assert page.services is services
     assert page.db is db
+    assert page.presenter.manager is manager
 
 
 def test_constructor_requires_db_manager_and_services(qapp):
@@ -90,50 +88,42 @@ def test_constructor_requires_db_manager_and_services(qapp):
         MonitorPage()
 
 
+def test_startup_lists_processes_selects_none_and_form_is_expanded(page):
+    picker = page.form.picker
+    assert [t.pid for t in picker.targets()] == [1001, 1002, 1003]
+    assert picker.text() == "" and picker.combo.current_data() is None
+    assert page.form.details.isVisible() and not page.form.expand_button.isVisible()
+    assert page.board.empty_state.isVisible()
+    assert "0/5 运行中" in page.board.count_label.text()
+
+
 def test_default_metrics_is_leak_check_preset(page):
-    assert page.selected_metrics == LEAK_CHECK_PRESET
-    assert "泄漏排查预设" in page.metric_summary_label.text()
+    assert page.form.metrics() == list(LEAK_CHECK_PRESET)
+    assert "泄漏排查预设" in page.form.metric_summary_label.text()
 
 
-def test_remembered_metrics_are_restored_on_new_page(qapp, db, manager):
-    prefs = FakePreferences(last_metrics=[MetricType.CPU_PERCENT, MetricType.MEMORY_RSS])
+def test_remembered_metrics_and_default_interval_are_restored(qapp, db, manager):
+    prefs = FakePreferences(last_metrics=[MetricType.CPU_PERCENT, MetricType.MEMORY_RSS],
+                            default_interval=7)
     widget = make_monitor_page(db, manager, make_services(preferences=prefs))
-    assert widget.selected_metrics == [MetricType.CPU_PERCENT, MetricType.MEMORY_RSS]
+    assert widget.form.metrics() == [MetricType.CPU_PERCENT, MetricType.MEMORY_RSS]
+    assert widget.form.interval_spinbox.value() == 7
+    widget.set_default_interval(9)
+    assert widget.form.interval_spinbox.value() == 9
     widget.close()
 
 
-def test_interval_spinbox_starts_from_default_interval_preference(qapp, db, manager):
-    widget = make_monitor_page(
-        db, manager, make_services(preferences=FakePreferences(default_interval=7)))
-    assert widget.interval_spinbox.value() == 7
-    widget.close()
-
-
-def test_confirming_metric_dialog_remembers_selection(page, services, dialogs):
+def test_metric_button_opens_dialog_and_updates_summary(page, services):
     chosen = [MetricType.NUM_THREADS, MetricType.MEMORY_PRIVATE]
-    dialogs.push("choose_metrics", chosen)
+    services.dialogs.push("choose_metrics", chosen)
 
-    page._on_select_metric_clicked()
+    page.form.metric_button.click()
 
-    # 对话框以当前选择预选、挂在主窗口上
-    call = dialogs.last_call("choose_metrics")
-    assert call["selected"] == list(LEAK_CHECK_PRESET)
-    assert call["parent"] is page.window()
-    assert page.selected_metrics == chosen
+    assert services.dialogs.last_call("choose_metrics")["parent"] is page.window()
+    assert page.form.metrics() == chosen
+    assert "已选 2 项" in page.form.metric_summary_label.text()
     assert services.preferences.remembered == [chosen]
-    assert "已选 2 项" in page.metric_summary_label.text()
 
-
-def test_cancelling_metric_dialog_keeps_selection(page, services, dialogs):
-    dialogs.push("choose_metrics", None)
-
-    page._on_select_metric_clicked()
-
-    assert page.selected_metrics == LEAK_CHECK_PRESET
-    assert services.preferences.remembered == []
-
-
-# ---------- 指标对话框 ----------
 
 def test_metric_dialog_has_tooltips_and_preset_button(qapp):
     host = QWidget()
@@ -154,636 +144,257 @@ def test_metric_dialog_has_tooltips_and_preset_button(qapp):
     host.close()
 
 
-# ---------- 进程选择 ----------
+# ---------- 开始监控 ----------
 
-def test_startup_selects_no_process_and_fills_no_pid(page):
-    assert page.process_combo.count() == len(FAKE_PROCESSES)
-    assert page.process_combo.currentIndex() == -1
-    assert page.process_combo.text() == ""
-    assert page.pid_input.text() == ""
-
-
-def test_start_without_any_selection_is_rejected(page, manager, notifier, monkeypatch):
-    created = []
-    monkeypatch.setattr(manager, "create_task", lambda *a, **k: created.append(a))
-    page._on_start_clicked()
-    assert created == []
-    assert notifier.levels() == ["warning"]
-
-
-def test_unmatched_combo_text_without_pid_is_rejected(page, manager, notifier, monkeypatch):
-    created = []
-    monkeypatch.setattr(manager, "create_task", lambda *a, **k: created.append(a))
-    page.process_combo.setText("不存在的进程")
-    page._on_start_clicked()
-    assert created == []
-    assert "不匹配" in notifier.last("warning").content
-
-
-def test_combo_selection_is_used_when_pid_empty(page, manager, monkeypatch):
-    started = []
-    monkeypatch.setattr(
-        page, "_start_monitoring", lambda *args, **kwargs: started.append((args, kwargs)))
-    page.process_combo.setCurrentIndex(1)
-    page.pid_input.clear()  # 用户清空了自动填入的 PID
-
-    page._on_start_clicked()
-
-    args, kwargs = started[0]
-    assert args[:2] == (1002, "beta.exe")
-    # 带上列表里该进程的创建时间，任务启动时据此确认 PID 未被复用
-    assert kwargs["create_time"] == 1002.5
-
-
-def test_autofilled_pid_carries_create_time_but_manual_pid_does_not(page, monkeypatch):
-    """下拉选择自动填入的 PID 沿用列表的创建时间；手动输入的 PID 没有可比对信息"""
-    started = []
-    monkeypatch.setattr(
-        page, "_start_monitoring", lambda *args, **kwargs: started.append((args, kwargs)))
-
-    page.process_combo.setCurrentIndex(1)
-    assert page.pid_input.text() == "1002"
-    page._on_start_clicked()
-    assert started[-1][0][:2] == (1002, "beta.exe")
-    assert started[-1][1]["create_time"] == 1002.5
-
-    # 用户清掉后手动输入同一个 PID（列表可能已过期）：不带创建时间，跳过比对
-    page.pid_input.clear()
-    page.pid_input.setText("1002")
-    page._on_start_clicked()
-    assert started[-1][0][0] == 1002 and started[-1][1]["create_time"] is None
-
-
-def test_create_time_is_passed_through_to_manager(page, manager, monkeypatch):
-    calls = []
-    monkeypatch.setattr(
-        manager, "create_task", lambda *a, **k: calls.append((a, k)) or None)
-    page._start_monitoring(1001, "alpha.exe", [MetricType.NUM_THREADS], 1.0,
-                           create_time=1001.5)
-    assert calls[0][1]["create_time"] == 1001.5
-
-
-def test_pid_input_takes_precedence_over_combo(page, query, monkeypatch):
-    started = []
-    monkeypatch.setattr(
-        page, "_start_monitoring", lambda *args, **kwargs: started.append(args))
-    page.process_combo.setCurrentIndex(0)
-    page.pid_input.setText("1003")
-
-    page._on_start_clicked()
-
-    # 进程名经注入的进程查询按 PID 取得
-    assert started[0][:2] == (1003, "MPrintExp.exe")
-    assert ("name_of", 1003) in query.calls
-
-
-def test_searching_another_process_clears_autofilled_pid(page):
-    """下拉选择自动填入的 PID，在用户改为搜索别的进程时要清掉，否则会盖过新选择"""
-    page.process_combo.setCurrentIndex(0)
-    assert page.pid_input.text() == "1001"
-    page.process_combo.setText("be")
-    assert page.pid_input.text() == ""
-    # 用户手动输入的 PID 不会被清掉
-    page.pid_input.setText("4242")
-    page.process_combo.setText("al")
-    assert page.pid_input.text() == "4242"
-
-
-def test_refresh_keeps_selection_but_does_not_select_first(page):
-    page.process_combo.setCurrentIndex(2)
-    page._refresh_process_list()
-    assert page.process_combo.currentIndex() == 2
-
-    page.process_combo.setCurrentIndex(-1)
-    page._refresh_process_list()
-    assert page.process_combo.currentIndex() == -1
-
-
-def test_refresh_picks_up_process_table_changes(page, query):
-    query.processes.append((1004, "gamma.exe", 1004.5))
-    page._refresh_process_list()
-    assert page.process_combo.count() == len(FAKE_PROCESSES) + 1
-    assert page.process_create_times[1004] == 1004.5
-
-
-def test_duplicate_pid_asks_for_confirmation(page, manager, dialogs, monkeypatch):
-    created = []
-    monkeypatch.setattr(
-        manager, "create_task", lambda *a, **k: created.append((a, k)) or None)
-    monkeypatch.setattr(manager, "has_running_task_for_pid", lambda pid: True)
-
-    dialogs.push("confirm", False, True)
-    assert page._start_monitoring(1001, "alpha.exe", [MetricType.NUM_THREADS], 1.0) is None
-    assert created == []
-
-    page._start_monitoring(1001, "alpha.exe", [MetricType.NUM_THREADS], 1.0)
-    assert len(created) == 1
-
-    calls = dialogs.calls_of("confirm")
-    assert len(calls) == 2
-    assert calls[0]["title"] == "已在监控该进程"
-    assert "alpha.exe（PID 1001）" in calls[0]["content"]
-    assert calls[0]["confirm_text"] == "继续创建"
-    assert calls[0]["cancel_text"] == "取消"
-    assert calls[0]["parent"] is page.window()
-
-
-def test_no_confirmation_when_pid_not_running(page, manager, dialogs, monkeypatch):
-    monkeypatch.setattr(manager, "create_task", lambda *a, **k: None)
-    # ScriptedDialogs 未预设 confirm：若被调用会直接断言失败
-    page._start_monitoring(1001, "alpha.exe", [MetricType.NUM_THREADS], 1.0)
-    assert dialogs.calls_of("confirm") == []
-
-
-# ---------- 备注 ----------
-
-def test_note_is_passed_to_create_task(page, manager, monkeypatch):
-    calls = []
-    monkeypatch.setattr(
-        manager, "create_task", lambda *a, **k: calls.append((a, k)) or None)
-    page.pid_input.setText("1001")
-    page.note_input.setText("  建模 200 次  ")
-
-    page._on_start_clicked()
-
-    args, kwargs = calls[0]
-    assert kwargs["note"] == "建模 200 次"
-    assert args[3] == float(page.interval_spinbox.value())
-
-
-def test_note_defaults_to_empty_and_shows_on_card(page, manager, monkeypatch):
+def test_start_button_creates_task_card_and_collapses_form(page, manager, started, monkeypatch):
     calls = []
     real_create = manager.create_task
-    monkeypatch.setattr(
-        manager, "create_task", lambda *a, **k: calls.append(k) or None)
-    page.pid_input.setText("1001")
-    page._on_start_clicked()
-    assert calls[0]["note"] == ""
-    monkeypatch.setattr(manager, "create_task", real_create)
+    monkeypatch.setattr(manager, "create_task",
+                        lambda *a, **k: calls.append((a, k)) or real_create(*a, **k))
+    _select(page, 1002)
+    page.form.note_input.setText("  建模 200 次  ")
 
-    _, card = _add_card(page, manager, note="过夜测试")
-    assert "过夜测试" in card.note_label.text()
-    assert not card.note_label.isHidden()
+    page.form.start_button.click()
+
+    args, kwargs = calls[0]
+    assert args[:2] == (1002, "beta.exe")
+    assert args[3] == float(page.form.interval_spinbox.value())
+    # 带上列表里该进程的创建时间，任务启动时据此确认 PID 未被复用
+    assert kwargs == {"note": "建模 200 次", "create_time": 1002.5}
+    assert len(started) == 1 and list(page.board.cards()) == started
+    card = page.board.cards()[started[0]]
+    assert "建模 200 次" in card.note_label.text() and not card.note_label.isHidden()
+    # 有任务后表单折叠成一行，空状态隐藏
+    assert page.form.is_collapsed() and page.form.expand_button.isVisible()
+    assert not page.board.empty_state.isVisible()
 
 
-# ---------- 卡片较开始变化量 ----------
+def test_typed_pid_in_search_box_is_used_without_create_time(page, manager, services,
+                                                             monkeypatch):
+    calls = []
+    monkeypatch.setattr(manager, "create_task", lambda *a, **k: calls.append((a, k)))
+    QTest.keyClicks(page.form.picker.combo.line_edit, "1003")
 
-def test_card_shows_delta_against_first_valid_value(page, manager):
-    _, card = _add_card(page, manager)
+    page.form.start_button.click()
+
+    assert calls[0][0][:2] == (1003, "MPrintExp.exe")
+    assert calls[0][1]["create_time"] is None
+    assert ("name_of", 1003) in services.process_query.calls
+
+
+def test_enter_in_search_box_selects_first_match(page):
+    line_edit = page.form.picker.combo.line_edit
+    QTest.keyClicks(line_edit, "MPRINT")
+    QTest.keyClick(line_edit, Qt.Key_Return)
+    assert page.form.picker.resolve().pid == 1003
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("", "请输入进程名或 PID，或从列表中选择进程"),
+    ("不存在的进程", "输入的内容与进程列表不匹配，请从下拉列表中选择，或直接输入 PID"),
+    ("999999", "进程 PID 999999 不存在或无法访问"),
+])
+def test_invalid_target_shows_error_under_field_and_clears_on_edit(
+        page, manager, services, monkeypatch, text, expected):
+    created = []
+    monkeypatch.setattr(manager, "create_task", lambda *a, **k: created.append(a))
+    page.form.picker.set_text(text)
+
+    page.form.start_button.click()
+
+    assert created == []
+    assert page.form.picker.error_label.isVisible()
+    assert page.form.picker.error_text() == expected
+    assert services.notifier.notices == []
+
+    QTest.keyClicks(page.form.picker.combo.line_edit, "x")
+    assert not page.form.picker.error_label.isVisible()
+
+
+def test_page_has_no_separate_pid_box(page):
+    """PID 直接在搜索框输入（P10）：表单里除搜索框外只剩备注一个单行输入框"""
+    from qfluentwidgets import EditableComboBox, LineEdit
+    edits = [w for w in page.form.findChildren(LineEdit)
+             if not isinstance(w, EditableComboBox)]
+    assert edits == [page.form.note_input]
+
+
+# ---------- 卡片按钮连线 ----------
+
+def test_data_updated_shows_values_delta_and_count(page, manager):
+    task_id = _add_card(manager)
+    card = page.board.cards()[task_id]
     private, gdi = MetricType.MEMORY_PRIVATE, MetricType.NUM_GDI_OBJECTS
 
-    card.update_values({private: 1024.0, gdi: 100.0})
-    assert card.delta_labels[private].text() == "较开始 ±0"
-    assert card.delta_labels[gdi].text() == "较开始 ±0"
+    manager.data_updated.emit(task_id, {private: 1024.0, gdi: 100.0})
+    manager.data_updated.emit(task_id, {private: 3072.0, gdi: 103.0})
 
-    card.update_values({private: 3072.0, gdi: 103.0})
+    assert card.value_labels[private].text() == "3 MB"
     assert card.delta_labels[private].text() == "较开始 +2 MB"
     assert card.delta_labels[gdi].text() == "较开始 +3 个"
-    # 趋势图旁显示首指标的较开始
     assert card.trend_delta_label.text() == "较开始 +2 MB"
-
-    card.update_values({private: 1024.0 - 512.0, gdi: 90.0})
-    assert card.delta_labels[private].text() == "较开始 -512 KB"
-    assert card.delta_labels[gdi].text() == "较开始 -10 个"
+    assert card.count == 2 and card.count_label.text() == "已记录：2 次采集"
 
 
-def test_card_baseline_is_first_valid_value_after_unavailable(page, manager):
-    _, card = _add_card(page, manager)
-    gdi = MetricType.NUM_GDI_OBJECTS
-    card.mark_unavailable({gdi: UnavailableReason.ACCESS_DENIED})
-    assert card.delta_labels[gdi].text() == "较开始 --"
-
-    card.update_values({gdi: 50.0})
-    assert card.delta_labels[gdi].text() == "较开始 ±0"
-    assert card.baselines[gdi] == 50.0
+def test_metrics_unavailable_marks_card(page, manager, services):
+    task_id = _add_card(manager)
+    manager.metrics_unavailable.emit(
+        task_id, {MetricType.NUM_GDI_OBJECTS: UnavailableReason.ACCESS_DENIED})
+    card = page.board.cards()[task_id]
+    assert card.value_labels[MetricType.NUM_GDI_OBJECTS].text() == "不可用"
+    assert "以管理员身份运行" in services.notifier.last("warning").content
 
 
-def test_card_trend_covers_whole_task_with_bounded_points(page, manager):
-    _, card = _add_card(page, manager)
-    for i in range(1000):
-        card.update_values({MetricType.MEMORY_PRIVATE: float(i)})
-    assert len(card.sparkline.series()) <= 240
-    assert "任务开始至今" in card.sparkline_label.text()
-
-
-# ---------- 打点 ----------
-
-def test_marker_flow_writes_via_manager_with_incrementing_default_label(
-        page, manager, db, notifier, dialogs):
-    task_id, card = _add_card(page, manager)
-    # 第一次用默认标签，第二次取消，第三次自定义
-    dialogs.push("ask_marker_label", "标记 1", None, "第 3 轮")
-
-    page._on_marker_task(task_id)
-    page._on_marker_task(task_id)   # 取消：不写库、序号不变
-    page._on_marker_task(task_id)
-
-    calls = dialogs.calls_of("ask_marker_label")
-    assert [c["default_label"] for c in calls] == ["标记 1", "标记 2", "标记 2"]
-    assert all(c["parent"] is page.window() for c in calls)
-    assert [m.label for m in db.get_markers(task_id)] == ["标记 1", "第 3 轮"]
-    assert card.next_marker_label() == "标记 3"
-    assert notifier.levels() == ["success", "success"]
-    assert "标记 1" in notifier.messages()[0].content
-
-
-def test_marker_failure_is_reported(page, manager, notifier, dialogs, monkeypatch):
-    task_id, card = _add_card(page, manager)
-    dialogs.push("ask_marker_label", "标记 1")
-    monkeypatch.setattr(manager, "add_marker", lambda tid, label, ts=None: None)
-
-    page._on_marker_task(task_id)
-
-    assert notifier.levels() == ["error"]
-    # 错误提示不自动消失（可手动关闭）
-    assert notifier.last("error").effective_duration == -1
-    assert card.next_marker_label() == "标记 1"
-
-
-class _ClockAdvancingDialogs(ScriptedDialogs):
-    """打点输入框开着期间让时钟走若干秒，模拟用户输入标签花的时间"""
-
-    def __init__(self, clock: FakeClock, typing_time: timedelta, **fixed):
-        super().__init__(**fixed)
-        self._clock = clock
-        self._typing_time = typing_time
-
-    def ask_marker_label(self, parent, default_label, timestamp):
-        answer = super().ask_marker_label(parent, default_label, timestamp)
-        self._clock.advance(self._typing_time)
-        return answer
-
-
-def test_marker_time_is_click_time_not_confirm_time(qapp, db, manager):
-    """打点时间取点击"打点"按钮的时刻：用户输入标签花了 12 秒，落库时间不能是确认时刻"""
-    clicked = datetime(2026, 11, 6, 10, 0, 0)
-    clock = FakeClock(clicked)
-    dialogs = _ClockAdvancingDialogs(
-        clock, timedelta(seconds=12), ask_marker_label="开始第 3 轮")
-    services = make_services(clock=clock, dialogs=dialogs)
-    page = make_monitor_page(db, manager, services)
-    try:
-        task_id, _ = _add_card(page, manager)
-
-        page._on_marker_task(task_id)
-
-        markers = db.get_markers(task_id)
-        assert [m.label for m in markers] == ["开始第 3 轮"]
-        assert markers[0].timestamp == clicked
-        assert dialogs.last_call("ask_marker_label")["timestamp"] == clicked
-        assert clock.now() == clicked + timedelta(seconds=12)
-        assert "10:00:00" in services.notifier.last("success").content
-    finally:
-        page.close()
-
-
-# ---------- 停止确认 ----------
-
-def test_stop_requires_confirmation(page, manager, dialogs, monkeypatch):
-    task_id, card = _add_card(page, manager)
+def test_stop_button_confirms_then_requests_stop(page, manager, services, monkeypatch):
+    task_id = _add_card(manager)
+    card = page.board.cards()[task_id]
     stops = []
     monkeypatch.setattr(manager, "stop_task", lambda tid: stops.append(tid) or True)
 
-    dialogs.push("confirm", False)
-    page._on_stop_task(task_id)
+    services.dialogs.push("confirm", False, True)
+    card.stop_button.click()
     assert stops == [] and card.stop_button.isEnabled()
-
-    dialogs.push("confirm", True)
-    page._on_stop_task(task_id)
+    card.stop_button.click()
     assert stops == [task_id]
-    # 发出停止请求后卡片等 task_stopped：按钮禁用，防止窗口期内重复点击
-    assert not card.stop_button.isEnabled()
-    assert not card.pause_button.isEnabled()
-
-    call = dialogs.last_call("confirm")
-    assert call["title"] == "停止监控"
-    assert call["confirm_text"] == "停止" and call["cancel_text"] == "取消"
-    assert "不可续采" in call["content"]
+    assert not card.stop_button.isEnabled() and not card.pause_button.isEnabled()
+    assert services.dialogs.last_call("confirm")["parent"] is page.window()
 
 
-def test_stop_returning_false_is_tolerated(page, manager, notifier, dialogs, monkeypatch):
-    task_id, card = _add_card(page, manager)
-    dialogs.always("confirm", True)
-    monkeypatch.setattr(manager, "stop_task", lambda tid: False)
-
-    page._on_stop_task(task_id)
-
-    assert card.stop_button.isEnabled()
-    assert notifier.notices == []
-
-
-def test_pause_resume_false_is_tolerated(page, manager, monkeypatch):
-    task_id, card = _add_card(page, manager)
-    monkeypatch.setattr(manager, "pause_task", lambda tid: False)
-    monkeypatch.setattr(manager, "resume_task", lambda tid: False)
-    page._on_pause_task(task_id)
-    page._on_resume_task(task_id)
-    assert not card.is_paused
-
+def test_pause_button_toggles_card(page, manager, monkeypatch):
+    task_id = _add_card(manager)
+    card = page.board.cards()[task_id]
     monkeypatch.setattr(manager, "pause_task", lambda tid: True)
-    page._on_pause_task(task_id)
+    monkeypatch.setattr(manager, "resume_task", lambda tid: True)
+
+    card.pause_button.click()
     assert card.is_paused and card.pause_button.text() == "恢复"
+    card.pause_button.click()
+    assert not card.is_paused and card.pause_button.text() == "暂停"
 
 
-# ---------- 任务结束后卡片保留 ----------
+def test_marker_button_writes_marker_via_manager(page, manager, db, services):
+    task_id = _add_card(manager)
+    services.dialogs.push("ask_marker_label", "第 1 轮")
 
-def test_card_is_kept_in_finished_state_after_stop(page, manager, notifier):
-    task_id, card = _add_card(page, manager, note="备注A")
-    card.update_values({MetricType.MEMORY_PRIVATE: 1024.0, MetricType.NUM_GDI_OBJECTS: 10.0})
-    card.update_values({MetricType.MEMORY_PRIVATE: 2048.0, MetricType.NUM_GDI_OBJECTS: 14.0})
+    page.board.cards()[task_id].marker_button.click()
 
-    page._on_task_stopped(task_id, StopReason.USER)
+    markers = db.get_markers(task_id)
+    assert [m.label for m in markers] == ["第 1 轮"]
+    assert markers[0].timestamp == DEFAULT_FAKE_NOW
+    assert services.dialogs.last_call("ask_marker_label")["default_label"] == "标记 1"
+    assert services.notifier.last().level == "success"
+
+
+# ---------- 任务结束 ----------
+
+def test_stopped_card_is_kept_in_finished_group(page, manager, monkeypatch):
+    task_id = _add_card(manager, note="备注A")
+    other_id = _add_card(manager)
+    card = page.board.cards()[task_id]
+    manager.data_updated.emit(task_id, {MetricType.MEMORY_PRIVATE: 1024.0})
+    manager.data_updated.emit(task_id, {MetricType.MEMORY_PRIVATE: 2048.0})
+    monkeypatch.setattr(manager, "running_task_count", lambda: 1)
+
+    manager.task_stopped.emit(task_id, StopReason.USER)
 
     # 卡片保留并即时转"已结束"；未启动的任务没有线程可等，core 侧立即移除
-    # （线程仍在收尾时由 manager 在 finished 后移除，见 test_session_end_and_deferred_remove）
-    assert task_id in page.task_cards and card.is_finished
+    assert card.is_finished and page.board.cards()[task_id] is card
     assert manager.get_task_info(task_id) is None
-    # 最后值与较开始保留
     assert card.value_labels[MetricType.MEMORY_PRIVATE].text() == "2 MB"
-    assert card.delta_labels[MetricType.NUM_GDI_OBJECTS].text() == "较开始 +4 个"
-    # 结束原因与时间（取注入的时钟）；运行中操作隐藏、结束后操作可见
     assert "用户停止" in card.finished_detail_label.text()
     assert DEFAULT_FAKE_NOW.strftime("%Y-%m-%d %H:%M:%S") in card.finished_detail_label.text()
     assert card.running_actions.isHidden() and not card.finished_actions.isHidden()
-    assert not card.finished_label.isHidden() and card.running_label.isHidden()
-    for button in (card.history_button, card.restart_button, card.close_button):
-        assert not button.isHidden()
-    # 空状态只在没有任何卡片时显示
-    assert page.empty_state_label.isHidden()
+    # 配额只计运行中；已结束的单独计数并归入下方分组
+    text = page.board.count_label.text()
+    assert "1/5 运行中" in text and "1 个已结束" in text
+    assert page.board.finished_label.isVisible()
+    assert other_id in page.board.cards()
 
 
-def test_quota_counts_only_running_tasks(page, manager, monkeypatch):
-    task_id, card = _add_card(page, manager)
-    other_id, _ = _add_card(page, manager)
-    monkeypatch.setattr(manager, "running_task_count", lambda: 1)
-    page._on_task_stopped(task_id, StopReason.PROCESS_EXITED)
-    text = page.tasks_label.text()
-    assert "1/" in text and "运行中" in text and "1 个已结束" in text
-    assert other_id in page.task_cards
+def test_abnormal_stop_signals_main_window(page, manager, services):
+    task_id = _add_card(manager)
+    received = []
+    page.task_ended_abnormally.connect(lambda title, content: received.append(content))
+
+    manager.task_stopped.emit(task_id, StopReason.PROCESS_EXITED)
+
+    assert received and "进程已终止" in received[0] and "demo.exe" in received[0]
+    assert services.notifier.last().parent is page
+    assert "进程已终止" in page.board.cards()[task_id].finished_detail_label.text()
 
 
-def test_close_button_removes_card_and_shows_empty_state(page, manager):
-    task_id, card = _add_card(page, manager)
-    page._on_task_stopped(task_id, StopReason.USER)
-    assert page.empty_state_label.isHidden()
-
-    card.close_button.click()
-    assert task_id not in page.task_cards
-    assert not page.empty_state_label.isHidden()
-
-
-def test_view_history_button_emits_request(page, manager):
-    task_id, card = _add_card(page, manager)
-    page._on_task_stopped(task_id, StopReason.USER)
+def test_history_button_emits_page_signal(page, manager):
+    task_id = _add_card(manager)
+    manager.task_stopped.emit(task_id, StopReason.USER)
     received = []
     page.history_requested.connect(received.append)
 
-    card.history_button.click()
+    page.board.cards()[task_id].history_button.click()
 
     assert received == [task_id]
 
 
-def test_restart_with_single_match_creates_task_with_same_settings(
-        page, manager, query, monkeypatch):
-    task_id, card = _add_card(
-        page, manager, metrics=[MetricType.NUM_HANDLES, MetricType.NUM_THREADS], note="第二轮")
-    card.interval = 5.0
-    page._on_task_stopped(task_id, StopReason.PROCESS_EXITED)
-    query.processes.append((4321, "demo.exe", 777.25))
-    started = []
-    monkeypatch.setattr(
-        page, "_start_monitoring", lambda *args, **kwargs: started.append((args, kwargs)))
+def test_close_button_removes_card_and_expands_form(page, manager):
+    task_id = _add_card(manager)
+    manager.task_stopped.emit(task_id, StopReason.USER)
+    assert page.form.is_collapsed()
 
-    card.restart_button.click()
+    page.board.cards()[task_id].close_button.click()
 
-    assert started == [((
-        4321, "demo.exe", [MetricType.NUM_HANDLES, MetricType.NUM_THREADS], 5.0, "第二轮"),
-        {"create_time": 777.25})]
+    assert task_id not in page.board.cards()
+    assert page.board.empty_state.isVisible()
+    assert not page.form.is_collapsed() and not page.form.expand_button.isVisible()
 
 
-@pytest.mark.parametrize("matches, keyword", [
-    ([], "未找到"), ([(11, 1.0), (22, 2.0)], "找到 2 个")])
-def test_restart_with_zero_or_many_matches_fills_search_box(
-        page, manager, notifier, query, monkeypatch, matches, keyword):
-    task_id, card = _add_card(page, manager)
-    page._on_task_stopped(task_id, StopReason.PROCESS_EXITED)
-    notifier.clear()
-    query.processes.extend((pid, "demo.exe", create_time) for pid, create_time in matches)
-    monkeypatch.setattr(
-        page, "_start_monitoring", lambda *a, **k: pytest.fail("不应直接创建任务"))
-    page.pid_input.setText("999")
+def test_restart_button_creates_new_task_for_single_match(page, manager, services, started):
+    task_id = _add_card(manager, metrics=[MetricType.NUM_HANDLES], note="第二轮")
+    manager.task_stopped.emit(task_id, StopReason.PROCESS_EXITED)
+    services.process_query.processes.append((4321, "demo.exe", 777.25))
 
-    card.restart_button.click()
+    page.board.cards()[task_id].restart_button.click()
 
-    assert page.process_combo.text() == "demo.exe"
-    assert page.pid_input.text() == ""
-    last = notifier.last("warning")
-    assert keyword in last.title + last.content
+    assert len(started) == 1
+    new_card = page.board.cards()[started[0]]
+    assert (new_card.pid, new_card.note, new_card.metric_types) == (
+        4321, "第二轮", [MetricType.NUM_HANDLES])
 
 
-def test_restart_matches_process_name_case_insensitively(page, manager, query, monkeypatch):
-    """重新监控经 ProcessQuery.find_pids_by_name 按名查找（不区分大小写），页面不自行遍历进程表"""
-    task_id, card = _add_card(page, manager)
-    card.process_name = "mprintexp.EXE"
-    page._on_task_stopped(task_id, StopReason.PROCESS_EXITED)
-    started = []
-    monkeypatch.setattr(
-        page, "_start_monitoring", lambda *args, **kwargs: started.append((args, kwargs)))
-    query.calls.clear()
+def test_restart_without_match_fills_search_box(page, manager, services):
+    task_id = _add_card(manager)
+    manager.task_stopped.emit(task_id, StopReason.PROCESS_EXITED)
 
-    card.restart_button.click()
+    page.board.cards()[task_id].restart_button.click()
 
-    assert [args[0] for args, _ in started] == [1003]
-    assert started[0][1] == {"create_time": 1003.5}
-    assert ('find_pids_by_name', None) in query.calls
-    assert ('list_processes', None) not in query.calls
+    assert page.form.picker.text() == "demo.exe"
+    assert "未找到" in services.notifier.last("warning").title
 
 
-def test_interval_range_comes_from_preferences(qapp, db, manager):
-    """采集周期输入框的范围取自偏好服务（只在 app_config 定义一份）"""
-    prefs = FakePreferences()
-    prefs.interval_bounds = (2, 120)
-    widget = make_monitor_page(db, manager, make_services(
-        process_query=FakeProcessQuery(FAKE_PROCESSES), preferences=prefs))
-    try:
-        assert (widget.interval_spinbox.minimum(), widget.interval_spinbox.maximum()) == (2, 120)
-    finally:
-        widget.close()
+def test_exited_process_is_cleared_from_form(page, manager, services):
+    """被测进程退出后，表单里不能一直留着已不存在的进程（再点开始才报"进程不存在"）"""
+    task_id = _add_card(manager, pid=1002)
+    _select(page, 1002)
 
+    services.process_query.kill(1002)
+    manager.task_stopped.emit(task_id, StopReason.PROCESS_EXITED)
 
-# ---------- 只经 manager 只读接口 ----------
+    assert page.form.picker.text() == ""
+    assert all(t.pid != 1002 for t in page.form.picker.targets())
+
 
 def test_page_never_touches_task_threads(page, manager, monkeypatch):
     """建卡、重复 PID 判断都只用 manager 的快照/查询接口，不取任务线程对象"""
     monkeypatch.setattr(manager, "get_task", lambda tid: pytest.fail("界面不应取任务线程"))
     monkeypatch.setattr(manager, "get_all_tasks", lambda: pytest.fail("界面不应取任务线程"))
 
-    task_id, card = _add_card(page, manager, metrics=[MetricType.NUM_THREADS], note="快照")
+    task_id = _add_card(manager, metrics=[MetricType.NUM_THREADS], note="快照")
+    card = page.board.cards()[task_id]
     assert (card.process_name, card.note, card.metric_types) == (
         "demo.exe", "快照", [MetricType.NUM_THREADS])
-
-    monkeypatch.setattr(manager, "has_running_task_for_pid", lambda pid: pid == 4321)
-    assert page._has_running_task_for_pid(4321) is True
-    assert page._has_running_task_for_pid(1) is False
+    _select(page, 1001)
+    page.form.start_button.click()
 
 
-# ---------- 指标不可用提示 ----------
-
-def test_unavailable_hint_mentions_admin_only_for_access_denied(page, manager, notifier):
-    task_id, _ = _add_card(page, manager)
-    gdi, uss = MetricType.NUM_GDI_OBJECTS, MetricType.MEMORY_USS
-
-    page._on_metrics_unavailable(task_id, {gdi: UnavailableReason.NOT_IN_SESSION})
-    content = notifier.last("warning").content
-    assert "进程不在当前会话" in content and "管理员" not in content
-
-    page._on_metrics_unavailable(task_id, {uss: UnavailableReason.ACCESS_DENIED})
-    content = notifier.last("warning").content
-    assert "权限不足" in content and "以管理员身份运行" in content
-
-
-# ---------- 异常结束提醒 ----------
-
-def test_abnormal_stop_is_prominent_and_signals_main_window(page, manager, notifier):
-    task_id, card = _add_card(page, manager)
-    received = []
-    page.task_ended_abnormally.connect(lambda title, content: received.append(content))
-
-    page._on_task_stopped(task_id, StopReason.PROCESS_EXITED)
-
-    last = notifier.last()
-    assert last.level == "warning" and last.effective_duration >= 10000
-    assert last.parent is page
-    assert received and "进程已终止" in received[0] and "demo.exe" in received[0]
-    # 结束原因非"用户停止"时卡片也有对应文案
-    assert "进程已终止" in card.finished_detail_label.text()
-
-
-def test_user_stop_does_not_signal_abnormal(page, manager, notifier):
-    task_id, _ = _add_card(page, manager)
-    received = []
-    page.task_ended_abnormally.connect(lambda *args: received.append(args))
-
-    page._on_task_stopped(task_id, StopReason.USER)
-
-    assert received == []
-    assert notifier.last().level == "info"
-
-
-def test_restart_excludes_own_process(page, manager, query, notifier, monkeypatch):
-    """被测的同名进程退出后，"重新监控"不能因为只剩本程序同名而监控起自己。"""
-    own = query.self_pid()
-    task_id, card = _add_card(page, manager)
-    card.process_name = "PYTHON.EXE"
-    page._on_task_stopped(task_id, StopReason.PROCESS_EXITED)
-    started = []
-    monkeypatch.setattr(
-        page, "_start_monitoring", lambda *args, **kwargs: started.append(args))
-
-    query.processes = [(own, "python.exe", 1.0), (99999, "python.exe", 2.0),
-                       (12345, "other.exe", 3.0)]
-    card.restart_button.click()
-    assert [args[0] for args in started] == [99999]
-
-    started.clear()
-    query.processes = [(own, "python.exe", 1.0)]
-    card.restart_button.click()
-    assert started == []
-    assert "未找到" in notifier.last("warning").title
-
-
-def test_exited_process_is_cleared_from_form(page, manager, query):
-    """被测进程退出后，表单里不能一直留着已不存在的 PID（再点开始才报"进程不存在"）。"""
-    task_id, _ = _add_card(page, manager, pid=1002)
-    page.process_combo.setCurrentIndex(1)
-    assert page.pid_input.text() == "1002"
-
-    query.kill(1002)
-    page._on_task_stopped(task_id, StopReason.PROCESS_EXITED)
-
-    assert page.pid_input.text() == ""
-    assert page.process_combo.currentIndex() == -1
-    assert page.process_combo.text() == ""
-    assert all(page.process_combo.itemData(i)[0] != 1002
-               for i in range(page.process_combo.count()))
-
-
-def test_form_is_kept_when_selection_is_another_or_still_alive(page, manager, query):
-    task_id, _ = _add_card(page, manager, pid=1002)
-    other_id, _ = _add_card(page, manager, pid=1002)
-
-    # 表单选的是别的进程：不动
-    page.process_combo.setCurrentIndex(0)
-    query.alive = set()
-    page._on_task_stopped(task_id, StopReason.PROCESS_EXITED)
-    assert page.pid_input.text() == "1001"
-    assert page.process_combo.currentIndex() == 0
-
-    # 选的就是它，但进程还活着（如用户手动停止）：不动
-    page.process_combo.setCurrentIndex(1)
-    query.alive = {1002}
-    page._on_task_stopped(other_id, StopReason.USER)
-    assert page.pid_input.text() == "1002"
-    assert page.process_combo.currentIndex() == 1
-
-
-# ---------- 表单校验错误与错误提示 ----------
-
-@pytest.mark.parametrize("pid_text, expected", [
-    ("abc", "PID 必须是数字"),
-    ("999999", "进程 PID 999999 不存在或无法访问"),
-])
-def test_form_validation_error_shows_under_field_and_clears_on_edit(
-        page, manager, notifier, monkeypatch, pid_text, expected):
-    """PID 无效/进程不存在：错误显示在输入框下方（不用一闪即逝的顶部提示），改输入即清除"""
-    created = []
-    monkeypatch.setattr(manager, "create_task", lambda *a, **k: created.append(a))
-    page.show()
-
-    page.pid_input.setText(pid_text)
-    page._on_start_clicked()
-
-    assert created == []
-    assert page.form_error_label.isVisible()
-    assert page.form_error_label.text() == expected
-    assert notifier.notices == []
-
-    page.pid_input.setText(pid_text + "1")
-    assert not page.form_error_label.isVisible()
-    assert page.form_error_label.text() == ""
-
-    # 改为在下拉框里搜索同样清除
-    page.pid_input.setText(pid_text)
-    page._on_start_clicked()
-    assert page.form_error_label.isVisible()
-    page.process_combo.setText("al")
-    assert not page.form_error_label.isVisible()
-
-
-def test_task_error_infobar_is_persistent(page, notifier):
-    """运行期错误提示不自动消失（可手动关闭）"""
-    page._on_error("t1", "采集数据时发生错误: x")
-    assert notifier.levels() == ["error"]
-    assert notifier.last("error").effective_duration == -1
-
-
-def test_repeated_task_error_is_not_stacked_until_closed(page, notifier):
-    """错误提示不再自动消失后，每周期重复上报的同一错误不能越叠越多；关掉后可再次提示"""
-    for _ in range(3):
-        page._on_error("t1", "采集数据时发生错误: x")
-    page._on_error("t2", "采集数据时发生错误: x")
-
-    errors = notifier.messages("error")
-    assert len(errors) == 2
-    assert set(page._error_bars) == {("t1", "采集数据时发生错误: x"),
-                                     ("t2", "采集数据时发生错误: x")}
-
-    errors[0].bar.close()
-    assert ("t1", "采集数据时发生错误: x") not in page._error_bars
-
-    page._on_error("t1", "采集数据时发生错误: x")
-    assert len(notifier.messages("error")) == 3
-
+# ---------- 错误提示 ----------
 
 def test_repeated_task_error_dedup_works_with_real_infobar(qapp, db, manager):
     """生产提示实现返回的真实 InfoBar：关闭信号同样能解除去重"""
@@ -793,13 +404,13 @@ def test_repeated_task_error_dedup_works_with_real_infobar(qapp, db, manager):
     page.show()
     try:
         for _ in range(3):
-            page._on_error("t1", "采集数据时发生错误: x")
-        page._on_error("t2", "采集数据时发生错误: x")
+            manager.error_occurred.emit("t1", "采集数据时发生错误: x")
+        manager.error_occurred.emit("t2", "采集数据时发生错误: x")
 
         bars = [w for w in page.findChildren(InfoBar) if not w.isHidden()]
         assert len(bars) == 2
 
-        page._error_bars[("t1", "采集数据时发生错误: x")].close()
-        assert ("t1", "采集数据时发生错误: x") not in page._error_bars
+        bars[0].close()
+        assert len(page.presenter.shown_errors()) == 1
     finally:
         page.close()

@@ -34,14 +34,14 @@ ProcessMonitor is a Windows 11 Fluent Design desktop app for keeping an eye on a
 - **Honest gaps instead of fake zeros** — when a metric cannot be read, the task card shows "unavailable" with the reason and nothing is recorded for it. Without administrator rights only USS of higher-privilege processes is unreadable; GDI/USER objects of processes in other sessions (e.g. system services) show "not supported"
 - **Change since start and full-run trend** — each card shows every metric's change since the task began, and the sparkline covers "task start until now" (automatically thinned out on long runs)
 - **Markers and notes** — attach a test note to a task and drop labelled markers on a running task to record key actions; stopping a task asks for confirmation
-- **Careful task creation** — no process is pre-selected, creating a second task for the same PID asks for confirmation, and the process list can be searched by name or PID
+- **Careful task creation** — no process is pre-selected, creating a second task for the same PID asks for confirmation, one search box accepts either a process name or a PID; once tasks exist the new-task form collapses to a single row, and finished tasks move to a separate "Finished" group
 - **Multi-metric, multi-task** — any metric combination per task, sharing one interval and timestamp; up to 5 running tasks at once (the quota counts running tasks only); any integer interval from 1 to 3600 seconds, default 1s
 - **Pause & resume** — pause a task without losing history; resuming samples immediately
 - **Cards stay after a task ends** — a finished card offers "View history", "Monitor again" and "Close"; if the target process ends unexpectedly you get an in-app notice, plus a tray balloon when the window is in the background
 - **Steady sampling** — scheduled on a monotonic-clock deadline so it does not drift over time, does not backfill after the machine sleeps, and detects PID reuse so a new process is never mistaken for the original
 
 ### 📊 History & Export
-- **Focused history workspace** — shows "All" data by default (leak analysis needs the whole run), with quick 10m / 1h / 6h / 24h ranges and separate Trend / Details views; the task dropdown shows duration, note and a "running" marker
+- **Focused history workspace** — shows "All" data by default (leak analysis needs the whole run), with quick 10m / 1h / 6h / 24h ranges and separate Trend / Details views; the task dropdown shows duration, note and a "running" marker; all loading runs in the background, so large tasks never freeze the UI
 - **Stats strip** — start, current, change, growth rate (per hour), min and max
 - **Interactive history charts** — hover crosshair with readout, a real date/time axis and marker lines; Y-axis ticks are rounded in the display unit, count metrics use integer ticks, and a flat curve is not blown up into full-height noise; export to PNG or copy to the clipboard
 - **Auto-refresh for running tasks** — chart and stats follow the live data, with a refresh interval that adapts to the data volume
@@ -113,6 +113,8 @@ flowchart TD
         MW --> SP[Settings Page]
         MW --> AP[About Page]
         TS[Typography System] --> MW
+        UW[Pages only wire things up: widgets/ · viewmodels/ · presenters/] --> MP
+        UW --> HP
     end
     subgraph Core["Core Layer (core/)"]
         MM[MonitorManager] --> MT[MonitorWorker QThread]

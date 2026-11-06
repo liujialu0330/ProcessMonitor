@@ -73,7 +73,7 @@ def test_task_stopped_calls_remove_task_directly(qapp, db):
     removed = []
     manager.remove_task = lambda tid: removed.append(tid) or True
 
-    page._on_task_stopped("t-unknown", StopReason.USER)
+    page.presenter.on_task_stopped("t-unknown", StopReason.USER)
     assert removed == ["t-unknown"]
     page.close()
 
@@ -96,12 +96,13 @@ def test_real_stop_card_kept_and_worker_removed_on_finished(qapp, db):
         assert worker.state in (WorkerState.STOPPING, WorkerState.STOPPED)
         assert process_events_until(lambda: removed == [task_id])
 
-        card = page.task_cards[task_id]
+        card = page.board.cards()[task_id]
         assert card.is_finished
         assert manager.get_task_info(task_id) is None
         assert process_events_until(lambda: sip.isdeleted(worker))
         assert manager.running_task_count() == 0
-        assert "0/" in page.tasks_label.text() and "1 个已结束" in page.tasks_label.text()
+        count_text = page.board.count_label.text()
+        assert "0/" in count_text and "1 个已结束" in count_text
     finally:
         stop_and_join(manager)
         page.close()

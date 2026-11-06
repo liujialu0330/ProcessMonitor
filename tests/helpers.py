@@ -50,6 +50,20 @@ def process_events_until(condition, timeout: float = 5.0) -> bool:
     return bool(condition())
 
 
+def dispose_widget(widget) -> None:
+    """隐藏并立即释放顶层控件（用例收尾用）。
+
+    无父对象的顶层窗口不会随 Python 引用消失而析构；qfluentwidgets 的全局
+    styleSheetManager 又登记着其中每个控件，残留窗口会让之后每次主题切换都给
+    它们重刷样式表（残留十几个主窗口时，冒烟用例的两次切主题要几十秒）。
+    """
+    from PyQt5.QtCore import QCoreApplication, QEvent
+
+    widget.hide()
+    widget.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+
+
 def record_stop_reasons(task) -> list:
     """直连记录 task_stopped 的停止原因（StopReason），在发射线程内同步追加，
     适用于 MonitorTask 与 MonitorManager"""
@@ -161,3 +175,90 @@ def make_broken_factories(tmp_dir: str) -> list:
         ConnectionFactoryStub(os.path.join(tmp_dir, 'no_such_dir', 'x.db')),
         ConnectionFactoryStub(corrupt),
     ]
+
+
+def fetch_history_render_inputs(db, task_id: str, metric_type: str, since, table_limit: int,
+                                max_buckets: int):
+    """
+    按历史页的四类查询取数（明细最近 table_limit 条、统计、分桶、打点），返回
+    (table_points, stats, chart_points, markers)，供历史页显示控件的渲染测试直接喂数据。
+    口径与历史页一致；只用数据层仓储，不依赖页面或查询编排模块。
+    """
+    from data.repos.point_repo import PointQuery
+
+    table_points = db.points.fetch(
+        PointQuery(task_id, metric_type, since=since, limit=table_limit))
+    stats = db.analytics.legacy_stats(task_id, metric_type, since=since)
+    chart_points = db.analytics.legacy_buckets(task_id, metric_type, max_buckets, since=since)
+    markers = db.markers.list(task_id, since=since)
+    return table_points, stats, chart_points, markers
+
+
+class SyncHistoryRunner:
+    """历史查询执行器替身：在当前线程同步执行 run_history_query 并立即回调。
+    requests 记下每次收到的请求（按顺序），threads 记下执行线程。"""
+
+    def __init__(self, db):
+        self.db = db
+        self.requests = []
+        self.threads = []
+
+    def __call__(self, request, on_done):
+        import threading
+        from core.history_query import run_history_query
+
+        self.requests.append(request)
+        self.threads.append(threading.current_thread())
+        on_done(run_history_query(self.db, request))
+
+
+class ManualHistoryRunner:
+    """历史查询执行器替身：只记下请求，测试调用 complete()/fail() 时才回调，
+    用于模拟"查询在途"、结果乱序到达与过期丢弃。"""
+
+    def __init__(self, db):
+        self.db = db
+        self.pending = []   # [(request, on_done)]
+        self.requests = []
+
+    def __call__(self, request, on_done):
+        self.requests.append(request)
+        self.pending.append((request, on_done))
+
+    def complete(self, index: int = 0):
+        """执行第 index 个在途请求的真实查询并回调，返回快照"""
+        from core.history_query import run_history_query
+
+        request, on_done = self.pending.pop(index)
+        snapshot = run_history_query(self.db, request)
+        on_done(snapshot)
+        return snapshot
+
+    def fail(self, message: str, index: int = 0, storage_error: bool = True):
+        """让第 index 个在途请求以失败快照返回"""
+        from core.history_query import HistorySnapshot
+
+        request, on_done = self.pending.pop(index)
+        snapshot = HistorySnapshot(request=request, error=message,
+                                   storage_error=storage_error)
+        on_done(snapshot)
+        return snapshot
+
+    def complete_all(self):
+        while self.pending:
+            self.complete(0)
+
+
+class ManualDefer:
+    """HistoryViewModel 的 defer 替身：把推迟的回调排队，run() 时才执行（模拟下一轮
+    事件循环），用于验证同一轮内的多次加载请求只发一次查询。"""
+
+    def __init__(self):
+        self.queue = []
+
+    def __call__(self, fn):
+        self.queue.append(fn)
+
+    def run(self):
+        while self.queue:
+            self.queue.pop(0)()

@@ -1,583 +1,345 @@
 """
-数据导出页面
-将监控任务的数据导出为CSV文件
+数据导出页面：选任务 -> 确认摘要 -> 选位置并导出 CSV（导出在后台线程中进行）。
 """
 import os
-from typing import TYPE_CHECKING
+from contextlib import suppress
+from typing import TYPE_CHECKING, Optional
 
-from PyQt5.QtCore import Qt, QStandardPaths, QTimer
-from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QScrollArea,
-                             QSizePolicy)
+from PyQt5.QtCore import Qt, QStandardPaths
+from PyQt5.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout
 from qfluentwidgets import (
-    ComboBox, CardWidget, PrimaryPushButton, PushButton, FluentIcon,
-    StrongBodyLabel, BodyLabel, CaptionLabel, LineEdit, HorizontalSeparator
+    CardWidget, PrimaryPushButton, PushButton, FluentIcon,
+    StrongBodyLabel, CaptionLabel, LineEdit, HorizontalSeparator
 )
 
 from core.export_worker import ExportWorker
 from data.database import Database
-from ui.formatting import (
-    default_export_filename, format_count, format_task_option_text,
-    task_status_text
-)
+from ui.formatting import default_export_filename, format_count, task_status_text
+from ui.models.task_options import TaskOptionsModel
 from ui.services import UiServices
-from ui.typography import DataCaptionLabel, PageTitleLabel
+from ui.typography import DataCaptionLabel
+from ui.widgets.empty_state import EmptyStateCard
+from ui.widgets.page_scaffold import PageScaffold
+from ui.widgets.task_selector import TaskSelector
+from ui.widgets.visible_timer import VisibleTimer
 from utils.metrics import get_metric_display_name
-
-# 页面可见时刷新运行中任务的下拉时长与摘要的间隔（毫秒）；时长按分钟显示，30 秒足够
-RUNNING_TASK_REFRESH_INTERVAL_MS = 30_000
 
 if TYPE_CHECKING:
     from core.monitor_manager import MonitorManager
 
+# 页面可见时刷新运行中任务的下拉时长与摘要的间隔（毫秒）；时长按分钟显示，30 秒足够
+RUNNING_TASK_REFRESH_INTERVAL_MS = 30_000
+DATETIME_FORMAT = '%Y-%m-%d %H:%M:%S'
+# 警告提示：(标题, 内容, 显示毫秒)
+NO_TASK_WARNING = ("请选择任务", "请先选择要导出的监控任务", 2000)
+MAINTENANCE_WARNING = ("暂时无法导出", "正在清理数据库，请稍后再导出", 4000)
 
-class ExportPage(QScrollArea):
-    """数据导出页面"""
+
+class ExportPage(PageScaffold):
+    """数据导出页面（db 与导出线程共用；manager 登记导出，与清理数据库互斥）"""
 
     def __init__(self, db: Database, manager: "MonitorManager",
                  services: UiServices, parent=None):
-        """初始化页面
-
-        Args:
-            db: 数据库实例（由主窗口注入，与导出线程共用）
-            manager: 监控管理器：导出期间登记，避免与清理/压缩数据库互相抢锁
-            services: 界面服务（提示、对话框、时钟、任务运行状态）
-            parent: 父窗口
-        """
-        super().__init__(parent)
-
-        # 设置对象名称
+        super().__init__("导出数据", parent=parent)
         self.setObjectName("exportPage")
+        self.db, self.manager, self.services = db, manager, services
 
-        self.db = db
-        self.manager = manager
-        self.services = services
-
-        # 当前选中的任务ID
-        self.current_task_id = None
-
-        # 当前任务信息
+        self.current_task_id: Optional[str] = None
         self.current_task = None
-
-        # 下拉列表里的任务对象（运行中任务的时长标签按定时器原地刷新）
-        self._task_by_id = {}
-
-        # 载入列表时各任务是否在运行：定时刷新只需处理这些任务，结束后置为 False
-        self._task_running = {}
-
-        # 页面可见时定时刷新运行中任务的时长与摘要；页面隐藏时停止
-        self._running_refresh_timer = QTimer(self)
-        self._running_refresh_timer.setInterval(RUNNING_TASK_REFRESH_INTERVAL_MS)
-        self._running_refresh_timer.timeout.connect(self._refresh_running_tasks)
-
-        # 导出工作线程（导出期间非None；生命周期与退出收尾由 services.threads 登记表负责）
-        self._export_worker = None
-
+        # 导出摘要场景下年份有意义：下拉项的开始时间带年份
+        self._task_options = TaskOptionsModel(full_date=True)
+        # 导出期间非 None；线程对象的释放与退出收尾由 services.threads 登记表负责
+        self._export_worker: Optional[ExportWorker] = None
         # 上次使用的保存目录：切换任务后默认文件名仍放在这里；首次默认"文档"目录
-        self._last_dir = (
+        self.last_dir = (
             QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation)
             or os.path.expanduser('~'))
 
-        # 初始化UI
         self._init_ui()
+        # 页面可见时定时刷新运行中任务的时长与摘要；页面隐藏时自动停止
+        self.running_timer = VisibleTimer(
+            self, RUNNING_TASK_REFRESH_INTERVAL_MS, self.refresh_running_tasks)
+
+    @property
+    def export_worker(self) -> Optional[ExportWorker]:
+        """进行中的导出线程（没有导出时为 None）。"""
+        return self._export_worker
 
     def _init_ui(self):
-        """初始化UI"""
-        # 设置滚动区域属性
-        self.setWidgetResizable(True)
-        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-
-        # 移除边框，设置透明背景
-        self.setStyleSheet("QScrollArea{background: transparent; border: none}")
-        self.viewport().setStyleSheet("background: transparent")
-
-        # 创建主容器
-        container = QWidget()
-        container.setStyleSheet("background: transparent")
-        self.setWidget(container)
-
-        # 主布局
-        main_layout = QVBoxLayout(container)
-        main_layout.setContentsMargins(30, 30, 30, 30)
-        main_layout.setSpacing(20)
-
-        title = PageTitleLabel("导出数据")
-        main_layout.addWidget(title)
-
-        # 导出是一个连续任务：选任务 -> 确认摘要 -> 选位置并导出。
-        # 收敛到同一张 Fluent 卡片，避免三张等权大卡片打断操作流。
-        export_card = CardWidget()
-        export_layout = QVBoxLayout(export_card)
-        export_layout.setContentsMargins(20, 18, 20, 20)
-        export_layout.setSpacing(14)
-
-        export_layout.addWidget(StrongBodyLabel("选择要导出的任务"))
-
-        # 任务选择行
-        task_row_layout = QHBoxLayout()
-        task_row_layout.setSpacing(15)
-
-        self.task_combo = ComboBox()
-        self.task_combo.setPlaceholderText("选择监控任务")
-        self.task_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.task_combo.currentIndexChanged.connect(self._on_task_selected)
-
-        # 刷新按钮
         self.refresh_button = PushButton("刷新", self, FluentIcon.SYNC)
-        self.refresh_button.clicked.connect(self._load_tasks)
+        self.refresh_button.clicked.connect(self.reload_tasks)
+        self.add_header_widget(self.refresh_button)
 
-        task_row_layout.addWidget(self.task_combo, 1)
-        task_row_layout.addWidget(self.refresh_button)
+        # 导出是一个连续任务，收敛到同一张卡片，避免几张等权大卡片打断操作流
+        self.export_card = CardWidget()
+        card_layout = QVBoxLayout(self.export_card)
+        card_layout.setContentsMargins(20, 18, 20, 20)
+        card_layout.setSpacing(14)
+        card_layout.addWidget(StrongBodyLabel("选择要导出的任务"))
+        self.task_selector = TaskSelector(placeholder="选择监控任务")
+        self.task_selector.task_selected.connect(self._on_task_selected)
+        card_layout.addWidget(self.task_selector)
+        card_layout.addWidget(HorizontalSeparator())
+        self.summary_widget = self._build_summary()
+        card_layout.addWidget(self.summary_widget)
+        card_layout.addWidget(HorizontalSeparator())
 
-        export_layout.addLayout(task_row_layout)
-
-        # 空状态占位：任务下拉为空时显示，同时禁用下拉框与浏览/导出按钮，
-        # 避免用户点击后触发既有"未选任务"提示与本占位重复打扰
-        self.empty_state_label = BodyLabel(
-            "暂无可导出的数据，请先创建监控任务")
-        self.empty_state_label.setAlignment(Qt.AlignCenter)
-        self.empty_state_label.setVisible(False)
-        export_layout.addWidget(self.empty_state_label)
-
-        self.summary_top_separator = HorizontalSeparator()
-        export_layout.addWidget(self.summary_top_separator)
-
-        # 紧凑任务摘要：保留原有公共 label 属性，便于既有逻辑与测试继续读取。
-        self.summary_widget = QWidget()
-        summary_layout = QVBoxLayout(self.summary_widget)
-        summary_layout.setContentsMargins(0, 0, 0, 0)
-        summary_layout.setSpacing(8)
-
-        # 进程信息行
-        process_layout = QHBoxLayout()
-        process_layout.setSpacing(20)
-        self.process_name_label = StrongBodyLabel("未选择任务")
-        process_layout.addWidget(self.process_name_label)
-        process_layout.addSpacing(8)
-        process_layout.addWidget(CaptionLabel("PID"))
-        self.pid_label = DataCaptionLabel("—")
-        process_layout.addWidget(self.pid_label)
-        process_layout.addSpacing(8)
-        process_layout.addWidget(CaptionLabel("状态"))
-        self.status_label = CaptionLabel("—")
-        process_layout.addWidget(self.status_label)
-        process_layout.addStretch()
-        summary_layout.addLayout(process_layout)
-
-        # 监控指标行
-        metric_layout = QHBoxLayout()
-        metric_layout.setSpacing(20)
-        metric_layout.addWidget(CaptionLabel("指标"))
-        self.metric_label = CaptionLabel("—")
-        metric_layout.addWidget(self.metric_label)
-        metric_layout.addStretch()
-        summary_layout.addLayout(metric_layout)
-
-        # 时间范围行
-        time_layout = QHBoxLayout()
-        time_layout.setSpacing(20)
-        time_layout.addWidget(CaptionLabel("时间"))
-        self.start_time_label = DataCaptionLabel("—")
-        time_layout.addWidget(self.start_time_label)
-        time_layout.addWidget(CaptionLabel("—"))
-        self.end_time_label = DataCaptionLabel("—")
-        time_layout.addWidget(self.end_time_label)
-        time_layout.addSpacing(12)
-        time_layout.addWidget(CaptionLabel("数据"))
-        self.data_count_label = DataCaptionLabel("—")
-        time_layout.addWidget(self.data_count_label)
-        time_layout.addStretch()
-        summary_layout.addLayout(time_layout)
-        export_layout.addWidget(self.summary_widget)
-
-        self.summary_bottom_separator = HorizontalSeparator()
-        export_layout.addWidget(self.summary_bottom_separator)
-
-        # 保存路径行
         path_layout = QHBoxLayout()
-        path_layout.setSpacing(15)
-
+        path_layout.setSpacing(8)
         self.path_edit = LineEdit()
         self.path_edit.setPlaceholderText("尚未选择保存位置")
         self.path_edit.setReadOnly(True)
-
         self.browse_button = PushButton("选择位置", self, FluentIcon.FOLDER)
         self.browse_button.clicked.connect(self._browse_save_path)
-
         self.export_button = PrimaryPushButton("导出 CSV", self, FluentIcon.DOWNLOAD)
         self.export_button.setMinimumWidth(128)
         self.export_button.clicked.connect(self._export_data)
-
         path_layout.addWidget(self.path_edit, 1)
         path_layout.addWidget(self.browse_button)
         path_layout.addWidget(self.export_button)
+        card_layout.addLayout(path_layout)
+        card_layout.addWidget(CaptionLabel(
+            "CSV · UTF-8 · 可用 Excel 打开 · 末列「打点」记录事件标记"))
+        self.add_section(self.export_card)
 
-        export_layout.addLayout(path_layout)
+        # 没有可导出任务时以空状态卡代替整张导出卡，不让用户点出"未选任务"提示
+        self.empty_state_card = EmptyStateCard(
+            FluentIcon.DOWNLOAD, "暂无可导出的数据",
+            "完成一次监控后，即可在这里把数据导出为 CSV")
+        self.empty_state_card.setVisible(False)
+        self.add_section(self.empty_state_card)
 
-        format_hint = CaptionLabel(
-            "CSV · UTF-8 · 可用 Excel 打开 · 末列「打点」记录事件标记")
-        export_layout.addWidget(format_hint)
-
-        main_layout.addWidget(export_card)
-
-        # 导出进度提示（默认隐藏，导出期间显示已处理行数）
-        self.export_status_label = CaptionLabel("")
+        self.export_status_label = CaptionLabel("")   # 导出期间显示已处理行数
         self.export_status_label.setAlignment(Qt.AlignCenter)
-        main_layout.addWidget(self.export_status_label)
+        self.add_section(self.export_status_label)
+        self.content_layout.addStretch()
 
-        # 添加底部伸缩空间
-        main_layout.addStretch()
+    def _build_summary(self) -> QWidget:
+        """紧凑任务摘要：进程 · PID · 状态 / 指标 / 时间范围 · 数据量。"""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
 
-    def _set_empty_state(self, is_empty: bool) -> None:
-        """
-        切换空状态占位说明与控件禁用
+        def row(*items):
+            # 字符串为说明标签，整数为额外间距，其余为控件
+            line = QHBoxLayout()
+            line.setSpacing(8)
+            for item in items:
+                if isinstance(item, int):
+                    line.addSpacing(item)
+                else:
+                    line.addWidget(CaptionLabel(item) if isinstance(item, str) else item)
+            line.addStretch()
+            layout.addLayout(line)
 
-        任务下拉为空时显示占位说明并禁用下拉框、浏览按钮；导出按钮的可用性
-        额外与"导出是否正在进行中"做 AND——不能在导出线程运行期间被这里误
-        重新启用（例如导出耗时较长、用户中途切走页面又切回来触发 showEvent
-        重新加载任务列表的场景），也不能在导出线程结束后被空状态覆盖为禁用。
-        按钮禁用后，既有 _browse_save_path/_export_data 内的"未选任务"/
-        "未选路径"提示不会被用户点击触发，不与本占位重复打扰。
+        self.process_name_label = StrongBodyLabel("未选择任务")
+        self.pid_label = DataCaptionLabel("—")
+        self.status_label = CaptionLabel("—")
+        row(self.process_name_label, 12, "PID", self.pid_label, 12, "状态",
+            self.status_label)
+        self.metric_label = CaptionLabel("—")
+        row("指标", self.metric_label)
+        self.start_time_label = DataCaptionLabel("—")
+        self.end_time_label = DataCaptionLabel("—")
+        self.data_count_label = DataCaptionLabel("—")
+        row("时间", self.start_time_label, "—", self.end_time_label, 12, "数据",
+            self.data_count_label)
+        return widget
 
-        Args:
-            is_empty: 当前是否处于"无可导出任务"的空状态
-        """
-        self.empty_state_label.setVisible(is_empty)
-        self.summary_widget.setVisible(not is_empty)
-        self.summary_top_separator.setVisible(not is_empty)
-        self.task_combo.setEnabled(not is_empty)
-        self.browse_button.setEnabled(not is_empty)
-
-        is_exporting = self._export_worker is not None and self._export_worker.isRunning()
-        if not is_exporting:
-            self.export_button.setEnabled(not is_empty)
-
-    def _load_tasks(self):
-        """加载任务列表"""
-        # 保存当前选中的任务ID
-        current_task_id = self.current_task_id
-
-        # 清空下拉框
-        self.task_combo.clear()
-        self._task_by_id = {}
-        self._task_running = {}
-
-        # 单条查询取出至少有一次采样的任务（与历史页口径一致，不再逐任务 COUNT）
+    def reload_tasks(self):
+        """重新载入任务列表：恢复之前选中的任务，找不到时默认选最新任务。"""
+        # 单条查询取出至少有一次采样的任务（与历史页口径一致，不逐任务 COUNT）
         tasks = self.db.get_tasks_with_data()
-
-        if not tasks:
-            # 清空显示
+        self.export_card.setVisible(bool(tasks))
+        self.empty_state_card.setVisible(not tasks)
+        running_ids = {t.task_id for t in tasks if self._is_task_running(t.task_id)}
+        options = self._task_options.rebuild(tasks, running_ids, self.services.clock.now())
+        keep_id = self.current_task_id
+        self.task_selector.set_options(options, keep_id=keep_id)
+        if not options:
+            self.current_task_id = self.current_task = None
             self._clear_task_info()
-            self.current_task_id = None
-            self.current_task = None
             self.path_edit.clear()
-            self._set_empty_state(True)
+        elif keep_id is not None and self.task_selector.current_id() == keep_id:
+            # 同一任务重新载入：只刷新摘要，保留用户已选的保存路径
+            self._load_task_info(keep_id)
+        else:
+            self.task_selector.select_by_id(options[0].task_id)
+
+    def refresh_running_tasks(self):
+        """原地刷新运行中任务：下拉项时长随时间增长，结束后改为最终时长；当前选中的
+        是运行中任务时一并刷新摘要。不重建列表，不影响当前选择与已选的保存路径。"""
+        tracked = self._task_options.tracked_running_ids()
+        if not tracked:
             return
+        # 已在别处被删除的任务取回 None：模型沿用旧记录，下次显示页面时整体重载
+        latest = {task_id: self.db.get_task(task_id) for task_id in tracked}
+        running_ids = {task_id for task_id in tracked if self._is_task_running(task_id)}
+        changed = self._task_options.refresh_running(
+            self.services.clock.now(), running_ids, latest)
+        options = self._task_options.options()
+        for index in changed:
+            self.task_selector.update_option(index, options[index])
+        if self.current_task_id in tracked:
+            self._load_task_info(self.current_task_id)
 
-        self._set_empty_state(False)
-
-        # 添加到下拉框：进程 · PID · 开始时间 · 时长 · 备注（同一批下拉项共用一个时刻）
-        now = self.services.clock.now()
-        for task in tasks:
-            running = self._is_task_running(task.task_id)
-            display_text = format_task_option_text(
-                task, running=running, now=now, full_date=True)
-            self.task_combo.addItem(display_text)
-            # 设置任务ID作为userData
-            index = self.task_combo.count() - 1
-            self.task_combo.setItemData(index, task.task_id)
-            self._task_by_id[task.task_id] = task
-            self._task_running[task.task_id] = running
-
-        # 尝试恢复之前选中的任务
-        if current_task_id:
-            for i in range(self.task_combo.count()):
-                if self.task_combo.itemData(i) == current_task_id:
-                    self.task_combo.setCurrentIndex(i)
-                    self._load_task_info(current_task_id)
-                    return
-
-        # 如果没有恢复成功，选择第一个
-        if self.task_combo.count() > 0:
-            self.task_combo.setCurrentIndex(-1)
-            self.task_combo.setCurrentIndex(0)
-
-    def _on_task_selected(self, index: int):
-        """任务选择事件"""
-        if index < 0:
+    def _on_task_selected(self, task_id: Optional[str], _explicit: bool):
+        if task_id is None:
             self._clear_task_info()
             return
-
-        # 获取任务ID
-        task_id = self.task_combo.itemData(index)
-        if not task_id:
-            return
-
         task_changed = task_id != self.current_task_id
         self.current_task_id = task_id
-
-        # 加载任务信息
         self._load_task_info(task_id)
-
         # 换了任务：保存路径重置为该任务的默认文件名，避免沿用上一个任务的文件名
         # 而覆盖或误导；同一任务重新载入列表（如页面再次显示）时保留用户已选的路径
         if task_changed and self.current_task is not None:
-            self._reset_save_path()
+            self.path_edit.setText(self._default_save_path())
 
     def _load_task_info(self, task_id: str):
-        """
-        加载并显示任务信息
-
-        Args:
-            task_id: 任务ID
-        """
-        # 获取任务信息
+        """加载并显示任务摘要。"""
         task = self.db.get_task(task_id)
         if not task:
             self.services.notifier.error(self, "任务加载失败", "无法读取所选任务")
             self._clear_task_info()
             return
-
         self.current_task = task
-
-        # 更新进程信息
         self.process_name_label.setText(task.process_name)
         self.pid_label.setText(str(task.pid))
-
-        # 更新监控指标（多指标显示"N 项: 名1、名2…"，超过3个截断并用tooltip显示全部）
-        metric_names = [get_metric_display_name(m) for m in task.metric_types]
-        if len(metric_names) > 3:
-            metric_display = f"{len(metric_names)} 项 · {'、'.join(metric_names[:3])}…"
-        else:
-            metric_display = f"{len(metric_names)} 项 · {'、'.join(metric_names)}"
-        self.metric_label.setText(metric_display)
-        self.metric_label.setToolTip('、'.join(metric_names))
-
+        # 多指标显示"N 项 · 名1、名2…"，超过3个截断，tooltip 显示全部
+        names = [get_metric_display_name(m) for m in task.metric_types]
+        shown = '、'.join(names[:3]) + ('…' if len(names) > 3 else '')
+        self.metric_label.setText(f"{len(names)} 项 · {shown}")
+        self.metric_label.setToolTip('、'.join(names))
+        # 未在运行却没有结束时间（库里仍标 running 的孤儿任务，启动时 reconcile
+        # 会补写）：结束时间退回最后采样时间，与下拉时长同口径
         running = self._is_task_running(task_id)
-
-        # 更新时间范围。未在运行却没有结束时间（库里仍标 running 的孤儿任务，
-        # 启动时 reconcile 会补写）：结束时间退回最后采样时间，与下拉时长同口径
-        self.start_time_label.setText(task.start_time.strftime('%Y-%m-%d %H:%M:%S'))
+        self.start_time_label.setText(task.start_time.strftime(DATETIME_FORMAT))
         end_time = None if running else (task.end_time or task.last_sample_at)
-        if running:
-            self.end_time_label.setText("进行中")
-        elif end_time is not None:
-            self.end_time_label.setText(end_time.strftime('%Y-%m-%d %H:%M:%S'))
-        else:
-            self.end_time_label.setText("—")
-
-        # 更新数据统计（采集次数与数据点总数）
-        data_count = self.db.get_data_point_count(task_id)
+        self.end_time_label.setText("进行中" if running else (
+            end_time.strftime(DATETIME_FORMAT) if end_time is not None else "—"))
         sample_count = self.db.get_sample_count(task_id)
+        data_count = self.db.get_data_point_count(task_id)
         self.data_count_label.setText(
             f"{format_count(sample_count)} 次采集 · {format_count(data_count)} 条数据")
-
-        # 更新任务状态
         self.status_label.setText(task_status_text(running))
 
     def _is_task_running(self, task_id: str) -> bool:
-        """任务是否仍在采集：以任务状态服务为准（与历史页同口径，含停止收尾中），
-        不看库里的 status 列——异常退出遗留的孤儿任务在库里仍是 running。"""
+        """以任务状态服务为准（与历史页同口径，含停止收尾中），不看库里的 status
+        列——异常退出遗留的孤儿任务在库里仍是 running。"""
         return self.services.task_status.is_running(task_id)
 
     def _clear_task_info(self):
-        """清空任务信息显示"""
         self.process_name_label.setText("未选择任务")
-        self.pid_label.setText("—")
-        self.metric_label.setText("—")
+        for label in (self.pid_label, self.metric_label, self.start_time_label,
+                      self.end_time_label, self.data_count_label, self.status_label):
+            label.setText("—")
         self.metric_label.setToolTip("")
-        self.start_time_label.setText("—")
-        self.end_time_label.setText("—")
-        self.data_count_label.setText("—")
-        self.status_label.setText("—")
 
     def _default_save_path(self) -> str:
-        """当前任务的默认保存路径：上次使用的目录 + 进程名_PID_开始时间.csv"""
+        """上次使用的目录 + 进程名_PID_开始时间.csv"""
         # normpath：上次目录来自文件对话框（正斜杠），统一成 Windows 反斜杠显示
         return os.path.normpath(
-            os.path.join(self._last_dir, default_export_filename(self.current_task)))
-
-    def _reset_save_path(self):
-        """把保存路径重置为当前任务的默认路径"""
-        self.path_edit.setText(self._default_save_path())
-
-    def _confirm_overwrite(self, file_path: str) -> bool:
-        """目标文件已存在：确认是否覆盖"""
-        return self.services.dialogs.confirm(
-            self.window(), "文件已存在", f"{file_path}\n已存在，是否覆盖？", "覆盖")
+            os.path.join(self.last_dir, default_export_filename(self.current_task)))
 
     def _browse_save_path(self):
-        """浏览保存路径"""
         if not self.current_task:
-            self._warn_no_task()
+            self._warn(NO_TASK_WARNING)
             return
-
+        default_path = self.path_edit.text().strip() or self._default_save_path()
         file_path = self.services.dialogs.ask_save_path(
-            self, "选择保存位置",
-            self.path_edit.text().strip() or self._default_save_path(),
-            "CSV 文件 (*.csv)")
+            self, "选择保存位置", default_path, "CSV 文件 (*.csv)")
         if file_path:
             self.path_edit.setText(file_path)
-            self._last_dir = os.path.dirname(file_path) or self._last_dir
+            self.last_dir = os.path.dirname(file_path) or self.last_dir
 
     def _export_data(self):
-        """
-        导出数据到CSV文件（在工作线程中执行，大数据量导出不阻塞界面）
-
-        实际的游标 fetchmany 分批读取 + pivot_rows 流式写文件在 ExportWorker
-        后台线程内完成，本方法只负责校验、禁用按钮、启动线程与持有引用防GC。
-        """
-        # 已有导出在进行中，忽略重复点击
+        """校验、禁用按钮、登记并启动导出线程（分批读库与流式写文件都在线程内）。"""
         if self._export_worker is not None and self._export_worker.isRunning():
-            return
-
+            return   # 已有导出在进行中，忽略重复点击
         # 正在清理/压缩数据库：导出读库会和 VACUUM 互相抢锁，先拒绝（不弹保存对话框）
         if self.manager.is_maintenance_running():
-            self._warn_maintenance_running()
+            self._warn(MAINTENANCE_WARNING)
             return
-
-        # 检查是否选择了任务
         if not self.current_task_id or not self.current_task:
-            self._warn_no_task()
+            self._warn(NO_TASK_WARNING)
             return
-
-        # 路径为空（如手动清空）时，直接在主操作中打开保存对话框，
-        # 使用户无需先点一次「选择位置」再点「导出」。
+        # 路径为空（如手动清空）时直接打开保存对话框，不必先点「选择位置」再点「导出」
         save_path = self.path_edit.text().strip()
         if not save_path:
             self._browse_save_path()
             save_path = self.path_edit.text().strip()
             if not save_path:
                 return
-
         # 目标已存在：确认覆盖（导出线程先写临时文件再原子替换，取消不会损坏原文件）
-        if os.path.exists(save_path) and not self._confirm_overwrite(save_path):
+        if os.path.exists(save_path) and not self.services.dialogs.confirm(
+                self.window(), "文件已存在", f"{save_path}\n已存在，是否覆盖？", "覆盖"):
             return
-
-        # 轻量存在性检查（COUNT 查询，不拉取全部数据，避免为了校验而重复加载大数据集）
+        # 轻量存在性检查（COUNT 查询，不拉取全部数据）
         if self.db.get_data_point_count(self.current_task_id) == 0:
             self.services.notifier.warning(
                 self, "暂无可导出数据", "该任务没有可导出的采集数据", duration=2000)
             return
-
         # 登记导出（确认框期间维护可能已开始，这里以登记结果为准）
         if not self.manager.begin_export():
-            self._warn_maintenance_running()
+            self._warn(MAINTENANCE_WARNING)
             return
 
         self.export_button.setEnabled(False)
         self.export_status_label.setText("正在导出…")
-
         worker = ExportWorker(self.db, self.current_task, save_path, metric_type=None)
         self._export_worker = worker
         worker.export_progress.connect(self._on_export_progress)
         worker.export_finished.connect(self._on_export_finished)
         worker.error_occurred.connect(self._on_export_error)
-        # 导出注销挂在 QThread.finished 上：完成/失败信号是 run() 的最后一个动作，
-        # 但此时线程尚未真正结束；取消导出（退出时）不发完成/失败信号，finished 仍会触发。
-        # 线程对象的释放由登记表负责；取消后线程会自行删除写了一半的临时文件
+        # 注销挂在 QThread.finished 上：完成/失败信号发出时线程尚未真正结束；取消导出
+        # （退出时）不发完成/失败信号，finished 仍会触发，取消后线程自行删除临时文件
         worker.finished.connect(lambda w=worker: self._on_export_thread_finished(w))
         self.services.threads.register(
             worker, name="导出数据", cancel=worker.cancel, timeout_ms=2000)
         worker.start()
 
-    def _warn_no_task(self):
-        """尚未选择任务"""
-        self.services.notifier.warning(
-            self, "请选择任务", "请先选择要导出的监控任务", duration=2000)
-
-    def _warn_maintenance_running(self):
-        """清理数据库进行中，拒绝开始导出"""
-        self.services.notifier.warning(
-            self, "暂时无法导出", "正在清理数据库，请稍后再导出", duration=4000)
+    def _warn(self, notice):
+        title, content, duration = notice
+        self.services.notifier.warning(self, title, content, duration=duration)
 
     def _on_export_progress(self, processed: int):
-        """导出进度更新（已处理的数据点行数）"""
-        self.export_status_label.setText(
-            f"正在导出… 已处理 {format_count(processed)} 条数据")
+        self.export_status_label.setText(f"正在导出… 已处理 {format_count(processed)} 条数据")
 
     def _on_export_finished(self, save_path: str, row_count: int, point_count: int):
-        """导出完成"""
         self.export_status_label.setText("")
-        self._last_dir = os.path.dirname(save_path) or self._last_dir
+        self.last_dir = os.path.dirname(save_path) or self.last_dir
         # 运行中任务在导出期间仍在采集：刷新摘要，避免与"已导出 N 次采集"对不上
         if self.current_task is not None:
             self._load_task_info(self.current_task.task_id)
-
-        info_bar = self.services.notifier.success(
-            self, "导出成功",
-            (f"已导出 {format_count(row_count)} 次采集"
-             f"（{format_count(point_count)} 条数据）"),
+        info_bar = self.services.notifier.success(self, "导出成功", (
+            f"已导出 {format_count(row_count)} 次采集（{format_count(point_count)} 条数据）"),
             duration=8000)
-
-        # 导出完成不再自动抢焦点打开资源管理器；保留显式快捷操作。
+        # 导出完成不自动抢焦点打开资源管理器；保留显式快捷操作
         self.open_folder_button = PushButton("打开文件夹")
         self.open_folder_button.clicked.connect(
-            lambda: self._ask_open_folder(save_path))
+            lambda: self._open_folder(os.path.dirname(save_path)))
         info_bar.addWidget(self.open_folder_button)
 
     def _on_export_error(self, msg: str):
-        """导出失败"""
         self.export_status_label.setText("")
         self.services.notifier.error(self, "导出失败", msg)
 
     def _on_export_thread_finished(self, worker):
-        """
-        导出线程真正结束（QThread.finished）：释放引用并恢复导出按钮。
-        线程对象的 deleteLater 由线程登记表负责；取消导出（退出时）时不发
-        完成/失败信号，但 finished 仍会触发，因此按钮恢复放在这里最可靠。
-        """
+        """导出线程真正结束（QThread.finished）：注销导出、释放引用并恢复导出按钮。"""
         # 每个已启动的 worker 都只在这里注销一次，即使引用已被新 worker 替换
         self.manager.end_export()
         if self._export_worker is worker:
             self._export_worker = None
-        self._set_empty_state(self.task_combo.count() == 0)
+        if self._export_worker is None:
+            self.export_button.setEnabled(True)
 
-    def _ask_open_folder(self, file_path: str):
-        """
-        询问是否打开文件所在文件夹
-
-        Args:
-            file_path: 文件路径
-        """
-        # 获取文件所在目录
-        folder_path = os.path.dirname(file_path)
-
-        # 用户在导出成功提示中显式选择后才打开文件夹；打不开（目录已被删除等）
-        # 时不再打扰，文件本身已经导出成功
-        try:
+    def _open_folder(self, folder_path: str):
+        # 打不开（目录已被删除等）时不再打扰，文件本身已经导出成功
+        with suppress(OSError):
             self.services.dialogs.open_folder(folder_path)
-        except OSError:
-            pass
 
     def showEvent(self, event):
-        """页面显示事件"""
+        # 每次显示时重新载入任务列表（运行中刷新定时器由 running_timer 自行启停）
         super().showEvent(event)
-        # 每次显示时刷新任务列表
-        self._load_tasks()
-        self._running_refresh_timer.start()
-
-    def hideEvent(self, event):
-        """页面隐藏时停止定时刷新，避免后台页面白白查库"""
-        super().hideEvent(event)
-        self._running_refresh_timer.stop()
-
-    def _refresh_running_tasks(self):
-        """原地刷新运行中任务：下拉项时长随时间增长，任务结束后改为最终时长；
-        当前选中的是运行中任务时一并刷新摘要（采集次数、状态、结束时间）。
-        不重建列表，不影响当前选择与已选的保存路径。"""
-        now = self.services.clock.now()
-        for index in range(self.task_combo.count()):
-            task_id = self.task_combo.itemData(index)
-            if task_id not in self._task_by_id or not self._task_running.get(task_id):
-                continue
-            latest = self.db.get_task(task_id)
-            if latest is None:
-                # 任务已在别处被删除：保持原样，下次显示页面时整体重载
-                continue
-            running = self._is_task_running(task_id)
-            self._task_by_id[task_id] = latest
-            self._task_running[task_id] = running
-            self.task_combo.setItemText(index, format_task_option_text(
-                latest, running=running, now=now, full_date=True))
-            if task_id == self.current_task_id:
-                self._load_task_info(task_id)
+        self.reload_tasks()

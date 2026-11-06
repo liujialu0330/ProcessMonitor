@@ -32,7 +32,7 @@ from core.monitor_manager import MonitorManager
 from data.database import Database
 from tests.doubles import FakePreferences, RecordingNotifier, ScriptedDialogs
 from tests.factories import make_main_window, make_services
-from tests.helpers import stop_and_join
+from tests.helpers import dispose_widget, stop_and_join
 from ui.components.dialogs import CloseActionDialog
 from ui.services import ManagerTaskStatus
 from utils.metrics import MetricType
@@ -58,6 +58,7 @@ def window(tmp_path, qapp):
     win.show()
     yield win
     stop_and_join(win.monitor_manager)
+    dispose_widget(win)
 
 
 def _enable_close_to_tray(window):
@@ -591,7 +592,7 @@ def test_close_action_dialog_tray_button_only_when_tray_available(qapp):
 
     without_tray = CloseActionDialog(1, can_tray=False, parent=host)
     assert without_tray.tray_button is None
-    host.close()
+    dispose_widget(host)
 
 
 @pytest.mark.parametrize("can_tray", [True, False])
@@ -633,7 +634,7 @@ def test_close_action_dialog_default_is_never_destructive(qapp, can_tray):
             assert accepted == ['tray']
     finally:
         dialog.close()
-        host.close()
+        dispose_widget(host)
 
 
 def test_abnormal_end_bubble_only_when_window_not_in_front(window):
@@ -753,6 +754,7 @@ def test_main_window_does_not_run_startup_maintenance(tmp_path, qapp, monkeypatc
     win.about_page.check_update = lambda *args, **kwargs: None
     monkeypatch.setattr(QApplication, 'quit', MagicMock())
     win.close()
+    dispose_widget(win)
 
 
 def test_main_window_requires_injected_dependencies(qapp):

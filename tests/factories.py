@@ -53,10 +53,14 @@ def make_monitor_page(db, manager, services: Optional[UiServices] = None, parent
     return MonitorPage(db, manager, _services_for(manager, services), parent=parent)
 
 
-def make_history_page(db, manager, services: Optional[UiServices] = None, parent=None):
-    """构造历史页。"""
+def make_history_page(db, manager, services: Optional[UiServices] = None, parent=None,
+                      worker_runner=None, defer=None, **vm_options):
+    """构造历史页。worker_runner / defer / vm_options（table_limit、max_buckets）透传给
+    HistoryViewModel：测试注入 SyncHistoryRunner 与立即执行的 defer 即可同步观察结果；
+    不给时与生产一致（后台线程查询、下一轮事件循环发出）。"""
     from ui.pages.history_page import HistoryPage
-    return HistoryPage(db, manager, _services_for(manager, services), parent=parent)
+    return HistoryPage(db, manager, _services_for(manager, services), parent=parent,
+                       worker_runner=worker_runner, defer=defer, **vm_options)
 
 
 def make_export_page(db, manager, services: Optional[UiServices] = None, parent=None):

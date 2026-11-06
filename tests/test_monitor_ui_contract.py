@@ -12,7 +12,7 @@ def test_interval_spinbox_keeps_maximum_value_visible(qapp, db):
     page.resize(800, 600)
     page.show()
 
-    spinbox = page.interval_spinbox
+    spinbox = page.form.interval_spinbox
     spinbox.setValue(spinbox.maximum())
     qapp.processEvents()
 
@@ -24,7 +24,7 @@ def test_interval_spinbox_keeps_maximum_value_visible(qapp, db):
 
 def test_task_card_mark_unavailable_shows_text_and_tooltip(qapp):
     """不可用指标显示"不可用"并给出原因；之后采到值会正常覆盖"""
-    from ui.pages.monitor_page import TaskCard
+    from ui.components.task_card import TaskCard
     card = TaskCard("t1", "demo.exe", 1234, ["memory_rss", "memory_uss"])
 
     card.mark_unavailable({"memory_uss": UnavailableReason.ACCESS_DENIED})
@@ -39,10 +39,16 @@ def test_task_card_mark_unavailable_shows_text_and_tooltip(qapp):
 
 
 def test_monitor_page_and_task_card_take_time_from_injected_clock():
-    """卡片结束时间、打点时刻都由页面经注入的 Clock 取得：两处源码都不再直接读系统时间"""
+    """卡片结束时间、打点时刻都由 Presenter 经注入的 Clock 取得：监控页相关源码
+    都不再直接读系统时间"""
     import inspect
 
     import ui.components.task_card as task_card_module
     import ui.pages.monitor_page as monitor_module
-    for module in (monitor_module, task_card_module):
+    import ui.presenters.monitor_presenter as presenter_module
+    import ui.widgets.monitor.new_task_form as form_module
+    import ui.widgets.monitor.process_picker as picker_module
+    import ui.widgets.monitor.task_board as board_module
+    for module in (monitor_module, task_card_module, presenter_module,
+                   form_module, picker_module, board_module):
         assert "datetime.now" not in inspect.getsource(module), module.__name__

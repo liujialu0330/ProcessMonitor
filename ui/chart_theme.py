@@ -1,8 +1,8 @@
 """
 图表主题配色助手
-按当前应用主题（浅色/深色）返回历史页图表配色，供 history_page.py 在构造时与
-qconfig.themeChanged 回调中统一取色，避免图表在深色主题下背景刺眼、坐标轴文字
-看不清。
+按当前应用主题（浅色/深色）返回历史页图表配色，供 ChartView
+（ui/widgets/history/chart_view.py）在构造时与 qconfig.themeChanged 回调中统一取色，
+避免图表在深色主题下背景刺眼、坐标轴文字看不清。
 """
 from qfluentwidgets import isDarkTheme
 
