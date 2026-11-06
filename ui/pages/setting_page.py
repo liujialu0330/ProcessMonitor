@@ -4,22 +4,26 @@
 """
 import logging
 import os
+from typing import TYPE_CHECKING
 
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtWidgets import QWidget
 from qfluentwidgets import (
     ScrollArea, ExpandLayout, SettingCardGroup, OptionsSettingCard,
     PushSettingCard, SwitchSettingCard, StateToolTip,
-    InfoBar, InfoBarPosition,
     FluentIcon as FIF, setTheme, qconfig, Theme
 )
 
 from app_config import cfg
-from ui.components.confirm import DestructiveConfirmBox
+from data.database import Database
 from ui.components.spinbox_setting_card import SpinBoxSettingCard
+from ui.services import UiServices
 from ui.thread_shutdown import BackgroundThread
 from ui.typography import PageTitleLabel
 import config
+
+if TYPE_CHECKING:
+    from core.monitor_manager import MonitorManager
 
 logger = logging.getLogger(__name__)
 
@@ -79,22 +83,26 @@ class _CnSwitchSettingCard(SwitchSettingCard):
 class SettingPage(ScrollArea):
     """设置页面"""
 
-    def __init__(self, parent=None, db=None, manager=None):
+    def __init__(self, db: Database, manager: "MonitorManager",
+                 services: UiServices, parent=None):
         """初始化页面
 
+        设置卡片直接绑定 cfg 的 ConfigItem（卡片自身负责读写与落盘）；
+        业务上要用到的偏好（如清理时的保留天数）经由 services.preferences 读取。
+
         Args:
+            db: 数据库实例："数据管理"卡片查询占用大小与执行清理压缩
+            manager: 监控管理器：清理前进入维护状态（begin_maintenance，有运行中
+                任务或导出时拒绝）、结束后退出（end_maintenance）。本页面不直接
+                操作任务，遵守分层
+            services: 界面服务（提示、确认框、打开文件夹、用户偏好）
             parent: 父窗口
-            db: 数据库实例（可选；生产路径由 MainWindow 注入，用于"数据管理"
-                卡片查询占用大小与执行清理压缩。为 None 时该卡片显示"数据库
-                未就绪"并禁用，不影响其余分组正常使用——保持独立构造的可测性）
-            manager: MonitorManager 实例（可选；生产路径由 MainWindow 注入，
-                用于清理前进入维护状态（begin_maintenance，有运行中任务时拒绝）、
-                结束后退出（end_maintenance）。本页面不直接操作任务，遵守分层）
         """
         super().__init__(parent)
         self.setObjectName("settingPage")
         self.db = db
         self.manager = manager
+        self.services = services
         self._cleanup_worker: _CleanupWorker = None
         self._state_tooltip: StateToolTip = None
 
@@ -215,10 +223,9 @@ class SettingPage(ScrollArea):
         self.cleanup_card.clicked.connect(self._on_cleanup_clicked)
         self.open_dir_card.clicked.connect(self._on_open_data_dir_clicked)
         # 任务启停时刷新清理按钮的可用状态（不再只依赖页面显示事件）
-        if self.manager is not None:
-            self.manager.task_started.connect(self._on_task_state_changed)
-            self.manager.task_stopped.connect(self._on_task_state_changed)
-            self.manager.task_removed.connect(self._on_task_state_changed)
+        self.manager.task_started.connect(self._on_task_state_changed)
+        self.manager.task_stopped.connect(self._on_task_state_changed)
+        self.manager.task_removed.connect(self._on_task_state_changed)
 
     def _on_theme_changed_apply(self, theme: Theme) -> None:
         """主题变化回调：用绑定方法而非 lambda 连接全局 qconfig 信号，连接可随
@@ -251,13 +258,8 @@ class SettingPage(ScrollArea):
 
     def _refresh_data_management_state(self) -> None:
         """刷新"清理并压缩数据库"卡片的占用文案与可用状态"""
-        if self.db is None:
-            self.cleanup_card.contentLabel.setText("数据库未就绪")
-            self.cleanup_card.button.setEnabled(False)
-            return
-
         size_text = _format_bytes(self.db.get_db_size_bytes())
-        has_running = bool(self.manager and self.manager.has_running_tasks())
+        has_running = self.manager.has_running_tasks()
         # 按钮禁用的原因直接写在说明里：禁用按钮上的 tooltip 很难被发现
         suffix = " · 有任务在监控，停止后可清理" if has_running else ""
         self.cleanup_card.contentLabel.setText(f"当前占用 {size_text}{suffix}")
@@ -268,48 +270,43 @@ class SettingPage(ScrollArea):
         self.cleanup_card.button.setToolTip("请先停止全部监控任务" if has_running else "")
 
     def _on_open_data_dir_clicked(self) -> None:
-        """"数据目录"卡片点击：用系统资源管理器打开数据目录"""
-        os.startfile(config.DATA_DIR)
+        """"数据目录"卡片点击：用系统资源管理器打开数据目录（失败给出提示）"""
+        try:
+            self.services.dialogs.open_folder(config.DATA_DIR)
+        except OSError as e:
+            self.services.notifier.error(self.window(), "无法打开数据目录", str(e))
 
     def _confirm_cleanup(self, days: int) -> bool:
-        """清理前的确认对话框；抽成方法便于测试替换"""
+        """清理前的确认框：文案随保留策略变化（是否会删除数据）"""
         if days > 0:
             content = f"将删除超过 {days} 天的已停止任务数据并压缩数据库文件，此操作不可撤销。"
         else:
             content = "当前为永久保留，仅压缩数据库文件，不会删除数据。"
-        box = DestructiveConfirmBox("清理并压缩数据库", content, "清理", self.window())
-        return bool(box.exec())
+        return self.services.dialogs.confirm(
+            self.window(), "清理并压缩数据库", content, "清理")
 
     def _on_cleanup_clicked(self) -> None:
         """"清理并压缩数据库"卡片点击：先进入维护状态（有运行中任务时拒绝并提示），
         再按当前保留策略确认，确认后在后台线程执行清理+压缩，StateToolTip 反馈
         进行中/完成。维护状态在线程结束（QThread.finished）时退出。"""
-        if self.db is None:
-            return
         if self._is_cleanup_running():
             return
 
         # 先占维护锁再弹确认：确认期间不会有新任务被创建/启动
-        if self.manager is not None and not self.manager.begin_maintenance():
+        if not self.manager.begin_maintenance():
             if self.manager.has_running_tasks():
                 content = "有监控任务正在运行，请先停止全部任务再清理数据库"
             else:
                 # 导出线程长时间读库，与压缩数据库互相抢锁
                 content = "正在导出数据，请等导出完成后再清理数据库"
-            InfoBar.warning(
-                title="无法清理",
-                content=content,
-                parent=self.window(),
-                position=InfoBarPosition.TOP,
-                duration=4000
-            )
+            self.services.notifier.warning(
+                self.window(), "无法清理", content, duration=4000)
             self._refresh_data_management_state()
             return
 
-        days = cfg.get(cfg.retention_days)
+        days = self.services.preferences.retention_days()
         if not self._confirm_cleanup(days):
-            if self.manager is not None:
-                self.manager.end_maintenance()
+            self.manager.end_maintenance()
             return
 
         self.cleanup_card.button.setEnabled(False)
@@ -340,6 +337,5 @@ class SettingPage(ScrollArea):
         deleteLater 由同一信号上的另一条连接负责。"""
         if self._cleanup_worker is worker:
             self._cleanup_worker = None
-        if self.manager is not None:
-            self.manager.end_maintenance()
+        self.manager.end_maintenance()
         self._refresh_data_management_state()

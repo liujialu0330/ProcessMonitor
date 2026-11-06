@@ -3,14 +3,14 @@
 明细视图/悬停图表/窗口最小化时跳过刷新；select_task 找不到目标任务时直接返回并提示。
 """
 from datetime import timedelta
-from types import SimpleNamespace
 
 import pytest
 
-import ui.pages.history_page as history_module
 from core.monitor_manager import MonitorManager
-from ui.pages.history_page import AUTO_REFRESH_INTERVAL_MS, HistoryPage
+from tests.doubles import FakeClock
+from tests.factories import make_history_page, make_services
 from tests.test_history_page_flow import BASE, _seed_task
+from ui.pages.history_page import AUTO_REFRESH_INTERVAL_MS, HistoryPage
 from utils.metrics import MetricType
 
 
@@ -20,8 +20,13 @@ def manager(db):
 
 
 @pytest.fixture
-def page(qapp, db, manager):
-    widget = HistoryPage(db=db, manager=manager)
+def services():
+    return make_services(clock=FakeClock(BASE + timedelta(hours=1)))
+
+
+@pytest.fixture
+def page(qapp, db, manager, services):
+    widget = make_history_page(db, manager, services)
     widget.resize(1200, 800)
     yield widget
     widget._auto_refresh_timer.stop()
@@ -82,13 +87,13 @@ def test_load_task_data_updates_refresh_interval_from_stats(page, db, monkeypatc
 # ---------- 跳过刷新 ----------
 
 @pytest.fixture
-def running_page(page, db, monkeypatch):
+def running_page(page, db, services, monkeypatch):
     task = _seed_task(db, samples=5)
     page.show()
     page.select_task(task.task_id)
     loads = []
     monkeypatch.setattr(page, '_start_auto_refresh_worker', lambda *a, **k: loads.append(1))
-    monkeypatch.setattr(page, '_is_task_running', lambda tid: True)
+    services.task_status.set_running(task.task_id)
     page.loads = loads
     return page
 
@@ -126,21 +131,19 @@ def test_auto_refresh_skipped_when_window_minimized(running_page, monkeypatch):
 
 # ---------- select_task 找不到目标 ----------
 
-def test_select_task_not_found_returns_with_hint(page, db, monkeypatch):
-    """目标任务不在列表（无采样数据）：清空界面 + InfoBar 提示，不静默选中第一个任务"""
+def test_select_task_not_found_returns_with_hint(page, db, services):
+    """目标任务不在列表（无采样数据）：清空界面 + 提示，不静默选中第一个任务"""
     first = _seed_task(db, samples=3, name="a.exe")
     nodata = _seed_task(db, samples=0, name="nodata.exe")
     page.select_task(first.task_id)
     assert page.current_task_id == first.task_id
-
-    hints = []
-    monkeypatch.setattr(history_module, 'InfoBar', SimpleNamespace(
-        info=lambda **k: hints.append(k), error=lambda **k: None,
-        success=lambda **k: None, warning=lambda **k: None))
+    services.notifier.clear()
 
     page.select_task(nodata.task_id)
 
     assert page.current_task_id is None
     assert page.task_combo.currentIndex() == -1
     assert page.empty_title_label.text() == "请选择监控任务"
-    assert len(hints) == 1 and "暂无采样数据" in hints[0]['content']
+    hints = services.notifier.messages()
+    assert len(hints) == 1 and hints[0].level == "info"
+    assert "暂无采样数据" in hints[0].content

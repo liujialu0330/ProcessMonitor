@@ -3,13 +3,20 @@ ui/formatting.py 纯函数：时长、任务下拉文案、统计条文本、打
 """
 from datetime import datetime
 
+import pytest
+
+from core.contracts import StopReason, UnavailableReason
 from data.models import MonitorTask
 from ui.formatting import (
     build_stat_texts, default_export_filename, format_count, format_duration,
     format_task_option_text, format_task_tooltip, marker_context,
-    sanitize_filename, truncate_text
+    sanitize_filename, stop_reason_text, task_duration_seconds, task_status_text,
+    truncate_text, unavailable_reason_text
 )
 from utils.metrics import MetricType
+
+# 已停止任务的时长不看 now；随便给一个远离起止时间的时刻，证明确实没被用到
+FAR_NOW = datetime(2030, 1, 1)
 
 
 def _task(**overrides) -> MonitorTask:
@@ -43,7 +50,8 @@ def test_truncate_text():
 
 def test_task_option_text_contains_all_parts_and_truncates_note():
     note = "建模 200 次回归测试，连续运行过夜观察内存"
-    text = format_task_option_text(_task(note=note), running=False, note_max=8)
+    text = format_task_option_text(
+        _task(note=note), running=False, now=FAR_NOW, note_max=8)
     parts = text.split(" · ")
     assert parts[0] == "MPrintExp.exe"
     assert parts[1] == "PID 1234"
@@ -51,7 +59,7 @@ def test_task_option_text_contains_all_parts_and_truncates_note():
     assert parts[3] == "2小时15分"
     assert parts[4] == note[:8] + "…"
     # 完整备注在 tooltip
-    assert note in format_task_tooltip(_task(note=note))
+    assert note in format_task_tooltip(_task(note=note), False, FAR_NOW)
 
 
 def test_task_option_text_marks_running_and_uses_now_for_duration():
@@ -63,8 +71,57 @@ def test_task_option_text_marks_running_and_uses_now_for_duration():
 
 
 def test_task_option_text_full_date():
-    text = format_task_option_text(_task(), full_date=True)
+    text = format_task_option_text(_task(), False, FAR_NOW, full_date=True)
     assert "2026-07-16 20:54" in text
+
+
+def test_task_duration_running_uses_given_now_only():
+    """运行中时长只取调用方传入的 now，模块内不再自取系统时间"""
+    task = _task(end_time=None, status="running")
+    now = datetime(2026, 7, 16, 21, 4, 51)
+    assert task_duration_seconds(task, True, now) == 600.0
+    assert task_duration_seconds(_task(), False, FAR_NOW) == 2 * 3600 + 15 * 60 + 9
+
+
+def test_task_tooltip_status_text():
+    running = format_task_tooltip(
+        _task(end_time=None, status="running"), True, datetime(2026, 7, 16, 21, 0))
+    assert "状态：运行中" in running and "时长：5分钟" in running
+    assert "状态：已停止" in format_task_tooltip(_task(), False, FAR_NOW)
+    assert task_status_text(True) == "运行中" and task_status_text(False) == "已停止"
+
+
+@pytest.mark.parametrize("reason, text", [
+    (StopReason.USER, "用户停止"),
+    (StopReason.PROCESS_EXITED, "进程已终止"),
+    (StopReason.PROCESS_NOT_FOUND, "进程不存在"),
+    (StopReason.PID_REUSED, "进程已终止"),
+    (StopReason.INTERNAL_ERROR, "内部错误"),
+])
+def test_stop_reason_text(reason, text):
+    assert stop_reason_text(reason) == text
+
+
+def test_stop_reason_text_covers_all_members():
+    """新增枚举成员必须同时补文案，否则界面会 KeyError"""
+    for reason in StopReason:
+        assert stop_reason_text(reason)
+
+
+@pytest.mark.parametrize("reason, text", [
+    (UnavailableReason.ACCESS_DENIED, "权限不足"),
+    (UnavailableReason.PROCESS_EXITING, "进程正在退出"),
+    (UnavailableReason.NOT_IN_SESSION, "进程不在当前会话，不支持采集"),
+    (UnavailableReason.NOT_SUPPORTED, "仅支持 Windows"),
+    (UnavailableReason.ERROR, "采集失败"),
+])
+def test_unavailable_reason_text(reason, text):
+    assert unavailable_reason_text(reason) == text
+
+
+def test_unavailable_reason_text_covers_all_members():
+    for reason in UnavailableReason:
+        assert unavailable_reason_text(reason)
 
 
 def test_build_stat_texts_growth():

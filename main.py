@@ -13,7 +13,10 @@ from PyQt5.QtGui import QIcon
 from PyQt5.QtNetwork import QLocalServer, QLocalSocket
 from qfluentwidgets import setTheme
 
+from core.monitor_manager import MonitorManager
+from data.database import Database
 from ui.main_window import MainWindow
+from ui.services import production_services
 from ui.typography import configure_application_typography
 from utils.logger import get_log_dir, setup_logging
 from utils.crash_handler import install_excepthook
@@ -170,8 +173,12 @@ def main():
     # 系统所处的具体主题，设置页里的主题单选状态也会跟着显示错乱
     setTheme(cfg.get(cfg.themeMode))
 
-    # 创建并显示主窗口
-    window = MainWindow()
+    # 组装依赖并创建主窗口：唯一数据库实例由入口显式构造，监控管理器与各页面共用它；
+    # 界面服务集合一次性组装，主窗口向下分发给全部页面
+    db = Database()
+    manager = MonitorManager(db=db)
+    services = production_services(manager)
+    window = MainWindow(db, manager, services)
     window.show()
     guard.activation_requested.connect(lambda: activate_main_window(window))
 

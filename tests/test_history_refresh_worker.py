@@ -11,13 +11,13 @@ import pytest
 from PyQt5.QtCore import QCoreApplication, QEvent
 from PyQt5.QtWidgets import QApplication
 
-import ui.pages.history_page as history_module
 from core.history_refresh_worker import HistoryRefreshResult
 from core.monitor_manager import MonitorManager
 from data.models import DataPoint
+from tests.doubles import FakeClock
+from tests.factories import make_history_page, make_main_window, make_services
 from tests.helpers import poll_until
 from tests.test_history_page_flow import BASE, _seed_task
-from ui.pages.history_page import HistoryPage
 from utils.metrics import MetricType
 from utils.thread_utils import shutdown_thread
 
@@ -42,11 +42,14 @@ def manager(db):
 
 
 @pytest.fixture
-def page(qapp, db, manager, monkeypatch):
-    widget = HistoryPage(db=db, manager=manager)
+def services():
+    return make_services(clock=FakeClock(BASE + timedelta(hours=1)))
+
+
+@pytest.fixture
+def page(qapp, db, manager, services):
+    widget = make_history_page(db, manager, services)
     widget.resize(1200, 800)
-    # 默认视为运行中，让 _on_auto_refresh 走后台刷新分支
-    monkeypatch.setattr(widget, '_is_task_running', lambda tid: True)
     widget._gate = None   # 测试可置入阻塞闸，teardown 统一放行
     yield widget
     if widget._gate is not None:
@@ -60,9 +63,11 @@ def page(qapp, db, manager, monkeypatch):
 
 
 @pytest.fixture
-def shown(page, db):
-    """已显示、已选中一个 20 点任务的页面"""
+def shown(page, db, services):
+    """已显示、已选中一个 20 点任务的页面；该任务视为运行中，让 _on_auto_refresh
+    走后台刷新分支"""
     task = _seed_task(db, samples=20, status="running")
+    services.task_status.set_running(task.task_id)
     page.show()
     page.select_task(task.task_id)
     page._auto_refresh_timer.stop()   # 只手动触发，避免定时器干扰
@@ -290,7 +295,6 @@ def test_main_window_close_joins_history_refresh_worker(qapp, tmp_path, monkeypa
     from unittest.mock import MagicMock
     from PyQt5.QtCore import QThread
     from data.database import Database
-    from ui.main_window import MainWindow
 
     class _SlowRefresh(QThread):
         def __init__(self):
@@ -301,7 +305,9 @@ def test_main_window_close_joins_history_refresh_worker(qapp, tmp_path, monkeypa
             self.started_evt.set()
             time.sleep(0.5)
 
-    win = MainWindow(db=Database(str(tmp_path / "close_join.db")))
+    db = Database(str(tmp_path / "close_join.db"))
+    manager = MonitorManager(db=db)
+    win = make_main_window(db, manager)
     win.about_page.check_update = lambda *args, **kwargs: None
     monkeypatch.setattr(QApplication, 'quit', MagicMock())
     worker = _SlowRefresh()
@@ -317,4 +323,4 @@ def test_main_window_close_joins_history_refresh_worker(qapp, tmp_path, monkeypa
     finally:
         worker.wait(5000)
         win.history_page._refresh_worker = None
-        win.monitor_manager.stop_all_tasks()
+        manager.stop_all_tasks()

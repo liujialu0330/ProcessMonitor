@@ -7,6 +7,7 @@ import psutil
 import pytest
 from PyQt5.QtCore import Qt
 
+from core.contracts import UnavailableReason
 from core.monitor_task import MonitorTask
 from core.process_collector import MetricNotSupported, ProcessCollector
 from utils.metrics import MetricType
@@ -31,10 +32,11 @@ def test_nonexistent_pid_returns_none():
 
 
 @pytest.mark.parametrize("exc, reason", [
-    (psutil.AccessDenied(1), "权限不足"),
-    (psutil.ZombieProcess(1), "进程正在退出"),
-    (RuntimeError("boom"), "采集失败"),
-    (MetricNotSupported("进程不在当前会话，不支持采集"), "进程不在当前会话，不支持采集"),
+    (psutil.AccessDenied(1), UnavailableReason.ACCESS_DENIED),
+    (psutil.ZombieProcess(1), UnavailableReason.PROCESS_EXITING),
+    (RuntimeError("boom"), UnavailableReason.ERROR),
+    (MetricNotSupported(UnavailableReason.NOT_IN_SESSION), UnavailableReason.NOT_IN_SESSION),
+    (MetricNotSupported(), UnavailableReason.NOT_SUPPORTED),
 ])
 def test_failed_metric_is_skipped_not_zero(monkeypatch, exc, reason):
     c = ProcessCollector(os.getpid())
@@ -81,7 +83,7 @@ class _FakeCollector:
         pass
 
     def collect_metrics(self, metric_types):
-        self.last_unavailable = {MetricType.MEMORY_USS: "权限不足"}
+        self.last_unavailable = {MetricType.MEMORY_USS: UnavailableReason.ACCESS_DENIED}
         return {MetricType.MEMORY_RSS: 1.0}
 
 
@@ -104,14 +106,14 @@ def test_monitor_task_notifies_unavailable_only_once(db, qapp):
     task.wait(3000)
 
     assert len(cycles) >= 5
-    assert notices == [(task.task_id, {MetricType.MEMORY_USS: "权限不足"})]
+    assert notices == [(task.task_id, {MetricType.MEMORY_USS: UnavailableReason.ACCESS_DENIED})]
 
 
 
 @win_only
 @pytest.mark.parametrize("last_error, expected", [
-    (87, "进程不在当前会话，不支持采集"),  # session 0 系统服务：提权也无用，不能提示权限不足
-    (5, "权限不足"),
+    (87, UnavailableReason.NOT_IN_SESSION),  # session 0 系统服务：提权也无用，不能提示权限不足
+    (5, UnavailableReason.ACCESS_DENIED),
 ])
 def test_gui_resource_zero_with_error_maps_to_reason(monkeypatch, last_error, expected):
     import core.process_collector as pc

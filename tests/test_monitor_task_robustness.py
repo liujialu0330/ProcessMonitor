@@ -13,6 +13,7 @@ import psutil
 import pytest
 from PyQt5.QtCore import Qt
 
+from core.contracts import StopReason
 from core.monitor_task import (
     FLUSH_FAILURE_LOG_INTERVAL, MonitorTask,
 )
@@ -139,8 +140,8 @@ def test_run_teardown_exactly_once_when_body_raises(make_task, monkeypatch):
 
     task.run()   # 同线程直接执行
 
-    assert teardowns == ["内部错误"]
-    assert stopped == ["内部错误"]
+    assert teardowns == [StopReason.INTERNAL_ERROR]
+    assert stopped == [StopReason.INTERNAL_ERROR]
     assert len(errors) == 1 and "未预期" in errors[0]
     assert task.is_running() is False
     assert task.task_model.status == 'stopped'
@@ -158,7 +159,7 @@ def test_run_normal_stop_teardown_once(make_task, monkeypatch):
     task.stop()
     assert task.wait(5000)
 
-    assert teardowns == ["用户停止"]
+    assert teardowns == [StopReason.USER]
 
 
 def test_run_process_not_exist_stops_with_reason(make_task):
@@ -171,12 +172,12 @@ def test_run_process_not_exist_stops_with_reason(make_task):
 
     task.run()
 
-    assert stopped == ["进程不存在"] and len(errors) == 1
+    assert stopped == [StopReason.PROCESS_NOT_FOUND] and len(errors) == 1
     assert collector.call_times == []
 
 
 def test_collect_returning_none_stops_as_process_terminated(make_task):
-    """collect_metrics 返回 None（进程终止/PID 复用）：按"进程已终止"停止"""
+    """collect_metrics 返回 None（进程终止/PID 复用）：以 PROCESS_EXITED 停止"""
     collector = _FakeCollector()
     collector.collect_metrics = lambda metric_types: None
     task = make_task(collector, interval=0.05)
@@ -186,7 +187,7 @@ def test_collect_returning_none_stops_as_process_terminated(make_task):
 
     task.run()
 
-    assert stopped == ["进程已终止"]
+    assert stopped == [StopReason.PROCESS_EXITED]
 
 
 # ========== 任务行补写 ==========
@@ -219,7 +220,7 @@ def test_task_row_written_late_before_flush(make_task, db):
     assert saved.start_time is not None
     # 每次采样 1 个指标 1 个数据点；sample_count 必须与落库的采样次数一致
     assert saved.sample_count == db.get_data_point_count(task.task_id) >= 3
-    assert stopped == ["用户停止"]
+    assert stopped == [StopReason.USER]
 
 
 class _ProxyDB:
@@ -307,7 +308,7 @@ def test_is_running_access_denied_treated_as_alive(monkeypatch):
 
 
 def test_task_stops_when_pid_reused(make_task, monkeypatch):
-    """端到端：采集器判定 PID 已被复用 -> 任务以"进程已终止"停止"""
+    """端到端：采集器判定 PID 已被复用 -> 任务以 PROCESS_EXITED 停止（运行中无从区分）"""
     collector = ProcessCollector(os.getpid())
     task = make_task(collector, interval=0.05)
     stopped = []
@@ -319,7 +320,7 @@ def test_task_stops_when_pid_reused(make_task, monkeypatch):
 
     task.run()
 
-    assert stopped == ["进程已终止"]
+    assert stopped == [StopReason.PROCESS_EXITED]
 
 
 # ========== CPU 预热后的首采时间 ==========
@@ -394,7 +395,7 @@ def _run_inline(task):
 
 
 def test_create_time_mismatch_stops_before_collecting(make_task, db):
-    """所选进程已退出、PID 被新进程复用：任务以"进程已终止"结束，不写任何数据点"""
+    """所选进程已退出、PID 被新进程复用：任务以 PID_REUSED 结束，不写任何数据点"""
     collector = _IdentityCollector(actual_create_time=2000.0)
     task = make_task(collector, interval=0.05, create_time=1000.0)
     stopped, errors = _run_inline(task)
@@ -402,7 +403,7 @@ def test_create_time_mismatch_stops_before_collecting(make_task, db):
 
     task.run()
 
-    assert stopped == ["进程已终止"]
+    assert stopped == [StopReason.PID_REUSED]
     assert len(errors) == 1 and "其他进程" in errors[0]
     assert collector.call_times == []
     assert db.get_sample_count(task.task_id) == 0
@@ -424,7 +425,7 @@ def test_create_time_match_or_unknown_runs_normally(make_task, expected, actual)
     task.stop()
     assert task.wait(5000)
 
-    assert stopped == ["用户停止"] and errors == []
+    assert stopped == [StopReason.USER] and errors == []
 
 
 def test_real_collector_detects_reused_pid_identity(make_task):
@@ -444,7 +445,7 @@ def test_real_collector_detects_reused_pid_identity(make_task):
         task.stop()
         task.wait(5000)
 
-    assert finished and stopped == ["进程已终止"] and samples == []
+    assert finished and stopped == [StopReason.PID_REUSED] and samples == []
 
 
 def test_get_all_processes_includes_create_time():

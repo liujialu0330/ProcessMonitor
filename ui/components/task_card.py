@@ -14,8 +14,9 @@ from qfluentwidgets import (
     PushButton, CardWidget, FluentIcon, CaptionLabel, StrongBodyLabel
 )
 
+from core.contracts import StopReason, UnavailableReason
 from ui.components.sparkline import SparklineWidget
-from ui.formatting import truncate_text
+from ui.formatting import stop_reason_text, truncate_text, unavailable_reason_text
 from ui.typography import DataCaptionLabel, DataLabel
 from utils.metrics import (
     format_metric_delta, format_metric_value, get_metric_display_name
@@ -26,9 +27,6 @@ from utils.metrics import (
 # 会自动用 lightColor/darkColor 重新套用样式），本文件无需再手动连接信号
 PAUSED_LABEL_LIGHT_COLOR = QColor("#D83B01")
 PAUSED_LABEL_DARK_COLOR = QColor("#FF9D42")
-
-# 用户主动停止的原因文案（与 core/monitor_task.py 的默认停止原因一致）
-USER_STOP_REASON = "用户停止"
 
 # 卡片身份行里备注的最大显示字数（完整内容放 tooltip）
 NOTE_DISPLAY_CHARS = 40
@@ -316,13 +314,13 @@ class TaskCard(CardWidget):
             if first_metric in values:
                 self.sparkline.append(values[first_metric])
 
-    def mark_unavailable(self, reasons: dict):
+    def mark_unavailable(self, reasons: Dict[str, UnavailableReason]):
         """
         把无法采集的指标标为"不可用"（本指标不记录数据，不会记为 0）；
         之后若该指标又采到值，update_values 会正常覆盖显示。
 
         Args:
-            reasons: {指标类型: 原因}
+            reasons: {指标类型: UnavailableReason}
         """
         for metric_type, reason in reasons.items():
             value_label = self.value_labels.get(metric_type)
@@ -330,7 +328,8 @@ class TaskCard(CardWidget):
                 continue
             value_label.setText("不可用")
             value_label.setToolTip(
-                f"{get_metric_display_name(metric_type)}：{reason}，"
+                f"{get_metric_display_name(metric_type)}："
+                f"{unavailable_reason_text(reason)}，"
                 "本指标不记录数据（不会记为 0）")
             self.delta_labels[metric_type].setText("较开始 --")
 
@@ -359,7 +358,7 @@ class TaskCard(CardWidget):
         更新暂停/恢复按钮的图标文案与"已暂停"状态提示的可见性。
 
         暂停期间 core 的主循环不采集，被监控进程退出不会被感知：卡片一直显示
-        "已暂停"，恢复后下一次采集才发现进程已消失，走 task_stopped("进程已终止")。
+        "已暂停"，恢复后下一次采集才发现进程已消失，以 StopReason.PROCESS_EXITED 结束。
 
         Args:
             is_paused: 任务是否处于暂停状态
@@ -383,27 +382,27 @@ class TaskCard(CardWidget):
         self.running_label.setVisible(True)
         self.paused_label.setVisible(False)
 
-    def set_finished(self, reason: str, end_time: Optional[datetime] = None) -> None:
+    def set_finished(self, reason: StopReason, end_time: datetime) -> None:
         """
         切换为"已结束"形态：隐藏运行中操作，显示结束原因与时间和后续操作按钮。
         各指标的最后值、"较开始"与趋势图原样保留。
 
         Args:
-            reason: 任务停止原因（"用户停止"/"进程已终止"等）
-            end_time: 结束时间，缺省取当前时刻
+            reason: 任务停止原因
+            end_time: 结束时间（由调用方传入）
         """
         self.is_finished = True
-        end_time = end_time or datetime.now()
 
         self.running_label.setVisible(False)
         self.paused_label.setVisible(False)
         self.finished_label.setVisible(True)
-        if reason != USER_STOP_REASON:
+        if reason is not StopReason.USER:
             self.finished_label.setTextColor(
                 PAUSED_LABEL_LIGHT_COLOR, PAUSED_LABEL_DARK_COLOR)
 
         self.finished_detail_label.setText(
-            f"结束原因：{reason} · {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            f"结束原因：{stop_reason_text(reason)} · "
+            f"{end_time.strftime('%Y-%m-%d %H:%M:%S')}")
         self.finished_detail_label.setVisible(True)
 
         self.running_actions.setVisible(False)

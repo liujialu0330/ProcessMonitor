@@ -12,8 +12,9 @@ import time
 import pytest
 from PyQt5.QtCore import Qt
 
+from core.contracts import StopReason
 from core.monitor_task import MonitorTask
-from tests.helpers import poll_until, wait_stable
+from tests.helpers import poll_until, record_stop_reasons, wait_stable
 
 
 @pytest.fixture
@@ -114,6 +115,7 @@ def test_stop_while_paused_terminates_promptly(make_task):
     """暂停态下调用 stop()：线程被事件唤醒后干净终止，无需先 resume"""
     task = make_task(interval=30.0)
     updates = _count_updates(task)
+    reasons = record_stop_reasons(task)
     task.start()
     assert poll_until(lambda: len(updates) >= 1)
 
@@ -129,3 +131,4 @@ def test_stop_while_paused_terminates_promptly(make_task):
     assert finished is True
     assert task.isRunning() is False
     assert duration < 1.0
+    assert reasons == [StopReason.USER]

@@ -8,6 +8,7 @@ import re
 from datetime import datetime
 from typing import Optional, Sequence
 
+from core.contracts import StopReason, UnavailableReason
 from data.models import MonitorTask
 from utils.metrics import (
     format_metric_delta, format_metric_rate, format_metric_value
@@ -15,6 +16,39 @@ from utils.metrics import (
 
 # 下拉项里备注的最大显示字数，超出截断并以省略号结尾（完整内容放 tooltip）
 NOTE_MAX_CHARS = 16
+
+# 停止原因与指标不可用原因的界面文案：core 只传枚举，显示文字只在这里定义
+_STOP_REASON_TEXTS = {
+    StopReason.USER: "用户停止",
+    StopReason.PROCESS_EXITED: "进程已终止",
+    StopReason.PROCESS_NOT_FOUND: "进程不存在",
+    # 与运行中发现 PID 被复用的情形口径一致：对用户而言都是原进程已经没了
+    StopReason.PID_REUSED: "进程已终止",
+    StopReason.INTERNAL_ERROR: "内部错误",
+}
+
+_UNAVAILABLE_REASON_TEXTS = {
+    UnavailableReason.ACCESS_DENIED: "权限不足",
+    UnavailableReason.PROCESS_EXITING: "进程正在退出",
+    UnavailableReason.NOT_IN_SESSION: "进程不在当前会话，不支持采集",
+    UnavailableReason.NOT_SUPPORTED: "仅支持 Windows",
+    UnavailableReason.ERROR: "采集失败",
+}
+
+
+def stop_reason_text(reason: StopReason) -> str:
+    """任务停止原因的界面文案。"""
+    return _STOP_REASON_TEXTS[reason]
+
+
+def unavailable_reason_text(reason: UnavailableReason) -> str:
+    """指标不可用原因的界面文案。"""
+    return _UNAVAILABLE_REASON_TEXTS[reason]
+
+
+def task_status_text(running: bool) -> str:
+    """任务运行状态文案（下拉 tooltip、导出页摘要共用）。"""
+    return "运行中" if running else "已停止"
 
 
 def format_count(number: int) -> str:
@@ -43,19 +77,21 @@ def truncate_text(text: str, max_chars: int) -> str:
 
 
 def task_duration_seconds(
-        task: MonitorTask, running: bool, now: Optional[datetime] = None) -> float:
-    """任务时长：运行中取到当前时刻；已停止取到结束时间，缺失时退回最后采样时间。"""
+        task: MonitorTask, running: bool, now: datetime) -> float:
+    """任务时长：运行中取到 now；已停止取到结束时间，缺失时退回最后采样时间。
+
+    now 由调用方传入（本模块不取系统时间），同一次刷新的多个下拉项共用一个时刻。
+    """
     if running:
-        end = now or datetime.now()
+        end = now
     else:
         end = task.end_time or task.last_sample_at or task.start_time
     return max(0.0, (end - task.start_time).total_seconds())
 
 
 def format_task_option_text(
-        task: MonitorTask, running: bool = False,
-        now: Optional[datetime] = None, note_max: int = NOTE_MAX_CHARS,
-        full_date: bool = False) -> str:
+        task: MonitorTask, running: bool, now: datetime,
+        note_max: int = NOTE_MAX_CHARS, full_date: bool = False) -> str:
     """任务下拉项文本：进程名 · PID · 开始时间 · 时长 · 备注（运行中标"运行中"）。"""
     time_format = '%Y-%m-%d %H:%M' if full_date else '%m-%d %H:%M'
     duration = format_duration(task_duration_seconds(task, running, now))
@@ -72,14 +108,13 @@ def format_task_option_text(
 
 
 def format_task_tooltip(
-        task: MonitorTask, running: bool = False,
-        now: Optional[datetime] = None) -> str:
+        task: MonitorTask, running: bool, now: datetime) -> str:
     """任务下拉项 tooltip：完整进程名、起止时间、时长与完整备注。"""
     duration = format_duration(task_duration_seconds(task, running, now))
     lines = [
         f"{task.process_name}（PID {task.pid}）",
         f"开始：{task.start_time.strftime('%Y-%m-%d %H:%M:%S')}",
-        "状态：运行中" if running else "状态：已停止",
+        f"状态：{task_status_text(running)}",
         f"时长：{duration}",
     ]
     note = (task.note or '').strip()

@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import Dict, Optional, List
 from PyQt5.QtCore import QThread, pyqtSignal
 
+from core.contracts import StopReason, TaskStatus, UnavailableReason
 from core.process_collector import ProcessCollector
 from data.models import MonitorTask as TaskModel, DataPoint
 from data.database import Database
@@ -34,9 +35,9 @@ class MonitorTask(QThread):
 
     # 信号定义
     data_updated = pyqtSignal(str, dict)    # 数据更新信号 (task_id, {指标类型: 指标值})
-    task_stopped = pyqtSignal(str, str)     # 任务停止信号 (task_id, reason)
+    task_stopped = pyqtSignal(str, object)  # 任务停止信号 (task_id, StopReason)
     error_occurred = pyqtSignal(str, str)   # 错误信号 (task_id, error_message)
-    # 指标不可用信号 (task_id, {指标类型: 原因})：每个指标每个任务只通知一次
+    # 指标不可用信号 (task_id, {指标类型: UnavailableReason})：每个指标每个任务只通知一次
     metrics_unavailable = pyqtSignal(str, dict)
 
     def __init__(self, pid: int, process_name: str, metric_types: List[str],
@@ -103,7 +104,7 @@ class MonitorTask(QThread):
             interval=self.interval,
             start_time=None,  # 启动时设置
             end_time=None,
-            status='pending',
+            status=TaskStatus.PENDING,
             note=self.note,
         )
 
@@ -120,14 +121,14 @@ class MonitorTask(QThread):
         """
         线程运行函数（重写QThread.run）。
 
-        主体放进 try/finally：无论正常结束、用户停止还是意外异常，收尾 _teardown
+        主体放进 try/finally：无论正常结束、主动停止还是意外异常，收尾 _teardown
         都恰好执行一次，且始终在工作线程内（保证"task_stopped 晚于落库完成"）。
         """
-        stop_reason = "用户停止"
+        stop_reason = StopReason.USER
         try:
             stop_reason = self._run_loop()
         except Exception as e:
-            stop_reason = "内部错误"
+            stop_reason = StopReason.INTERNAL_ERROR
             error_msg = f"监控线程发生未预期错误: {e}"
             logger.error(error_msg, exc_info=True)
             self.error_occurred.emit(self.task_id, error_msg)
@@ -135,15 +136,15 @@ class MonitorTask(QThread):
             self._running = False
             self._teardown(stop_reason)
 
-    def _run_loop(self) -> str:
+    def _run_loop(self) -> StopReason:
         """
         任务主体：登记任务行 -> 预热 -> 定时采集循环。
 
         Returns:
-            str: 停止原因
+            StopReason: 停止原因
         """
         self.task_model.start_time = datetime.now()
-        self.task_model.status = 'running'
+        self.task_model.status = TaskStatus.RUNNING
         self._task_saved = self.db.save_task(self.task_model)
         logger.info("任务启动: task_id=%s pid=%s process=%s metrics=%s",
                     self.task_id, self.pid, self.process_name, self.metric_types)
@@ -152,10 +153,10 @@ class MonitorTask(QThread):
         if not self.collector.is_process_running():
             error_msg = f"进程 {self.process_name} (PID: {self.pid}) 不存在或无法访问"
             self.error_occurred.emit(self.task_id, error_msg)
-            return "进程不存在"
+            return StopReason.PROCESS_NOT_FOUND
 
         # 进程列表可能已过期：选中到开始之间该 PID 若被别的进程复用，继续采集会把
-        # 另一个进程的数据记到所选进程名下。读不到创建时间（如权限不足）时无法确认，
+        # 另一个进程的数据记到所选进程名下。读不到创建时间（如无权读取）时无法确认，
         # 按原进程处理，不误停任务
         if self.expected_create_time is not None:
             actual_create_time = self.collector.get_create_time()
@@ -164,7 +165,7 @@ class MonitorTask(QThread):
                 error_msg = (f"进程 {self.process_name} (PID: {self.pid}) 已退出，"
                              "该 PID 已被其他进程占用，未开始监控")
                 self.error_occurred.emit(self.task_id, error_msg)
-                return "进程已终止"
+                return StopReason.PID_REUSED
 
         # 含CPU使用率指标时先预热，丢弃cpu_percent首次返回的无效0值。预热后要隔满
         # 一个周期再采：紧接着采的 CPU 样本统计窗口近乎为零，仍是 0 或量化尖峰
@@ -172,7 +173,7 @@ class MonitorTask(QThread):
         if cpu_primed:
             self.collector.prime_cpu()
 
-        stop_reason = "用户停止"
+        stop_reason = StopReason.USER
 
         # 调度：用单调时钟的截止时间驱动，每周期 deadline += interval，避免
         # "采集耗时 + 睡眠"造成的累积漂移；等待统一走 Event.wait，stop/pause/resume
@@ -233,8 +234,8 @@ class MonitorTask(QThread):
                         self._flush_buffer()
 
                 else:
-                    # 进程已终止（含 PID 被复用为另一个进程的情形）
-                    stop_reason = "进程已终止"
+                    # 进程已退出（运行中 PID 被另一个进程复用也走这里，采集器无从区分）
+                    stop_reason = StopReason.PROCESS_EXITED
                     break
 
             except Exception as e:
@@ -251,7 +252,7 @@ class MonitorTask(QThread):
         unavailable = getattr(self.collector, "last_unavailable", None)
         if not unavailable:
             return
-        fresh: Dict[str, str] = {
+        fresh: Dict[str, UnavailableReason] = {
             metric: reason for metric, reason in unavailable.items()
             if metric not in self._unavailable_notified
         }
@@ -294,7 +295,7 @@ class MonitorTask(QThread):
         """获取任务信息"""
         return self.task_model
 
-    def _teardown(self, reason: str):
+    def _teardown(self, reason: StopReason):
         """
         收尾（由 run() 的 finally 在工作线程内调用且仅调用一次）：
         最后一次 flush -> 写 stopped 状态 -> emit task_stopped。
@@ -310,16 +311,17 @@ class MonitorTask(QThread):
             logger.error("task_id=%s 收尾 flush 异常", self.task_id, exc_info=True)
 
         self.task_model.end_time = datetime.now()
-        self.task_model.status = 'stopped'
+        self.task_model.status = TaskStatus.STOPPED
         try:
             if self._task_saved:
-                self.db.update_task_status(self.task_id, 'stopped', self.task_model.end_time)
+                self.db.update_task_status(
+                    self.task_id, TaskStatus.STOPPED.value, self.task_model.end_time)
             else:
                 # 启动时任务行没写成功：用最终状态补写一次，避免任务行缺失
                 self._task_saved = self.db.save_task(self.task_model)
         except Exception:
             logger.error("task_id=%s 写入停止状态失败", self.task_id, exc_info=True)
-        logger.info("任务停止: task_id=%s 原因=%s", self.task_id, reason)
+        logger.info("任务停止: task_id=%s 原因=%s", self.task_id, reason.value)
 
         # 发送停止信号
         self.task_stopped.emit(self.task_id, reason)
@@ -421,7 +423,7 @@ if __name__ == "__main__":
         print(f"[数据更新] 任务: {task_id[:8]}..., 值: {formatted}")
 
     def on_task_stopped(task_id, reason):
-        print(f"[任务停止] 任务: {task_id[:8]}..., 原因: {reason}")
+        print(f"[任务停止] 任务: {task_id[:8]}..., 原因: {reason.value}")
         app.quit()
 
     def on_error(task_id, error_msg):

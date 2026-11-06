@@ -10,7 +10,7 @@ from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import QApplication, QSystemTrayIcon
 from qfluentwidgets import (
-    FluentWindow, NavigationItemPosition, FluentIcon, InfoBar, InfoBarPosition,
+    FluentWindow, NavigationItemPosition, FluentIcon,
     PushButton, SystemTrayMenu, Action
 )
 
@@ -19,7 +19,7 @@ from ui.pages.history_page import HistoryPage
 from ui.pages.export_page import ExportPage
 from ui.pages.about_page import AboutPage
 from ui.pages.setting_page import SettingPage
-from ui.components.dialogs import CloseActionDialog
+from ui.services import CLOSE_ACTION_CANCEL, CLOSE_ACTION_TRAY, UiServices
 from core.monitor_manager import MonitorManager
 from data.database import Database
 from utils.thread_utils import shutdown_thread
@@ -32,20 +32,22 @@ logger = logging.getLogger(__name__)
 class MainWindow(FluentWindow):
     """主窗口类"""
 
-    def __init__(self, db=None):
+    def __init__(self, db: Database, manager: MonitorManager, services: UiServices):
         """初始化主窗口
 
+        三项依赖都由入口（main.py）构造后注入，主窗口不再自建；测试注入隔离的
+        临时库与替身服务。同一份 services 向下分发给全部页面。
+
         Args:
-            db: 数据库实例（可选，默认回退新建 Database()；测试可注入隔离的临时库）。
-                必须在构造 MonitorManager 之前赋值，确保全局唯一数据库向下分发。
+            db: 唯一数据库实例，向下分发给各页面（manager 也应持有同一实例）
+            manager: 监控管理器
+            services: 界面服务（提示、对话框、时钟、进程查询、任务状态、用户偏好）
         """
         super().__init__()
 
-        # 唯一数据库实例：向下分发给 MonitorManager 与各页面
-        self.db = db if db is not None else Database()
-
-        # 初始化监控管理器（单例：仅首次构造时传入的 db 生效）
-        self.monitor_manager = MonitorManager(db=self.db)
+        self.db = db
+        self.monitor_manager = manager
+        self.services = services
 
         # 托盘驻留相关状态：必须在 _init_tray()/closeEvent 用到之前初始化完毕。
         # - _really_quit：托盘菜单"退出"与 quit_for_install() 会置 True，
@@ -67,11 +69,11 @@ class MainWindow(FluentWindow):
         # 会在历史页/导出页消失，这里按数据点重算一次（同样只在启动时、任务启动前调用）
         self.db.reconcile_sample_counts()
 
-        # 启动自动清理：保留天数取自设置页（app_config.cfg），默认禁用
+        # 启动自动清理：保留天数取自用户偏好（设置页可改），默认禁用
         # （0=永久保留，config.DATA_RETENTION_DAYS 缺省值同此）。执行顺序固定在
         # 孤儿校正之后，避免把本次启动才校正为 stopped 的"刚崩溃"任务当作过期
         # 任务误删。
-        self.db.cleanup_old_tasks(cfg.get(cfg.retention_days))
+        self.db.cleanup_old_tasks(self.services.preferences.retention_days())
 
         # 初始化界面
         self._init_window()
@@ -87,7 +89,7 @@ class MainWindow(FluentWindow):
                 self._on_commit_data_request, Qt.DirectConnection)
 
         # 非模态更新提醒：静默检查发现新版本时不由 about_page 直接弹模态对话框，
-        # 而是发信号，这里统一处理为 InfoBar 提示（必须在 self.about_page 创建
+        # 而是发信号，这里统一处理为非模态提示（必须在 self.about_page 创建
         # 之后连接，故放在 _init_navigation 之后）
         self.about_page.update_available_silent.connect(self._on_update_available_silent)
 
@@ -106,39 +108,24 @@ class MainWindow(FluentWindow):
     def _show_migration_failed_tip(self):
         """迁移失败且旧数据仍在原库（已从备份还原，或还原与改名都失败而原样保留）：
         本次运行新数据无法保存，下次启动会重新迁移"""
-        InfoBar.warning(
-            title="数据库升级失败",
-            content="数据库升级失败，本次运行新数据无法保存；旧数据已保留，请重启重试。",
-            orient=Qt.Horizontal,
-            isClosable=True,
-            position=InfoBarPosition.TOP,
-            duration=-1,
-            parent=self
-        )
+        self.services.notifier.warning(
+            self, "数据库升级失败",
+            "数据库升级失败，本次运行新数据无法保存；旧数据已保留，请重启重试。",
+            duration=-1)
 
     def _show_data_reset_tip(self):
         """还原备份也失败：损坏库已改名保留，应用以新空库运行"""
-        InfoBar.warning(
-            title="数据库已重置",
-            content="历史数据已移至 monitor.db.broken_*，应用以新空库正常运行。",
-            orient=Qt.Horizontal,
-            isClosable=True,
-            position=InfoBarPosition.TOP,
-            duration=-1,
-            parent=self
-        )
+        self.services.notifier.warning(
+            self, "数据库已重置",
+            "历史数据已移至 monitor.db.broken_*，应用以新空库正常运行。",
+            duration=-1)
 
     def _show_backup_aborted_tip(self):
         """迁移前备份失败：中止迁移，旧库原样保留未做任何改动"""
-        InfoBar.warning(
-            title="数据库升级已中止",
-            content="未能升级数据库，历史数据完好保存在磁盘，请释放磁盘空间后重启。",
-            orient=Qt.Horizontal,
-            isClosable=True,
-            position=InfoBarPosition.TOP,
-            duration=-1,
-            parent=self
-        )
+        self.services.notifier.warning(
+            self, "数据库升级已中止",
+            "未能升级数据库，历史数据完好保存在磁盘，请释放磁盘空间后重启。",
+            duration=-1)
 
     def _init_window(self):
         """初始化窗口属性"""
@@ -162,17 +149,20 @@ class MainWindow(FluentWindow):
         # 设置导航栏宽度（减少一半）
         self.navigationInterface.setExpandWidth(150)  # 默认是250，现在设置为150
 
-        # 创建页面实例（注入统一数据库实例与监控管理器；about_page 不涉及数据库，不传）
+        # 创建页面实例：统一注入同一数据库、监控管理器与服务集合
+        # （about_page 不涉及数据库与任务，只注入服务）
         self.monitor_page = MonitorPage(
-            self, db=self.db, manager=self.monitor_manager)
+            self.db, self.monitor_manager, self.services, parent=self)
         self.history_page = HistoryPage(
-            self, db=self.db, manager=self.monitor_manager)
+            self.db, self.monitor_manager, self.services, parent=self)
         # 导出页需要 manager 登记导出，与设置页的清理/压缩数据库互斥
-        self.export_page = ExportPage(self, db=self.db, manager=self.monitor_manager)
-        # 设置页数据管理卡片需要 db（查询占用/清理压缩）与 manager（只读查询
-        # 是否有运行中任务，决定清理按钮是否可用）两个依赖，均为可选注入
-        self.setting_page = SettingPage(self, db=self.db, manager=self.monitor_manager)
-        self.about_page = AboutPage(self)
+        self.export_page = ExportPage(
+            self.db, self.monitor_manager, self.services, parent=self)
+        # 设置页数据管理卡片需要 db（查询占用/清理压缩）与 manager（维护锁、
+        # 是否有运行中任务决定清理按钮是否可用）
+        self.setting_page = SettingPage(
+            self.db, self.monitor_manager, self.services, parent=self)
+        self.about_page = AboutPage(self.services, parent=self)
 
         # 默认采集周期联动：设置页改动"默认采集周期"后，实时同步到监控页
         # 采集周期输入框的默认显示值（不影响已创建任务，只影响下一次新建）
@@ -294,21 +284,14 @@ class MainWindow(FluentWindow):
 
     def _on_update_available_silent(self, info: dict) -> None:
         """静默检查更新发现新版本：不由 about_page 直接弹出模态对话框打断用户，
-        改为右上角 InfoBar 非模态提示+「查看」按钮，点击后切到关于页并弹出与
+        改为顶部非模态提示+「查看」按钮，点击后切到关于页并弹出与
         手动检查一致的确认对话框。
 
-        若此时主窗口处于托盘隐藏态，InfoBar 挂在隐藏窗口上不会被用户看到，
+        若此时主窗口处于托盘隐藏态，提示条挂在隐藏窗口上不会被用户看到，
         需额外补一条托盘气泡。
         """
-        info_bar = InfoBar.info(
-            title=f"发现新版本 {info['version']}",
-            content="点击查看详情",
-            orient=Qt.Horizontal,
-            isClosable=True,
-            position=InfoBarPosition.TOP,
-            duration=10000,
-            parent=self
-        )
+        info_bar = self.services.notifier.info(
+            self, f"发现新版本 {info['version']}", "点击查看详情", duration=10000)
         view_button = PushButton("查看")
         view_button.clicked.connect(lambda: self._show_update_detail(info))
         info_bar.addWidget(view_button)
@@ -319,7 +302,7 @@ class MainWindow(FluentWindow):
                 QSystemTrayIcon.Information)
 
     def _show_update_detail(self, info: dict) -> None:
-        """InfoBar「查看」按钮点击：切到关于页并弹出更新确认对话框"""
+        """更新提示条「查看」按钮点击：切到关于页并弹出更新确认对话框"""
         self.switchTo(self.about_page)
         self.about_page.show_update_dialog_for(info)
 
@@ -329,8 +312,8 @@ class MainWindow(FluentWindow):
         self.history_page.select_task(task_id)
 
     def _on_task_ended_abnormally(self, title: str, content: str) -> None:
-        """被测进程非用户停止而结束：主窗口隐藏或不在前台时补一条托盘气泡
-        （窗口在前台时监控页自身的 InfoBar 已足够显眼）。tray_icon 为 None
+        """被测进程自行结束（不是用户点停止）：主窗口隐藏或不在前台时补一条托盘气泡
+        （窗口在前台时监控页自身的提示条已足够显眼）。tray_icon 为 None
         （无托盘环境）时短路。"""
         if self.tray_icon is None:
             return
@@ -342,14 +325,11 @@ class MainWindow(FluentWindow):
 
         Returns:
             'quit'（停止监控并退出）/ 'tray'（最小化到托盘）/ 'cancel'（取消关闭）。
-            抽成独立方法，测试中可 monkeypatch，避免弹出模态对话框阻塞。
+            对话框经由注入的 services.dialogs；保留为薄方法，测试也可直接替换它。
         """
-        dialog = CloseActionDialog(
-            self.monitor_manager.running_task_count(),
-            can_tray=self.tray_icon is not None, parent=self)
-        if dialog.exec():
-            return dialog.choice
-        return 'cancel'
+        return self.services.dialogs.ask_close_action(
+            self, self.monitor_manager.running_task_count(),
+            self.tray_icon is not None)
 
     def _hide_to_tray(self, event) -> None:
         """隐藏到托盘：不停止任务、不做任何清理，忽略本次关闭事件。"""
@@ -401,17 +381,17 @@ class MainWindow(FluentWindow):
            tray_icon 为 None，隐藏分支天然短路，行为与现状一致。
         """
         if (not self._really_quit and self.tray_icon is not None
-                and cfg.get(cfg.close_to_tray)):
+                and self.services.preferences.close_to_tray()):
             self._hide_to_tray(event)
             return
 
         # 真退出前的确认：仍有任务在监控时让用户选择，避免误关窗口丢失长时间监控
         if not self._really_quit and self.monitor_manager.has_running_tasks():
             action = self._ask_close_action()
-            if action == 'cancel':
+            if action == CLOSE_ACTION_CANCEL:
                 event.ignore()
                 return
-            if action == 'tray' and self.tray_icon is not None:
+            if action == CLOSE_ACTION_TRAY and self.tray_icon is not None:
                 self._hide_to_tray(event)
                 return
             # 'quit'：继续走下面的真退出流程
@@ -429,9 +409,7 @@ class MainWindow(FluentWindow):
             #     收尾的线程补一个带超时的 join。main.py 退出时用 os._exit() 直接
             #     终止进程（规避下载线程残留导致的 0xC0000409），若不在此兜底等待，
             #     可能在收尾写库的中途就被掐死，丢失最后一批数据。
-            for task in self.monitor_manager.get_all_tasks():
-                if task.isRunning():
-                    shutdown_thread(task, timeout_ms=3000)
+            self.monitor_manager.join_all(timeout_ms=3000)
 
             # 2. 各页面登记的后台线程（下载、检查更新、导出、清理数据库、历史自动
             #    刷新）：取消语义与超时由页面的 background_threads() 给出
