@@ -74,11 +74,12 @@ class BaselineSamples:
     samples: Dict[str, List[float]] = field(default_factory=dict)
     settled: bool = False
 
-# WorkerState -> 快照里的 TaskStatus（RUNNING 覆盖暂停中与停止收尾中）
+# WorkerState -> 快照里的 TaskStatus（RUNNING 覆盖暂停中、等待重启与停止收尾中）
 _STATUS_BY_STATE = {
     WorkerState.WAITING: TaskStatus.PENDING,
     WorkerState.RUNNING: TaskStatus.RUNNING,
     WorkerState.PAUSED: TaskStatus.RUNNING,
+    WorkerState.WAITING_RESTART: TaskStatus.RUNNING,
     WorkerState.STOPPING: TaskStatus.RUNNING,
     WorkerState.STOPPED: TaskStatus.STOPPED,
 }
@@ -96,6 +97,18 @@ def _quality_of(task) -> Optional[QualityStats]:
         logger.warning("读取任务数据质量失败: task_id=%s", getattr(task, 'task_id', '?'),
                        exc_info=True)
         return None
+
+
+def _restart_limit_of(task) -> int:
+    """任务的续接次数上限（不续接为 0）；替身对象没有该接口时为 0。"""
+    reader = getattr(task, 'restart_policy', None)
+    if reader is None:
+        return 0
+    try:
+        enabled, limit = reader()
+    except Exception:
+        return 0
+    return int(limit) if enabled else 0
 
 
 class MonitorManager(QObject):
@@ -128,6 +141,13 @@ class MonitorManager(QObject):
     members_changed = pyqtSignal(str)
     # 被测目标元数据已探测 (task_id, TargetInfo)：任务卡片据此补上悬停提示里的被测程序行
     target_info_ready = pyqtSignal(str, object)
+    # 被测进程退出后进入 / 离开"等待重启" (task_id, 是否在等待)：卡片据此显示"等待重启（第 n/m 次）"
+    task_waiting_restart = pyqtSignal(str, bool)
+    # 被测进程已重启并续接到同一任务 (task_id, 已续接次数)：PID 已变，卡片可刷新
+    task_restarted = pyqtSignal(str, int)
+    # 某任务写库遇到磁盘已满 (task_id)：存储守卫据此暂停任务（见 StorageGuard）。先于管理器
+    # 自己的兜底暂停发出，守卫才能把该任务记入"因空间不足暂停"
+    storage_full_detected = pyqtSignal(str)
     # 内部：探针线程通知本对象所在线程来取结果 (task_id)；结果本身放在 _probe_results 里，
     # 退出路径的 join_all 不经事件循环也能直接取走
     _target_probed = pyqtSignal(str)
@@ -165,6 +185,9 @@ class MonitorManager(QObject):
         self._clock = clock if clock is not None else SYSTEM_CLOCK
         self._dpi_scale = dpi_scale
         self._tree_source_factory = tree_source_factory
+        # 传给每个任务线程的额外构造参数（退出码探针 / 重启查找 / 采集器工厂 / 时钟），测试经
+        # set_worker_options 注入替身，生产保持缺省
+        self._worker_options: Dict[str, object] = {}
         self._probe_threads: Dict[str, threading.Thread] = {}
         self._probe_results: Dict[str, Optional[TargetInfo]] = {}
         self._probe_lock = threading.Lock()
@@ -190,7 +213,9 @@ class MonitorManager(QObject):
     def create_task(self, pid: int, process_name: str, metric_types: List[str],
                     interval: float = None, note: str = '',
                     create_time: Optional[float] = None, *,
-                    target_kind: str = TARGET_PID) -> Optional[str]:
+                    target_kind: str = TARGET_PID,
+                    resume_on_restart: Optional[bool] = None,
+                    restart_limit: Optional[int] = None) -> Optional[str]:
         """
         创建新的监控任务
 
@@ -208,6 +233,9 @@ class MonitorManager(QObject):
                 确认 PID 未被别的进程复用；为 None 时跳过比对
             target_kind: 监控目标类型（'pid' 单个进程，默认；'tree' 根进程及其全部后代；
                 'name' 全部同名进程）。组任务只占 1 个任务配额
+            resume_on_restart / restart_limit: 被测进程退出后续接同一任务的策略（pid / tree
+                任务有效）；None 表示由库里 tasks.resume_on_restart / restart_limit 决定
+                （随自动化方案落库）
 
         Returns:
             Optional[str]: 任务ID，创建失败（数据库维护中/任务数达上限）返回None
@@ -248,23 +276,85 @@ class MonitorManager(QObject):
             tree_source=(self._tree_source_factory(group_spec)
                          if group_spec is not None and self._tree_source_factory is not None
                          else None),
+            resume_on_restart=resume_on_restart,
+            restart_limit=restart_limit,
+            **self._worker_options,
         )
+        self._connect_worker(task)
+        return self._register_worker(task)
 
-        # 连接任务信号（工作线程发出，经队列在本对象所在的 GUI 线程执行）
+    def _connect_worker(self, task: MonitorWorker) -> None:
+        """连接任务信号（工作线程发出，经队列在本对象所在的 GUI 线程执行）。"""
         task.members_changed.connect(self._on_task_members_changed)
         task.data_updated.connect(self._on_task_data_updated)
         task.task_stopped.connect(self._on_task_stopped)
         task.error_occurred.connect(self._on_task_error)
         task.metrics_unavailable.connect(self._on_task_metrics_unavailable)
+        task.markers_changed.connect(self.markers_changed)
+        task.waiting_restart_changed.connect(self.task_waiting_restart)
+        task.target_restarted.connect(self._on_task_restarted)
+        task.storage_full.connect(self._on_task_storage_full)
         task.finished.connect(self._on_worker_finished)
 
-        # 添加到字典
+    def _register_worker(self, task: MonitorWorker) -> str:
+        """加入任务字典并发 task_added。"""
         self._tasks[task.task_id] = task
-
-        # 发送信号
         self.task_added.emit(task.task_id)
-
         return task.task_id
+
+    def set_restart_policy(self, task_id: str, enabled: bool, limit: int) -> bool:
+        """直接设定运行中任务的续接策略（覆盖库里的方案值）。任务不存在返回 False。"""
+        task = self._tasks.get(task_id)
+        if task is None:
+            return False
+        task.set_restart_policy(enabled, limit)
+        return True
+
+    def recover_task(self, task_id: str) -> bool:
+        """
+        工具重启后续采：用库里的任务行重建采集线程（任务 ID、开始时间与已有数据都不变），
+        目标进程仍在运行且创建时间一致时才有意义（由调用方事先判定，见 core.session_recovery）。
+        线程启动后写"续采"打点；中断期间是数据空洞。已在管理器中、维护中、数量已满返回 False。
+        """
+        if self._maintenance or task_id in self._tasks:
+            return False
+        if len(self._tasks) >= config.MAX_MONITOR_TASKS:
+            self.task_limit_reached.emit()
+            return False
+        record = self.db.get_task(task_id)
+        if record is None or record.status != TaskStatus.RUNNING.value:
+            return False
+        group_spec: Optional[GroupSpec] = None
+        try:
+            if record.target_kind == TARGET_TREE:
+                # 进程树以任务行里的当前根为准（发生过重启续接时它已不是 target_spec 里的首个根）
+                group_spec = GroupSpec.tree(record.pid, record.create_time)
+            elif record.target_kind == TARGET_NAME:
+                group_spec = GroupSpec.from_json(record.target_kind, record.target_spec)
+        except ValueError:
+            logger.error("续采失败：任务目标参数无法还原 task_id=%s", task_id, exc_info=True)
+            return False
+        restarts = sum(1 for m in self.list_markers(task_id) if m.kind == 'restart')
+        task = MonitorWorker(
+            pid=record.pid, process_name=record.process_name,
+            metric_types=list(record.metric_types), interval=record.interval,
+            task_id=record.task_id, db=self.db, note=record.note,
+            create_time=record.create_time, hub=self._snapshot_hub,
+            group_spec=group_spec,
+            tree_source=(self._tree_source_factory(group_spec)
+                         if group_spec is not None and self._tree_source_factory is not None
+                         else None),
+            restart_count=restarts, recovering=True, start_time=record.start_time,
+            **self._worker_options)
+        self._connect_worker(task)
+        self._register_worker(task)
+        logger.info("续采任务: task_id=%s pid=%s", task_id, record.pid)
+        return self.start_task(task_id)
+
+    def set_worker_options(self, **options) -> None:
+        """设定之后新建的任务线程的额外构造参数（exit_probe_factory / restart_finder /
+        collector_factory / clock）。只给测试与组合根注入替身用。"""
+        self._worker_options = dict(options)
 
     def start_task(self, task_id: str) -> bool:
         """
@@ -515,6 +605,10 @@ class MonitorManager(QObject):
             quality=_quality_of(task),
             target_kind=getattr(task, 'target_kind', TARGET_PID),
             members_truncated=getattr(task, 'members_truncated', False),
+            waiting_restart=state is WorkerState.WAITING_RESTART,
+            restart_count=getattr(task, 'restart_count', 0),
+            restart_limit=_restart_limit_of(task),
+            exit_code=getattr(task, 'last_exit_code', None),
         )
 
     def get_task_info(self, task_id: str) -> Optional[TaskInfo]:
@@ -650,6 +744,16 @@ class MonitorManager(QObject):
     def running_task_count(self) -> int:
         """仍可能写库的任务数（含暂停中与停止收尾中的任务）"""
         return sum(1 for task in self._tasks.values() if task.state in LIVE_STATES)
+
+    def held_point_count(self) -> int:
+        """因磁盘已满而留在内存、尚未写进数据库的数据点总数（全部任务之和；没有为 0）。
+        退出时仍写不进去的这部分会丢失，退出确认据此提示用户。"""
+        total = 0
+        for task in self._tasks.values():
+            reader = getattr(task, 'held_point_count', None)
+            if reader is not None:
+                total += reader()
+        return total
 
     def has_running_tasks(self) -> bool:
         """是否存在仍在运行的任务"""
@@ -964,6 +1068,18 @@ class MonitorManager(QObject):
         if task_id in self._pending_meta and not self._save_pending_meta(task_id):
             self._drop_pending_meta(task_id)
         self.task_stopped.emit(task_id, reason)
+
+    def _on_task_restarted(self, task_id: str, _pid: int, count: int) -> None:
+        """线程发出的是 (任务, 新 PID, 次数)，对外只给次数：新 PID 经 get_task_info 取。"""
+        self.task_restarted.emit(task_id, count)
+
+    def _on_task_storage_full(self, task_id: str) -> None:
+        """任务报告磁盘已满：先通知存储守卫（它会暂停全部运行中任务并记入"因空间不足暂停"），
+        没有守卫接线时自己暂停这个任务，保证缓冲的数据不再无谓增长。"""
+        logger.error("任务写库遇到磁盘已满: task_id=%s", task_id)
+        self.storage_full_detected.emit(task_id)
+        if not self.is_task_paused(task_id) and self.is_task_active(task_id):
+            self.pause_task(task_id)
 
     def _on_task_error(self, task_id: str, error_msg: str):
         """任务错误处理"""

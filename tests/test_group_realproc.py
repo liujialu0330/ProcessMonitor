@@ -82,6 +82,7 @@ def series(db, task_id, metric, member=None):
     return [p.value for p in db.points.fetch(PointQuery(task_id, key))]
 
 
+@pytest.mark.real_exit_probe
 def test_tree_task_over_real_processes(db, qapp, started, process_tree):  # noqa: F811
     root, kids = process_tree
     create_time = psutil.Process(root.pid).create_time()

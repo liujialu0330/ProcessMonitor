@@ -302,6 +302,13 @@ class SnapshotTreeSource:
                           root_create_time: Optional[float]) -> Observation:
         procs = snapshot.processes
         root_alive, root_ct, pids = self._resolve(procs, spec, root_create_time)
+        if spec.kind == TARGET_TREE and root_alive and procs[spec.root_pid].num_threads == 0:
+            # 根进程已退出、只是还被句柄握着（线程数为 0 的僵尸条目）：按根已退出处理
+            self._known.clear()
+            root_alive, root_ct, pids = False, None, []
+        else:
+            # 同理，别的僵尸条目不是在运行的成员，不计入实例与进程总数
+            pids = [pid for pid in pids if procs[pid].num_threads > 0]
         snapshot_metrics = [m for m in metrics if uses_snapshot(m)
                             and m != MetricType.CPU_PERCENT]
         process_metrics = [m for m in metrics if not uses_snapshot(m) and m in SAMPLERS

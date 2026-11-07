@@ -191,6 +191,10 @@ class StorageGuard(QObject):
             sig = getattr(manager, name, None)
             if sig is not None:
                 sig.connect(self._on_task_left_pause)
+        # 采集线程写库遇到磁盘已满：与"空间低于 200 MB"同一路径暂停任务
+        full_signal = getattr(manager, 'storage_full_detected', None)
+        if full_signal is not None:
+            full_signal.connect(lambda _task_id: self.report_storage_full())
 
     # ========== 生命周期 ==========
 

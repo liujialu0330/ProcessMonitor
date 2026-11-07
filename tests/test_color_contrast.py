@@ -93,6 +93,15 @@ CHART_REQUIREMENTS = [
     ('marker', 'band', GRAPHIC, "打点竖线穿过 min/max 带"),
     ('marker', 'gap', GRAPHIC, "打点竖线落在空洞阴影里"),
     ('system_marker', 'card', GRAPHIC, "暂停/恢复短竖线"),
+    ('crash_marker', 'card', TEXT, "异常退出点划线与底部文字标签"),
+    ('crash_marker', 'band', GRAPHIC, "异常退出线穿过 min/max 带"),
+    ('crash_marker', 'gap', GRAPHIC, "异常退出线落在空洞阴影里（崩溃后常有空洞）"),
+    ('restart_marker', 'card', TEXT, "重启续接点划线与底部文字标签"),
+    ('restart_marker', 'band', GRAPHIC, "重启续接线穿过 min/max 带"),
+    ('restart_marker', 'gap', GRAPHIC, "重启续接线落在空洞阴影里"),
+    ('recover_marker', 'card', TEXT, "续采点划线与底部文字标签"),
+    ('recover_marker', 'band', GRAPHIC, "续采线穿过 min/max 带"),
+    ('recover_marker', 'gap', GRAPHIC, "续采线落在空洞阴影里（工具重启前后的空洞）"),
     ('selection', 'window', GRAPHIC, "概览条选区边线（选中色条）"),
     ('overview_curve', 'window', GRAPHIC, "概览条走势线"),
     ('overview_curve', 'selection', GRAPHIC, "概览条走势线在选区填充内"),
@@ -123,8 +132,14 @@ def test_palettes_cover_same_keys_and_differ():
     light, dark = chart_palette(False), chart_palette(True)
     assert set(light) == set(dark)
     for key in ('text', 'axis', 'curve', 'crosshair', 'marker', 'system_marker',
-                'overview_curve', 'selection'):
+                'overview_curve', 'selection', 'crash_marker', 'restart_marker',
+                'recover_marker'):
         assert light[key] != dark[key], key
+    # 三种系统事件互相区分，也与用户打点、曲线不同色
+    for palette in (light, dark):
+        colors = [palette[k] for k in ('crash_marker', 'restart_marker', 'recover_marker',
+                                       'marker', 'curve')]
+        assert len(set(colors)) == len(colors)
     # 导出图片的不透明底 = 卡片常态底色
     assert light['background'] == tokens.SURFACE[0]
     assert dark['background'] == tokens.SURFACE[1]
@@ -145,6 +160,7 @@ TOKEN_REQUIREMENTS = [
     ('TERTIARY', TEXT, "状态：已结束 / 正在停止"),
     ('DATA', TEXT, "迷你图折线（要求 ≥ 4.5:1）"),
     ('ATTENTION', TEXT, "迷你图打点刻度、徽标"),
+    ('INFO', TEXT, "续采打点（图表标签是文字、迷你图刻度）"),
     ('DIMMED_TEXT', TEXT, "摘要表置灰行文字"),
 ]
 
@@ -185,7 +201,8 @@ def test_verdict_and_status_share_tones():
     assert tokens.verdict_tone("波动") == "caution"
     assert tokens.verdict_tone("数据不足") == "neutral"
     pairs = {'running': tokens.SUCCESS, 'paused': tokens.CAUTION,
-             'abnormal': tokens.CRITICAL, 'finished': tokens.TERTIARY}
+             'abnormal': tokens.CRITICAL, 'finished': tokens.TERTIARY,
+             'waiting_restart': tokens.CAUTION}
     for status, pair in pairs.items():
         _text, light, dark = STATUS_STYLES[status]
         assert (light.name(), dark.name()) == (QColor(pair[0]).name(), QColor(pair[1]).name())

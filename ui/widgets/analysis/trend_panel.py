@@ -36,7 +36,7 @@ from ui.widgets.analysis.overview_strip import OverviewStrip
 from ui.widgets.analysis.summary_table import pill_style
 from ui.widgets.history.chart_view import ChartView, value_axis_title
 from ui.widgets.history.common import CARD_PADDING_H
-from utils.metrics import VALUE_CLASS_RATE, get_metric_display_name
+from utils.metrics import VALUE_CLASS_RATE, get_metric_display_name, split_member_key
 
 # 焦点大图、小倍数单图的绘图区最小高度；两列布局所需的最小内容宽度
 FOCUS_CHART_MIN_HEIGHT = 280
@@ -63,6 +63,12 @@ LEGEND_SWATCH = "━━"
 CenterPoint = namedtuple('CenterPoint', 'timestamp value')
 
 
+def plain_name(metric: str) -> str:
+    """指标显示名；成员序列键（指标@成员键）去掉成员后缀——成员已由工具条与结论条点明，
+    折叠行与小图标题不必再重复一遍。"""
+    return get_metric_display_name(split_member_key(metric)[0])
+
+
 def center_line(snapshot: HistorySnapshot) -> list:
     """中心线：每个时间桶的均值，记在桶首末点的中点；没有带时退回分桶点。"""
     if not snapshot.band:
@@ -82,10 +88,10 @@ def draw_snapshot(chart: ChartView, metric: str, snapshot: HistorySnapshot,
 
 
 def overlay_reference(snapshot: HistorySnapshot) -> Optional[float]:
-    """叠加 Δ% 的参考值：基线值（统计只用基线之后时），否则显示范围首个桶均值。"""
-    baseline = snapshot.baseline
-    if baseline is not None and baseline.value is not None and snapshot.request.baseline_only:
-        return baseline.value
+    """叠加 Δ% 的参考值：基线值（统计只用基线之后、且基线与统计在同一启动段时），否则显示
+    范围首个桶均值。"""
+    if snapshot.baseline_in_use:
+        return snapshot.baseline.value
     line = center_line(snapshot)
     return line[0].value if line else None
 
@@ -98,11 +104,11 @@ def overlay_series(analysis: TaskAnalysis) -> tuple:
         if not snapshot.points or not metric:
             continue
         if snapshot.value_class == VALUE_CLASS_RATE:
-            skipped.append(get_metric_display_name(metric))
+            skipped.append(plain_name(metric))
             continue
         line = center_line(snapshot)
         reference = overlay_reference(snapshot)
-        name = get_metric_display_name(metric)
+        name = plain_name(metric)
         if reference is None or reference == 0 or not line:
             skipped.append(name)
             continue
@@ -173,7 +179,7 @@ class FoldedMetricRow(QWidget):
         self.setFixedHeight(FOLDED_ROW_HEIGHT)
         self.setCursor(Qt.PointingHandCursor)
         self.setToolTip(FOLDED_ROW_TIP)
-        self.name_label = BodyLabel(get_metric_display_name(metric), self)
+        self.name_label = BodyLabel(plain_name(metric), self)
         self.name_label.setFixedWidth(FOLDED_NAME_WIDTH)
         self.sparkline = SparklineWidget(FOLDED_SPARK_POINTS, metric_type=metric, parent=self)
         self.value_label = DataLabel("", self)
@@ -500,7 +506,8 @@ class TrendPanel(QWidget):
         for metric in small:
             chart = self._small.get(metric) or self._make_small()
             draw_snapshot(chart, metric, self._snapshots[metric], self._origin)
-            chart.set_title(value_axis_title(metric, chart.display_unit, chart.is_rate))
+            chart.set_title(value_axis_title(
+                split_member_key(metric)[0], chart.display_unit, chart.is_rate))
             charts[metric] = chart
         self._small = charts
         if not self._fit_columns():

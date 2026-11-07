@@ -247,8 +247,11 @@ class ScriptedDialogs:
                             default_label=default_label, timestamp=timestamp,
                             process_name=process_name, pid=pid)
 
-    def choose_metrics(self, parent, selected: Sequence[str]) -> Optional[List[str]]:
-        value = self._answer('choose_metrics', parent=parent, selected=list(selected))
+    def choose_metrics(self, parent, selected: Sequence[str], *,
+                       group: bool = False) -> Optional[List[str]]:
+        # group 只在为真时记入参数：单进程路径的调用记录与旧版逐项相同
+        extra = {'group': True} if group else {}
+        value = self._answer('choose_metrics', parent=parent, selected=list(selected), **extra)
         return list(value) if value is not None else None
 
     def ask_save_path(self, parent, title: str, default_path: str,
@@ -264,9 +267,11 @@ class ScriptedDialogs:
     def ask_directory(self, parent, title: str, start_dir: str) -> Optional[str]:
         return self._answer('ask_directory', parent=parent, title=title, start_dir=start_dir)
 
-    def ask_close_action(self, parent, running_count: int, can_tray: bool) -> str:
+    def ask_close_action(self, parent, running_count: int, can_tray: bool,
+                         notice: str = "") -> str:
+        extra = {'notice': notice} if notice else {}
         return self._answer('ask_close_action', parent=parent,
-                            running_count=running_count, can_tray=can_tray)
+                            running_count=running_count, can_tray=can_tray, **extra)
 
     def open_folder(self, path: str) -> None:
         self._answer('open_folder', path=path)

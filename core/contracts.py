@@ -30,6 +30,7 @@ class StopReason(Enum):
     PROCESS_NOT_FOUND = 'process_not_found'  # 启动时进程就不存在或无法访问
     PID_REUSED = 'pid_reused'                # 启动时发现所选 PID 已被另一个进程占用
     INTERNAL_ERROR = 'internal_error'        # 监控线程内部未预期异常
+    CRASHED = 'crashed'                      # 被测进程异常退出（退出码为 NTSTATUS 异常码等），且未续接或续接次数已用完
 
 
 class UnavailableReason(Enum):
@@ -67,3 +68,11 @@ class TaskInfo:
     target_kind: str = 'pid'
     # 进程组是否出现过因成员名超过上限而没建序列的进程（只在合计里；pid 任务恒为 False）
     members_truncated: bool = False
+    # 被测进程退出后正在等待它重新启动以续接（C-2；线程仍在，status 仍为 RUNNING，与 is_paused 并列）
+    waiting_restart: bool = False
+    # 本任务已续接的次数与上限（上限 0 表示不续接）
+    restart_count: int = 0
+    restart_limit: int = 0
+    # 被测进程最近一次退出的退出码（无符号 32 位）；未退出或没取到为 None。异常退出的任务据此
+    # 在卡片上显示"异常退出：访问冲突 0xC0000005"（文本用 core.exit_forensics.format_exit_code）
+    exit_code: Optional[int] = None

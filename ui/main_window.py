@@ -43,6 +43,20 @@ import config
 
 logger = logging.getLogger(__name__)
 
+# 退出确认里的提示：磁盘已满时数据只能留在内存，退出后还写不进去就丢了
+TEXT_UNSAVED_DATA = "有 {count} 条因磁盘已满未写入的数据，退出后将丢失"
+
+
+# 托盘"退出"与"安装更新并退出"没有关窗确认：有这类数据时单独确认一次
+QUIT_HELD_TITLE = "确认退出"
+QUIT_HELD_CONTENT = "{notice}。仍要退出吗？"
+QUIT_HELD_CONFIRM = "仍然退出"
+
+
+def unsaved_data_text(count: int) -> str:
+    """磁盘已满而留在内存的数据点数 → 退出确认里的那一句；没有未写入的数据为空串。"""
+    return TEXT_UNSAVED_DATA.format(count=count) if count > 0 else ""
+
 # 窗口宽度达到该值时侧栏展开显示文字，窄于它时收成图标栏
 NAV_EXPAND_MIN_WIDTH = 1200
 NAV_EXPAND_WIDTH = 150
@@ -87,6 +101,8 @@ class MainWindow(FluentWindow):
         # 界面提示的 StorageNotices：真退出收尾前同样要先停守卫
         self.storage_guard = None
         self.storage_notices: Optional[StorageNotices] = None
+        # 会话锁（组合根创建后交给这里）：真退出收尾走完后删除，下次启动据此判断上次是否正常退出
+        self.session_lock = None
 
         # 托盘驻留相关状态：必须在 _init_tray()/closeEvent 用到之前初始化完毕。
         # - _really_quit：托盘菜单"退出"、设置页"立即安装"与会话结束会置 True，
@@ -103,6 +119,8 @@ class MainWindow(FluentWindow):
         self._really_quit = False
         self._session_ending = False
         self._shutdown_started = False
+        # 更新安装前（启动安装程序之前）已确认过可以退出：quit_for_install 不再重复问
+        self._install_exit_confirmed = False
         self.tray: Optional[TrayController] = None
         self._tray_tip_shown = False
         # 真退出收尾期间报告过的进度文案（按顺序；供日志与测试核对）
@@ -139,6 +157,7 @@ class MainWindow(FluentWindow):
         self.about_group.update_available_silent.connect(self._on_update_available_silent)
         # "立即安装"：安装向导已启动，主程序必须真退出释放文件占用
         self.about_group.install_requested.connect(self.quit_for_install)
+        self.about_group.exit_guard = self._confirm_install_exit
 
         # 启动3秒后静默检查更新（对齐参考实现，避免阻塞启动）
         QTimer.singleShot(3000, lambda: self.about_group.check_update(silent=True))
@@ -312,6 +331,19 @@ class MainWindow(FluentWindow):
         except Exception:
             logger.warning("停止界面看门狗失败", exc_info=True)
 
+    def attach_session_lock(self, lock) -> None:
+        """组合根写好会话锁后交给主窗口：真退出收尾完成后由它删除。"""
+        self.session_lock = lock
+
+    def _release_session_lock(self) -> None:
+        lock = self.session_lock
+        if lock is None:
+            return
+        try:
+            lock.release()
+        except Exception:
+            logger.warning("删除会话锁失败", exc_info=True)
+
     def attach_storage_guard(self, guard) -> None:
         """组合根创建存储守卫后交给主窗口（在 guard.start() 之前调用，首次检查才不会错过
         提示）：磁盘空间提示、暂停原因标注、完整性警告都经 StorageNotices 显示；真退出时先停它。"""
@@ -407,19 +439,50 @@ class MainWindow(FluentWindow):
     def _quit_from_tray(self) -> None:
         """托盘菜单"退出"：置真退出标志后走正常关闭流程（与 quit_for_install
         走同一条真退出路径）"""
+        if not self._confirm_quit_with_held_data():
+            return
         self._really_quit = True
         self.close()
 
     def request_quit(self) -> None:
-        """命令行 quit（IPC）：与托盘菜单"退出"走同一条真退出路径。"""
-        self._quit_from_tray()
+        """命令行 quit（IPC）：与托盘菜单"退出"走同一条真退出路径。没有人可以确认，
+        有因磁盘已满未写入的数据时只记 WARNING。"""
+        self._warn_held_data_on_quit("命令行 quit")
+        self._really_quit = True
+        self.close()
 
     def quit_for_install(self) -> None:
         """更新安装流程（install_requested）：无论"关闭时最小化到托盘"是否
         开启，都必须走真退出路径——否则该开关开启时，安装向导已经启动，主程序却被
-        closeEvent 的隐藏分支拦截、常驻托盘继续占用文件，导致覆盖安装因文件占用而失败。"""
+        closeEvent 的隐藏分支拦截、常驻托盘继续占用文件，导致覆盖安装因文件占用而失败。
+
+        有因磁盘已满未写入的数据时，启动安装程序之前就已经确认过（about_group.exit_guard，
+        用户取消则根本不会启动安装程序）；直接调用（没经过那一步）时在这里补一次确认。"""
+        confirmed, self._install_exit_confirmed = self._install_exit_confirmed, False
+        if not confirmed and not self._confirm_quit_with_held_data():
+            return
         self._really_quit = True
         self.close()
+
+    def _confirm_install_exit(self) -> bool:
+        """about_group.exit_guard：启动安装程序之前确认能否退出（取消则不启动安装程序）。"""
+        self._install_exit_confirmed = self._confirm_quit_with_held_data()
+        return self._install_exit_confirmed
+
+    def _confirm_quit_with_held_data(self) -> bool:
+        """退出前确认：有因磁盘已满留在内存里、退出后会丢失的数据时让用户确认，取消返回
+        False；没有这类数据直接返回 True。"""
+        notice = self._unsaved_data_notice()
+        if not notice:
+            return True
+        return bool(self.services.dialogs.confirm(
+            self, QUIT_HELD_TITLE, QUIT_HELD_CONTENT.format(notice=notice), QUIT_HELD_CONFIRM))
+
+    def _warn_held_data_on_quit(self, reason: str) -> None:
+        """无法交互的退出路径（会话结束、命令行 quit）：只把会丢失的数据记进 WARNING 日志。"""
+        notice = self._unsaved_data_notice()
+        if notice:
+            logger.warning("%s退出：%s", reason, notice)
 
     def _on_commit_data_request(self, session_manager=None) -> None:
         """系统会话即将结束（注销/关机）：置真退出标志并直接 close()。
@@ -432,6 +495,7 @@ class MainWindow(FluentWindow):
             # 已由托盘退出/立即安装置位时不标记为会话结束，免得窗口重新显示时被复位
             self._really_quit = True
             self._session_ending = True
+            self._warn_held_data_on_quit("会话结束（注销 / 关机）")
         self.close()
 
     def _on_update_available_silent(self, info: dict) -> None:
@@ -478,9 +542,23 @@ class MainWindow(FluentWindow):
             'quit'（停止监控并退出）/ 'tray'（最小化到托盘）/ 'cancel'（取消关闭）。
             对话框经由注入的 services.dialogs；保留为薄方法，测试也可直接替换它。
         """
+        notice = self._unsaved_data_notice()
+        extra = {'notice': notice} if notice else {}
         return self.services.dialogs.ask_close_action(
             self, self.monitor_manager.running_task_count(),
-            self._tray_available())
+            self._tray_available(), **extra)
+
+    def _unsaved_data_notice(self) -> str:
+        """磁盘已满、数据只留在内存里时的退出提示；没有这种数据为空串。"""
+        reader = getattr(self.monitor_manager, 'held_point_count', None)
+        if reader is None:
+            return ""
+        try:
+            held = int(reader())
+        except Exception:
+            logger.warning("读取未写入的数据条数失败", exc_info=True)
+            return ""
+        return unsaved_data_text(held)
 
     def _hide_to_tray(self, event) -> None:
         """隐藏到托盘：不停止任务、不做任何清理，忽略本次关闭事件。"""
@@ -509,7 +587,11 @@ class MainWindow(FluentWindow):
         self.hide()
         coordinator = ShutdownCoordinator(
             self.monitor_manager, self.services.threads, db=self.db)
-        ok = coordinator.run(on_progress=self._on_shutdown_progress)
+        try:
+            ok = coordinator.run(on_progress=self._on_shutdown_progress)
+        finally:
+            # 收尾走完（或中途异常、超时）后删锁：任务已停、数据库已关，此刻起算"正常退出"
+            self._release_session_lock()
         if not ok:
             logger.error("退出收尾未在期限内全部完成，详见上方日志")
         return ok

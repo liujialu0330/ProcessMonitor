@@ -43,6 +43,12 @@ ShutdownCoordinator 收尾后退出，退出码 0。
 退出收尾（停任务、等线程、关闭数据库）只在主窗口的真退出路径里经 ShutdownCoordinator
 做一次，这里不再重复关闭数据库。
 
+会话锁与续采：build_context 在启动校正之前读数据目录里的 session.lock，判断上次是否异常结束
+（core.session_lock）；异常结束且库里仍有 running 任务、被测进程还活着时，这些任务不被校正，
+留在 AppContext.recovery_candidates 里，由 run_recovery 在窗口显示后弹"继续监控"对话框
+（--resume-tasks 不弹窗、全部续采；无窗口模式没有该参数时不续采、照常收尾并记日志）。锁在
+校正之后写入，所有正常退出路径收尾完成后删除（主窗口真退出、无窗口 quit、事件循环结束兜底）。
+
 build_context() 是第 7~9 步（未传入迁移报告时先在这里同步迁移），不涉及 QApplication 与
 窗口，测试可直接用临时目录调用。
 """
@@ -60,6 +66,8 @@ from app.paths import (
 
 if TYPE_CHECKING:
     from core.maintenance_service import MaintenanceService, ReconcileResult
+    from core.session_lock import PreviousSession, SessionLock
+    from core.session_recovery import RecoveryCandidate
     from core.monitor_manager import MonitorManager
     from core.power_guard import PowerGuard
     from core.self_monitor import SelfMonitor
@@ -85,6 +93,8 @@ EXIT_AUTOMATION_DISABLED = 0
 # 无窗口模式的命令行参数
 BACKGROUND_ARG = "--background"
 IDLE_EXIT_ARG = "--idle-exit-s"
+# 上次异常退出时：不弹对话框，全部可续采的任务直接续采（脚本 / 无窗口模式用）
+RESUME_ARG = "--resume-tasks"
 # 启动阶段计时：各阶段耗时写一条 INFO 日志
 STARTUP_TRACE_ARG = "--startup-trace"
 # 自身监控的采样间隔（毫秒）
@@ -138,6 +148,12 @@ class AppContext:
     # 存储守卫：磁盘空间、-wal 兜底 checkpoint、后台 quick_check（build_context 创建，
     # start_storage_guard 启动；有窗口与无窗口模式都用）
     storage_guard: Optional["StorageGuard"] = None
+    # 会话锁（数据目录下的 session.lock）：build_context 写入，正常退出路径收尾后删除
+    session_lock: Optional["SessionLock"] = None
+    # 启动时对上次运行的判断（None 表示没做判断：只读库等）
+    previous_session: Optional["PreviousSession"] = None
+    # 上次异常退出时仍可续采的任务（被测进程还活着）；run_recovery 处理后清空
+    recovery_candidates: Tuple["RecoveryCandidate", ...] = ()
 
     @property
     def hub(self):
@@ -193,8 +209,36 @@ def build_context(paths: AppPaths, *, registry=None,
     if retention_days is None:
         from app_config import cfg
         retention_days = cfg.get(cfg.retention_days)
+
+    # 会话锁：残留且记录的进程已不在 = 上次异常退出，此时被测进程还活着的 running 任务先
+    # 留着、等用户决定是否续采；只读库不写锁也不续采
+    from core.session_lock import PreviousSession, SessionLock
+    from core.session_recovery import find_recoverable
+    session_lock = SessionLock(paths.data_dir)
+    previous: Optional[PreviousSession] = None
+    candidates: Tuple["RecoveryCandidate", ...] = ()
+    if not read_only:
+        previous = session_lock.check_previous()
+        if previous is PreviousSession.ABNORMAL:
+            candidates = tuple(find_recoverable(db))
     # 必须在任何监控任务启动之前；此时 manager 刚构造，还没有任务
-    reconcile = maintenance.startup_reconcile(retention_days, legacy_importer=legacy_importer)
+    if previous in (PreviousSession.OTHER_INSTANCE, PreviousSession.UNKNOWN):
+        # 另一个实例仍在运行（或探测权限不足、无法排除它在运行，如上一个实例以管理员身份运行）：
+        # 库里"运行中"的任务可能是它正在跑的，校正会把它们收尾成已停止（还会清理它在写的数据），
+        # 整个启动校正跳过
+        if previous is PreviousSession.OTHER_INSTANCE:
+            logger.warning("数据目录的会话锁属于仍在运行的另一个实例，跳过启动校正")
+        else:
+            logger.warning("数据目录的会话锁属于一个无法确认是否仍在运行的进程（探测权限不足），"
+                           "跳过启动校正")
+        from core.maintenance_service import ReconcileResult
+        reconcile = ReconcileResult(orphans=0, recounted=0, cleaned=0)
+    else:
+        reconcile = maintenance.startup_reconcile(
+            retention_days, legacy_importer=legacy_importer,
+            protect_task_ids=[c.task_id for c in candidates])
+    if not read_only:
+        session_lock.acquire()
 
     if registry is None:
         registry = ThreadRegistry()
@@ -210,7 +254,8 @@ def build_context(paths: AppPaths, *, registry=None,
     return AppContext(paths=paths, db=db, manager=manager, services=services,
                       registry=registry, maintenance=maintenance, reconcile=reconcile,
                       power_guard=power_guard, self_monitor=SelfMonitor(),
-                      storage_guard=storage_guard)
+                      storage_guard=storage_guard, session_lock=session_lock,
+                      previous_session=previous, recovery_candidates=candidates)
 
 
 def schema_not_upgraded(report: "MigrationReport") -> bool:
@@ -424,14 +469,14 @@ def _parse_idle_exit(argv: List[str]) -> float:
 
 
 def strip_background_args(argv: List[str]) -> List[str]:
-    """去掉 --background 与 --idle-exit-s（及其值）后的命令行参数（交给 QApplication）"""
+    """去掉 --background、--resume-tasks 与 --idle-exit-s（及其值）后的命令行参数（交给 QApplication）"""
     result: List[str] = []
     skip_next = False
     for i, arg in enumerate(argv):
         if skip_next:
             skip_next = False
             continue
-        if i > 0 and arg == BACKGROUND_ARG:
+        if i > 0 and arg in (BACKGROUND_ARG, RESUME_ARG):
             continue
         if i > 0 and arg == IDLE_EXIT_ARG:
             skip_next = True
@@ -486,6 +531,57 @@ def start_self_monitor(ctx: AppContext, interval_ms: int = SELF_MONITOR_INTERVAL
     return timer
 
 
+def run_recovery(ctx: AppContext, *, auto_marker=None, prompt=None,
+                 resume_all: bool = False):
+    """处理上次异常退出遗留的可续采任务（只处理一次）。
+
+    Args:
+        ctx: 组合根上下文（recovery_candidates 为空时什么都不做）
+        auto_marker: 自动打点服务：续采前按库里的方案重新挂接
+        prompt: 询问用户的函数 candidates -> 选中的任务 ID 列表（有窗口模式传对话框）；
+            None 表示没有界面可问（无窗口模式）
+        resume_all: 不询问，全部续采（--resume-tasks）
+
+    Returns:
+        RecoveryOutcome；没有候选任务返回 None
+    """
+    from core.session_recovery import apply_decision, close_all
+    candidates = ctx.recovery_candidates
+    if not candidates:
+        return None
+    ctx.recovery_candidates = ()
+    if resume_all:
+        selected = [c.task_id for c in candidates]
+    elif prompt is not None:
+        try:
+            selected = list(prompt(candidates))
+        except Exception:
+            logger.error("续采确认出错，按放弃处理", exc_info=True)
+            selected = []
+    else:
+        # 没有界面可问：不擅自续采，照常收尾；想续采的脚本用 --resume-tasks
+        outcome = close_all(ctx.db, candidates)
+        logger.info("上次异常退出，有 %d 个任务的被测进程仍在运行，但当前无法询问，已按结束处理"
+                    "（需要续采请使用 %s）: %s", len(candidates), RESUME_ARG,
+                    ", ".join(t[:8] for t in outcome.abandoned))
+        return outcome
+    outcome = apply_decision(ctx.manager, ctx.db, candidates, selected, auto_marker=auto_marker)
+    logger.info("续采结果: 续采 %d 个，放弃 %d 个，失败 %d 个", len(outcome.resumed),
+                len(outcome.abandoned), len(outcome.failed))
+    return outcome
+
+
+def release_session_lock(ctx: AppContext) -> None:
+    """删除会话锁（正常退出路径的收尾；可重复调用，出错只记日志）。"""
+    lock = ctx.session_lock
+    if lock is None:
+        return
+    try:
+        lock.release()
+    except Exception:
+        logger.warning("删除会话锁失败", exc_info=True)
+
+
 def start_storage_guard(ctx: AppContext, window=None) -> None:
     """启动存储守卫的定时检查。有窗口模式先让主窗口接上守卫的信号（提示与卡片标注），再启动，
     首次检查才不会错过任何提示；无窗口模式不连界面，守卫只记日志。没有守卫时什么都不做。"""
@@ -522,6 +618,24 @@ def _report_trace(trace) -> None:
         logger.info("%s", trace.report().rstrip())
 
 
+def _schedule_recovery(ctx: AppContext, window, *, resume_all: bool = False) -> None:
+    """窗口显示后（事件循环里）处理可续采的任务：先让主窗口画出来再弹对话框。
+    没有候选任务时什么都不做。"""
+    if not ctx.recovery_candidates:
+        return
+    from PyQt5.QtCore import QTimer
+    from ui.dialogs.recover_dialog import default_prompt
+
+    def _go() -> None:
+        try:
+            run_recovery(ctx, auto_marker=window.monitor_page.presenter.auto_marker,
+                         prompt=default_prompt(window), resume_all=resume_all)
+        except Exception:
+            logger.error("处理续采任务失败", exc_info=True)
+
+    QTimer.singleShot(0, _go)
+
+
 def _attach_ipc_to_window(guard, ctx: AppContext, window) -> None:
     """有窗口模式：把命令处理器的上下文交给 IPC。自动打点服务用监控页 Presenter 持有的
     那一份（全程只有一个），quit 等价于托盘"退出"。守卫没有处理器（监听失败、测试替身）
@@ -536,17 +650,20 @@ def _attach_ipc_to_window(guard, ctx: AppContext, window) -> None:
         manager=ctx.manager, db=ctx.db, auto_marker=presenter.auto_marker,
         registry=ctx.registry, clock=ctx.services.clock, quit=window.request_quit,
         report_renderer=render_report_image_for_ipc,
-        launcher=getattr(ctx.services, "launcher", None)))
+        launcher=getattr(ctx.services, "launcher", None),
+        log_path=getattr(ctx.services, "log_path", None)))
     logger.info("命令行控制已就绪（有窗口模式）")
 
 
 def _run_headless(app, guard, paths: AppPaths, idle_exit_s: float, *,
-                  exit_process: Callable[[int], None], trace=None) -> int:
+                  exit_process: Callable[[int], None], trace=None,
+                  argv: Optional[List[str]] = None) -> int:
     """
     无窗口模式（--background）：加载配置 → 同步迁移 → build_context → HeadlessRuntime
     → 把上下文交给 IPC → 事件循环。不导入 ui.main_window，不建窗口、托盘与全局快捷键；
     迁移不显示进度窗口（没有窗口可依附，pmctl 会一直等到就绪或超时）。
     """
+    argv = argv if argv is not None else []
     from app_config import load_app_config
     from core.headless import HeadlessRuntime
     from core.ipc.commands import CommandContext
@@ -570,15 +687,19 @@ def _run_headless(app, guard, paths: AppPaths, idle_exit_s: float, *,
         ctx.manager, ctx.registry, ctx.db, idle_exit_s=idle_exit_s,
         busy=(dispatcher.has_pending if dispatcher is not None else None),
         stage_renderer=render_stage_snapshot_image,
-        quit_hooks=([ctx.storage_guard.stop] if ctx.storage_guard is not None else []))
+        quit_hooks=([ctx.storage_guard.stop] if ctx.storage_guard is not None else []),
+        exit_hooks=[lambda: release_session_lock(ctx)])
     if dispatcher is not None:
         dispatcher.set_settings(command_settings())
         dispatcher.set_context(CommandContext(
             manager=ctx.manager, db=ctx.db, auto_marker=runtime.auto_marker,
             registry=ctx.registry, clock=ctx.services.clock, quit=runtime.quit,
             report_renderer=render_report_image_for_ipc, handle_auto_export=True,
-            launcher=getattr(ctx.services, "launcher", None)))
+            launcher=getattr(ctx.services, "launcher", None),
+            log_path=getattr(ctx.services, "log_path", None)))
     runtime.start()
+    run_recovery(ctx, auto_marker=runtime.auto_marker, prompt=None,
+                 resume_all=RESUME_ARG in argv[1:])
     start_self_monitor(ctx)
     start_storage_guard(ctx)
     logger.info("无窗口模式已就绪（空闲退出：%s）",
@@ -588,6 +709,7 @@ def _run_headless(app, guard, paths: AppPaths, idle_exit_s: float, *,
 
     exit_code = app.exec_()
     logger.info("无窗口模式退出，退出码=%d", exit_code)
+    release_session_lock(ctx)
     exit_process(exit_code)
     return exit_code
 
@@ -686,7 +808,7 @@ def run(argv: List[str], *, exit_process: Callable[[int], None] = os._exit,
             logger.error("无窗口模式无法开始 IPC 监听，退出（否则没有办法控制或结束它）")
             return EXIT_IPC_UNAVAILABLE
         return _run_headless(app, guard, paths, idle_exit_s, exit_process=exit_process,
-                             trace=trace)
+                             trace=trace, argv=argv)
 
     _apply_preferences(app, paths)
     _mark(trace, "配置与主题")
@@ -711,6 +833,7 @@ def run(argv: List[str], *, exit_process: Callable[[int], None] = os._exit,
     window = MainWindow(ctx.db, ctx.manager, ctx.services, hotkey=hotkey,
                         diagnostics_provider=lambda: ctx)
     ctx.window = window
+    window.attach_session_lock(ctx.session_lock)
     _mark(trace, "主窗口")
     window.show()
     _mark(trace, "显示")
@@ -719,6 +842,7 @@ def run(argv: List[str], *, exit_process: Callable[[int], None] = os._exit,
     start_storage_guard(ctx, window)
     guard.activation_requested.connect(lambda: activate_main_window(window))
     _attach_ipc_to_window(guard, ctx, window)
+    _schedule_recovery(ctx, window, resume_all=RESUME_ARG in argv[1:])
     hint = sync_dir_hint(paths.data_dir)
     if hint:
         logger.warning("%s: %s", hint, paths.data_dir)
@@ -727,6 +851,9 @@ def run(argv: List[str], *, exit_process: Callable[[int], None] = os._exit,
     _report_trace(trace)
 
     exit_code = app.exec_()
+
+    # 真退出路径里主窗口已删过会话锁；事件循环因其他原因正常结束时在这里兜底
+    release_session_lock(ctx)
 
     # 主窗口收尾时已尽力停止后台线程，但仍可能有线程没能在期限内停下（如下载线程
     # 阻塞在 urlopen() 的 connect() 阶段，取消标志只在读取循环里检查）。走 Python

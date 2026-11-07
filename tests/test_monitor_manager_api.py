@@ -770,6 +770,9 @@ def test_task_info_snapshot_fields_and_status_lifecycle(manager):
     collector = _SlowCollector(gate)
     collector.get_create_time = lambda: 1234.5   # 与所选进程一致，正常采集
     manager.get_task(task_id).collector = collector
+    # 假创建时间不能拿去和真实进程的句柄核对
+    from core.exit_forensics import NullExitCodeProbe
+    manager.get_task(task_id)._exit_probe_factory = lambda pid: NullExitCodeProbe()
     assert manager.start_task(task_id) is True
     assert collector.entered.wait(5)
     running = manager.get_task_info(task_id)

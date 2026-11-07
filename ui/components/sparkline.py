@@ -17,7 +17,7 @@ from PyQt5.QtCore import Qt, QPointF
 from PyQt5.QtGui import QPainter, QPen, QPolygonF
 from PyQt5.QtWidgets import QWidget, QSizePolicy
 
-from ui.theme_tokens import ATTENTION, DATA, qcolor
+from ui.theme_tokens import ATTENTION, DATA, EVENT_MARKER_COLORS, qcolor
 
 # 最小跨度规则按指标 kind 定义在 utils.metrics；常量在此再导出，保持原有导入路径可用
 from utils.metrics import (  # noqa: F401
@@ -38,8 +38,10 @@ DEFAULT_MAX_POINTS = 240
 LINE_COLOR = DATA
 TICK_COLOR = ATTENTION
 
-# 画在迷你图上的打点类型：暂停/恢复系统打点不画，小图上只留用户关心的轮次边界
-TICK_KINDS = ('baseline', 'user')
+# 画在迷你图上的打点类型：暂停/恢复系统打点不画，小图上只留用户关心的轮次边界与系统事件
+# （被测进程异常退出 / 重启续接 / 工具重启后续采，点划线，颜色与分析页图表一致）
+EVENT_TICK_KINDS = tuple(EVENT_MARKER_COLORS)
+TICK_KINDS = ('baseline', 'user') + EVENT_TICK_KINDS
 
 
 def merge_pairs(values: Sequence[float]) -> List[float]:
@@ -149,6 +151,23 @@ def compute_y_range(
         low = middle - required / 2.0
         high = middle + required / 2.0
     return low, high
+
+
+def tick_pen(kind: str) -> QPen:
+    """打点刻度的画笔：基线实线，普通打点虚线，系统事件（异常退出 / 重启 / 续采）点划线并取各自
+    语义色，让它们在迷你图上一眼与用户打点区分开。"""
+    if kind in EVENT_TICK_KINDS:
+        pen = QPen(qcolor(EVENT_MARKER_COLORS[kind]))
+        pen.setWidthF(1.5)
+        pen.setStyle(Qt.DashDotLine)
+        return pen
+    pen = QPen(qcolor(TICK_COLOR))
+    if kind == 'baseline':
+        pen.setWidthF(1.5)
+    else:
+        pen.setWidthF(1.0)
+        pen.setStyle(Qt.DashLine)
+    return pen
 
 
 class SparklineWidget(QWidget):
@@ -276,18 +295,12 @@ class SparklineWidget(QWidget):
         painter.end()
 
     def _paint_ticks(self, painter: QPainter, width: int, height: int) -> None:
-        """打点刻度：基线注意色实线，普通打点注意色虚线，贯穿整个高度。"""
+        """打点刻度：基线注意色实线，普通打点注意色虚线，系统事件各自的语义色点划线，
+        都贯穿整个高度。"""
         positions = self.tick_positions()
         if not positions:
             return
-        color = qcolor(TICK_COLOR)
         for fraction, kind in positions:
-            pen = QPen(color)
-            if kind == 'baseline':
-                pen.setWidthF(1.5)
-            else:
-                pen.setWidthF(1.0)
-                pen.setStyle(Qt.DashLine)
-            painter.setPen(pen)
+            painter.setPen(tick_pen(kind))
             x = min(max(fraction * width, 0.5), max(width - 0.5, 0.5))
             painter.drawLine(QPointF(x, 0), QPointF(x, height))

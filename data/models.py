@@ -71,6 +71,15 @@ class MonitorTask:
     # save() 只在插入时写入
     target_kind: str = 'pid'
     target_spec: Optional[str] = None
+    # 被测进程最近一次退出的退出码（无符号 32 位；没取到或仍在运行为 None），只经
+    # TaskRepo.save_stop 写入，save() 不碰它
+    exit_code: Optional[int] = None
+    # 任务的停止原因（StopReason 的值，如 'crashed'）。存在 meta_json 的 "stop" 键里（不另开列），
+    # 由 TaskRepo.save_stop 写入；没有记录（旧任务、仍在运行、异常中止）为 None
+    stop_reason: Optional[str] = None
+    # 被测进程退出后续接同一任务的策略（由 TaskRepo.save_plan 随方案同步；上限 0 表示不续接）
+    resume_on_restart: bool = False
+    restart_limit: int = 0
 
     def is_running(self) -> bool:
         """判断任务是否正在运行"""

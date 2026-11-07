@@ -187,8 +187,11 @@ def test_layout_order_puts_conclusions_and_intervals_first(loaded):
     page, _task = loaded
     layout = page.body.layout()
     order = [layout.itemAt(i).widget() for i in range(layout.count())]
-    assert order == [page.verdict_banner, page.summary_table, page.compare_panel,
-                     page.lower_views, page.trend_panel]
+    assert order == [page.verdict_banner, page.summary_table, page.member_panel,
+                     page.compare_panel, page.lower_views, page.trend_panel]
+    # pid 任务没有成员结论与成员下拉
+    assert not page.member_panel.isVisible()
+    assert not page.toolbar.members_visible()
     # 焦点区：区间 | 采集明细页签在焦点大图之上
     trend = page.trend_panel
     assert trend.layout().indexOf(trend.focus_chart) < trend.layout().indexOf(trend.overview)

@@ -238,6 +238,7 @@ class FakeBoard(QObject):
         super().__init__()
         self.cards: Dict[str, FakeCard] = {}
         self.finished: Dict[str, tuple] = {}
+        self.exit_codes: Dict[str, Optional[int]] = {}
         self.counts = None
         self.waiting: Dict[str, tuple] = {}
 
@@ -258,8 +259,9 @@ class FakeBoard(QObject):
     def card(self, task_id):
         return self.cards.get(task_id)
 
-    def finish_card(self, task_id, reason, end_time):
+    def finish_card(self, task_id, reason, end_time, exit_code=None):
         self.finished[task_id] = (reason, end_time)
+        self.exit_codes[task_id] = exit_code
 
     def set_counts(self, running, limit):
         self.counts = (running, limit)

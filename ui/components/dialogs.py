@@ -81,7 +81,7 @@ class CloseActionDialog(MessageBoxBase):
     exec() 为真（点"最小化到托盘"或"停止监控并退出"）时，choice 给出具体选择。
     """
 
-    def __init__(self, running_count: int, can_tray: bool, parent=None):
+    def __init__(self, running_count: int, can_tray: bool, parent=None, notice: str = ""):
         super().__init__(parent)
         # 主按钮只在托盘可用时显示，exec() 为真且未点退出即为"最小化到托盘"
         self.choice = 'tray' if can_tray else 'cancel'
@@ -94,6 +94,13 @@ class CloseActionDialog(MessageBoxBase):
         body = BodyLabel(hint, self)
         body.setWordWrap(True)
         self.viewLayout.addWidget(body)
+        if notice:
+            # 退出会丢失数据之类的警示：单独一段，不与常规说明混在一起
+            warning = BodyLabel(notice, self)
+            warning.setWordWrap(True)
+            warning.setObjectName('closeNotice')
+            self.notice_label = warning
+            self.viewLayout.addWidget(warning)
 
         self.cancelButton.setText("取消")
 

@@ -49,6 +49,10 @@ class _TaskCombo(ComboBox):
         return _TooltipComboMenu(self.item_tooltips, self)
 
 
+# 带逐项提示的下拉（分析页的成员下拉复用）：item_tooltips 与选项一一对应
+TooltipCombo = _TaskCombo
+
+
 class TaskSelector(QWidget):
     """任务下拉：set_options 填充、select_by_id 程序选中、task_selected 通知选择。
 

@@ -6,6 +6,15 @@
 
 卡片只负责显示：基线值由 MonitorPresenter 按"基线打点之后 5 个样本的中位数"
 算好后交给卡片；"现在几点"也由 Presenter 经注入的时钟传入，卡片不自己读系统时间。
+
+进程组任务（进程树 / 同名进程）：身份行写目标类型（"进程树 · 根 PID 1234"、"同名进程"），
+指标格显示合计值，身份行下多一行成员摘要（进程树"成员 3 种 · 共 7 个进程"，悬停列出各成员的实例数；
+同名进程只有一种成员，写"共 7 个进程"；进程树成员种类超限时提示超出部分只计入合计），成员由
+Presenter 经 set_members 交给卡片。
+
+被测进程退出后等它重启并续接：状态胶囊写"等待重启（第 2/3 次）"（警示色），暂停按钮置灰；续接成功
+后 PID 换成新的（set_pid）。因被测进程异常退出（StopReason.CRASHED）而结束的卡片，已结束行写
+"异常退出：访问冲突 0xC0000005"。
 """
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -24,8 +33,11 @@ from qfluentwidgets.common.icon import FluentIconBase, SvgIconEngine, drawSvgIco
 from core.contracts import StopReason, UnavailableReason
 from ui import theme_tokens as tokens
 from ui.components.sparkline import SparklineWidget
+from data.models import TARGET_NAME, TARGET_PID
 from ui.formatting import (
-    is_abnormal_stop, stop_reason_text, task_status_text, truncate_text, unavailable_reason_text,
+    MEMBERS_TRUNCATED_TEXT, is_abnormal_stop, members_summary_text, members_tooltip,
+    stop_detail_text, target_identity_text, task_status_text, truncate_text,
+    unavailable_reason_text, waiting_restart_text,
 )
 from ui.typography import DataCaptionLabel, MetricValueLabel
 from utils.metrics import (
@@ -40,6 +52,7 @@ from utils.metrics import (
 STATUS_RUNNING = 'running'
 STATUS_PAUSED = 'paused'
 STATUS_STOPPING = 'stopping'
+STATUS_WAITING_RESTART = 'waiting_restart'    # 被测进程已退出，等它重新启动后续接
 STATUS_FINISHED = 'finished'      # 用户停止（正常结束）
 STATUS_ABNORMAL = 'abnormal'      # 被测进程退出、内部错误等（异常结束）
 
@@ -47,6 +60,7 @@ STATUS_STYLES = {
     STATUS_RUNNING: (task_status_text(True), *tokens.colors(tokens.SUCCESS)),
     STATUS_PAUSED: (task_status_text(True, paused=True), *tokens.colors(tokens.CAUTION)),
     STATUS_STOPPING: ("正在停止…", *tokens.colors(tokens.TERTIARY)),
+    STATUS_WAITING_RESTART: (waiting_restart_text(0, 0), *tokens.colors(tokens.CAUTION)),
     STATUS_FINISHED: (task_status_text(False), *tokens.colors(tokens.TERTIARY)),
     STATUS_ABNORMAL: (task_status_text(False, abnormal=True), *tokens.colors(tokens.CRITICAL)),
 }
@@ -64,6 +78,9 @@ PAUSE_TOOLTIP = "暂停采集（会记一个暂停打点），恢复后继续记
 MARKER_TOOLTIP = "记下当前时刻（默认名称依次为：基线、第 1 轮、第 2 轮…）"
 ANALYSIS_TOOLTIP = "查看本任务的趋势与各轮增量"
 RESTART_TOOLTIP = "按进程名查找进程，并以相同的指标、间隔和备注新建任务"
+WAITING_RESTART_TOOLTIP = ("被测进程已退出，正在等它重新启动（每秒查找一次同名同路径的进程）；"
+                           "找到后在这个任务里继续记录，达到续接次数上限则按退出原因结束")
+WAITING_PAUSE_TOOLTIP = "等待被测进程重启期间没有数据可暂停"
 
 # 指标格列数随卡片宽度在 [MIN, MAX] 之间自适应；每格至少 CELL_MIN_WIDTH 宽
 MIN_VALUE_COLUMNS = 3
@@ -247,7 +264,8 @@ class TaskCard(CardWidget):
 
     def __init__(self, task_id: str, process_name: str, pid: int,
                  metric_types: List[str], parent=None, *,
-                 interval: Optional[float] = None, note: str = ''):
+                 interval: Optional[float] = None, note: str = '',
+                 target_kind: str = TARGET_PID, members_truncated: bool = False):
         """
         初始化任务卡片
 
@@ -259,6 +277,8 @@ class TaskCard(CardWidget):
             parent: 父窗口
             interval: 采集间隔（秒），用于身份行显示与"同配置再测"时沿用
             note: 测试备注
+            target_kind: 监控目标类型（pid / tree / name）；后两者是进程组任务，多一行成员摘要
+            members_truncated: 进程组成员种类是否已超限（超出部分只计入合计）
         """
         super().__init__(parent)
 
@@ -268,6 +288,11 @@ class TaskCard(CardWidget):
         self.metric_types = list(metric_types)
         self.interval = interval
         self.note = note or ''
+        self.target_kind = target_kind or TARGET_PID
+        # 同名进程永远只有一种成员名，不会因成员种类超限而截断
+        self.members_truncated = bool(members_truncated) and self.target_kind != TARGET_NAME
+        # 最近一次交给卡片的成员快照（Presenter 经 set_members 更新）
+        self._members: tuple = ()
 
         # 指标格与其中的值/变化量标签 {指标类型: 控件}
         self.cells: Dict[str, MetricCell] = {}
@@ -290,6 +315,13 @@ class TaskCard(CardWidget):
         self.now: Optional[datetime] = None
         self.finished_at: Optional[datetime] = None
         self.stop_reason: Optional[StopReason] = None
+
+        # 被测进程退出后等它重启并续接的状态（Presenter 经 set_waiting_restart 更新）：
+        # 已续接次数、允许的上限与最近一次退出的退出码
+        self.waiting_restart = False
+        self.restart_count = 0
+        self.restart_limit = 0
+        self.exit_code: Optional[int] = None
 
         # 采集次数：UI 内存计数，卡片创建时置 0，每次收到 data_updated 加 1，
         # 不查库（当前没有"重启后恢复运行中任务"的路径）
@@ -424,6 +456,23 @@ class TaskCard(CardWidget):
         header_layout.addWidget(self.finished_actions, 0, Qt.AlignRight | Qt.AlignVCenter)
         layout.addLayout(header_layout)
 
+        # 进程组任务：身份行下的成员摘要（pid 任务不显示）；结束后收成一行时一并隐藏
+        self.members_box = QWidget(self)
+        members_layout = QHBoxLayout(self.members_box)
+        members_layout.setContentsMargins(0, 0, 0, 0)
+        members_layout.setSpacing(12)
+        self.members_label = CaptionLabel("", self.members_box)
+        self.members_label.setMinimumWidth(1)
+        members_layout.addWidget(self.members_label)
+        self.members_hint_label = CaptionLabel(MEMBERS_TRUNCATED_TEXT, self.members_box)
+        self.members_hint_label.setTextColor(*tokens.colors(tokens.CAUTION))
+        self.members_hint_label.setMinimumWidth(1)
+        members_layout.addWidget(self.members_hint_label)
+        members_layout.addStretch(1)
+        layout.addWidget(self.members_box)
+        self.members_box.setVisible(self.is_group)
+        self._refresh_members_text()
+
         # 中部：指标格，列数随卡片宽度自适应（resizeEvent 里重排）
         self.values_box = QWidget(self)
         self.values_layout = QGridLayout(self.values_box)
@@ -489,6 +538,43 @@ class TaskCard(CardWidget):
         super().resizeEvent(event)
         self._relayout_cells(value_columns_for(event.size().width(), len(self.metric_types)))
 
+    # ========== 进程组成员 ==========
+
+    @property
+    def is_group(self) -> bool:
+        """是否进程组任务（进程树 / 同名进程）。"""
+        return self.target_kind != TARGET_PID
+
+    def set_members(self, members, truncated: bool = False) -> None:
+        """成员快照（MonitorManager.group_members 的结果）与"成员种类超限"标志；内容没变
+        不重画。pid 任务忽略。"""
+        if not self.is_group:
+            return
+        members = tuple(members)
+        truncated = bool(truncated) and self.target_kind != TARGET_NAME
+        key = tuple((m.member_key, m.name, int(m.instance_count)) for m in members)
+        old = tuple((m.member_key, m.name, int(m.instance_count)) for m in self._members)
+        if key == old and truncated == self.members_truncated:
+            return
+        self._members, self.members_truncated = members, truncated
+        self._refresh_members_text()
+
+    def members_text(self) -> str:
+        """成员摘要行的文字，如 "成员 3 种 · 共 7 个进程"（同名进程只写"共 7 个进程"）。"""
+        return self.members_label.text()
+
+    def members_hint_visible(self) -> bool:
+        """"成员种类超限"提示是否显示。"""
+        return not self.members_hint_label.isHidden()
+
+    def _refresh_members_text(self) -> None:
+        text = members_summary_text(self._members, self.target_kind)
+        tooltip = members_tooltip(self._members, self.target_kind)
+        self.members_label.setText(text)
+        self.members_label.setToolTip(tooltip)
+        self.members_hint_label.setVisible(self.members_truncated)
+        self.members_hint_label.setToolTip(tooltip)
+
     # ========== 迷你趋势对象 ==========
 
     def select_trend_metric(self, metric_type: str) -> None:
@@ -506,8 +592,8 @@ class TaskCard(CardWidget):
                 if self.trend_metric else "指标")
         self.sparkline_label.setText(f"{name} · 任务开始至今趋势")
         self.sparkline_label.setToolTip(
-            f"{name}：从任务开始到现在的走势（点多时自动合并抽稀；竖线为打点，实线是基线）。"
-            "点击上方其他指标格可切换")
+            f"{name}：从任务开始到现在的走势（点多时自动合并抽稀；竖线为打点，实线是基线，"
+            "点划线是被测进程异常退出 / 重启续接 / 工具重启后续采）。点击上方其他指标格可切换")
         self.sparkline.setToolTip(f"任务开始至今的趋势（{name}）")
         if self.trend_metric:
             self.trend_delta_label.setText(self.delta_text(self.trend_metric))
@@ -580,7 +666,7 @@ class TaskCard(CardWidget):
         seconds = self.running_seconds()
         interval_text = format_interval(self.interval)
 
-        meta = [f"PID {self.pid}"]
+        meta = [target_identity_text(self.target_kind, self.pid, self.process_name)]
         if not self.is_finished:
             if interval_text:
                 meta.append(interval_text)
@@ -600,7 +686,8 @@ class TaskCard(CardWidget):
             self._refresh_finished_detail()
 
     def _refresh_finished_detail(self) -> None:
-        reason = stop_reason_text(self.stop_reason) if self.stop_reason is not None else ""
+        reason = (stop_detail_text(self.stop_reason, self.exit_code)
+                  if self.stop_reason is not None else "")
         end = self.finished_at
         parts = [p for p in (reason, format_end_time(end, self.now) if end else "") if p]
         parts.append(f"已记录 {self.count} 次")
@@ -621,8 +708,19 @@ class TaskCard(CardWidget):
         self.status = status
         if status == STATUS_PAUSED and self.pause_reason:
             text = f"{text}（{self.pause_reason}）"
+        if status == STATUS_WAITING_RESTART:
+            text = waiting_restart_text(self.restart_count, self.restart_limit)
         self.status_label.setText(f"● {text}")
         self.status_label.setTextColor(light, dark)
+        self.status_label.setToolTip(self._status_tooltip(status))
+
+    def _status_tooltip(self, status: str) -> str:
+        if status != STATUS_WAITING_RESTART:
+            return ""
+        if self.exit_code is None:
+            return WAITING_RESTART_TOOLTIP
+        return (f"{WAITING_RESTART_TOOLTIP}\n"
+                f"上一个进程：{stop_detail_text(StopReason.CRASHED, self.exit_code)}")
 
     # ========== 数据更新 ==========
 
@@ -803,6 +901,45 @@ class TaskCard(CardWidget):
             self.pause_button.setToolTip(self._resume_tooltip())
             self._apply_status(STATUS_PAUSED)
 
+    def set_waiting_restart(self, waiting: bool, restart_count: int = 0, restart_limit: int = 0,
+                            exit_code: Optional[int] = None,
+                            paused: Optional[bool] = None) -> None:
+        """被测进程退出后进入 / 离开"等待重启"：状态胶囊写"等待重启（第 N/M 次）"，等待期间
+        没有数据可暂停，暂停按钮置灰；续接成功或任务结束后恢复。已结束或正在停止的卡片只记数字。
+
+        Args:
+            waiting: 是否正在等待被测进程重启
+            restart_count: 已续接的次数（胶囊上的 N = 这个数 + 1）
+            restart_limit: 允许续接的次数上限（M；0 表示未知，只写"等待重启"）
+            exit_code: 上一个进程的退出码（只放进悬停提示）
+            paused: 离开等待时任务的真实暂停状态（TaskInfo.is_paused）。进入等待前处于暂停的
+                任务续接后回到暂停，而卡片可能不知道（暂停是在别处发生的，如命令行；或卡片是
+                等待期间才建出来的），据此刷新暂停按钮与状态胶囊；None 表示沿用卡片自己记的
+        """
+        self.restart_count, self.restart_limit = int(restart_count), int(restart_limit)
+        if exit_code is not None:
+            self.exit_code = exit_code
+        waiting = bool(waiting)
+        if self.is_finished or self.status == STATUS_STOPPING:
+            self.waiting_restart = False
+            return
+        self.waiting_restart = waiting
+        if not waiting and paused is not None and bool(paused) != self.is_paused:
+            self.set_paused(bool(paused))
+        self.pause_button.setEnabled(not waiting)
+        if waiting:
+            self.pause_button.setToolTip(WAITING_PAUSE_TOOLTIP)
+            self._apply_status(STATUS_WAITING_RESTART)
+            return
+        self.pause_button.setToolTip(
+            self._resume_tooltip() if self.is_paused else PAUSE_TOOLTIP)
+        self._apply_status(STATUS_PAUSED if self.is_paused else STATUS_RUNNING)
+
+    def set_pid(self, pid: int) -> None:
+        """被测进程重启后同一任务续接到新进程：身份行换成新 PID。"""
+        self.pid = pid
+        self._refresh_running_texts()
+
     def set_stopping(self) -> None:
         """已发出停止请求、等待任务收尾（task_stopped）期间：禁用全部操作按钮，
         避免用户在收尾窗口内重复点击（"分析"不改变任务，保持可用）。"""
@@ -810,7 +947,8 @@ class TaskCard(CardWidget):
             button.setEnabled(False)
         self._apply_status(STATUS_STOPPING)
 
-    def set_finished(self, reason: StopReason, end_time: datetime) -> None:
+    def set_finished(self, reason: StopReason, end_time: datetime,
+                     exit_code: Optional[int] = None) -> None:
         """
         切换为"已结束"形态：收成一行（进程名 ●状态 · PID · 结束原因 · 结束时间 ·
         已记录 N 次 [查看分析][同配置再测] ✕）。各指标的最后值与趋势仍保存在卡片里，
@@ -819,8 +957,13 @@ class TaskCard(CardWidget):
         Args:
             reason: 任务停止原因
             end_time: 结束时间（由调用方传入）
+            exit_code: 被测进程最近一次退出的退出码；停止原因是异常退出（CRASHED）时写进
+                已结束行（"异常退出：访问冲突 0xC0000005"）
         """
         self.is_finished = True
+        self.waiting_restart = False
+        if exit_code is not None:
+            self.exit_code = exit_code
         self.finished_at = end_time
         self.stop_reason = reason
         self._apply_status(STATUS_ABNORMAL if is_abnormal_stop(reason)
@@ -828,6 +971,7 @@ class TaskCard(CardWidget):
 
         self.finished_detail_label.setVisible(True)
         self.values_box.setVisible(False)
+        self.members_box.setVisible(False)
         self.trend_box.setVisible(False)
         self.running_actions.setVisible(False)
         self.finished_actions.setVisible(True)

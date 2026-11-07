@@ -41,7 +41,8 @@ from ui import theme_tokens as tokens
 from ui.chart_theme import chart_palette, make_transparent
 from ui.color_contrast import to_qcolor
 from ui.formatting import (STAT_EMPTY, build_summary_row, format_duration, format_rate_text,
-                           object_usage_text)
+                           object_usage_text, overall_summary, task_overall_verdict,
+                           verdict_summary)
 from ui.typography import data_font, ui_font
 from ui.widgets.analysis.report_layout import (
     block_height, chunk, column_widths, grid_shape, logical_width, pixel_size, row_height,
@@ -88,6 +89,7 @@ SECTION_META = "概况"
 SECTION_CONCLUSION = "结论"
 SECTION_ROUNDS = "打点区间增量"
 SECTION_CHARTS = "趋势图"
+OVERALL_LINE = "整体判定：{verdict}。{sentence}"
 ROUNDS_HINT = "每行是相邻两个打点之间的一轮；Δ = 本轮终值 − 起值，与上轮差 = 本轮 Δ − 上一轮 Δ"
 CHARTS_HINT = "只画持续上涨与波动的指标，平稳等其余指标见结论表"
 NO_CHART_TEXT = "没有持续上涨或波动的指标，未附趋势图"
@@ -149,6 +151,8 @@ class ReportText:
     round_table: Optional[RoundTable] = None
     chart_metrics: Tuple[str, ...] = ()
     footer: str = ''
+    # 整体判定行：被测进程重启续接过、中途崩溃过或提前退出时才有，与分析页结论条同一口径
+    overall_line: str = ''
 
 
 def report_is_dark(scheme: Optional[str] = None) -> bool:
@@ -200,8 +204,10 @@ def _conclusion_row(metric: str, snapshot) -> ConclusionRow:
     usage = object_usage_text(metric, snapshot.stats['last'] if snapshot.stats else None)
     cells = (row.text('baseline'), row.text('current'), row.text('delta'),
              row.text('per_round'), rate, r2)
+    # 基线在别的启动段（"基线""较基线"写 —）：把原因写在指标名下方，报告里没有悬停可看
+    note = " · ".join(t for t in (usage, snapshot.baseline_note) if t)
     return ConclusionRow(metric, get_metric_display_name(metric), row.text('verdict'),
-                         cells, usage, row.dimmed)
+                         cells, note, row.dimmed)
 
 
 def _round_table(analysis: TaskAnalysis,
@@ -230,6 +236,16 @@ def _round_table(analysis: TaskAnalysis,
                            f"{format_metric_delta(m, item.vs_previous[m])}" for m in focus)
         body.append((item.label, format_duration(item.duration_seconds)) + deltas + (vs,))
     return RoundTable(headers, tuple(body))
+
+
+def _overall_line(task, analysis: TaskAnalysis) -> str:
+    """整体判定行（与结论条同一函数得出）；没有分段 / 崩溃 / 提前退出的信息时为空串。"""
+    base = verdict_summary([(m, s if s.points else None)
+                            for m, s in analysis.snapshots.items() if m])
+    overall = overall_summary(base, analysis, task_overall_verdict(task, analysis))
+    if overall is base:
+        return ''
+    return OVERALL_LINE.format(verdict=overall.verdict, sentence=overall.sentence)
 
 
 def build_report_text(task, analysis: TaskAnalysis, range_desc: str,
@@ -268,6 +284,9 @@ def build_report_text(task, analysis: TaskAnalysis, range_desc: str,
         conclusions.append("，".join(parts))
         rows.append(_conclusion_row(metric, snapshot))
 
+    overall_line = _overall_line(task, analysis)
+    if overall_line:
+        conclusions.insert(0, overall_line)
     verdicts = {row.metric: row.verdict for row in rows}
     charted = tuple(row.metric for row in rows if row.verdict in CHART_VERDICTS
                     and analysis.snapshots[row.metric].points)
@@ -279,7 +298,8 @@ def build_report_text(task, analysis: TaskAnalysis, range_desc: str,
         title, info, conclusions, footnote,
         heading=" · ".join(heading_parts), time_range=_time_range_text(analysis, range_desc),
         metadata=tuple(metadata_items(task, analysis)), conclusion_rows=tuple(rows),
-        round_table=_round_table(analysis, verdicts), chart_metrics=charted, footer=footer)
+        round_table=_round_table(analysis, verdicts), chart_metrics=charted, footer=footer,
+        overall_line=overall_line)
 
 
 # ---------------------------------------------------------------- 绘制工具
@@ -659,6 +679,10 @@ def _layout_blocks(text: ReportText, analysis: TaskAnalysis, inner: float, dark:
     # 结论表
     if text.conclusion_rows:
         blocks += _section(SECTION_CONCLUSION, page, inner)
+        if text.overall_line:
+            blocks.append(_text_block(text.overall_line, _font(BODY_PX, QFont.DemiBold),
+                                      page['text'], inner))
+            blocks.append(_spacer(HEADING_GAP))
         rows = [(row.name, row.verdict) + row.cells for row in text.conclusion_rows]
         blocks.append(_table(CONCLUSION_HEADERS, rows, CONCLUSION_WEIGHTS, page, dark, inner,
                              pill_column=VERDICT_COLUMN,

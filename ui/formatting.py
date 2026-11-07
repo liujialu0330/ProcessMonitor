@@ -6,6 +6,7 @@
 import bisect
 import math
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, List, Optional, Sequence
@@ -16,13 +17,22 @@ from core.analysis.trend import (
 from core.automation.plan import plan_from_json_or_none
 from core.automation.stop_conditions import AUTO_STOP_DURATION, AUTO_STOP_ROUNDS
 from core.contracts import StopReason, UnavailableReason
+from core.exit_forensics import (
+    CRASH_MARKER_PREFIX, exception_text, is_abnormal_exit, normalize_exit_code)
+from core.history_query import segment_note
+from core.verdict import (
+    crash_detail, REASON_NO_DATA, REASON_NO_STATS, VERDICT_INSUFFICIENT, VERDICT_RISING, VERDICT_STABLE,
+    VERDICT_TARGET_EXITED, crashes_of, is_target_exit, member_overall, member_snapshots_of,
+    metric_reason, metric_verdict, overall_verdict, segments_of, segments_summary,
+    worst_segment_verdict,
+)
 from data.db.migrations.runner import disk_shortage_message
-from data.models import MonitorTask
+from data.models import TARGET_NAME, TARGET_PID, TARGET_TREE, MonitorTask
 from utils.metrics import (
-    KB_UNIT_DIVISORS, VALUE_CLASS_PEAK, VALUE_CLASS_RATE, display_unit_for,
+    KB_UNIT_DIVISORS, MAX_GROUP_MEMBERS, VALUE_CLASS_PEAK, VALUE_CLASS_RATE, display_unit_for,
     format_metric_delta, format_metric_rate, format_metric_value,
     get_metric_description, get_metric_display_name, get_metric_unit, is_kb_metric,
-    object_count_limit, value_class,
+    object_count_limit, split_member_key, value_class,
 )
 
 if TYPE_CHECKING:
@@ -39,6 +49,7 @@ _STOP_REASON_TEXTS = {
     # 与运行中发现 PID 被复用的情形口径一致：对用户而言都是原进程已经没了
     StopReason.PID_REUSED: "进程已终止",
     StopReason.INTERNAL_ERROR: "内部错误",
+    StopReason.CRASHED: "被测进程异常退出",
 }
 
 _UNAVAILABLE_REASON_TEXTS = {
@@ -60,6 +71,25 @@ def unavailable_reason_text(reason: UnavailableReason) -> str:
     return _UNAVAILABLE_REASON_TEXTS[reason]
 
 
+def crash_exit_text(exit_code: Optional[int]) -> str:
+    """被测进程异常退出的说明："异常退出：访问冲突 0xC0000005"。退出码没取到时只写
+    "被测进程异常退出"；表外的异常码写"未知异常"；非异常码（不应出现在这里）写退出码本身。"""
+    value = normalize_exit_code(exit_code)
+    if value is None:
+        return _STOP_REASON_TEXTS[StopReason.CRASHED]
+    if not is_abnormal_exit(value):
+        return f"{CRASH_MARKER_PREFIX}：退出码 {value}"
+    return f"{CRASH_MARKER_PREFIX}：{exception_text(value)} 0x{value:08X}"
+
+
+def stop_detail_text(reason: StopReason, exit_code: Optional[int] = None) -> str:
+    """已结束行 / 异常结束提示里的停止说明：异常退出（CRASHED）带退出码说明，其余同
+    stop_reason_text。"""
+    if reason is StopReason.CRASHED:
+        return crash_exit_text(exit_code)
+    return stop_reason_text(reason)
+
+
 def is_abnormal_stop(reason: Optional[StopReason]) -> bool:
     """停止原因是否算"异常结束"：只有用户自己停止（含退出程序）是正常结束。"""
     return reason is not None and reason is not StopReason.USER
@@ -76,6 +106,24 @@ def task_status_text(
     if running:
         return "已暂停" if paused else "运行中"
     return "异常结束" if abnormal else "已结束"
+
+
+def waiting_restart_text(restart_count: int, restart_limit: int) -> str:
+    """被测进程退出后等它重启并续接的状态词："等待重启（第 2/3 次）"：数字是这次等的是第几次
+    续接（已续接次数 + 1）与允许的上限；上限未知（0）时不写次数。"""
+    if int(restart_limit) <= 0:
+        return "等待重启"
+    return f"等待重启（第 {int(restart_count) + 1}/{int(restart_limit)} 次）"
+
+
+RESTARTED_TITLE = "已续接"
+
+
+def restarted_hint_text(restart_count: int, pid: Optional[int]) -> str:
+    """续接成功的短暂提示："已续接：第 2 次启动 PID 4321"（第 N 次启动 = 已续接次数 + 1，
+    与"重启"打点的名称同口径）。"""
+    text = f"已续接：第 {int(restart_count) + 1} 次启动"
+    return f"{text} PID {pid}" if pid else text
 
 
 def format_count(number: int) -> str:
@@ -116,6 +164,39 @@ def task_duration_seconds(
     return max(0.0, (end - task.start_time).total_seconds())
 
 
+# ---------- 监控目标类型（单个进程 / 进程树 / 同名进程） ----------
+
+TARGET_KIND_TEXTS = {TARGET_PID: "单个进程", TARGET_TREE: "进程树", TARGET_NAME: "同名进程"}
+
+
+def target_identity_text(kind: Optional[str], pid: int, name: str) -> str:
+    """任务卡片身份行的目标标签：单个进程 "PID 1234"，进程树 "进程树 · 根 PID 1234"，
+    同名进程 "同名进程"（进程名已在身份行最前，不再重复）。"""
+    if kind == TARGET_TREE:
+        return f"进程树 · 根 PID {pid}"
+    if kind == TARGET_NAME:
+        return TARGET_KIND_TEXTS[TARGET_NAME]
+    return f"PID {pid}"
+
+
+def task_pid_part(task) -> str:
+    """任务下拉项里"PID 1234"的位置：进程树写根 PID，同名进程没有 PID（写"同名进程"）。"""
+    kind = getattr(task, 'target_kind', TARGET_PID)
+    if kind == TARGET_TREE:
+        return f"进程树 · 根 PID {task.pid}"
+    if kind == TARGET_NAME:
+        return TARGET_KIND_TEXTS[TARGET_NAME]
+    return f"PID {task.pid}"
+
+
+def task_title_text(task) -> str:
+    """"chrome.exe（PID 1234）"一类的完整任务称呼（tooltip、确认框用）。"""
+    kind = getattr(task, 'target_kind', TARGET_PID)
+    if kind == TARGET_NAME:
+        return f"{task.process_name}（{TARGET_KIND_TEXTS[TARGET_NAME]}）"
+    return f"{task.process_name}（{task_pid_part(task)}）"
+
+
 def format_task_option_text(
         task: MonitorTask, running: bool, now: datetime,
         note_max: int = NOTE_MAX_CHARS) -> str:
@@ -126,7 +207,7 @@ def format_task_option_text(
     duration = format_duration(task_duration_seconds(task, running, now))
     parts = [
         task.process_name,
-        f"PID {task.pid}",
+        task_pid_part(task),
         task.start_time.strftime('%m-%d %H:%M'),
         f"运行中 {duration}" if running else duration,
     ]
@@ -141,7 +222,7 @@ def format_task_tooltip(
     """任务下拉项 tooltip：完整进程名、起止时间、时长、完整备注与自动化方案简述。"""
     duration = format_duration(task_duration_seconds(task, running, now))
     lines = [
-        f"{task.process_name}（PID {task.pid}）",
+        task_title_text(task),
         f"开始：{task.start_time.strftime('%Y-%m-%d %H:%M:%S')}",
         f"状态：{task_status_text(running)}",
         f"时长：{duration}",
@@ -281,13 +362,14 @@ STAT_EMPTY = "--"
 
 
 def _baseline_in_use(snapshot: "HistorySnapshot") -> bool:
-    baseline = snapshot.baseline
-    return (baseline is not None and baseline.value is not None
-            and snapshot.request.baseline_only)
+    """基线值是否作为摘要表 / 基线依据的起点：基线不在统计所在的启动段时不是（见
+    HistorySnapshot.baseline_in_use）。"""
+    return snapshot.baseline_in_use
 
 
 def basis_text(snapshot: "HistorySnapshot") -> str:
-    """统计依据行，如 "基线 16:37:33 起 · 2小时15分 · 8,100 点"；无统计时为空串。"""
+    """统计依据行，如 "基线 16:37:33 起 · 2小时15分 · 8,100 点"；无统计时为空串。被测进程
+    重启并续接过的任务末尾追加"仅统计第 N 次启动后的数据"（与报告、证据包同一句）。"""
     stats = snapshot.stats
     if not stats:
         return ""
@@ -298,6 +380,9 @@ def basis_text(snapshot: "HistorySnapshot") -> str:
         parts.append(f"基线 {baseline.timestamp.strftime('%H:%M:%S')} 起")
     parts.append(format_duration(stats['span_seconds']))
     parts.append(f"{stats['count']:,} 点")
+    note = segment_note(snapshot)
+    if note:
+        parts.append(note)
     return " · ".join(parts)
 
 
@@ -378,14 +463,19 @@ def build_summary_row(metric: str, snapshot: Optional["HistorySnapshot"]) -> Sum
     start = snapshot.baseline.value if use_baseline else stats['first']
     last = stats['last']
     unit = display_unit_for(metric, max(abs(start), abs(last))) if is_kb_metric(metric) else None
-    texts["baseline"] = format_metric_value(metric, start, display_unit=unit)
-    tips["baseline"] = ("基线打点之后 5 个样本的中位数" if use_baseline
-                        else "统计范围内最早一次采集的值（尚无基线）")
     texts["current"] = format_metric_value(metric, last, display_unit=unit)
-    delta = last - start
-    change = format_metric_delta(metric, delta)
-    pct = percent_change(last, start)
-    texts["delta"] = change if change == "±0" or pct is None else f"{change} ({pct:+.1f}%)"
+    if snapshot.baseline_foreign:
+        # 基线属于另一个启动段（另一个进程）：它既不能当起点，也不能拿来算增量
+        texts["baseline"] = texts["delta"] = BASELINE_DASH
+        tips["baseline"] = tips["delta"] = snapshot.baseline_note
+    else:
+        texts["baseline"] = format_metric_value(metric, start, display_unit=unit)
+        tips["baseline"] = ("基线打点之后 5 个样本的中位数" if use_baseline
+                            else "统计范围内最早一次采集的值（尚无基线）")
+        delta = last - start
+        change = format_metric_delta(metric, delta)
+        pct = percent_change(last, start)
+        texts["delta"] = change if change == "±0" or pct is None else f"{change} ({pct:+.1f}%)"
 
     mean = mean_round_delta(snapshot.rounds)
     if mean is not None:
@@ -439,10 +529,22 @@ def build_summary_row(metric: str, snapshot: Optional["HistorySnapshot"]) -> Sum
 
 # 平稳行的"增速""每轮均增"写这个（平稳就不必再读数），原文放 tooltip
 STABLE_DASH = "—"
+# 基线与统计不在同一启动段时，"基线"与"较基线"写这个（悬停说明"基线在第 N 段，不可比"）
+BASELINE_DASH = STABLE_DASH
 STABLE_TIP_PREFIX = "判定平稳，不列出该值；原值："
 # 样本不足的行在判定胶囊后加的标记
 INFO_MARK = "ⓘ"
 NO_DATA_NOTE = "所选范围内没有该指标的数据"
+# 有明细点但统计范围里没有数据（重启后的新一段还没有样本）：不是"没有数据"
+NO_STATS_NOTE = "所选范围内没有可统计的数据"
+METRIC_REASON_TEXTS = {REASON_NO_DATA: NO_DATA_NOTE, REASON_NO_STATS: NO_STATS_NOTE}
+
+
+def metric_reason_text(snapshot: Optional["HistorySnapshot"]) -> str:
+    """没有统计的指标的原因文案（core.verdict.metric_reason 的 no_data / no_stats_in_range）；
+    没有快照按没有数据。"""
+    reason = metric_reason(snapshot) if snapshot is not None else REASON_NO_DATA
+    return METRIC_REASON_TEXTS.get(reason, NO_DATA_NOTE)
 
 
 def usage_percent_text(value: float, limit: float) -> str:
@@ -451,10 +553,14 @@ def usage_percent_text(value: float, limit: float) -> str:
     return f"{percent:.0f}%" if percent >= 10 else f"{_plain_number(percent)}%"
 
 
-def build_table_row(metric: str, snapshot: Optional["HistorySnapshot"]) -> SummaryRow:
+def build_table_row(metric: str, snapshot: Optional["HistorySnapshot"], *,
+                    usage_note: Optional[str] = None) -> SummaryRow:
     """分析页判定摘要表的一行：在 build_summary_row 的基础上——平稳行的增速、每轮均增
     写 "—"；上限占比只写百分比（原文 "62.0% / 10000" 进 tooltip）；样本不足的行带
-    note（判定胶囊后的 ⓘ，tooltip 写原因）。"""
+    note（判定胶囊后的 ⓘ，tooltip 写原因）。
+
+    usage_note 非 None 表示该行的上限占比不适用（进程组合计、有多个实例的成员：GDI/USER
+    对象数的 10000 上限是单个进程的口径）：有上限的指标写 "—"，usage_note 作为 tooltip。"""
     row = build_summary_row(metric, snapshot)
     texts, tips = dict(row.texts), dict(row.tooltips)
     if texts["verdict"] == verdict_text(Verdict.STABLE):
@@ -466,13 +572,15 @@ def build_table_row(metric: str, snapshot: Optional["HistorySnapshot"]) -> Summa
             texts[column] = STABLE_DASH
     stats = snapshot.stats if snapshot is not None else None
     limit = object_count_limit(metric)
-    if texts["usage"] and limit is not None and stats:
+    if usage_note is not None and limit is not None:
+        texts["usage"], tips["usage"] = STABLE_DASH, usage_note
+    elif texts["usage"] and limit is not None and stats:
         tips["usage"] = f"{texts['usage']}\n{tips.get('usage', '')}".rstrip()
         texts["usage"] = usage_percent_text(stats['last'], limit)
     note = ""
     if row.dimmed:
         if not stats:
-            note = NO_DATA_NOTE
+            note = metric_reason_text(snapshot)
         else:
             interval = snapshot.interval_seconds
             note = (insufficient_text(stats['span_seconds'], stats['count'], interval)
@@ -501,6 +609,7 @@ BANNER_STABLE_PARTIAL = "{stable} 项平稳，{insufficient} 项数据不足"
 BANNER_SHORT_SPAN = "数据不足：已采 {span} / 需 ≥ {need}"
 BANNER_FEW_POINTS = "数据不足：仅 {count} 点 / 需 ≥ {need} 点"
 BANNER_NO_DATA = "数据不足：所选范围内没有数据"
+BANNER_NO_STATS = "数据不足：所选范围内没有可统计的数据"
 BANNER_UNJUDGED = "所选指标均为累计量或峰值类，不做趋势判定"
 BANNER_MORE = "等 {count} 项"
 AUTO_REFRESH_STATUS = "自动刷新 · {ago}"
@@ -573,12 +682,293 @@ def _insufficient_sentence(members) -> str:
     """全部数据不足时的主句：取统计跨度最长的一个指标说明还差什么。"""
     with_stats = [s for _m, s in members if s is not None and s.stats]
     if not with_stats:
-        return BANNER_NO_DATA
+        # 有明细点（快照在）但统计范围里没有数据，与整个范围都没有数据区分
+        return BANNER_NO_STATS if any(s is not None for _m, s in members) else BANNER_NO_DATA
     snapshot = max(with_stats, key=lambda s: s.stats['span_seconds'])
     span, need = snapshot.stats['span_seconds'], min_span_for(snapshot.interval_seconds)
     if span < need:
         return BANNER_SHORT_SPAN.format(span=format_duration(span), need=format_duration(need))
     return BANNER_FEW_POINTS.format(count=f"{snapshot.stats['count']:,}", need=MIN_POINTS)
+
+
+# ---------- 整体判定：重启续接的分段与中途崩溃 ----------
+
+BANNER_CRASHES = "被测进程中途异常退出 {count} 次（最近一次 {detail}）"
+BANNER_EARLY_EXIT = "被测进程在停止条件达成之前退出，测试未完成"
+BANNER_LAST_SEGMENT = "最后一段：{sentence}"
+BANNER_CRASH_LINE = "{time} 中途异常退出：{detail}"
+BANNER_LAST_SEGMENT_TOOLTIP = "最后一段各指标："
+SEGMENT_TOTAL = "共 {count} 段，"
+SEGMENT_ALL_STABLE = "各段均平稳"
+SEGMENT_MAX_NUMBERS = 3
+# core.verdict.segments_summary 的两段文字的开头（悬停里逐段列出时去掉它们）
+CRASH_SUMMARY_PREFIX = "中途异常退出"
+SEGMENT_SUMMARY_PREFIX = "各段判定："
+SEGMENT_VERDICT_SHORT = "数据不足"
+PILL_CRASHED = "异常退出"
+PILL_EARLY_EXIT = "提前退出"
+
+_CRASH_CODE_RE = re.compile(r"0[xX]([0-9A-Fa-f]{1,8})")
+# 结论胶囊的严重程度（整体判定的次序：持续上涨 > 数据不足 > 平稳；波动与平稳同属一类，
+# 但比平稳醒目）。空串（没有可判定的指标）最低
+_PILL_RANK = {verdict_text(Verdict.RISING): 4, verdict_text(Verdict.INSUFFICIENT): 3,
+              verdict_text(Verdict.FLUCTUATING): 2, verdict_text(Verdict.STABLE): 1, "": 0}
+_SEGMENT_PILLS = {VERDICT_RISING: verdict_text(Verdict.RISING),
+                  VERDICT_INSUFFICIENT: verdict_text(Verdict.INSUFFICIENT),
+                  VERDICT_STABLE: verdict_text(Verdict.STABLE)}
+
+
+def crash_label_text(marker) -> str:
+    """"异常退出 0xC0000005（访问冲突）"打点 → "访问冲突 0xC0000005"（与卡片、已结束行同一写法）；
+    认不出异常码时退回打点标签里的说明。"""
+    label = str(getattr(marker, 'label', '') or '')
+    found = _CRASH_CODE_RE.search(label)
+    if found:
+        code = int(found.group(1), 16)
+        text = exception_text(code)
+        if text:
+            return f"{text} 0x{code:08X}"
+    return crash_detail(marker)
+
+
+def segment_digest(segments: Sequence) -> str:
+    """多段摘要，如 "共 3 段，第 2 段持续上涨"；有数据不足的段同写，都没有时"各段均平稳"。
+    同类的段超过 SEGMENT_MAX_NUMBERS 个时只写个数。"""
+    def phrase(verdict: str, what: str) -> Optional[str]:
+        numbers = [s.number for s in segments if s.verdict == verdict]
+        if not numbers:
+            return None
+        if len(numbers) > SEGMENT_MAX_NUMBERS:
+            return f"{len(numbers)} 段{what}"
+        return f"第 {'、'.join(str(n) for n in numbers)} 段{what}"
+
+    parts = [p for p in (phrase(VERDICT_RISING, verdict_text(Verdict.RISING)),
+                         phrase(VERDICT_INSUFFICIENT, SEGMENT_VERDICT_SHORT))
+             if p is not None]
+    return SEGMENT_TOTAL.format(count=len(segments)) + ("，".join(parts) or SEGMENT_ALL_STABLE)
+
+
+
+def task_overall_verdict(task, analysis) -> str:
+    """任务的整体判定，与 pmctl verdict、证据包同一口径（core.verdict.overall_verdict）：
+    逐启动段取最差、中途崩溃过即 target_exited；任务记录里保存的停止原因是"被测进程退出"类、
+    且当时停止条件还没达成时同样是 target_exited。"""
+    stop_reason = getattr(task, 'stop_reason', None)
+    before = False
+    if task is not None and is_target_exit(stop_reason):
+        from core.evidence import target_exited_before_condition
+        try:
+            before = target_exited_before_condition(task, stop_reason, analysis.markers)
+        except AttributeError:
+            before = False
+    return overall_verdict(analysis, stop_reason=stop_reason, stopped_before_condition=before)
+
+
+def overall_summary(base: VerdictSummary, analysis, overall: str) -> VerdictSummary:
+    """在结论条（base，只反映当前显示的那一段）上叠加整体判定的内容，与 core.verdict 一致：
+
+    - 中途异常退出过：主句以"被测进程中途异常退出 N 次（最近一次 访问冲突 0xC0000005）"开头，
+      胶囊取最严重的"异常退出"；
+    - 多个启动段：附"共 3 段，第 2 段持续上涨"，胶囊取各段与当前段里最严重的一个；
+      悬停逐段列出结论（core.verdict.segments_summary）；
+    - 被测进程在停止条件达成之前退出（没有崩溃）：主句写"测试未完成"，胶囊不再写"平稳"，
+      改为"提前退出"（持续上涨仍保持原样，泄漏线索不能被盖掉）。
+    都不是时原样返回 base。"""
+    segments, crashes = segments_of(analysis), crashes_of(analysis)
+    multi = len(segments) > 1
+    early = overall == VERDICT_TARGET_EXITED and not crashes
+    if not (crashes or multi or early):
+        return base
+
+    parts: List[str] = []
+    if crashes:
+        parts.append(BANNER_CRASHES.format(count=len(crashes),
+                                           detail=crash_label_text(crashes[-1])))
+    elif early:
+        parts.append(BANNER_EARLY_EXIT)
+    if multi:
+        parts.append(segment_digest(segments))
+    if base.sentence:
+        parts.append(BANNER_LAST_SEGMENT.format(sentence=base.sentence) if multi
+                     else base.sentence)
+
+    verdict = base.verdict
+    if segments:
+        worst = _SEGMENT_PILLS[worst_segment_verdict(segments)]
+        if verdict and _PILL_RANK[worst] > _PILL_RANK.get(verdict, 0):
+            verdict = worst
+    if crashes:
+        verdict = PILL_CRASHED
+    elif early and verdict != verdict_text(Verdict.RISING):
+        verdict = PILL_EARLY_EXIT
+
+    lines: List[str] = []
+    if early:
+        lines.append(BANNER_EARLY_EXIT)
+    lines += [BANNER_CRASH_LINE.format(time=m.timestamp.strftime("%m-%d %H:%M:%S"),
+                                       detail=crash_label_text(m)) for m in crashes]
+    summary = segments_summary(analysis)
+    if multi and summary:
+        lines += [part.removeprefix(SEGMENT_SUMMARY_PREFIX) for part in summary.split("；")
+                  if not part.startswith(CRASH_SUMMARY_PREFIX)]
+    if base.tooltip:
+        lines.append(BANNER_LAST_SEGMENT_TOOLTIP if multi else "")
+        lines += base.tooltip.split("\n")
+    return VerdictSummary(verdict, "；".join(parts), "\n".join(line for line in lines if line))
+
+
+# ---------- 进程组任务：成员摘要、成员结论与组结论条 ----------
+
+GROUP_USAGE_NOTE = "进程组合计不适用单进程上限"
+MEMBER_USAGE_NOTE = "该成员有 {count} 个实例，合计不适用单进程上限"
+MEMBERS_TRUNCATED_TEXT = f"成员种类超过 {MAX_GROUP_MEMBERS}，超出部分只计入合计"
+MEMBERS_EMPTY_TEXT = "尚无成员"
+MEMBERS_EMPTY_TOOLTIP = "第一次采集后显示各成员；同名进程任务在没有匹配进程时也暂无成员"
+MEMBER_TOTAL_OPTION = "合计（默认）"
+MEMBER_TOTAL_TOOLTIP = "全部成员的合计（报告与导出用的就是合计）"
+MEMBER_OPTION_TOOLTIP = "{name}：出现过 {count} 个实例（含已退出的）；切换后整页只看该成员"
+MEMBER_OPTION_TOOLTIP_PLAIN = "{name}：切换后整页只看该成员"
+MEMBER_ROWS_TITLE = "成员结论"
+MEMBER_ROWS_HINT = "点击一行，整页切到该成员"
+GROUP_BANNER_MEMBERS_ALSO = "；成员 {names} 也在持续上涨"
+GROUP_BANNER_MEMBERS_ONLY = "合计未见持续上涨，但 {count} 个成员持续上涨：{items}"
+MEMBER_BANNER_PREFIX = "成员 {name}："
+
+
+NAME_GROUP_TOOLTIP = "监控全部同名进程；进程退出、新启动的同名进程都会自动计入"
+
+
+def members_summary_text(members: Sequence, kind: Optional[str] = None) -> str:
+    """任务卡片的成员摘要，如 "成员 3 种 · 共 7 个进程"；还没有成员时为"尚无成员"。
+    members 为带 instance_count 的成员快照（MonitorManager.group_members）；"共 N 个进程"
+    是各成员当前实例数之和。同名进程任务（kind 为 name）永远只有一种成员，不写"成员 1 种"，
+    只写"共 N 个进程"。"""
+    total = sum(int(m.instance_count) for m in members)
+    if kind == TARGET_NAME:
+        return f"共 {total} 个进程"
+    if not members:
+        return MEMBERS_EMPTY_TEXT
+    return f"成员 {len(members)} 种 · 共 {total} 个进程"
+
+
+def members_tooltip(members: Sequence, kind: Optional[str] = None) -> str:
+    """成员摘要的悬停说明：每行一个成员"显示名 × 当前实例数"，实例数多的在前、同数按名称；
+    当前没有实例的成员注明。同名进程任务只有一种成员，改写说明口径。"""
+    if kind == TARGET_NAME:
+        return NAME_GROUP_TOOLTIP
+    if not members:
+        return MEMBERS_EMPTY_TOOLTIP
+    ordered = sorted(members, key=lambda m: (-int(m.instance_count), m.name.casefold()))
+    lines = []
+    for m in ordered:
+        suffix = "（当前没有实例）" if int(m.instance_count) == 0 else ""
+        lines.append(f"{m.name} × {int(m.instance_count)}{suffix}")
+    return "\n".join(lines)
+
+
+def member_option_text(name: str, instances: Optional[int]) -> str:
+    """成员下拉项文本："chrome.exe（37）"，括号里是出现过的实例数；未知时只写名称。"""
+    return f"{name}（{instances}）" if instances is not None else name
+
+
+def member_option_tooltip(name: str, instances: Optional[int]) -> str:
+    """成员下拉项的悬停说明；实例数未知时不写实例数。"""
+    if instances is None:
+        return MEMBER_OPTION_TOOLTIP_PLAIN.format(name=name)
+    return MEMBER_OPTION_TOOLTIP.format(name=name, count=instances)
+
+
+@dataclass(frozen=True)
+class MemberVerdictRow:
+    """成员结论的一行：判定码（rising / stable / insufficient）与中文、持续上涨的指标说明
+    （没有时为 "—"）。"""
+    member_key: str
+    name: str
+    instances: Optional[int]
+    verdict: str
+    verdict_text: str
+    rising_text: str
+    rising_metrics: tuple = ()
+
+
+_MEMBER_VERDICT_TEXTS = {
+    VERDICT_RISING: verdict_text(Verdict.RISING),
+    VERDICT_STABLE: verdict_text(Verdict.STABLE),
+    VERDICT_INSUFFICIENT: verdict_text(Verdict.INSUFFICIENT),
+}
+
+
+def _rising_parts(analysis, member: str) -> List[str]:
+    """某成员持续上涨的指标，如 ["私有字节 +35 MB/小时", ...]（按成员快照里的指标顺序）。"""
+    parts = []
+    for series_key, snapshot in member_snapshots_of(analysis).items():
+        metric, key = split_member_key(series_key)
+        if key != member or metric_verdict(snapshot) != VERDICT_RISING:
+            continue
+        name = get_metric_display_name(metric)
+        parts.append(f"{name} {rate_brief(metric, snapshot.rate)}"
+                     if snapshot.rate is not None else name)
+    return parts
+
+
+def build_member_rows(analysis, names: Optional[dict] = None,
+                      instances: Optional[dict] = None) -> List[MemberVerdictRow]:
+    """每个成员一行的结论（成员判定见 core.verdict.member_overall）：持续上涨的在前，其余
+    按显示名排序。names / instances 为 {成员键: 显示名 / 出现过的实例数}，缺省用成员键。"""
+    names, instances = names or {}, instances or {}
+    rows = []
+    for member, verdict in member_overall(analysis).items():
+        parts = _rising_parts(analysis, member)
+        rows.append(MemberVerdictRow(
+            member_key=member, name=names.get(member, member),
+            instances=instances.get(member), verdict=verdict,
+            verdict_text=_MEMBER_VERDICT_TEXTS.get(verdict, verdict),
+            rising_text=_name_list(parts) if parts else STABLE_DASH,
+            rising_metrics=tuple(parts)))
+    rows.sort(key=lambda r: (r.verdict != VERDICT_RISING, r.name.casefold()))
+    return rows
+
+
+def rising_member_rows(rows: Sequence[MemberVerdictRow]) -> List[MemberVerdictRow]:
+    return [r for r in rows if r.verdict == VERDICT_RISING]
+
+
+def member_rows_header(rows: Sequence[MemberVerdictRow]) -> str:
+    """成员结论折叠区的标题行，如 "成员结论 · 5 个成员，2 个持续上涨"。"""
+    rising = len(rising_member_rows(rows))
+    tail = f"，{rising} 个持续上涨" if rising else "，没有成员持续上涨"
+    return f"{MEMBER_ROWS_TITLE} · {len(rows)} 个成员{tail}"
+
+
+def group_verdict_summary(total: VerdictSummary, rows: Sequence[MemberVerdictRow]
+                          ) -> VerdictSummary:
+    """进程组合计视图的结论条：合计或任一成员持续上涨即算上涨，文案点名上涨的成员。
+    合计已在涨时在主句后追加"；成员 a、b 也在持续上涨"；合计没涨而成员在涨时改写成
+    "合计未见持续上涨，但 N 个成员持续上涨：renderer.exe（私有字节 +35 MB/小时）"。"""
+    rising = rising_member_rows(rows)
+    if not rising:
+        return total
+    tooltip = "\n".join(
+        t for t in (total.tooltip,
+                    "持续上涨的成员：" + "；".join(
+                        f"{r.name}（{'、'.join(r.rising_metrics)}）" for r in rising)) if t)
+    rising_text = verdict_text(Verdict.RISING)
+    if total.verdict == rising_text:
+        names = _name_list([r.name for r in rising])
+        return VerdictSummary(
+            rising_text, total.sentence + GROUP_BANNER_MEMBERS_ALSO.format(names=names), tooltip)
+    items = _name_list([f"{r.name}（{'、'.join(r.rising_metrics[:2])}）" for r in rising])
+    sentence = GROUP_BANNER_MEMBERS_ONLY.format(count=len(rising), items=items)
+    return VerdictSummary(rising_text, sentence, tooltip)
+
+
+def member_view_summary(name: str, summary: VerdictSummary) -> VerdictSummary:
+    """成员视图的结论条：在该成员自己的结论主句前点名成员。"""
+    if not summary.sentence:
+        return summary
+    return VerdictSummary(
+        summary.verdict, MEMBER_BANNER_PREFIX.format(name=name) + summary.sentence,
+        summary.tooltip)
 
 
 def refresh_status_text(seconds_ago: float) -> str:
@@ -714,6 +1104,7 @@ AUTO_EXPORT_NO_DATABASE = "未连接数据库，未能自动导出"
 AUTO_EXPORT_RANGE_TEXT = "全部（任务结束后自动导出）"
 PLAN_INVALID_TITLE = "自动化设置有误"
 STAGE_SNAPSHOT_SUMMARY_TEMPLATE = "每 {hours} 小时写阶段快照"
+RESTART_SUMMARY_TEMPLATE = "退出后续接（最多 {limit} 次）"
 STAGE_SNAPSHOT_DONE_TITLE = "已写阶段快照"
 STAGE_SNAPSHOT_FAILED_TITLE = "阶段快照写入失败"
 # 失败只提示一次：说明采集不受影响、之后不再提示
@@ -750,6 +1141,8 @@ def plan_summary(plan) -> str:
     hours = getattr(plan, 'stage_snapshot_hours', None)
     if hours is not None and getattr(plan, 'stage_snapshot_dir', None):
         parts.append(stage_snapshot_summary(hours))
+    if getattr(plan, 'resume_on_restart', False):
+        parts.append(RESTART_SUMMARY_TEMPLATE.format(limit=plan.restart_limit))
     return " · ".join(parts)
 
 

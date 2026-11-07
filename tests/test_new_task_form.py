@@ -8,8 +8,9 @@ from core.automation.plan import AutomationPlan
 from tests.doubles import FakePreferences, FakeProcessQuery
 from ui.formatting import plan_summary
 from ui.widgets.monitor.new_task_form import NewTaskForm, TaskRequest
-from ui.widgets.monitor.process_picker import ERROR_EMPTY, ERROR_NOT_FOUND
-from utils.metrics import LEAK_CHECK_PRESET, MetricType
+from ui.widgets.monitor.process_picker import (
+    ERROR_EMPTY, ERROR_GROUP_NEEDS_NAME, ERROR_NOT_FOUND)
+from utils.metrics import LEAK_CHECK_PRESET, PROCESS_COUNT, MetricType
 
 PROCESSES = [(1001, "alpha.exe", 1001.5), (1002, "beta.exe", 1002.5)]
 
@@ -23,8 +24,9 @@ def prefs():
 def form(qapp, prefs):
     widget = NewTaskForm(FakeProcessQuery(PROCESSES), prefs)
     widget.picker.refresh()
-    widget.requests, widget.invalid = [], []
+    widget.requests, widget.invalid, widget.waits = [], [], []
     widget.start_requested.connect(widget.requests.append)
+    widget.wait_requested.connect(widget.waits.append)
     widget.target_invalid.connect(widget.invalid.append)
     widget.resize(900, 300)
     yield widget
@@ -466,3 +468,157 @@ def test_launch_browse_buttons_only_emit_signals(form):
     form.launch_options.cwd_browse_button.click()
 
     assert received == ["exe", "cwd"]
+
+
+# ========== 目标类型：单个进程 / 进程树 / 同名进程 ==========
+
+PEAK = MetricType.MEMORY_PEAK_WSET
+PRIORITY = MetricType.CPU_PRIORITY
+
+
+def _pick_kind(form, kind):
+    """像用户点分段控件那样切换目标类型。"""
+    form.kind_segmented.setCurrentItem(kind)
+    assert form.target_kind() == kind
+
+
+def test_kind_segmented_offers_three_types_default_pid(form):
+    assert [form.kind_segmented.items[k].text() for k in ('pid', 'tree', 'name')] == [
+        "单个进程", "进程树", "同名进程"]
+    assert form.target_kind() == 'pid'
+
+
+def test_pid_request_keeps_pid_kind_and_unfiltered_metrics(form):
+    form.set_metrics_summary([MetricType.CPU_PERCENT, PEAK, PRIORITY])
+    form.picker.set_text("beta.exe · PID 1002")
+    form.start_button.click()
+    request = form.requests[0]
+    assert request.target_kind == 'pid'
+    assert request.metrics == (MetricType.CPU_PERCENT, PEAK, PRIORITY)     # pid 不过滤、不加进程总数
+    assert PROCESS_COUNT not in request.metrics
+
+
+def test_tree_request_filters_metrics_and_adds_process_count(form):
+    form.set_metrics_summary([MetricType.CPU_PERCENT, PEAK, PRIORITY, MetricType.MEMORY_RSS])
+    _pick_kind(form, 'tree')
+    form.picker.set_text("beta.exe · PID 1002")
+    form.start_button.click()
+    assert form.requests == [TaskRequest(
+        pid=1002, name="beta.exe", create_time=1002.5,
+        metrics=(MetricType.CPU_PERCENT, MetricType.MEMORY_RSS, PROCESS_COUNT),
+        interval=3.0, note="", target_kind='tree')]
+
+
+def test_name_request_takes_selected_process_name(form):
+    form.set_metrics_summary([MetricType.CPU_PERCENT, PEAK])
+    _pick_kind(form, 'name')
+    form.picker.set_text("beta.exe · PID 1002")
+    form.start_button.click()
+    assert form.requests == [TaskRequest(
+        pid=0, name="beta.exe", create_time=None,
+        metrics=(MetricType.CPU_PERCENT, PROCESS_COUNT), interval=3.0, note="",
+        target_kind='name')]
+
+
+def test_name_request_accepts_typed_name_of_process_not_running(form):
+    _pick_kind(form, 'name')
+    form.picker.set_text("chrome.exe")                       # 此刻没有这个进程
+    form.start_button.click()
+    assert [(r.pid, r.name, r.create_time, r.target_kind) for r in form.requests] == [
+        (0, "chrome.exe", None, 'name')]
+    assert form.invalid == []
+
+
+def test_name_without_extension_completes_to_listed_process(form):
+    _pick_kind(form, 'name')
+    form.picker.set_text("beta")
+    form.start_button.click()
+    assert form.requests[0].name == "beta.exe"
+
+
+def test_name_kind_needs_a_name_not_a_pid(form):
+    _pick_kind(form, 'name')
+    form.start_button.click()
+    form.picker.set_text("1002")                             # 纯数字不是进程名
+    form.start_button.click()
+    assert form.requests == []
+    assert [e.kind for e in form.invalid] == [ERROR_GROUP_NEEDS_NAME, ERROR_GROUP_NEEDS_NAME]
+
+
+def test_tree_kind_still_requires_existing_process(form):
+    _pick_kind(form, 'tree')
+    form.picker.set_text("999999")
+    form.start_button.click()
+    assert form.requests == [] and [e.kind for e in form.invalid] == [ERROR_NOT_FOUND]
+
+
+def test_group_metrics_are_kept_apart_from_pid_metrics(form):
+    form.set_metrics_summary([MetricType.CPU_PERCENT, PEAK])
+    _pick_kind(form, 'tree')
+    assert form.metrics() == [MetricType.CPU_PERCENT, PROCESS_COUNT]    # 沿用时剔除不适用的
+    form.set_metrics_summary([MetricType.MEMORY_RSS])
+    assert form.metrics() == [MetricType.MEMORY_RSS, PROCESS_COUNT]
+    _pick_kind(form, 'pid')
+    assert form.metrics() == [MetricType.CPU_PERCENT, PEAK]             # 单个进程的选择没被改动
+    assert form.metric_summary_label.text() == "已选 2 项"
+
+
+def test_group_metric_summary_counts_process_count(form):
+    _pick_kind(form, 'tree')
+    form.set_metrics_summary([MetricType.MEMORY_RSS])
+    assert form.metric_summary_label.text() == "已选 2 项"
+    assert "进程总数" in form.metric_summary_label.toolTip()
+
+
+def test_storage_estimate_is_per_member_for_groups(form):
+    form.set_metrics_summary([MetricType.CPU_PERCENT, MetricType.MEMORY_RSS])
+    pid_text = form.storage_estimate_text()
+    assert pid_text and "成员" not in pid_text
+    _pick_kind(form, 'tree')
+    group_text = form.storage_estimate_text()
+    assert group_text.startswith("按 3 种成员估算（每种成员另加一份）：")
+    assert "按成员数估算，每种成员另加一份" in form.storage_label.toolTip()
+    _pick_kind(form, 'pid')
+    assert form.storage_estimate_text() == pid_text
+
+
+def test_name_kind_disables_wait_and_launch(form):
+    form.show()
+    form.set_wait_enabled(True)
+    _pick_kind(form, 'name')
+    assert not form.wait_enabled() and not form.wait_checkbox.isEnabled()
+    assert not form.launch_enabled() and not form.launch_options.isEnabled()
+    form.picker.set_text("alpha.exe")
+    form.start_button.click()
+    assert [r.target_kind for r in form.requests] == ['name'] and form.waits == []
+    _pick_kind(form, 'tree')
+    assert form.wait_checkbox.isEnabled() and form.launch_options.isEnabled()
+
+
+def test_tree_kind_waits_by_name_with_tree_kind(form):
+    form.show()
+    _pick_kind(form, 'tree')
+    form.set_wait_enabled(True)
+    form.picker.set_text("later.exe")
+    form.start_button.click()
+    assert [(w.name, w.target_kind) for w in form.waits] == [("later.exe", 'tree')]
+    assert PROCESS_COUNT in form.waits[0].metrics
+
+
+def test_target_kind_changed_signal_and_unknown_kind(form):
+    seen = []
+    form.target_kind_changed.connect(seen.append)
+    _pick_kind(form, 'tree')
+    form.set_target_kind('name')
+    form.set_target_kind('name')                             # 没变不再发
+    assert seen == ['tree', 'name']
+    with pytest.raises(ValueError):
+        form.set_target_kind('bogus')
+
+
+def test_name_kind_placeholder_asks_for_a_name(form):
+    plain = form.picker.combo.line_edit.placeholderText()
+    _pick_kind(form, 'name')
+    assert "进程名" in form.picker.combo.line_edit.placeholderText()
+    _pick_kind(form, 'pid')
+    assert form.picker.combo.line_edit.placeholderText() == plain

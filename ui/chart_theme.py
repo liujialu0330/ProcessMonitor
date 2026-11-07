@@ -33,6 +33,8 @@ GRID_ALPHA = 0.18
 #   crosshair       悬停十字线（图形）
 #   marker          打点竖线与编号徽标（徽标是文字）
 #   system_marker   暂停/恢复的底部短竖线（图形）
+#   crash_marker / restart_marker / recover_marker
+#                   被测进程异常退出 / 重启续接 / 工具重启后续采的点划竖线与标签（标签是文字）
 #   gap_shade       空洞阴影的基色（按 GAP_SHADE_ALPHA 半透明叠加）
 #   selection       概览条选区边线（选中色条，图形；填充按 SELECTION_ALPHA）
 #   overview_curve  概览条走势线（图形）
@@ -47,6 +49,9 @@ _PALETTES = tuple({
     'crosshair': ('#767676', '#8a8a8a')[i],
     'marker': tokens.ATTENTION[i],
     'system_marker': ('#858585', '#8f8f8f')[i],
+    'crash_marker': tokens.EVENT_MARKER_COLORS['crash'][i],
+    'restart_marker': tokens.EVENT_MARKER_COLORS['restart'][i],
+    'recover_marker': tokens.EVENT_MARKER_COLORS['recover'][i],
     'gap_shade': ('#606060', '#d0d0d0')[i],
     'selection': tokens.DATA[i],
     'overview_curve': ('#6e6e6e', '#9e9e9e')[i],

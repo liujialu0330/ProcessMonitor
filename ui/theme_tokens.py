@@ -45,6 +45,16 @@ TERTIARY: ThemePair = ("#6E6E6E", "#9E9E9E")
 DATA: ThemePair = ("#087575", "#44D7D1")
 # 打点注意色：打点竖线、编号徽标、迷你图刻度
 ATTENTION: ThemePair = ("#C2410C", "#FFB454")
+# 信息色：工具重启后续采的系统打点（与分析页多曲线系列里的蓝色同值，对卡片底 ≥ 4.5:1）
+INFO: ThemePair = ("#2563EB", "#7AB8FF")
+
+# 系统事件打点（被测进程异常退出 / 重启续接 / 工具重启后续采）：颜色取语义色，线型用点划线，
+# 与用户打点（注意色虚线）区分；文字说明另有（颜色不是唯一线索）
+EVENT_MARKER_COLORS: Dict[str, ThemePair] = {
+    "crash": CRITICAL,
+    "restart": SUCCESS,
+    "recover": INFO,
+}
 
 # ---------- 胶囊 ----------
 
@@ -64,7 +74,9 @@ PILL_TEXT_DIMMED: ThemePair = ("rgba(0, 0, 0, 0.60)", "rgba(255, 255, 255, 0.70)
 DIMMED_TEXT: ThemePair = ("rgba(0, 0, 0, 0.59)", "rgba(255, 255, 255, 0.59)")
 
 # 判定 → 胶囊语气（判定摘要表）
-VERDICT_TONES: Dict[str, str] = {"持续上涨": "critical", "平稳": "success", "波动": "caution"}
+# 整体判定的"被测进程异常退出"取最严重的语气；提前退出（测试没做完）是警示
+VERDICT_TONES: Dict[str, str] = {"持续上涨": "critical", "平稳": "success", "波动": "caution",
+                                 "异常退出": "critical", "提前退出": "caution"}
 
 # ---------- 选中 / 悬停 ----------
 

@@ -37,7 +37,7 @@ class EvidenceWorker(ReportWorker):
     """证据包导出线程：三件套写到临时工作目录 → 打包 zip 到 out_path。"""
 
     def __init__(self, db, job: ReportJob, *, analysis: TaskAnalysis, out_path: str,
-                 log_path: Optional[str], clock, parent=None):
+                 log_path: Optional[str], clock, stop_reason=None, parent=None):
         """
         Args:
             db: 调用方已有的 Database 实例（同 ReportWorker；证据包另用它补任务元数据）
@@ -46,12 +46,15 @@ class EvidenceWorker(ReportWorker):
             out_path: 目标 zip 路径
             log_path: app.log 路径；None 不收录日志摘录
             clock: 时钟（只用 now()）
+            stop_reason: 任务的停止原因（命令行导出传内存里记下的）；None 时由证据包取任务
+                记录里保存的
         """
         super().__init__(db, job, parent)
         self.analysis = analysis
         self.out_path = out_path
         self.log_path = log_path
         self.clock = clock
+        self.stop_reason = stop_reason
 
     def execute(self, token: CancelToken) -> Optional[ReportResult]:
         work_dir = tempfile.mkdtemp(prefix=EVIDENCE_WORK_DIR_PREFIX)
@@ -68,7 +71,7 @@ class EvidenceWorker(ReportWorker):
                 self.db, self.job.task, self.analysis,
                 report_png=self.job.image_path, detail_csv=self.job.csv_path,
                 summary_csv=self.job.summary_path, out_path=self.out_path,
-                log_path=self.log_path, clock=self.clock)
+                log_path=self.log_path, clock=self.clock, stop_reason=self.stop_reason)
             return ReportResult((self.out_path,), report.row_count, report.point_count)
         except Exception:
             logger.error("证据包导出失败: task_id=%s", self.job.task.task_id, exc_info=True)

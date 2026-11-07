@@ -136,6 +136,30 @@ def db(db_path):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_update_check(monkeypatch):
+    """
+    任何用例里建出来的主窗口都不会真的联网检查更新。
+
+    MainWindow 构造时登记了"3 秒后静默检查更新"的定时器；用例若没有自己把
+    about_group.check_update 换成空函数，窗口随用例结束被释放后，定时器会在后面某个用例的
+    事件循环里触发，对已释放的控件抛 RuntimeError（随机让 1–3 个无关用例失败）。
+    在构造函数末尾统一换掉，工厂 make_main_window 与直接 MainWindow(...) 都覆盖；
+    需要真实检查流程的用例直接用 AboutUpdateGroup（make_about_update_group），不经主窗口。
+    """
+    try:
+        from ui.main_window import MainWindow
+    except ImportError:     # 极少数不带界面依赖的环境：没有主窗口也就没有这个定时器
+        return
+    original = MainWindow.__init__
+
+    def init(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        self.about_group.check_update = lambda *a, **k: None
+
+    monkeypatch.setattr(MainWindow, '__init__', init)
+
+
+@pytest.fixture(autouse=True)
 def _reset_migration_guard():
     """
     重置进程级迁移记录（MigrationRunner 按库路径记住本进程内的迁移结果）。
@@ -188,3 +212,20 @@ def _reset_app_config():
     _reset()
     yield
     _reset()
+
+
+@pytest.fixture(autouse=True)
+def _no_real_exit_probe(request, monkeypatch):
+    """
+    默认不让任何任务线程对真实进程取退出码句柄。
+
+    MonitorWorker 默认用 open_exit_probe（ctypes OpenProcess）：用例里的假 PID（例如 5000）
+    恰好被本机某个真实进程占用时，句柄的创建时间与预期不符，任务会被误判为 PID 已复用，
+    让全量里偶发失败、单独跑却通过。默认换成"不可用"的空探针；确实要对真实子进程取退出码
+    的用例用 @pytest.mark.real_exit_probe 保留真实实现。
+    """
+    if request.node.get_closest_marker('real_exit_probe'):
+        return
+    from core import monitor_task
+    from core.exit_forensics import NullExitCodeProbe
+    monkeypatch.setattr(monitor_task, 'open_exit_probe', lambda pid: NullExitCodeProbe())

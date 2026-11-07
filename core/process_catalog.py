@@ -53,8 +53,8 @@ def display_name(pid: int, image_name: str) -> str:
     return _PSUTIL_FIXED_NAMES.get(pid, image_name)
 
 
-def _from_snapshot(hub: Optional["SnapshotHub"]) -> Optional[List[ProcessEntry]]:
-    """从快照取进程列表；快照不可用或取失败返回 None（调用方回退 psutil）。"""
+def _snapshot_processes(hub: Optional["SnapshotHub"]):
+    """取一份快照里的进程条目 {pid: ProcessSample}；快照不可用或取失败返回 None。"""
     global _fallback_logged
     if hub is None:
         hub = _default_hub()
@@ -63,15 +63,22 @@ def _from_snapshot(hub: Optional["SnapshotHub"]) -> Optional[List[ProcessEntry]]
     try:
         if not hub.available():
             return None
-        snapshot = hub.get(LIST_MAX_AGE_S)
+        return hub.get(LIST_MAX_AGE_S).processes
     except Exception:
         if not _fallback_logged:
             _fallback_logged = True
             logger.warning("从全系统快照读取进程列表失败，改用 psutil（之后不再重复记录）",
                            exc_info=True)
         return None
+
+
+def _from_snapshot(hub: Optional["SnapshotHub"]) -> Optional[List[ProcessEntry]]:
+    """从快照取进程列表；快照不可用或取失败返回 None（调用方回退 psutil）。"""
+    processes = _snapshot_processes(hub)
+    if processes is None:
+        return None
     entries: List[ProcessEntry] = []
-    for pid, sample in snapshot.processes.items():
+    for pid, sample in processes.items():
         name = display_name(pid, sample.name)
         if name and name.strip():
             entries.append(ProcessEntry(pid, name, sample.create_time))
@@ -155,3 +162,33 @@ def search_by_name(keyword: str,
     """按进程名部分匹配（不区分大小写），返回 [(pid, 进程名)]，按进程名排序"""
     wanted = keyword.lower()
     return [(e.pid, e.name) for e in list_processes(hub) if wanted in e.name.lower()]
+
+
+def find_instances_by_name(name: str, exclude_self: bool = True,
+                           hub: Optional["SnapshotHub"] = None
+                           ) -> List[Tuple[int, Optional[float], int]]:
+    """
+    按进程名精确查找（不区分大小写），返回 [(pid, 创建时间, 父进程 PID)]。
+
+    与 find_pids_by_name 的区别：多给父进程 PID（被测进程退出后找"重启"时，要排除旧进程
+    留下的子进程）；已退出但仍被别的句柄握着的"僵尸"条目（快照里线程数为 0）不算——它们
+    不是在运行的进程。父进程 PID 读不到为 0。
+    """
+    wanted = name.lower()
+    own = self_pid() if exclude_self else None
+    processes = _snapshot_processes(hub)
+    found: List[Tuple[int, Optional[float], int]] = []
+    if processes is not None:
+        for pid, sample in processes.items():
+            if (pid != own and sample.num_threads > 0
+                    and display_name(pid, sample.name).lower() == wanted):
+                found.append((pid, sample.create_time, sample.parent_pid))
+        return sorted(found)
+    for proc in psutil.process_iter(['pid', 'ppid', 'name', 'create_time']):
+        try:
+            info = proc.info
+            if info['pid'] != own and (info['name'] or '').lower() == wanted:
+                found.append((info['pid'], info.get('create_time'), info.get('ppid') or 0))
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return sorted(found)

@@ -253,6 +253,9 @@ def run_env(monkeypatch, app_paths):
             assert hotkey == 'hotkey'
             state['diagnostics_provider'] = diagnostics_provider
 
+        def attach_session_lock(self, lock):
+            pass
+
         def show(self):
             events.append('window.show')
 
@@ -655,7 +658,7 @@ def bg_env(run_env, monkeypatch):
 
     class FakeRuntime:
         def __init__(self, manager, registry, db, *, idle_exit_s=0.0, busy=None,
-                     stage_renderer=None, quit_hooks=()):
+                     stage_renderer=None, quit_hooks=(), exit_hooks=()):
             events.append(('runtime', manager, registry, idle_exit_s))
             self.auto_marker = 'auto_marker'
             self.busy = busy
@@ -781,6 +784,9 @@ def test_run_gui_attaches_ipc_after_window(bg_env, monkeypatch):
 
         def __init__(self, *args, **kwargs):
             events.append('window')
+
+        def attach_session_lock(self, lock):
+            pass
 
         def show(self):
             events.append('window.show')
