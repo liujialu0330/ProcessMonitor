@@ -41,8 +41,8 @@ Inno Setup 编译、产物命名，全流程一次跑完）：
 ```
 
 **数据存储位置**：数据目录固定在 `%LOCALAPPDATA%\进程监控助手\data\monitor.db`
-（与安装目录无关，覆盖安装/卸载重装不影响该目录，详见 `config.py` 的
-`get_data_dir()`）。
+（与安装目录无关，覆盖安装/卸载重装不影响该目录，详见 `app/paths.py` 的
+`AppPaths.resolve()`）。
 
 ---
 
@@ -231,6 +231,9 @@ build\
 ├── setup.iss                 # Inno Setup脚本
 ├── build.bat                 # 一键打包脚本（无人值守，含冒烟测试）
 ├── check_dependencies.py     # 打包前依赖检查
+├── dist_stats.py             # 统计onedir产物总大小与文件数（build.bat 验证打包结果时调用）
+├── clear_icon_cache.bat      # 清理Windows图标缓存（安装后快捷方式图标不刷新时手动运行）
+├── app_green_icon.ico        # 应用图标（spec/setup.iss/build.bat 均引用此文件）
 └── README_打包说明.md        # 本文档
 ```
 
@@ -250,6 +253,13 @@ PyInstaller打包配置文件，主要功能：
 从 `config.APP_VERSION` 单源动态生成 `build\version_info.txt`（Windows
 exe 版本信息4元组），供 spec 的 `version=` 参数引用；每次打包前由
 `build.bat` 自动调用，不需要手动维护版本号。
+
+#### dist_stats.py
+
+统计 onedir 产物目录的总大小（MB取整）与文件数，以两行纯数字输出到标准输出，
+供 `build.bat` 在"验证打包结果"一步用 `for /f` 逐行捕获。单独写成脚本是为了
+避免在批处理里内联 PowerShell 与嵌套引号带来的编码和解析问题；手动排查时也可
+运行 `python build\dist_stats.py dist\进程监控助手`。
 
 #### setup.iss
 

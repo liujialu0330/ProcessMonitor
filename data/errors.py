@@ -8,7 +8,3 @@
 
 class StorageError(Exception):
     """数据库读写失败（连接、锁、磁盘、损坏等）。"""
-
-
-class MigrationError(StorageError):
-    """数据库迁移失败。"""

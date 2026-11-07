@@ -37,8 +37,6 @@ ERROR_NO_MATCH = 'no_match'            # 文本与进程列表任何一项都不
 ERROR_NOT_A_NUMBER = 'not_a_number'    # 形似数字但不是合法 PID
 ERROR_NOT_FOUND = 'not_found'          # 输入的 PID 对应的进程不存在或无权访问
 ERROR_WAIT_NEEDS_NAME = 'wait_needs_name'   # 等待进程启动只能按进程名（空或纯数字）
-ERROR_KINDS = (ERROR_EMPTY, ERROR_NO_MATCH, ERROR_NOT_A_NUMBER, ERROR_NOT_FOUND,
-               ERROR_WAIT_NEEDS_NAME)
 
 # 自动刷新的节流间隔（秒）：展开下拉、获得焦点、窗口激活可能接连发生，只读一次
 REFRESH_THROTTLE_SECONDS = 2.0

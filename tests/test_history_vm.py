@@ -18,7 +18,6 @@ import pytest
 from PyQt5.QtCore import QObject, pyqtSignal
 from PyQt5.QtWidgets import QApplication
 
-from core.history_query import HistorySnapshot
 from core.monitor_manager import MonitorManager
 from data.errors import StorageError
 from data.models import DataPoint, MonitorTask

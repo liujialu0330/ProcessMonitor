@@ -426,7 +426,6 @@ def build_summary_row(metric: str, snapshot: Optional["HistorySnapshot"]) -> Sum
     return SummaryRow(metric, texts, tips, dimmed=dimmed)
 
 
-INTERVAL_COLUMNS = ("span", "duration", "start", "end", "delta", "rate", "peak", "vs_prev")
 INTERVAL_HEADERS = ("区间", "时长", "起值", "终值", "Δ", "速率", "峰值", "与上轮差")
 
 

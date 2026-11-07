@@ -3,8 +3,6 @@ import logging
 import logging.handlers
 import os
 
-import pytest
-
 import utils.logger as logger_module
 
 

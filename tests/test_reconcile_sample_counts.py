@@ -6,7 +6,6 @@ sample_count=0（只写数据点、不维护计数），启动时需按数据点
 import sqlite3
 from datetime import datetime, timedelta
 
-from data.models import DataPoint
 from tests.test_schema_v3 import _make_task, _points
 
 

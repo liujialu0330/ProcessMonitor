@@ -94,10 +94,10 @@ def test_is_frozen_dataclass(tmp_path):
 
 
 def test_config_compat_values_match(tmp_path, monkeypatch):
-    """config 的兼容常量/函数与 AppPaths 一致"""
+    """config 的兼容常量与 AppPaths 一致"""
     monkeypatch.setenv(config.DATA_DIR_ENV, str(tmp_path))
     paths = AppPaths.resolve()
-    assert config.get_data_dir() == config.DATA_DIR == paths.data_dir
+    assert config.DATA_DIR == paths.data_dir
     assert config.DB_PATH == paths.db_path
     assert config.UPDATE_PREFS_PATH == paths.prefs_path
     assert config.LOG_DIR == paths.log_dir

@@ -72,15 +72,13 @@ ProcessMonitor is a Windows 11 Fluent Design desktop app for keeping an eye on a
 
 ## 📸 Screenshots
 
-> These screenshots show the pre-redesign (v1.4) UI; new shots of the Monitor, Analysis and Settings pages are still to come.
-
-| Monitor | Analysis (old History page) |
+| Monitor | Analysis |
 |---|---|
-| ![Monitor page](screenshots/monitor-page.png) | ![Analysis page](screenshots/history-page.png) |
+| ![Monitor page](screenshots/monitor-page.png) | ![Analysis page](screenshots/analysis-page.png) |
 
-| Report export (old Export page) | Settings (incl. About & updates) |
-|---|---|
-| ![Export page](screenshots/export-page.png) | ![Settings page](screenshots/setting-page.png)<br>![About & updates](screenshots/about-page.png) |
+| Settings (incl. About & updates) |
+|---|
+| ![Settings page](screenshots/setting-page.png) |
 
 ## 🚀 Getting Started
 
