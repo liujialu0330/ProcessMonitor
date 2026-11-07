@@ -59,7 +59,8 @@ CUSTOM_RANGE_KEY = 'custom'
 
 # 表格取数上限：只取最近 N 条采集，避免大数据量下界面卡顿
 TABLE_POINT_LIMIT = 2000
-# 图表分桶上限：按行号分桶后每桶取 MIN/MAX 两点，故图表最多 2*CHART_MAX_BUCKETS 个点
+# 图表分桶上限：按时间等分为不超过这么多个桶、每桶取 MIN/MAX 两个真实点（见
+# AnalyticsRepo.legacy_buckets），故图表最多 2*CHART_MAX_BUCKETS 个点
 CHART_MAX_BUCKETS = 2000
 # 基线值 = 基线时刻之后这么多个样本的中位数（单个尖峰样本不会带偏基线）
 BASELINE_SAMPLES = 5
@@ -273,7 +274,8 @@ def _stats_dict(agg, fit) -> dict:
 def _baseline_info(db, task_id: str, metric: str, marker: Marker,
                    stats_since: Optional[datetime], stats_count: int) -> BaselineInfo:
     """基线值与参与取值的样本数。统计起点就是基线时刻时样本数可由统计范围点数推出，
-    否则（统计起点晚于基线）只有统计范围点数不足 BASELINE_SAMPLES 时才需要再数一次。"""
+    否则（统计起点晚于基线）只有统计范围点数不足 BASELINE_SAMPLES 时才需要再数一次
+    （point_count 按范围计数，大范围读分钟汇总，不扫样本）。"""
     value = db.analytics.value_near(
         task_id, metric, marker.timestamp, BASELINE_SAMPLES, after_only=True)
     if value is None:
@@ -281,7 +283,7 @@ def _baseline_info(db, task_id: str, metric: str, marker: Marker,
     if stats_since == marker.timestamp or stats_count >= BASELINE_SAMPLES:
         after = stats_count
     else:
-        after = db.analytics.aggregates(task_id, metric, since=marker.timestamp).count
+        after = db.analytics.point_count(task_id, metric, since=marker.timestamp)
     return BaselineInfo(marker, value, max(1, min(BASELINE_SAMPLES, after)))
 
 

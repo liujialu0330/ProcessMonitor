@@ -162,11 +162,15 @@ def test_delete_removes_task_points_and_markers(repo, factory):
     assert repo.delete(victim.task_id) is True
 
     assert repo.get(victim.task_id) is None
-    for table in ('data_points', 'task_markers'):
-        assert _count(factory, f'SELECT COUNT(*) FROM {table} WHERE task_id = ?',
-                      (victim.task_id,)) == 0
-        assert _count(factory, f'SELECT COUNT(*) FROM {table} WHERE task_id = ?',
-                      (other.task_id,)) > 0
+    # v5 样本在 series/samples 里（samples 不带 task_id，按序列统计）
+    samples_sql = ('SELECT COUNT(*) FROM samples WHERE series_id IN '
+                   '(SELECT series_id FROM series WHERE task_id = ?)')
+    for sql in (samples_sql, 'SELECT COUNT(*) FROM series WHERE task_id = ?',
+                'SELECT COUNT(*) FROM task_markers WHERE task_id = ?'):
+        assert _count(factory, sql, (victim.task_id,)) == 0
+        assert _count(factory, sql, (other.task_id,)) > 0
+    # 没有留下失去序列的样本：剩下的恰好是 other 的 2 行
+    assert _count(factory, 'SELECT COUNT(*) FROM samples', ()) == 2
     assert repo.get(other.task_id) is not None
     assert repo.delete(victim.task_id) is False
 

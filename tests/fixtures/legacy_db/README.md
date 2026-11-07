@@ -70,5 +70,18 @@ python tests/fixtures/legacy_db/generate.py --keep     # 保留工作目录便�
 
 这条路径的意义：1.4.1 只判断 `user_version >= 1` 就按原样使用库，任何新结构都会被它直接读写。
 库结构每次升级都必须保证"回退到 1.4.1 不损坏数据、升回来不丢数据"，否则用户在新版出问题时
-没有安全的退路。阶段 1 升到 v5 后的预期（降级期间写入空的 `data_points`、升级时导回）写在
-该测试文件开头。
+没有安全的退路。v5 下的预期（1.4.1 看不到 2.0 写的历史、降级期间写入空的 `data_points`、
+升级回来时启动校正导回并清理孤儿序列）写在该测试文件开头。
+
+## v5（重建式迁移）
+
+- 样本仍是 v0–v3 的库，`manifest.json` 的期望值不变；`test_migration_golden.py` 的目标版本跟着
+  `SCHEMA_VERSION` 走（现为 5），样本计数改按 `series` / `samples` 统计（`rows_after` 即迁移后
+  `samples` 的行数，`rows_after_by_metric` 按 `series.metric` 分组）。
+- 迁移不再就地改旧库：旧库以只读（immutable）方式挂载，搬进 `<库>.migrating`，最后旧文件改名为
+  `.bak_v<n>`。因此备份与原样本逐字节相同（v4 时回滚日志模式样本的文件头会被改，曾是 xfail）。
+- 冻结的就地迁移链（v1–v4）仍保留：`generate.py` 派生 v2/v3 样本、测试里的"就地链到 v4"对照
+  都显式传 `target_version`（≤ 4）走它。
+- `tests/test_rebuild_migration.py` 用这些样本验证"直接重建 == 就地链到 v4 再重建"、时间换算
+  两条路径一致；`tests/test_storage_v5.py` 用它们验证 v5 仓储与 v4 仓储（`tests/fixtures/frozen_v4_repos/`
+  冻结副本）查询结果逐项一致。

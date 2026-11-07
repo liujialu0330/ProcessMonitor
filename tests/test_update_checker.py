@@ -1,10 +1,11 @@
 """
-core/update_checker.py 纯函数用例
+core/update_checker.py 纯函数用例（compare_version 已移到 utils.version，core 原样导出）
 覆盖 compare_version 全边界与 parse_release_info（mock JSON dict）
 """
 import pytest
 
-from core.update_checker import compare_version, parse_release_info
+from core.update_checker import parse_release_info
+from utils.version import compare_version
 
 
 # ========== compare_version ==========

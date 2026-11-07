@@ -7,6 +7,10 @@
 代码统一读 cfg.get(...)，config.py 里被本模块接管的常量只在此处被引用一次
 （作为 ConfigItem 的 default 参数），不再是运行时唯一真相来源。
 
+配置文件根上的 config_version 记录文件格式版本（没有该键的旧文件视为 1）。
+load_app_config 读文件后、交给 qconfig 之前经 migrate_config（表驱动的纯函数，
+CONFIG_MIGRATIONS）迁移到当前版本，迁移发生过才回写；版本高于当前时不改写文件。
+
 【关键契约，务必遵守，勿在本类重定义 themeMode】
 主题项直接复用 QConfig 基类内置的 themeMode，本类不重新声明同名 ConfigItem。
 原因（已读源码 + 实测核实）：qfluentwidgets.setTheme() 内部固定操作模块级单例
@@ -21,11 +25,12 @@ qfluentwidgets 内置的那个、设置页的 OptionsSettingCard 绑定的是本
 （继承自类属性，未被覆盖），已用脚本验证 `AppConfig.themeMode is QConfig.
 themeMode` 为 True。
 """
+import copy
 import json
 import logging
 import os
 
-from typing import TYPE_CHECKING, Iterable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, Iterable, List, Optional, Tuple
 
 from qfluentwidgets import (
     QConfig, ConfigItem, ConfigValidator, OptionsConfigItem, RangeConfigItem,
@@ -83,8 +88,68 @@ class MarkerHotkeyValidator(ConfigValidator):
         return value.strip() if self.validate(value) else DEFAULT_MARKER_HOTKEY
 
 
+# ========== 配置文件版本 ==========
+
+# config.json 根上的版本号键；没有该键的旧文件视为版本 1
+CONFIG_VERSION_KEY = "config_version"
+LEGACY_CONFIG_VERSION = 1
+CURRENT_CONFIG_VERSION = 2
+
+
+def _migrate_v1_to_v2(data: dict) -> dict:
+    """1 → 2：内容无变更，只写入版本号。
+
+    v2 原计划剔除 Monitor.LastMetrics 里已废弃的 num_ctx_switches_involuntary、
+    把 memory_vms / memory_pagefile 映射为 memory_private；这两件事 normalize_metrics
+    在每次加载时（MetricListValidator）已经做了，文件里的旧键不影响读取，下次保存时
+    自然写成新键，因此这里不重复改写。旧版 update_prefs.json 的导入仍由
+    _import_legacy_update_prefs 负责，与版本号无关。
+    """
+    return dict(data)
+
+
+# 表驱动迁移：键为源版本，函数把该版本的配置字典变换为"源版本 + 1"（不必写版本号，
+# migrate_config 统一写）。新增版本时在这里加一项并调大 CURRENT_CONFIG_VERSION
+CONFIG_MIGRATIONS: Dict[int, Callable[[dict], dict]] = {
+    1: _migrate_v1_to_v2,
+}
+
+
+def config_version_of(data: dict) -> int:
+    """配置字典的版本号：缺失或不是正整数时按旧版（1）处理"""
+    value = data.get(CONFIG_VERSION_KEY, LEGACY_CONFIG_VERSION)
+    if isinstance(value, bool) or not isinstance(value, int) or value < LEGACY_CONFIG_VERSION:
+        return LEGACY_CONFIG_VERSION
+    return value
+
+
+def migrate_config(data: dict) -> Tuple[dict, List[str]]:
+    """
+    把配置字典逐版本迁移到 CURRENT_CONFIG_VERSION（纯函数，不修改入参）。
+
+    Returns:
+        (迁移后的字典, 执行过的步骤说明)。步骤为空表示无需迁移（已是当前版本，或版本
+        高于当前——那种情况原样返回，由调用方决定如何处理）。
+    """
+    version = config_version_of(data)
+    if version >= CURRENT_CONFIG_VERSION:
+        return data, []
+    result = copy.deepcopy(data)
+    steps: List[str] = []
+    while version < CURRENT_CONFIG_VERSION:
+        result = CONFIG_MIGRATIONS[version](result)
+        steps.append(f"{version} → {version + 1}")
+        version += 1
+    result[CONFIG_VERSION_KEY] = CURRENT_CONFIG_VERSION
+    return result, steps
+
+
 class AppConfig(QConfig):
     """应用级用户偏好配置"""
+
+    # 配置文件版本号（根级键 config_version）：由 load_app_config 维护，不是用户偏好；
+    # 声明成 ConfigItem 是为了 qconfig 保存时把它一并写回
+    config_version = ConfigItem(CONFIG_VERSION_KEY, "", CURRENT_CONFIG_VERSION)
 
     # 默认采集周期（秒）：新建监控任务时采集周期输入框的初始值；用户仍可在
     # 监控页为单次任务临时改动，不影响本配置项
@@ -113,6 +178,24 @@ class AppConfig(QConfig):
     # 写法是否合法、能否注册由 ui/hotkey 判断，这里只保证是不太长的字符串
     marker_hotkey = ConfigItem(
         "Behavior", "MarkerHotkey", DEFAULT_MARKER_HOTKEY, MarkerHotkeyValidator())
+
+    def __init__(self):
+        super().__init__()
+        # 配置文件版本高于当前时读到的原始内容：保存时保留本版本不认识的键，
+        # 避免用户回退到旧版后改一项设置就把新版的配置抹掉
+        self._newer_raw: dict = {}
+
+    def toDict(self, serialize=True):
+        items = super().toDict(serialize)
+        if not serialize or not self._newer_raw:
+            return items
+        merged = copy.deepcopy(self._newer_raw)
+        for key, value in items.items():
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                merged[key].update(value)
+            else:
+                merged[key] = value
+        return merged
 
 
 # 全局单例：进程内所有代码统一通过该实例读写配置（不要自行 AppConfig() 构造新实例
@@ -145,6 +228,9 @@ def load_app_config(paths: Optional["AppPaths"] = None) -> None:
     已存在）不做任何主题相关的额外动作，尊重用户上次保存的选择（哪怕用户主动
     从"跟随系统"改回了固定的浅色/深色）。
 
+    加载前按 migrate_config 把配置文件迁移到当前版本（迁移发生过才回写）；版本高于
+    当前时不改写文件、记 WARNING，按能识别的键读取。
+
     加载后把旧版 update_prefs.json 里"跳过的版本"一次性导入本配置并删除旧文件。
 
     Args:
@@ -156,12 +242,61 @@ def load_app_config(paths: Optional["AppPaths"] = None) -> None:
     config_path = paths.config_path
     is_first_launch = not os.path.exists(config_path)
 
+    # 新建或损坏的配置文件按当前版本保存；文件里有版本号时由 qconfig.load 读回
+    cfg.config_version.value = CURRENT_CONFIG_VERSION
+    cfg._newer_raw = {}
+    if not is_first_launch:
+        _migrate_config_file(config_path)
+
     qconfig.load(config_path, cfg)
 
     if is_first_launch:
         setTheme(Theme.AUTO, save=True)
 
     _import_legacy_update_prefs(paths.prefs_path)
+
+
+def _migrate_config_file(config_path: str) -> None:
+    """
+    按版本号迁移配置文件，迁移发生过才回写（先写临时文件再替换，避免写一半留下坏文件）。
+
+    读不出或不是 JSON 对象时不动它，保持原有行为（qconfig.load 按空配置处理）；
+    版本高于当前时不改写，只记 WARNING，并记下原始内容供保存时保留未知的键。
+    """
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception:
+        logger.warning("读取配置文件失败，按默认配置加载: %s", config_path, exc_info=True)
+        return
+    if not isinstance(data, dict):
+        return
+
+    version = config_version_of(data)
+    if version > CURRENT_CONFIG_VERSION:
+        logger.warning("配置文件版本 %d 高于当前支持的 %d，不改写文件，按能识别的键读取: %s",
+                       version, CURRENT_CONFIG_VERSION, config_path)
+        cfg._newer_raw = data
+        return
+
+    migrated, steps = migrate_config(data)
+    if not steps:
+        return
+    tmp_path = config_path + ".tmp"
+    try:
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            json.dump(migrated, f, ensure_ascii=False, indent=4)
+        os.replace(tmp_path, config_path)
+    except OSError:
+        # 写不回去也不影响本次读取：qconfig.load 读旧文件，下次启动再迁移
+        logger.warning("回写迁移后的配置文件失败: %s", config_path, exc_info=True)
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        return
+    logger.info("配置文件已迁移到版本 %d（%s）: %s",
+                CURRENT_CONFIG_VERSION, "，".join(steps), config_path)
 
 
 def _import_legacy_update_prefs(prefs_path: str) -> None:

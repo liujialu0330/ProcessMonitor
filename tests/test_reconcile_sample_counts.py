@@ -6,11 +6,33 @@ sample_count=0（只写数据点、不维护计数），启动时需按数据点
 import sqlite3
 from datetime import datetime, timedelta
 
+import pytest
+
+from data.mappers import to_ms
 from tests.test_schema_v3 import _make_task, _points
 
 
 def _insert_points_like_old_version(db_path, task_id, base, n, metric="memory_rss"):
-    """模拟旧版写入：直接插数据点，不更新 tasks.sample_count / last_sample_at"""
+    """
+    模拟"样本在、计数为 0"：直接插 v5 样本，不更新 tasks.sample_count / last_sample_at
+    （v5 下的成因是 1.4.1 对已有任务 INSERT OR REPLACE 清零了计数，或手工改库）
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute('INSERT OR IGNORE INTO series (task_id, metric) VALUES (?, ?)',
+                     (task_id, metric))
+        sid = conn.execute('SELECT series_id FROM series WHERE task_id = ? AND metric = ?',
+                           (task_id, metric)).fetchone()[0]
+        conn.executemany(
+            'INSERT INTO samples (series_id, ts_ms, value) VALUES (?, ?, ?)',
+            [(sid, to_ms(base + timedelta(seconds=i)), float(i)) for i in range(n)])
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _insert_points_like_v141(db_path, task_id, base, n, metric="memory_rss"):
+    """模拟 1.4.1 写入：直接插 data_points，不更新计数（启动校正先导回再重算）"""
     conn = sqlite3.connect(db_path)
     try:
         conn.executemany(
@@ -62,7 +84,9 @@ def test_reconcile_sample_counts_counts_distinct_timestamps(db, db_path):
     assert db.get_task(task.task_id).sample_count == 4
 
 
-def test_startup_reconcile_restores_sample_counts(qapp, tmp_path):
+@pytest.mark.parametrize('insert', [_insert_points_like_old_version, _insert_points_like_v141],
+                         ids=['zeroed_count', 'v141_data_points'])
+def test_startup_reconcile_restores_sample_counts(qapp, tmp_path, insert):
     """启动校正由组合根经 MaintenanceService.startup_reconcile 执行（主窗口不再调用，
     启动顺序见 tests/test_bootstrap.py）：旧版写入的任务在启动后重新可见"""
     from core.maintenance_service import MaintenanceService
@@ -73,7 +97,7 @@ def test_startup_reconcile_restores_sample_counts(qapp, tmp_path):
     db = Database(db_file)
     task = _make_task(status='stopped')
     db.save_task(task)
-    _insert_points_like_old_version(db_file, task.task_id, datetime(2026, 3, 1), 3)
+    insert(db_file, task.task_id, datetime(2026, 3, 1), 3)
 
     MaintenanceService(db, MonitorManager(db=db)).startup_reconcile(0)
 

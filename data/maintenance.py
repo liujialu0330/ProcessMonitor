@@ -1,5 +1,6 @@
 """
-数据库维护：过期任务清理、压缩、占用统计
+数据库维护：过期任务清理、压缩、占用统计，以及回退 1.4.1 后再升级时的两步启动校正
+（导回降级期间写入 data_points 的样本、清理已删任务留下的孤儿序列）
 
 与仓储一样，sqlite3 异常包成 StorageError 抛出；尤其 vacuum 失败必须让调用方知道，
 否则设置页会在压缩失败时仍提示"完成"。
@@ -8,9 +9,13 @@ import logging
 import os
 from datetime import datetime, timedelta
 
+from data.db.meta import MetaInfo, read_meta, touch_writer
+from data.db.migrations import rebuild
 from data.errors import StorageError
 from data.mappers import to_iso
+from data.repos import rollup, series_cache
 from data.repos._guard import storage_errors
+from data.repos._samples import delete_series_rows
 from data.repos.task_repo import delete_task_rows
 
 logger = logging.getLogger(__name__)
@@ -24,7 +29,7 @@ class Maintenance:
 
     def cleanup_older_than(self, retention_days: int) -> int:
         """
-        删除已停止且早于保留期限的任务及其全部数据点、打点（一个事务）。
+        删除已停止且早于保留期限的任务及其全部样本、打点与附属行（一个事务）。
 
         retention_days <= 0 表示禁用清理，直接返回 0、不碰库。调用方必须保证在孤儿任务
         校正之后调用：先把上次崩溃遗留的 running 任务校正为 stopped，否则"刚崩溃、其实
@@ -52,6 +57,89 @@ class Maintenance:
             # 大批量删除会把 -wal 撑大；常驻连接下 -wal 不会随连接关闭而删除，主动截断
             self._checkpoint_truncate()
         return len(task_ids)
+
+    def import_legacy_points(self) -> int:
+        """
+        启动校正：把 data_points 中的行（用户回退 1.4.1 期间由它写入）导回 samples，
+        清空 data_points，并重算受影响任务的采样计数（一个事务）。
+
+        口径同重建式迁移对 v1 源库的处理：旧内存指标键（memory_vms / memory_pagefile）并入
+        memory_private、同一时刻的重复内存指标只留一行，NULL 指标回填为任务首指标，
+        任务已不存在的孤儿行丢弃；任务指标列表里的旧键同样改名。
+        data_points 为空时只做一次只读检查，不开写事务。
+
+        Returns:
+            int: 导回前 data_points 的行数（0 表示无事可做）
+        """
+        with storage_errors("检查降级期间写入的数据点"):
+            with self._factory.connect() as conn:
+                pending = conn.execute(
+                    'SELECT EXISTS (SELECT 1 FROM data_points)').fetchone()[0]
+        if not pending:
+            return 0
+        with storage_errors("导回降级期间写入的数据点"):
+            with self._factory.transaction() as cursor:
+                total, tasks = rebuild.import_legacy_points(cursor.connection)
+        logger.warning("已导回回退旧版本期间写入的数据点: %d 行，涉及任务 %d 个",
+                       total, len(tasks))
+        return total
+
+    def rebuild_rollups(self) -> int:
+        """
+        按 samples 整体重算全部序列的分钟汇总（rollup_1m）与空洞（series_gaps），一个事务。
+
+        正常写入路径在同一事务内维护二者，这里是兜底（设置页"重建汇总"）：手工改库、
+        异常中断留下的不一致都以样本为准修正。调用方应持有维护锁（与运行中任务的写入互斥）。
+
+        Returns:
+            int: 重算的序列数
+        """
+        with storage_errors("重建分钟汇总"):
+            with self._factory.transaction() as cursor:
+                count = rollup.rebuild_rollups(cursor.connection)
+        logger.info("重建分钟汇总完成: %d 条序列", count)
+        return count
+
+    def purge_orphan_series(self) -> int:
+        """
+        启动校正：删除任务已不存在的序列及其样本、汇总、空洞，以及孤儿的成员、句柄快照与
+        打点行（1.4.1 删除任务时只删它认识的 tasks / data_points，其余表留下孤儿行）。
+
+        Returns:
+            int: 被删除的孤儿序列数
+        """
+        with storage_errors("清理孤儿序列"):
+            with self._factory.transaction() as cursor:
+                conn = cursor.connection
+                orphans = [row[0] for row in conn.execute(
+                    'SELECT series_id FROM series '
+                    'WHERE task_id NOT IN (SELECT task_id FROM tasks)')]
+                if orphans:
+                    series_cache.invalidate()
+                    samples = delete_series_rows(conn, orphans)
+                else:
+                    samples = 0
+                others = 0
+                for table in ('task_members', 'handle_snapshots', 'task_markers'):
+                    others += conn.execute(
+                        f'DELETE FROM {table} WHERE task_id NOT IN '
+                        f'(SELECT task_id FROM tasks)').rowcount
+        if orphans or others:
+            logger.warning("孤儿清理: 序列 %d 条（样本 %d 行），其他附属行 %d 行",
+                           len(orphans), samples, others)
+        return len(orphans)
+
+    def read_meta(self) -> MetaInfo:
+        """读取 meta 表（旧库没有该表时各字段为 None）"""
+        with storage_errors("读取数据库元数据"):
+            with self._factory.connect() as conn:
+                return read_meta(conn)
+
+    def touch_writer(self, app_version: str) -> None:
+        """记录本次以可写方式启动的应用版本（meta.last_writer_version）"""
+        with storage_errors("记录数据库写入版本"):
+            with self._factory.transaction() as cursor:
+                touch_writer(cursor, app_version)
 
     def _checkpoint_truncate(self) -> None:
         """

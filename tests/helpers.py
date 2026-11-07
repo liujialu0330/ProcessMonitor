@@ -138,27 +138,16 @@ class ConnectionFactoryStub:
         return _cm()
 
 
-def make_v4_db(db_path: str) -> str:
-    """
-    建一个 v4 结构的临时库并返回路径。
-    现在先用 Database(path) 建 v3，再补 v4 的两列；连接工厂/迁移的 v4 就绪后改为直接用 Database。
-    """
-    import sqlite3
+def make_current_db(db_path: str) -> str:
+    """建一个当前结构（data.db.schema.SCHEMA_VERSION）的临时库并返回路径。"""
     from data.database import Database
 
-    Database(db_path)
-    conn = sqlite3.connect(db_path)
-    try:
-        columns = {row[1] for row in conn.execute('PRAGMA table_info(tasks)')}
-        if 'create_time' not in columns:
-            conn.execute('ALTER TABLE tasks ADD COLUMN create_time REAL')
-        columns = {row[1] for row in conn.execute('PRAGMA table_info(task_markers)')}
-        if 'kind' not in columns:
-            conn.execute("ALTER TABLE task_markers ADD COLUMN kind TEXT NOT NULL DEFAULT 'user'")
-        conn.commit()
-    finally:
-        conn.close()
+    Database(db_path).close()
     return db_path
+
+
+# 过时：旧名，库结构已不止 v4；新用例请用 make_current_db
+make_v4_db = make_current_db
 
 
 def make_broken_factories(tmp_dir: str) -> list:

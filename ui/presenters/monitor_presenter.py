@@ -24,7 +24,10 @@ from PyQt5.QtWidgets import QWidget
 import config
 from core.contracts import StopReason, UnavailableReason
 from core.monitor_manager import BASELINE_SAMPLE_COUNT, default_marker_kind, median_of
-from ui.formatting import stop_reason_text, truncate_text, unavailable_reason_text
+from ui.formatting import (
+    READ_ONLY_MARKER_BLOCKED, READ_ONLY_TITLE, stop_reason_text, truncate_text,
+    unavailable_reason_text,
+)
 from ui.services import UiServices
 from ui.widgets.monitor.new_task_form import TaskRequest, WaitRequest
 from ui.widgets.monitor.process_picker import (
@@ -152,6 +155,8 @@ class MonitorPresenter(QObject):
         self.task_limit = task_limit
 
         self._tasks: Dict[str, _TaskEntry] = {}
+        # 数据库只读（由更高版本创建）时的原因文案：不能开始监控、不能打点
+        self._read_only_reason: Optional[str] = None
         # 等待进程启动的请求 {等待 ID: 请求}
         self._waits: Dict[str, _WaitEntry] = {}
         self._wait_ids = itertools.count(1)
@@ -221,6 +226,24 @@ class MonitorPresenter(QObject):
         """等待中的进程启动请求 ID（按加入顺序）。"""
         return list(self._waits)
 
+    @property
+    def read_only(self) -> bool:
+        """数据库是否只读（只读时拒绝开始监控与打点）"""
+        return self._read_only_reason is not None
+
+    def set_read_only(self, reason: Optional[str]) -> None:
+        """数据库只读（主窗口按 Database.read_only 设置）：禁用开始按钮并在 tooltip 写明原因，
+        之后的开始、等待、同配置再测与打点请求都被拒绝并就近提示。reason 为 None 时恢复。"""
+        self._read_only_reason = reason or None
+        self.form.set_start_blocked(self._read_only_reason)
+
+    def _reject_if_read_only(self) -> bool:
+        """只读时就近提示并返回 True"""
+        if self._read_only_reason is None:
+            return False
+        self._warn(self._read_only_reason, title=READ_ONLY_TITLE)
+        return True
+
     def next_marker_label(self, task_id: str) -> Optional[str]:
         """下一个打点的默认名称（基线 / 第 N 轮）；面板上没有该任务时返回 None。"""
         if task_id not in self._tasks:
@@ -282,6 +305,8 @@ class MonitorPresenter(QObject):
         self.form.show_error(resolve_error_text(error))
 
     def on_start_requested(self, request: TaskRequest) -> Optional[str]:
+        if self._reject_if_read_only():
+            return None
         if not request.metrics:
             self._warn("请先选择要监控的指标")
             return None
@@ -289,7 +314,9 @@ class MonitorPresenter(QObject):
 
     def start_monitoring(self, request: TaskRequest) -> Optional[str]:
         """创建并启动任务；同一 PID 已有运行中任务时先确认。返回任务 ID，
-        取消或创建失败返回 None。"""
+        取消或创建失败返回 None；数据库只读时拒绝并提示。"""
+        if self._reject_if_read_only():
+            return None
         if (self.manager.has_running_task_for_pid(request.pid)
                 and not self._confirm_duplicate_pid(request)):
             return None
@@ -311,7 +338,9 @@ class MonitorPresenter(QObject):
 
     def on_wait_requested(self, request: WaitRequest) -> Optional[str]:
         """登记一次等待：面板放占位卡，立刻查一次（进程已在运行就直接开始），
-        之后每秒查一次。返回等待 ID；没选指标时拒绝并返回 None。"""
+        之后每秒查一次。返回等待 ID；没选指标或数据库只读时拒绝并返回 None。"""
+        if self._reject_if_read_only():
+            return None
         if not request.metrics:
             self._warn("请先选择要监控的指标")
             return None
@@ -547,6 +576,9 @@ class MonitorPresenter(QObject):
         entry = self._tasks.get(task_id)
         if entry is None or entry.finished:
             return
+        if self._read_only_reason is not None:
+            self._warn(READ_ONLY_MARKER_BLOCKED, title=READ_ONLY_TITLE)
+            return
         # 打点时间取点击按钮的这一刻：输入名称要花好几秒，按确认时刻记录会让
         # 竖线落在事件之后，短周期下甚至把增长归到下一轮
         clicked_at = self.services.clock.now()
@@ -578,6 +610,11 @@ class MonitorPresenter(QObject):
         任务（全局快捷键、只有一个任务时的托盘菜单）——同一轮操作对各被测进程是同一个
         时刻。结果经 quick_marker_feedback 交给主窗口弹托盘气泡。
         """
+        if self._read_only_reason is not None:
+            # 托盘与全局快捷键也不能写只读库（正常情况下只读时本来就没有运行中的任务）
+            self.quick_marker_feedback.emit(
+                QUICK_MARKER_FAILED, READ_ONLY_TITLE, READ_ONLY_MARKER_BLOCKED)
+            return []
         ids = self.active_task_ids()
         if task_id is not None:
             ids = [task_id] if task_id in ids else []

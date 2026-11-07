@@ -25,7 +25,7 @@ from data.database import Database
 from data.models import DataPoint, TaskRecord
 
 # 生成逻辑（数值模型、时间戳规则、打点位置）变化时加一，使旧缓存失效
-SYNTH_VERSION = 1
+SYNTH_VERSION = 2   # v5 汇总表加入后缓存作废
 
 # 泄漏排查预设的 5 项指标
 LEAK_METRICS = ('memory_private', 'num_handles', 'num_gdi_objects',

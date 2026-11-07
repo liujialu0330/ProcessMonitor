@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 import pytest
 
 from data.errors import StorageError
+from data.mappers import to_ms
 from data.models import DataPoint, MonitorTask
 from data.repos.point_repo import PointQuery, PointRepo
 from data.repos.task_repo import TaskRepo
@@ -57,7 +58,7 @@ def _raw(factory, sql, params=()):
 def test_append_counts_distinct_timestamps_once(repo, factory, task):
     repo.append(_points(task.task_id, 3, metrics=('memory_rss', 'cpu_percent')))
     assert _counts(factory, task.task_id) == (3, BASE + timedelta(seconds=2))
-    assert _raw(factory, 'SELECT COUNT(*) FROM data_points') == 6
+    assert _raw(factory, 'SELECT COUNT(*) FROM samples') == 6
 
 
 def test_append_accumulates_and_never_moves_last_sample_back(repo, factory, task):
@@ -166,7 +167,7 @@ def test_iter_batches_early_close_releases_connection(repo, factory, seeded):
     gen.close()
     # 连接已释放：写事务可以立即拿到锁
     repo.append(_points(seeded, 1, start=BASE + timedelta(hours=1)))
-    assert _raw(factory, 'SELECT COUNT(*) FROM data_points') == 21
+    assert _raw(factory, 'SELECT COUNT(*) FROM samples') == 21
 
 
 def test_iter_batches_rejects_bad_batch_size_immediately(repo):
@@ -198,11 +199,16 @@ def test_recount_all_only_touches_zero_count_tasks_with_points(repo, factory, ta
     tasks.save(healthy)
     tasks.save(empty)
     repo.append(_points('healthy', 3))
-    # 模拟旧版本写入：只插数据点，不维护计数
+    # 模拟"样本在、计数为 0"（如 1.4.1 重存任务清零了计数）：直接插样本，不维护计数
     with factory.connect() as conn:
+        sids = {}
+        for m in ('memory_rss', 'cpu_percent'):
+            conn.execute('INSERT INTO series (task_id, metric) VALUES (?, ?)', (task.task_id, m))
+            sids[m] = conn.execute('SELECT series_id FROM series WHERE task_id = ? AND metric = ?',
+                                   (task.task_id, m)).fetchone()[0]
         conn.executemany(
-            'INSERT INTO data_points (task_id, timestamp, value, metric_type) VALUES (?,?,?,?)',
-            [(task.task_id, (BASE + timedelta(seconds=i)).isoformat(), 1.0, m)
+            'INSERT INTO samples (series_id, ts_ms, value) VALUES (?, ?, ?)',
+            [(sids[m], to_ms(BASE + timedelta(seconds=i)), 1.0)
              for i in range(4) for m in ('memory_rss', 'cpu_percent')])
 
     assert repo.recount_all() == 1

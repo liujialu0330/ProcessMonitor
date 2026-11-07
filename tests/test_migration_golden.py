@@ -6,6 +6,7 @@ README 与 generate.py），本文件只读 manifest.json 与 *.db.gz：解压�
 MigrationRunner 迁到 data.db.schema.SCHEMA_VERSION → 断言结构与新建库一致、计数与
 manifest 的独立推算一致、启动校正与历史查询可用、迁移幂等。
 目标版本跟着 SCHEMA_VERSION 走：库结构升级后这些断言自动以新版本为准。
+v5 起为重建式迁移：样本计数按 series/samples 统计，旧文件原样改名为 .bak_v<n>（逐字节不变）。
 """
 import gzip
 import json
@@ -129,21 +130,17 @@ def _read_bytes(path) -> bytes:
         return f.read()
 
 
-# SQLite 文件头里切换日志模式时会变化的字节：读写版本(18,19)、变更计数(24-27)、
-# version-valid-for(92-95)
-_HEADER_ONLY = {18, 19, 24, 25, 26, 27, 92, 93, 94, 95}
-
-
 def _rows_by_metric(conn, task_id):
     return dict(conn.execute(
-        'SELECT metric_type, COUNT(*) FROM data_points WHERE task_id = ? '
-        'GROUP BY metric_type', (task_id,)).fetchall())
+        'SELECT se.metric, COUNT(*) FROM samples s JOIN series se ON se.series_id = s.series_id '
+        'WHERE se.task_id = ? GROUP BY se.metric', (task_id,)).fetchall())
 
 
 def _sums_by_metric(conn, task_id):
     return dict(conn.execute(
-        'SELECT metric_type, SUM(value) FROM data_points WHERE task_id = ? '
-        'GROUP BY metric_type', (task_id,)).fetchall())
+        'SELECT se.metric, SUM(s.value) FROM samples s '
+        'JOIN series se ON se.series_id = s.series_id '
+        'WHERE se.task_id = ? GROUP BY se.metric', (task_id,)).fetchall())
 
 
 @pytest.mark.parametrize('sample', _sample_params())
@@ -156,17 +153,15 @@ def test_golden_sample_migrates_to_current(sample, tmp_path):
 
     report = _migrate(db_path)
 
-    # 迁移结果与备份：备份逻辑内容与原样本一致（字节级比较见 test_golden_backup_is_byte_identical）
+    # 迁移结果与备份：备份就是原文件本身（重建式迁移只读旧库、最后改名），逐字节相同
     assert report.outcome is MigrationOutcome.MIGRATED
     assert (report.from_version, report.to_version) == (sample['schema_version'],
                                                         SCHEMA_VERSION)
     assert report.backup_path == db_path + f'.bak_v{sample["schema_version"]}'
     assert os.path.exists(report.backup_path)
     assert _dump(report.backup_path) == original_dump
-    backup = _read_bytes(report.backup_path)
-    assert len(backup) == len(original)
-    # 与原样本最多只差文件头里的日志模式与计数字段（见 _BACKUP_BYTES_XFAIL），数据页逐字节相同
-    assert {i for i in range(len(original)) if backup[i] != original[i]} <= _HEADER_ONLY
+    assert _read_bytes(report.backup_path) == original
+    assert not os.path.exists(db_path + '.migrating')
 
     # 结构与新建库一致（对象、版本号、列定义、索引）
     assert _shape(db_path) == _shape(_fresh_db(tmp_path))
@@ -176,16 +171,19 @@ def test_golden_sample_migrates_to_current(sample, tmp_path):
     conn = sqlite3.connect(db_path)
     try:
         assert conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == len(expected_tasks)
-        assert conn.execute('SELECT COUNT(*) FROM data_points').fetchone()[0] == \
+        assert conn.execute('SELECT COUNT(*) FROM samples').fetchone()[0] == \
             sample['totals']['rows_after']
         assert conn.execute('SELECT COUNT(*) FROM task_markers').fetchone()[0] == \
             sample['totals']['markers_after']
-        # 迁移链的每一步都不应留下 NULL 指标或孤儿数据点
+        # 旧表在 v5 里保留为空表；不应有空名指标（NULL 未回填）、孤儿序列或失去序列的样本
+        assert conn.execute('SELECT COUNT(*) FROM data_points').fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM series WHERE metric = ''").fetchone()[0] == 0
         assert conn.execute(
-            'SELECT COUNT(*) FROM data_points WHERE metric_type IS NULL').fetchone()[0] == 0
-        assert conn.execute(
-            'SELECT COUNT(*) FROM data_points WHERE task_id NOT IN '
+            'SELECT COUNT(*) FROM series WHERE task_id NOT IN '
             '(SELECT task_id FROM tasks)').fetchone()[0] == 0
+        assert conn.execute(
+            'SELECT COUNT(*) FROM samples WHERE series_id NOT IN '
+            '(SELECT series_id FROM series)').fetchone()[0] == 0
         for task_id, exp in expected_tasks.items():
             row = conn.execute(
                 'SELECT process_name, metric_type, status, note, sample_count, '
@@ -260,25 +258,25 @@ def test_golden_schema_sql_matches_fresh_db(sample, tmp_path):
     assert _sql_texts(db_path) == _sql_texts(_fresh_db(tmp_path))
 
 
-# 迁移运行器在备份之前就用 ConnectionFactory 打开了旧库，而工厂的每个连接都会设
-# journal_mode=WAL：回滚日志模式的旧库（v1.0.x、v1.1.0 写出的库）在备份前文件头已被改成
-# WAL（偏移 18/19），并随之更新了变更计数（24-27）与 version-valid-for（92-95）。
-# 备份的逻辑内容与原库完全一致（见主用例），但不再是"迁移前原始字节"。
-_BACKUP_BYTES_XFAIL = {
-    name: '迁移前探测连接把回滚日志模式的旧库切成 WAL，备份文件头 18/19/24-27/92-95 '
-          '字节与原库不同（数据页一致）'
-    for name in ('v1.0.6_v0.db.gz', 'v1.1.0_v1.db.gz')
-}
-
-
-@pytest.mark.parametrize('sample', _sample_params(_BACKUP_BYTES_XFAIL))
+@pytest.mark.parametrize('sample', _sample_params())
 def test_golden_backup_is_byte_identical(sample, tmp_path):
-    """迁移前备份与原样本逐字节一致"""
+    """
+    迁移前备份与原样本逐字节一致。
+
+    v4 之前探测连接走 ConnectionFactory（设 journal_mode=WAL），回滚日志模式的旧库
+    （v1.0.x、v1.1.0）文件头在备份前就被改掉，这里曾是 strict xfail。v5 的探测用裸连接、
+    旧库以 immutable 只读方式 ATTACH、最后原文件改名为备份：回滚日志模式的库一个字节都不变；
+    WAL 模式的库只做一次 checkpoint——样本解压时没有 -wal 文件，checkpoint 不改主文件，
+    同样逐字节相同（带未合并 -wal 的情形见 test_rebuild_migration）。
+    """
     db_path = _unpack(sample, tmp_path)
     original = _read_bytes(db_path)
     report = _migrate(db_path)
     assert report.outcome is MigrationOutcome.MIGRATED
     assert _read_bytes(report.backup_path) == original
+    names = sorted(n for n in os.listdir(tmp_path) if n.startswith('monitor.db'))
+    # 新库为 WAL 模式，可能留有它自己的 -wal / -shm；不应有 .migrating 或备份的边车文件
+    assert [n for n in names if n not in ('monitor.db-wal', 'monitor.db-shm')] ==         ['monitor.db', f'monitor.db.bak_v{sample["schema_version"]}'], names
 
 
 def test_manifest_lists_every_fixture_file():

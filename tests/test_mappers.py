@@ -129,7 +129,8 @@ def test_row_to_marker_with_and_without_kind():
 def test_model_changes():
     assert TaskRecord is MonitorTask
     assert Marker('t', datetime(2026, 1, 1), 'x').kind == 'user'
-    assert models.MARKER_KINDS == ('user', 'baseline', 'pause', 'resume')
+    assert models.MARKER_KINDS == ('user', 'baseline', 'pause', 'resume',
+                                   'crash', 'restart', 'interrupt', 'recover')
     task = MonitorTask('t', 1, 'a', ['m'], 1.0, None, None, 'pending')
     assert task.create_time is None
     for cls in (MonitorTask, DataPoint):

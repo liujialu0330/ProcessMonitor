@@ -2,11 +2,10 @@
 ; 进程监控助手安装程序配置
 
 #define MyAppName "进程监控助手"
-; 版本号优先由外部命令行传入 /DMyAppVersion=x.y.z（build.bat 已实现，读取
-; config.APP_VERSION 单源）；此处 #ifndef 仅作直接用 Inno Setup IDE 打开
-; 编译时的兜底，避免忘传参数时编译出错误版本号的安装包
+; 版本号只能由外部命令行传入 /DMyAppVersion=x.y.z（build.bat 读取 config.APP_VERSION
+; 单源后传入）；没有传入时直接报错，不再用写死的兜底版本号——那会编译出版本号错误的安装包
 #ifndef MyAppVersion
-#define MyAppVersion "1.3.0"
+  #error 版本号必须由 build.bat 传入（/DMyAppVersion=x.y.z）
 #endif
 #define MyAppPublisher "软件测试工程师"
 #define MyAppExeName "进程监控助手.exe"

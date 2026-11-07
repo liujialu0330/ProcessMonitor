@@ -8,7 +8,8 @@
 
 结束后检查不变式：sample_count == 实际行数；last_sample_at == 最后一行时间；
 空洞数 == 休眠注入次数（db.analytics.gaps 口径，与分析页一致）；每指标行数相等；
-无重复时间戳；分析页整批查询（'all', analysis=True）能算出判定。
+无重复时间戳；分钟汇总与写时空洞 == 从样本整体重算的结果（且写时空洞数 == 休眠次数）；
+原始路径与汇总路径的分析查询结果一致；分析页整批查询（'all', analysis=True）能算出判定。
 
 默认不跑（@pytest.mark.soak，pytest.ini 默认排除）：
     python -m pytest tests/test_soak_accelerated.py -m soak -s
@@ -22,7 +23,10 @@ import pytest
 
 from core.contracts import StopReason
 from core.history_query import build_request, run_history_query
+from data.repos.analytics_repo import AnalyticsRepo
 from data.repos.point_repo import PointQuery
+from tests.test_analytics_rollup_path import close
+from tests.test_rollup import assert_rollups_consistent
 from tests.test_monitor_worker_clock import (
     ScriptedCollector, SteppingClock, make_clocked_worker,
 )
@@ -141,6 +145,21 @@ def test_seven_days_accelerated_soak(db, qapp, tmp_path):
     deltas = {b - a for a, b in zip(reference, reference[1:])}
     assert timedelta(seconds=INTERVAL) in deltas
     assert timedelta(seconds=2 * INTERVAL) in deltas   # 采集失败留下的一次缺采
+
+    # 分钟汇总与写时空洞：与从样本整体重算的结果一致；每条序列的写时空洞 == 休眠次数
+    assert assert_rollups_consistent(db.db_path) > 0
+    with db._factory.connect() as conn:
+        per_series = conn.execute(
+            'SELECT COUNT(*) FROM series_gaps GROUP BY series_id').fetchall()
+    assert [r[0] for r in per_series] == [len(clock.sleeps)] * len(METRICS)
+    raw = AnalyticsRepo(db._factory, path='raw')
+    rolled = AnalyticsRepo(db._factory, path='rollup')
+    for metric in METRICS:
+        assert close(raw.aggregates(task_id, metric), rolled.aggregates(task_id, metric))
+        assert raw.gaps(task_id, INTERVAL, metric=metric) ==             rolled.gaps(task_id, INTERVAL, metric=metric)
+        assert close(raw.buckets(task_id, metric, 50, interval_seconds=INTERVAL),
+                     rolled.buckets(task_id, metric, 50, interval_seconds=INTERVAL))
+        assert raw.legacy_buckets(task_id, metric, 2000) ==             rolled.legacy_buckets(task_id, metric, 2000)
 
     # 分析页整批查询能算出结果
     for metric in METRICS:
