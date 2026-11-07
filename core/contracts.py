@@ -62,3 +62,8 @@ class TaskInfo:
     is_paused: bool
     is_stopping: bool
     quality: Optional['QualityStats'] = None
+    # 监控目标类型：'pid' 单个进程（默认）/ 'tree' 根进程及其全部后代 / 'name' 全部同名进程。
+    # tree 的 pid / create_time 是根进程；name 的 pid 为 0、process_name 是要监控的进程名
+    target_kind: str = 'pid'
+    # 进程组是否出现过因成员名超过上限而没建序列的进程（只在合计里；pid 任务恒为 False）
+    members_truncated: bool = False

@@ -162,7 +162,7 @@ def row_to_task(row: sqlite3.Row) -> MonitorTask:
     """tasks 表的一行 → MonitorTask。
 
     后加的列（v3 的 note/sample_count/last_sample_at、v4 的 create_time、v5 的 plan_json、
-    meta_json 与数据质量列）缺失时取默认值，兼容迁移失败后仍停留在旧版本的库。
+    meta_json、target_kind / target_spec 与数据质量列）缺失时取默认值，兼容迁移失败后仍停留在旧版本的库。
     """
     return MonitorTask(
         task_id=row['task_id'],
@@ -180,6 +180,8 @@ def row_to_task(row: sqlite3.Row) -> MonitorTask:
         plan_json=(row['plan_json'] or None) if _has(row, 'plan_json') else None,
         quality=row_to_quality(row),
         meta_json=(row['meta_json'] or None) if _has(row, 'meta_json') else None,
+        target_kind=(row['target_kind'] or 'pid') if _has(row, 'target_kind') else 'pid',
+        target_spec=(row['target_spec'] or None) if _has(row, 'target_spec') else None,
     )
 
 

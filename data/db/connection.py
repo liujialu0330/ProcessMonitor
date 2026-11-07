@@ -132,6 +132,24 @@ class ConnectionFactory:
 
     # ========== checkpoint ==========
 
+    def wal_checkpoint(self, mode: str, busy_timeout_ms: Optional[int] = None) -> Optional[tuple]:
+        """
+        执行一次 PRAGMA wal_checkpoint(<mode>) 并返回结果行 (busy, -wal 总页数, 已合并页数)；
+        非 WAL 库为 (0, -1, -1)。被其他连接挡住时 SQLite 不抛错而是 busy=1。
+        sqlite3 异常原样抛出，由调用方决定怎么处理。
+
+        Args:
+            mode: PASSIVE（不等待，能合并多少算多少）/ FULL / RESTART / TRUNCATE（合并完把
+                -wal 截到 0 字节，需要等其他连接的读写让路）
+            busy_timeout_ms: 本次连接的忙等待上限；None 沿用连接默认的 5 秒。TRUNCATE 等待读者
+                时会挡住新的写入，周期性的后台 checkpoint 应传较小的值，别让采集线程跟着等
+        """
+        with self.connect() as conn:
+            if busy_timeout_ms is not None:
+                conn.execute(f'PRAGMA busy_timeout={int(busy_timeout_ms)}')
+            row = conn.execute(f'PRAGMA wal_checkpoint({mode})').fetchone()
+        return tuple(row) if row is not None else None
+
     def checkpoint(self, truncate: bool = True) -> bool:
         """
         手动 WAL checkpoint，把 -wal 中已提交的内容合并回主库文件。
@@ -146,15 +164,14 @@ class ConnectionFactory:
         """
         mode = 'TRUNCATE' if truncate else 'PASSIVE'
         try:
-            with self.connect() as conn:
-                row = conn.execute(f'PRAGMA wal_checkpoint({mode})').fetchone()
+            row = self.wal_checkpoint(mode)
         except sqlite3.Error:
             logger.warning("WAL checkpoint(%s) 失败: %s", mode, self.db_path, exc_info=True)
             return False
         # 结果行为 (busy, -wal 总页数, 已合并页数)；非 WAL 库为 (0, -1, -1)
         if row is None or row[0] != 0:
             logger.warning("WAL checkpoint(%s) 被其他连接阻挡未完成: %s, 结果=%s",
-                           mode, self.db_path, tuple(row) if row is not None else None)
+                           mode, self.db_path, row)
             return False
         return True
 

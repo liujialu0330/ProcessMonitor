@@ -25,6 +25,7 @@ from data.models import DataPoint
 from data.repos import rollup, series_cache
 from data.repos._guard import storage_errors
 from data.repos._samples import fetch_packed, in_clause, ms_range, recount_task, task_series
+from utils.metrics import is_member_series
 
 logger = logging.getLogger(__name__)
 
@@ -274,22 +275,29 @@ class PointRepo:
         return [DataPoint(task_id, from_ms(ms), value, metric_of[sid])
                 for sid, ms, value in rows]
 
-    def iter_batches(self, task_id: str,
-                     batch_size: int = 5000) -> Iterator[List[DataPoint]]:
+    def iter_batches(self, task_id: str, batch_size: int = 5000, *,
+                     include_members: bool = True) -> Iterator[List[DataPoint]]:
         """
         按时间升序分批流式产出任务的全部数据点（每个序列一个有序游标，按 (时间, 序列号)
         归并），避免一次性载入内存。同一时刻的多个指标相邻产出、按序列建立顺序排列。
         每批非空；无数据时不产出任何批。提前关闭生成器时连接随之关闭。
+
+        include_members 为 False 时不读进程组的成员序列（指标键带 "@"），只产出合计
+        序列：明细导出只要合计，成员序列的行数是合计的几十倍，不必读出来再丢掉。
         """
         if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
             raise ValueError(f"batch_size 必须是正整数，收到 {batch_size!r}")
         # 参数校验放在生成器外，调用时立即报错，而不是等到第一次 next()
-        return self._iter_batches(task_id, batch_size)
+        return self._iter_batches(task_id, batch_size, include_members)
 
-    def _iter_batches(self, task_id: str, batch_size: int) -> Iterator[List[DataPoint]]:
+    def _iter_batches(self, task_id: str, batch_size: int,
+                      include_members: bool) -> Iterator[List[DataPoint]]:
         with storage_errors(f"流式读取数据点 {task_id} "):
             with self._factory.connect() as conn:
                 series = task_series(conn, task_id)
+                if not include_members:
+                    series = [(sid, metric) for sid, metric in series
+                              if not is_member_series(metric)]
                 metric_of = dict(series)
                 cursors = []
                 for sid, _metric in series:

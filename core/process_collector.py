@@ -269,6 +269,31 @@ def _uses_snapshot(metric_type: str) -> bool:
             and (metric_type in _SNAPSHOT_READERS or metric_type in SNAPSHOT_DERIVED))
 
 
+def uses_snapshot(metric_type: str) -> bool:
+    """该指标在快照路径下是否从快照取（进程组采集与单进程采集共用同一判据）。"""
+    return _uses_snapshot(metric_type)
+
+
+def read_snapshot_metric(metric_type: str, snapshot: SystemSnapshot,
+                         sample: ProcessSample) -> Optional[float]:
+    """
+    从快照里一个进程的条目取指标（已换算到存储单位）；取不到返回 None。
+    不含 CPU 使用率：它要两次快照做差分，由各采集方自己按实例维护差分起点。
+    """
+    reader = _SNAPSHOT_READERS.get(metric_type)
+    if reader is not None:
+        return reader(sample)
+    if metric_type == MetricType.MEMORY_PERCENT:
+        return sample.working_set / _physical_memory_total() * 100
+    if metric_type == MetricType.NUM_CTX_SWITCHES_VOL:
+        switches = snapshot.context_switches(sample.pid)
+        return float(switches) if switches is not None else None
+    if metric_type == MetricType.NUM_CTX_SWITCHES_INVOL:
+        # psutil 在 Windows 上此项恒为 0（指标已废弃，仅为旧任务"重新监控"保留）
+        return 0.0
+    return None
+
+
 # collect 内部的哨兵：本周期改走 psutil 原路径
 _FALLBACK = object()
 
@@ -622,20 +647,9 @@ class ProcessCollector:
     def _snapshot_value(self, metric_type: str, snapshot: SystemSnapshot,
                         sample: ProcessSample) -> Optional[float]:
         """从快照取一个指标（已换算到存储单位）；取不到返回 None。"""
-        reader = _SNAPSHOT_READERS.get(metric_type)
-        if reader is not None:
-            return reader(sample)
         if metric_type == MetricType.CPU_PERCENT:
             return self._cpu_percent_from(snapshot, sample)
-        if metric_type == MetricType.MEMORY_PERCENT:
-            return sample.working_set / _physical_memory_total() * 100
-        if metric_type == MetricType.NUM_CTX_SWITCHES_VOL:
-            switches = snapshot.context_switches(self.pid)
-            return float(switches) if switches is not None else None
-        if metric_type == MetricType.NUM_CTX_SWITCHES_INVOL:
-            # psutil 在 Windows 上此项恒为 0（指标已废弃，仅为旧任务"重新监控"保留）
-            return 0.0
-        return None
+        return read_snapshot_metric(metric_type, snapshot, sample)
 
     def _cpu_percent_from(self, snapshot: SystemSnapshot,
                           sample: ProcessSample) -> Optional[float]:

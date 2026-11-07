@@ -29,7 +29,21 @@ pmctl quit
 pmctl run --name MyApp.exe --wait --rounds-every 60 --rounds 20 --out D:\out --junit D:\out\leak.xml
 ```
 
-多个目标（多个 `--pid` / `--name`）时取最严重的判定：被测进程退出 > 持续上涨 > 数据不足 > 平稳。
+进程组：`--tree` 监控 `--pid`（或 `--launch` 启动的程序）及其全部子孙进程，根进程退出任务才结束；
+`--group-name 进程名` 监控全部同名进程（不要求唯一，当前没有也能开始，成员归零不结束任务）。
+两者都不能是本程序自身。进程组不接受峰值类与基本优先级指标，会自动加上“进程总数”；判定结果
+另含每个成员（同名进程的合并）各指标的结论，任一成员持续上涨即整体持续上涨。
+
+```bat
+pmctl start --tree --pid 1234
+pmctl start --group-name chrome.exe --metrics memory_private,num_handles
+pmctl run --tree --launch D:pp\App.exe --stop-after 3600 --out D:\out
+```
+
+协议里对应 `start` 的 `target_kind` 参数（`pid` 缺省 / `tree` / `name`）；`status` 的每个任务带
+`target_kind`，`verdict` 在进程组任务里多一个 `members` 数组。
+
+多个目标（多个 `--pid` / `--name` / `--group-name`）时取最严重的判定：被测进程退出 > 持续上涨 > 数据不足 > 平稳。
 
 ### 退出码
 

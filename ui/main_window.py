@@ -27,6 +27,7 @@ from ui.pages.monitor_page import MonitorPage
 from ui.pages.setting_page import SettingPage
 from ui.presenters.monitor_presenter import QUICK_MARKER_OK
 from ui.services import CLOSE_ACTION_CANCEL, CLOSE_ACTION_TRAY, UiServices
+from ui.storage_notices import StorageNotices
 from ui.theme_follow import SystemThemeWatcher
 from ui.tray import TrayController
 from core.monitor_manager import MonitorManager
@@ -82,6 +83,10 @@ class MainWindow(FluentWindow):
         # 界面卡死看门狗（组合根在窗口显示后安装并交给这里）：真退出收尾会阻塞界面线程，
         # 收尾前必须先停掉它，否则会把正常的收尾当成卡死转储
         self.watchdog = None
+        # 存储守卫（组合根在窗口显示后经 attach_storage_guard 交给这里）与把它的信号翻译成
+        # 界面提示的 StorageNotices：真退出收尾前同样要先停守卫
+        self.storage_guard = None
+        self.storage_notices: Optional[StorageNotices] = None
 
         # 托盘驻留相关状态：必须在 _init_tray()/closeEvent 用到之前初始化完毕。
         # - _really_quit：托盘菜单"退出"、设置页"立即安装"与会话结束会置 True，
@@ -306,6 +311,29 @@ class MainWindow(FluentWindow):
             self.watchdog.stop()
         except Exception:
             logger.warning("停止界面看门狗失败", exc_info=True)
+
+    def attach_storage_guard(self, guard) -> None:
+        """组合根创建存储守卫后交给主窗口（在 guard.start() 之前调用，首次检查才不会错过
+        提示）：磁盘空间提示、暂停原因标注、完整性警告都经 StorageNotices 显示；真退出时先停它。"""
+        self.storage_guard = guard
+        self.storage_notices = StorageNotices(
+            guard, self.services.notifier, self, db_path=getattr(guard, 'db_path', None),
+            set_pause_marks=self.monitor_page.presenter.set_space_paused,
+            show_integrity=self.setting_page.show_integrity_warning,
+            tray_message=self._storage_tray_message, parent=self)
+
+    def _storage_tray_message(self, title: str, content: str) -> None:
+        """窗口隐藏在托盘时，补发存储提示的托盘气泡（提示条挂在隐藏的窗口上看不到）"""
+        if self.isHidden() and self._tray_available():
+            self.tray.show_message(title, content, 'warning')
+
+    def _stop_storage_guard(self) -> None:
+        if self.storage_guard is None:
+            return
+        try:
+            self.storage_guard.stop()
+        except Exception:
+            logger.warning("停止存储守卫失败", exc_info=True)
 
     def _init_tray(self) -> None:
         """创建托盘控制器（图标常驻；托盘不可用时 is_available() 为 False）"""
@@ -532,6 +560,8 @@ class MainWindow(FluentWindow):
         self._shutdown_started = True
         # 收尾会阻塞界面线程（最长 30 秒），看门狗不能把它当成卡死
         self._stop_watchdog()
+        # 守卫的定时器与在途后台作业也先停（作业的等待交给登记表）
+        self._stop_storage_guard()
         # 收尾期间不再切主题（窗口已隐藏，重刷样式表只会拖慢退出）
         self.theme_watcher.stop()
         try:

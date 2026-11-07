@@ -18,7 +18,8 @@ run() 的顺序是固定的，调整前先确认每一步的前置条件：
    schema_mismatch——本版本的读写都按 v5 结构写成，不能在旧结构上写；构造 Database（不再在
    构造时迁移）→ 8. 启动校正（任何任务启动之前；只读库跳过）。其中导回回退 1.4.1 期间写入的
    数据一步：待导回行数超过 MIGRATION_PROGRESS_THRESHOLD_ROWS 时经进度窗口在工作线程执行
-→ 9. 线程登记表、界面服务、阻止睡眠守卫、自身监控 → 10. 主窗口（托盘由主窗口创建并持有；迁移结果与只读状态由主窗口
+→ 9. 线程登记表、界面服务、阻止睡眠守卫、自身监控、存储守卫（磁盘空间 / -wal 兜底 checkpoint /
+后台 quick_check，窗口显示后与无窗口模式就绪时启动，退出收尾前停止）→ 10. 主窗口（托盘由主窗口创建并持有；迁移结果与只读状态由主窗口
 按 Database 的标志提示；数据目录在同步盘上时交给主窗口显示一次提示；设置页的诊断信息经
 diagnostics_provider 取本上下文）→ 10a. 窗口显示后在界面线程安装界面卡死看门狗（主窗口真退出
 时先停掉它，收尾期间界面线程会阻塞）、自身监控每 60 秒采一次 → 10b. 把命令处理器的上下文交给
@@ -63,6 +64,7 @@ if TYPE_CHECKING:
     from core.power_guard import PowerGuard
     from core.self_monitor import SelfMonitor
     from core.shutdown import ThreadRegistry
+    from core.storage_guard import StorageGuard
     from data.database import Database
     from data.db.migrations.runner import MigrationReport, MigrationRunner, ProbeResult
     from ui.main_window import MainWindow
@@ -133,6 +135,9 @@ class AppContext:
     self_monitor_timer: Any = None
     # 界面卡死看门狗（只在有窗口模式、窗口显示后安装；诊断信息用）
     watchdog: Any = None
+    # 存储守卫：磁盘空间、-wal 兜底 checkpoint、后台 quick_check（build_context 创建，
+    # start_storage_guard 启动；有窗口与无窗口模式都用）
+    storage_guard: Optional["StorageGuard"] = None
 
     @property
     def hub(self):
@@ -199,9 +204,13 @@ def build_context(paths: AppPaths, *, registry=None,
     from core.power_guard import PowerGuard
     power_guard = PowerGuard.from_config_item(manager, cfg.keep_awake_while_monitoring)
     from core.self_monitor import SelfMonitor
+    from core.storage_guard import StorageGuard
+    storage_guard = StorageGuard(manager, maintenance, registry, paths.db_path,
+                                 read_only=bool(getattr(db, 'read_only', False)))
     return AppContext(paths=paths, db=db, manager=manager, services=services,
                       registry=registry, maintenance=maintenance, reconcile=reconcile,
-                      power_guard=power_guard, self_monitor=SelfMonitor())
+                      power_guard=power_guard, self_monitor=SelfMonitor(),
+                      storage_guard=storage_guard)
 
 
 def schema_not_upgraded(report: "MigrationReport") -> bool:
@@ -477,6 +486,18 @@ def start_self_monitor(ctx: AppContext, interval_ms: int = SELF_MONITOR_INTERVAL
     return timer
 
 
+def start_storage_guard(ctx: AppContext, window=None) -> None:
+    """启动存储守卫的定时检查。有窗口模式先让主窗口接上守卫的信号（提示与卡片标注），再启动，
+    首次检查才不会错过任何提示；无窗口模式不连界面，守卫只记日志。没有守卫时什么都不做。"""
+    guard = ctx.storage_guard
+    if guard is None:
+        return
+    attach = getattr(window, 'attach_storage_guard', None)
+    if attach is not None:
+        attach(guard)
+    guard.start()
+
+
 def install_watchdog(app, ctx: AppContext, window) -> None:
     """界面卡死看门狗：窗口显示后在界面线程安装，交给主窗口（真退出时先停掉它）。
     没有 crash.log 等原因装不上时只记日志。"""
@@ -548,7 +569,8 @@ def _run_headless(app, guard, paths: AppPaths, idle_exit_s: float, *,
     runtime = HeadlessRuntime(
         ctx.manager, ctx.registry, ctx.db, idle_exit_s=idle_exit_s,
         busy=(dispatcher.has_pending if dispatcher is not None else None),
-        stage_renderer=render_stage_snapshot_image)
+        stage_renderer=render_stage_snapshot_image,
+        quit_hooks=([ctx.storage_guard.stop] if ctx.storage_guard is not None else []))
     if dispatcher is not None:
         dispatcher.set_settings(command_settings())
         dispatcher.set_context(CommandContext(
@@ -558,6 +580,7 @@ def _run_headless(app, guard, paths: AppPaths, idle_exit_s: float, *,
             launcher=getattr(ctx.services, "launcher", None)))
     runtime.start()
     start_self_monitor(ctx)
+    start_storage_guard(ctx)
     logger.info("无窗口模式已就绪（空闲退出：%s）",
                 f"{idle_exit_s:g} 秒" if idle_exit_s > 0 else "不退出")
     _mark(trace, "就绪")
@@ -693,6 +716,7 @@ def run(argv: List[str], *, exit_process: Callable[[int], None] = os._exit,
     _mark(trace, "显示")
     install_watchdog(app, ctx, window)
     start_self_monitor(ctx)
+    start_storage_guard(ctx, window)
     guard.activation_requested.connect(lambda: activate_main_window(window))
     _attach_ipc_to_window(guard, ctx, window)
     hint = sync_dir_hint(paths.data_dir)

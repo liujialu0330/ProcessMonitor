@@ -7,6 +7,11 @@
 - cleanup_and_vacuum：设置页"清理并压缩数据库"，耗时，由后台线程调用
 - rebuild_rollups：设置页"重建汇总"，按样本重算分钟汇总与空洞，耗时，由后台线程调用
 
+另有存储健康的后台作业（core.storage_guard）：-wal 过大时的兜底 checkpoint 与启动后的
+quick_check。兜底 checkpoint 经 begin_storage_job() / end_storage_job() 登记，与清理、
+重建汇总互斥（登记时维护进行中则被拒，登记期间 begin() 抛 MaintenanceBusy）；quick_check 只用
+只读连接、不写库，不登记，维护开始时由守卫推迟。
+
 维护锁（MonitorManager.begin_maintenance / end_maintenance）只经本服务持有与释放，
 调用方不直接碰 manager。两种用法（cleanup_and_vacuum 与 rebuild_rollups 相同）：
 - 一段式：cleanup_and_vacuum(days) 内部占锁、结束（无论成败）必释放；
@@ -22,6 +27,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 import config
 
 if TYPE_CHECKING:
+    from data.db.maintenance import CheckpointOutcome, QuickCheck
     from core.monitor_manager import MonitorManager
     from data.database import Database
 
@@ -35,11 +41,12 @@ LegacyImporter = Callable[[int, Callable[[Optional[Callable[[str, int, int], Non
 BUSY_TASKS_RUNNING = 'tasks_running'
 BUSY_EXPORT_RUNNING = 'export_running'
 BUSY_MAINTENANCE_RUNNING = 'maintenance_running'
+BUSY_STORAGE_JOB_RUNNING = 'storage_job_running'
 
 
 class MaintenanceBusy(Exception):
-    """维护被拒绝：有运行中的监控任务（'tasks_running'）、导出进行中（'export_running'）
-    或已有维护在进行（'maintenance_running'）"""
+    """维护被拒绝：有运行中的监控任务（'tasks_running'）、导出进行中（'export_running'）、
+    已有维护在进行（'maintenance_running'）或存储健康的后台作业正在跑（'storage_job_running'）"""
 
     def __init__(self, reason: str):
         super().__init__(reason)
@@ -76,6 +83,8 @@ class MaintenanceService:
     def __init__(self, db: "Database", manager: "MonitorManager"):
         self._db = db
         self._manager = manager
+        # 正在跑的存储健康后台作业数（只在界面线程增减，与 begin() 串行，无需加锁）
+        self._storage_jobs = 0
 
     def startup_reconcile(self, retention_days: int, *,
                           legacy_importer: Optional[LegacyImporter] = None) -> ReconcileResult:
@@ -137,6 +146,8 @@ class MaintenanceService:
         """
         if self._manager.is_maintenance_running():
             raise MaintenanceBusy(BUSY_MAINTENANCE_RUNNING)
+        if self._storage_jobs > 0:
+            raise MaintenanceBusy(BUSY_STORAGE_JOB_RUNNING)
         if not self._manager.begin_maintenance():
             reason = (BUSY_TASKS_RUNNING if self._manager.has_running_tasks()
                       else BUSY_EXPORT_RUNNING)
@@ -198,3 +209,50 @@ class MaintenanceService:
             if not already_locked:
                 self.end()
         return RebuildRollupsResult(series=series)
+
+    # ========== 存储健康后台作业（-wal 兜底 checkpoint 与 quick_check） ==========
+
+    def begin_storage_job(self) -> bool:
+        """登记一个存储健康后台作业（界面线程，启动作业线程之前调用）。
+
+        维护（清理、重建汇总）进行中返回 False，调用方跳过这一轮；否则登记成功，此后
+        begin() 在作业结束前抛 MaintenanceBusy(BUSY_STORAGE_JOB_RUNNING)。每次成功的
+        begin_storage_job 都必须对应一次 end_storage_job（线程 finished 时调用）。
+        """
+        if self._manager.is_maintenance_running():
+            return False
+        self._storage_jobs += 1
+        return True
+
+    def end_storage_job(self) -> None:
+        """注销一个存储健康后台作业（界面线程，作业线程 finished 之后）"""
+        self._storage_jobs = max(0, self._storage_jobs - 1)
+
+    def has_storage_job(self) -> bool:
+        """是否有存储健康后台作业在跑"""
+        return self._storage_jobs > 0
+
+    def is_busy(self) -> bool:
+        """数据库维护是否正在进行（守卫据此推迟 quick_check、跳过兜底 checkpoint）"""
+        return self._manager.is_maintenance_running()
+
+    def wal_size_bytes(self) -> int:
+        """-wal 文件的字节数（不存在为 0）"""
+        return self._db.wal_size_bytes()
+
+    def checkpoint_wal(self) -> "CheckpointOutcome":
+        """-wal 兜底 checkpoint（工作线程调用；占用维护登记由调用方经 begin_storage_job 负责）。
+        先 TRUNCATE、被挡住退到 PASSIVE，前后大小与耗时记日志；不抛 sqlite3 异常。"""
+        outcome = self._db.checkpoint_wal()
+        if outcome.error:
+            logger.warning("-wal 兜底 checkpoint 失败: 模式=%s, %s", outcome.mode, outcome.error)
+        else:
+            logger.info(
+                "-wal 兜底 checkpoint: 模式=%s%s, -wal %d -> %d 字节, 耗时 %.2f 秒",
+                outcome.mode, "（TRUNCATE 被挡住，已退到 PASSIVE）" if outcome.fell_back else "",
+                outcome.size_before, outcome.size_after, outcome.elapsed_s)
+        return outcome
+
+    def new_quick_check(self) -> "QuickCheck":
+        """新建一次后台 quick_check（只读连接；run() 在工作线程执行，interrupt() 任意线程）"""
+        return self._db.new_quick_check()

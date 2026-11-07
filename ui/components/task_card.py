@@ -297,6 +297,8 @@ class TaskCard(CardWidget):
 
         # 暂停/结束状态；卡片创建时任务必为运行态
         self.is_paused = False
+        # 暂停的原因说明（目前只有"磁盘空间不足"由存储守卫自动暂停），None 表示用户自己暂停
+        self.pause_reason: Optional[str] = None
         self.is_finished = False
         self.status = STATUS_RUNNING
 
@@ -617,6 +619,8 @@ class TaskCard(CardWidget):
     def _apply_status(self, status: str) -> None:
         text, light, dark = STATUS_STYLES[status]
         self.status = status
+        if status == STATUS_PAUSED and self.pause_reason:
+            text = f"{text}（{self.pause_reason}）"
         self.status_label.setText(f"● {text}")
         self.status_label.setTextColor(light, dark)
 
@@ -769,15 +773,35 @@ class TaskCard(CardWidget):
             is_paused: 任务是否处于暂停状态
         """
         self.is_paused = is_paused
+        if not is_paused:
+            self.pause_reason = None
         if is_paused:
             self.pause_button.setText("恢复")
             self.pause_button.setIcon(FluentIcon.PLAY)
-            self.pause_button.setToolTip("恢复采集，继续记录到这个任务")
+            self.pause_button.setToolTip(self._resume_tooltip())
         else:
             self.pause_button.setText("暂停")
             self.pause_button.setIcon(FluentIcon.PAUSE)
             self.pause_button.setToolTip(PAUSE_TOOLTIP)
         self._apply_status(STATUS_PAUSED if is_paused else STATUS_RUNNING)
+
+    def _resume_tooltip(self) -> str:
+        if self.pause_reason:
+            return f"因{self.pause_reason}自动暂停；问题解决后点“恢复”继续记录到这个任务"
+        return "恢复采集，继续记录到这个任务"
+
+    def set_pause_reason(self, reason: Optional[str]) -> None:
+        """标注当前暂停的原因（状态胶囊显示"已暂停（原因）"）；只在已暂停时有意义，
+        None 或任务没在暂停时清除标注"""
+        reason = reason or None
+        if reason is not None and not self.is_paused:
+            reason = None
+        if reason == self.pause_reason:
+            return
+        self.pause_reason = reason
+        if self.is_paused:
+            self.pause_button.setToolTip(self._resume_tooltip())
+            self._apply_status(STATUS_PAUSED)
 
     def set_stopping(self) -> None:
         """已发出停止请求、等待任务收尾（task_stopped）期间：禁用全部操作按钮，

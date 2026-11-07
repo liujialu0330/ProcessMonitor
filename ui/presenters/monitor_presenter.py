@@ -57,6 +57,7 @@ from ui.formatting import (
     stop_reason_text, truncate_text, unavailable_reason_text,
 )
 from ui.services import UiServices
+from ui.storage_notices import SPACE_PAUSE_REASON
 from ui.widgets.analysis.report_sheet import render_report_for
 from ui.widgets.monitor.new_task_form import TaskRequest, WaitRequest
 from ui.widgets.monitor.process_picker import (
@@ -954,6 +955,13 @@ class MonitorPresenter(QObject):
     def on_task_resumed(self, task_id: str) -> None:
         if task_id != self._commanding:
             self._show_paused(task_id, False)
+
+    def set_space_paused(self, task_ids) -> None:
+        """存储守卫因磁盘空间不足暂停的任务集合有变化：集合内（且确实在暂停）的卡片标注
+        暂停原因，其余清除标注。"""
+        ids = set(task_ids)
+        for task_id, card in self.board.cards().items():
+            card.set_pause_reason(SPACE_PAUSE_REASON if task_id in ids else None)
 
     def on_marker(self, task_id: str) -> None:
         """打点：弹出名称输入框（默认名称按序列：基线 / 第 N 轮），经 manager 写库，

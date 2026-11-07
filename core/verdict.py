@@ -1,7 +1,7 @@
 """
 泄漏判定的统一口径（命令行 verdict / pmctl run 与证据包共用）
 
-只依赖标准库，不碰 Qt、不查数据库；输入是分析快照（core.history_query 的
+只依赖标准库与 utils.metrics，不碰 Qt、不查数据库；输入是分析快照（core.history_query 的
 HistorySnapshot / TaskAnalysis，或同字段的替身）。
 
 单指标（metric_verdict）：
@@ -16,12 +16,18 @@ HistorySnapshot / TaskAnalysis，或同字段的替身）。
 3. 没有任何指标得出平稳/波动的结论 → insufficient；
 4. 否则 → stable。
 
+进程组任务（tree / name）：合计序列与进程总数照常判定；每个成员的每个序列（指标@成员键）
+各自判定（member_verdicts），整体判定把合计与全部成员一起看——合计或任一成员持续上涨即
+rising（总量持平而某个成员在涨，同样是泄漏线索）。pid 任务没有成员，规则不变。
+
 "停止条件达成之前"由调用方判断（见 exited_before_condition）：任务按方案的时长/轮数
 已经满足停止条件之后被测进程才退出（如停止条件到点后关闭被测程序、或二者几乎同时发生），
 测试本身是完整的，照常判定，退出信息另行附在结果里。没有停止条件的任务，被测进程退出
 一律算"之前"。
 """
-from typing import Any, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional
+
+from utils.metrics import split_member_key
 
 VERDICT_STABLE = 'stable'
 VERDICT_RISING = 'rising'
@@ -83,6 +89,30 @@ def combine_verdicts(verdicts: Iterable[str], *, stop_reason: Any = None,
     return VERDICT_STABLE
 
 
+def member_snapshots_of(analysis) -> Dict[str, Any]:
+    """分析结果里的成员序列快照 {指标@成员键: 快照}；pid 任务（或旧结构的替身）为空。"""
+    return getattr(analysis, 'member_snapshots', None) or {}
+
+
+def member_verdicts(analysis) -> Dict[str, Dict[str, str]]:
+    """每个成员各指标的判定：{成员键: {指标键: 判定}}（成员与指标保持快照里的顺序）。
+    无 Qt 依赖，命令行、证据包与界面共用。"""
+    result: Dict[str, Dict[str, str]] = {}
+    for series_key, snapshot in member_snapshots_of(analysis).items():
+        metric, member = split_member_key(series_key)
+        if member is None:
+            continue
+        result.setdefault(member, {})[metric] = metric_verdict(snapshot)
+    return result
+
+
+def member_overall(analysis) -> Dict[str, str]:
+    """每个成员自己的整体判定：{成员键: rising / stable / insufficient}（规则同 combine_verdicts，
+    不含"被测进程退出"，那是任务级的）。"""
+    return {member: combine_verdicts(metrics.values())
+            for member, metrics in member_verdicts(analysis).items()}
+
+
 def overall_verdict(analysis, *, stop_reason: Any = None,
                     stopped_before_condition: bool = False) -> str:
     """
@@ -95,8 +125,9 @@ def overall_verdict(analysis, *, stop_reason: Any = None,
             exited_before_condition 判断）。只有它为真且 stop_reason 是退出类时才判
             target_exited；缺省为假，即调用方不知道时按普通判定处理
     """
-    return combine_verdicts((metric_verdict(s) for s in analysis.snapshots.values()),
-                            stop_reason=stop_reason,
+    verdicts = [metric_verdict(s) for s in analysis.snapshots.values()]
+    verdicts += [metric_verdict(s) for s in member_snapshots_of(analysis).values()]
+    return combine_verdicts(verdicts, stop_reason=stop_reason,
                             stopped_before_condition=stopped_before_condition)
 
 
@@ -125,5 +156,6 @@ __all__ = [
     'VERDICT_STABLE', 'VERDICT_RISING', 'VERDICT_INSUFFICIENT', 'VERDICT_TARGET_EXITED',
     'VERDICT_FLUCTUATING', 'METRIC_NOT_JUDGED', 'REASON_NO_DATA', 'TARGET_EXIT_REASONS',
     'stop_reason_value', 'is_target_exit', 'metric_verdict', 'metric_reason',
-    'combine_verdicts', 'overall_verdict', 'stop_condition_reached', 'exited_before_condition',
+    'combine_verdicts', 'overall_verdict', 'member_snapshots_of', 'member_verdicts',
+    'member_overall', 'stop_condition_reached', 'exited_before_condition',
 ]

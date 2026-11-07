@@ -14,10 +14,13 @@ import os
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
 
-from core.report import SUMMARY_HEADER, build_report_csv_header, report_rows
+from core.report import (MEMBER_SUMMARY_TITLE, SUMMARY_HEADER, build_report_csv_header,
+                         member_summary_table, report_rows)
 from core.workers.base import BackgroundTask, CancelToken
 from data.database import Database
-from data.models import MonitorTask
+from data.models import TARGET_PID, MonitorTask
+from data.repos.point_repo import PointQuery
+from utils.metrics import member_series_key
 
 logger = logging.getLogger(__name__)
 
@@ -124,7 +127,9 @@ class ReportWorker(BackgroundTask):
     def _write_csv(self, tmp: str, token: CancelToken) -> Tuple[int, int]:
         task = self.job.task
         processed = rows = 0
-        batches = self.db.points.iter_batches(task.task_id, FETCH_BATCH_SIZE)
+        # 进程组的明细只导出合计序列：成员序列另以"成员汇总"段附在末尾（pid 任务没有成员序列）
+        options = {} if task.target_kind == TARGET_PID else {'include_members': False}
+        batches = self.db.points.iter_batches(task.task_id, FETCH_BATCH_SIZE, **options)
         try:
             markers = self.db.markers.list(task.task_id)
 
@@ -150,9 +155,41 @@ class ReportWorker(BackgroundTask):
                     writer.writerow(row)
                     if row:
                         rows += 1
+                if task.target_kind != TARGET_PID and not token.is_cancelled:
+                    self._write_member_summary(writer)
         finally:
             batches.close()
         return rows, processed
+
+    def _write_member_summary(self, writer) -> None:
+        """进程组任务：在明细后空一行写"成员汇总"段。成员留痕读不到或没有成员时不写
+        （留痕只是附带信息，不能让导出失败）。"""
+        task = self.job.task
+        try:
+            members = self.db.members.list_members(task.task_id)
+            last_values = {}
+            if members:
+                known = set(self.db.members.member_series(task.task_id))
+                for member in members:
+                    for metric in task.metric_types:
+                        if (metric, member.member_key) not in known:
+                            continue
+                        points = self.db.points.fetch(PointQuery(
+                            task.task_id, member_series_key(metric, member.member_key),
+                            limit=1))
+                        if points:
+                            last_values[(member.member_key, metric)] = points[-1].value
+        except Exception:
+            logger.error("读取进程组成员汇总失败，明细 CSV 不含成员汇总段: task_id=%s",
+                         task.task_id, exc_info=True)
+            return
+        if not members:
+            return
+        header, rows = member_summary_table(task, members, last_values)
+        writer.writerow([])
+        writer.writerow([MEMBER_SUMMARY_TITLE])
+        writer.writerow(header)
+        writer.writerows(rows)
 
     def failure_message(self, exc: Exception) -> str:
         return f"导出失败：{exc}"

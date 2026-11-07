@@ -10,6 +10,9 @@
   "#" 跳过；
 - <任务>_摘要.csv：指标 × 打点区间，每行一个指标的一个区间。
 
+进程组任务（tree / name）的明细 CSV 只含合计序列；成员（同名实例的合并）另在文件末尾追加
+一个"成员汇总"段（成员、实例数、首次出现、最后出现与各指标末值），报告图片不变。
+
 报告图片用到的结构化数据也在这里组装：metadata_items（元信息网格的 (标签, 值)）、
 round_delta_rows（打点区间增量表：相邻两个打点围出的每一轮、各指标的 Δ 与与上轮差）。
 
@@ -30,6 +33,7 @@ from utils.metrics import get_metric_display_name, get_metric_unit
 
 if TYPE_CHECKING:
     from core.history_query import HistorySnapshot, TaskAnalysis
+    from data.repos.member_repo import MemberSummary
 
 REPORT_IMAGE_SUFFIX = '_报告.png'
 SUMMARY_CSV_SUFFIX = '_摘要.csv'
@@ -44,6 +48,10 @@ SUMMARY_HEADER = (
     '指标', '单位', '区间', '起点', '终点', '时长(秒)', '点数',
     '起值', '终值', '变化量', '每小时速率', '峰值', '与上轮差',
 )
+
+# 进程组明细 CSV 末尾的"成员汇总"段
+MEMBER_SUMMARY_TITLE = '成员汇总'
+MEMBER_SUMMARY_HEADER = ('成员', '实例数', '首次出现', '最后出现')
 
 _INVALID_CHARS = '\\/:*?"<>|\r\n\t'
 
@@ -276,6 +284,28 @@ def report_rows(task: MonitorTask, data_points: Iterable[DataPoint],
         previous = timestamp
         elapsed = (timestamp - task.start_time).total_seconds()
         yield [row[0], format_elapsed(elapsed), *row[1:]]
+
+
+def member_summary_table(task: MonitorTask, members: Sequence["MemberSummary"],
+                         last_values: Mapping[Tuple[str, str], float]
+                         ) -> Tuple[List[str], List[list]]:
+    """进程组"成员汇总"段：(表头, 数据行)。实例数为任务期间出现过的不同实例数（含已退出的），
+    首次出现 / 最后出现取该成员全部实例的最早与最晚时刻；各指标末值取成员序列的最后一个
+    采样（last_values 的键为 (成员键, 指标键)，没有样本的格子留空）。没有成员时行为空。"""
+    metrics = list(task.metric_types)
+    header = list(MEMBER_SUMMARY_HEADER)
+    for metric in metrics:
+        name, unit = get_metric_display_name(metric), get_metric_unit(metric)
+        header.append(f"{name}({unit})末值" if unit else f"{name}末值")
+    rows = []
+    for member in members:
+        rows.append([
+            member.name, member.instance_count,
+            member.first_at.strftime(TIME_FORMAT), member.last_at.strftime(TIME_FORMAT),
+            *[_number(metric, last_values.get((member.member_key, metric)))
+              for metric in metrics],
+        ])
+    return header, rows
 
 
 def interval_spans(intervals: Sequence[IntervalStats],

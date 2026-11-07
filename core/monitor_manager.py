@@ -8,21 +8,25 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from PyQt5 import sip
 from PyQt5.QtCore import QObject, pyqtSignal
 
 from core.contracts import StopReason, TaskInfo, TaskStatus
+from core.group_aggregator import MemberSnapshot
 from core.monitor_task import (ACTIVE_STATES, LIVE_STATES, SYSTEM_CLOCK, MonitorWorker,
                                WorkerState)
+from core.process_tree import GroupSpec
 from core.snapshot_hub import SnapshotHub, default_hub
 from core.target_info import TargetInfo
 from core.target_info import probe as default_target_probe
 from data.database import Database
 from data.errors import StorageError
-from data.models import MARKER_KINDS, Marker, QualityStats, TaskRecord
+from data.models import (MARKER_KINDS, TARGET_KINDS, TARGET_NAME, TARGET_PID, TARGET_TREE,
+                         Marker, QualityStats, TaskRecord)
 from data.repos.point_repo import PointQuery
+from utils.metrics import PROCESS_COUNT
 from utils.thread_utils import shutdown_thread
 import config
 
@@ -118,6 +122,10 @@ class MonitorManager(QObject):
     # 同步卡片状态
     task_paused = pyqtSignal(str)
     task_resumed = pyqtSignal(str)
+    # 进程组任务（tree / name）的成员集合变化 (task_id)：已建成员列表或"有实例的成员"集合与
+    # 上个周期不同才发（首个周期发一次）；实例数的涨落不发，那体现在进程总数的采集值里。
+    # 当前成员用 group_members(task_id) 取
+    members_changed = pyqtSignal(str)
     # 被测目标元数据已探测 (task_id, TargetInfo)：任务卡片据此补上悬停提示里的被测程序行
     target_info_ready = pyqtSignal(str, object)
     # 内部：探针线程通知本对象所在线程来取结果 (task_id)；结果本身放在 _probe_results 里，
@@ -128,7 +136,8 @@ class MonitorManager(QObject):
                  snapshot_hub: Optional[SnapshotHub] = None,
                  target_probe: Optional[Callable[..., TargetInfo]] = None,
                  clock=None,
-                 dpi_scale: Optional[Callable[[], Optional[float]]] = None):
+                 dpi_scale: Optional[Callable[[], Optional[float]]] = None,
+                 tree_source_factory: Optional[Callable[[GroupSpec], object]] = None):
         """
         Args:
             db: 数据库实例（与各页面共用同一实例，由组合根注入）
@@ -141,6 +150,8 @@ class MonitorManager(QObject):
             clock: 探针 captured_at 取时的时钟（只用 now()），缺省为系统时钟
             dpi_scale: 读显示缩放倍数的函数（界面层提供，见 set_dpi_scale_provider）；
                 无窗口模式为 None，元数据里缩放留空
+            tree_source_factory: 进程组成员来源的工厂 (GroupSpec) -> ProcessTreeSource；
+                None 用从快照解析的生产实现；测试注入假实现
         """
         super().__init__(parent)
 
@@ -153,6 +164,7 @@ class MonitorManager(QObject):
         self._target_probe = target_probe if target_probe is not None else default_target_probe
         self._clock = clock if clock is not None else SYSTEM_CLOCK
         self._dpi_scale = dpi_scale
+        self._tree_source_factory = tree_source_factory
         self._probe_threads: Dict[str, threading.Thread] = {}
         self._probe_results: Dict[str, Optional[TargetInfo]] = {}
         self._probe_lock = threading.Lock()
@@ -177,22 +189,41 @@ class MonitorManager(QObject):
 
     def create_task(self, pid: int, process_name: str, metric_types: List[str],
                     interval: float = None, note: str = '',
-                    create_time: Optional[float] = None) -> Optional[str]:
+                    create_time: Optional[float] = None, *,
+                    target_kind: str = TARGET_PID) -> Optional[str]:
         """
         创建新的监控任务
 
         Args:
-            pid: 进程ID
-            process_name: 进程名称
-            metric_types: 监控指标类型列表
+            pid: 进程ID（tree 为根进程；name 忽略，任务行记为 0）
+            process_name: 进程名称（name 为要监控的进程名，不区分大小写）
+            metric_types: 监控指标类型列表。进程组（tree / name）任务缺少"进程总数"
+                （process_count）时自动补在末尾：它是组任务的基本指标，也是 name 任务
+                成员归零周期里唯一写入的数据；对组不适用的指标（峰值类、基本优先级）
+                原样保留，采集时按"不适用"记为不可用，选择时的剔除由调用方做
+                （utils.metrics.filter_group_metrics）
             interval: 采集间隔（可选）
             note: 任务备注（可选）
-            create_time: 所选进程的创建时间（可选）。任务线程启动时据此确认 PID
-                未被别的进程复用；为 None 时跳过比对
+            create_time: 所选进程的创建时间（可选；tree 为根进程的）。任务线程启动时据此
+                确认 PID 未被别的进程复用；为 None 时跳过比对
+            target_kind: 监控目标类型（'pid' 单个进程，默认；'tree' 根进程及其全部后代；
+                'name' 全部同名进程）。组任务只占 1 个任务配额
 
         Returns:
             Optional[str]: 任务ID，创建失败（数据库维护中/任务数达上限）返回None
         """
+        if target_kind not in TARGET_KINDS:
+            raise ValueError(f"未知的监控目标类型 {target_kind!r}，可选：{', '.join(TARGET_KINDS)}")
+        group_spec: Optional[GroupSpec] = None
+        metric_types = list(metric_types)
+        if target_kind == TARGET_TREE:
+            group_spec = GroupSpec.tree(pid, create_time)
+        elif target_kind == TARGET_NAME:
+            group_spec = GroupSpec.by_name(process_name)
+            pid, create_time = 0, None
+        if group_spec is not None and PROCESS_COUNT not in metric_types:
+            metric_types.append(PROCESS_COUNT)
+
         # 数据库清理/压缩期间不允许新建任务
         if self._maintenance:
             self.error_occurred.emit('', '正在清理数据库，请稍后再试')
@@ -213,9 +244,14 @@ class MonitorManager(QObject):
             note=note,
             create_time=create_time,
             hub=self._snapshot_hub,
+            group_spec=group_spec,
+            tree_source=(self._tree_source_factory(group_spec)
+                         if group_spec is not None and self._tree_source_factory is not None
+                         else None),
         )
 
         # 连接任务信号（工作线程发出，经队列在本对象所在的 GUI 线程执行）
+        task.members_changed.connect(self._on_task_members_changed)
         task.data_updated.connect(self._on_task_data_updated)
         task.task_stopped.connect(self._on_task_stopped)
         task.error_occurred.connect(self._on_task_error)
@@ -249,9 +285,12 @@ class MonitorManager(QObject):
         if task.state is not WorkerState.WAITING:
             return False
         task.start()
-        logger.info("任务启动请求: task_id=%s pid=%s", task_id, task.pid)
+        logger.info("任务启动请求: task_id=%s pid=%s target=%s", task_id, task.pid,
+                    getattr(task, 'target_kind', TARGET_PID))
         self.task_started.emit(task_id)
-        self._start_target_probe(task_id, task.pid)
+        if getattr(task, 'target_kind', TARGET_PID) != TARGET_NAME:
+            # 按名监控没有单一的被测进程可探测
+            self._start_target_probe(task_id, task.pid)
         return True
 
     def stop_task(self, task_id: str) -> bool:
@@ -474,6 +513,8 @@ class MonitorManager(QObject):
             is_paused=state is WorkerState.PAUSED,
             is_stopping=state is WorkerState.STOPPING,
             quality=_quality_of(task),
+            target_kind=getattr(task, 'target_kind', TARGET_PID),
+            members_truncated=getattr(task, 'members_truncated', False),
         )
 
     def get_task_info(self, task_id: str) -> Optional[TaskInfo]:
@@ -497,9 +538,18 @@ class MonitorManager(QObject):
         return task is not None and task.state is WorkerState.PAUSED
 
     def has_running_task_for_pid(self, pid: int) -> bool:
-        """该 PID 是否已有在采集（未在停止）的任务"""
-        return any(task.pid == pid and task.state in ACTIVE_STATES
-                   for task in self._tasks.values())
+        """该 PID 是否已有在采集（未在停止）的单进程任务（进程树 / 按名任务不算：它们监控的
+        是一组进程，与同 PID 的单进程任务并不重复）"""
+        return any(task.pid == pid and getattr(task, 'target_kind', TARGET_PID) == TARGET_PID
+                   and task.state in ACTIVE_STATES for task in self._tasks.values())
+
+    def group_members(self, task_id: str) -> Tuple[MemberSnapshot, ...]:
+        """进程组任务当前的成员快照，供任务卡片用：每个已建序列的成员一项（成员键、显示名、
+        当前实例数、最近一个周期的各指标合计值），含本周期没有实例的（实例数为 0），按建立
+        顺序排列。pid 任务、任务不在管理器中、还没采集到第一个周期时返回空元组。"""
+        task = self._tasks.get(task_id)
+        reader = getattr(task, 'group_members', None)
+        return reader() if reader is not None else ()
 
     # ========== 任务线程对象（core 内部与测试使用，UI 禁用） ==========
 
@@ -897,6 +947,10 @@ class MonitorManager(QObject):
         for task_id, task in list(self._tasks.items()):
             if task.isFinished():
                 self._discard(task_id)
+
+    def _on_task_members_changed(self, task_id: str):
+        """进程组成员集合变化：原样转发"""
+        self.members_changed.emit(task_id)
 
     def _on_task_data_updated(self, task_id: str, values: dict):
         """任务数据更新处理：首个周期到达时任务行已落库，挂起的元数据在这里补存"""

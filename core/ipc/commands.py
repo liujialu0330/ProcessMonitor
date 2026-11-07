@@ -19,13 +19,19 @@ label / note 有长度上限，超出回 invalid_args。处理器中途抛出任
 | ping | — | proto, app_version, pid, ready, automation_enabled, headless |
 | activate | — | 显示主窗口；无窗口模式回 invalid_state |
 | status | — | tasks（快照 + 方案 + 当前轮次 + 数据质量）、finished（含数据质量）、waits |
-| start | pid / name / launch 三选一，metrics?, interval?, note?, plan?, wait?, wait_timeout_s? | task_id |
+| start | pid / name / launch 三选一，target_kind?（pid / tree / name），metrics?, interval?, note?, plan?, wait?, wait_timeout_s? | task_id, target_kind |
 | marker | task_id（或 "all"），label? | markers |
 | pause / resume / stop | task_id | — |
 | wait | task_id, until（stopped / rounds>=N / elapsed>=S），timeout_s? | reached |
 | export | task_id, dir, kinds（csv / report / summary），evidence? | paths |
 | verdict | task_id | verdict, metrics |
 | quit | — | 回包后走真退出路径 |
+
+target_kind 缺省 pid（单个进程）。tree：监控 pid（或 launch 启动的程序）及其全部子孙进程，根进程
+退出任务才结束；name：监控全部同名进程（用 name 参数，不要求唯一，没有也能开始——成员归零不结束
+任务，wait=true 时同样立即开始），不能是本程序自身的进程名；tree 的根不能是本程序自身。进程组
+不接受峰值类与基本优先级指标（显式给出回 invalid_args；缺省指标自动剔除），并自动加上进程总数
+（process_count）。
 
 launch = {exe, args?, cwd?, close_on_stop?}：先启动被测程序（exe 与 cwd 必须是绝对路径），用拿到的
 PID 与创建时间建任务；close_on_stop 为真时，任务因用户停止（stop 命令、方案的停止条件）结束后
@@ -59,6 +65,7 @@ from core.monitor_task import SYSTEM_CLOCK
 from core.wait_service import WAIT_FAILED_TIMEOUT, WaitMatch, WaitService
 from core.workers.base import BackgroundTask, CancelToken
 from data.errors import StorageError
+from data.models import TARGET_KINDS, TARGET_NAME, TARGET_PID, TARGET_TREE
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +151,11 @@ MSG_TOO_MANY_PENDING = "同一连接上进行中的等待/导出/判定请求已
 MSG_VERDICT_BUSY = "同时进行中的判定已达上限 {limit} 个，请稍后再试"
 MSG_IDENTITY_UNKNOWN = "无法确认进程监控助手自身的权限级别，出于安全拒绝该命令"
 MSG_PID_OR_NAME = "start 需要 pid 与 name 二选一"
+MSG_TARGET_KIND = "target_kind 只能是 {kinds}"
+MSG_TREE_NEEDS_PID = "target_kind=tree 需要 pid（或 launch），不能同时给 name"
+MSG_NAME_KIND_NEEDS_NAME = "target_kind=name 需要 name，不能给 pid 或 launch"
+MSG_GROUP_METRICS = "指标 {metrics} 不适用于进程组（tree / name）：峰值类与基本优先级只对单个进程有意义"
+MSG_SELF_NAME = "不能监控本程序自身的进程名（{name}）"
 MSG_TARGET_REQUIRED = "start 需要 pid、name、launch 三者之一"
 MSG_LAUNCH_INVALID = "launch 有误：{detail}"
 MSG_LAUNCH_NO_WAIT = "launch 不能与 wait 同时使用（程序由本次命令启动，不需要等待）"
@@ -400,23 +412,24 @@ def compute_verdict(analysis, stop_reason: Optional[StopReason] = None, *,
     时长与轮数算出后传入）；缺省为真——不知道方案时，被测进程退出一律按异常退出处理。
     停止原因是退出类时结果另附 target_exit = {reason, before_stop_condition}：条件已满足后
     才退出的，照常判定，退出信息只放在这里。
+
+    进程组任务（analysis 带成员序列快照）另附 members = [{key, verdict, metrics}]：每个成员各
+    指标的判定，条目格式同 metrics（key 为 "指标@成员键"，另有 metric / member 两个字段）；
+    整体判定把合计与全部成员一起看。pid 任务没有 members 字段。
     """
     from core.analysis.intervals import mean_round_delta
-    from utils.metrics import get_metric_display_name
+    from utils.metrics import get_metric_display_name, split_member_key
 
-    metrics: List[Dict[str, Any]] = []
-    for key, snapshot in analysis.snapshots.items():
+    def item(key: str, snapshot) -> Dict[str, Any]:
         if snapshot.error is not None:
             raise CommandError(ERR_INTERNAL, MSG_ANALYSIS_FAILED.format(detail=snapshot.error))
-        verdict = verdict_rules.metric_verdict(snapshot)
-        reason = verdict_rules.metric_reason(snapshot)
         stats = snapshot.stats or {}
         baseline = snapshot.baseline.value if snapshot.baseline is not None else None
-        metrics.append({
+        return {
             'key': key,
             'name': get_metric_display_name(key),
-            'verdict': verdict,
-            'reason': reason,
+            'verdict': verdict_rules.metric_verdict(snapshot),
+            'reason': verdict_rules.metric_reason(snapshot),
             'samples': stats.get('count', snapshot.total_count),
             'first': _clean_number(stats.get('first')),
             'last': _clean_number(stats.get('last')),
@@ -424,16 +437,35 @@ def compute_verdict(analysis, stop_reason: Optional[StopReason] = None, *,
             'rate_per_hour': _clean_number(stats.get('slope_per_hour')),
             'rate_per_round': _clean_number(mean_round_delta(snapshot.rounds)),
             'rounds': len(snapshot.rounds),
-        })
+        }
+
+    metrics: List[Dict[str, Any]] = [item(key, snapshot)
+                                     for key, snapshot in analysis.snapshots.items()]
+    members: List[Dict[str, Any]] = []
+    for key, snapshot in verdict_rules.member_snapshots_of(analysis).items():
+        metric, member = split_member_key(key)
+        entry = item(key, snapshot)
+        entry.update(metric=metric, member=member)
+        group = next((m for m in members if m['key'] == member), None)
+        if group is None:
+            group = {'key': member, 'verdict': None, 'metrics': []}
+            members.append(group)
+        group['metrics'].append(entry)
+    for group in members:
+        group['verdict'] = verdict_rules.combine_verdicts(
+            m['verdict'] for m in group['metrics'])
     overall = verdict_rules.overall_verdict(analysis, stop_reason=stop_reason,
                                             stopped_before_condition=stopped_before_condition)
     target_exit = None
     if verdict_rules.is_target_exit(stop_reason):
         target_exit = {'reason': verdict_rules.stop_reason_value(stop_reason),
                        'before_stop_condition': bool(stopped_before_condition)}
-    return {'verdict': overall, 'metrics': metrics,
-            'stop_reason': verdict_rules.stop_reason_value(stop_reason),
-            'target_exit': target_exit}
+    result = {'verdict': overall, 'metrics': metrics,
+              'stop_reason': verdict_rules.stop_reason_value(stop_reason),
+              'target_exit': target_exit}
+    if members:
+        result['members'] = members
+    return result
 
 
 # ---------- 后台线程 ----------
@@ -450,7 +482,8 @@ class TaskAnalysisWorker(BackgroundTask):
         self.analysis = analysis
 
     def execute(self, token: CancelToken):
-        from core.history_query import TaskAnalysis, build_request, run_history_query
+        from core.history_query import (TaskAnalysis, build_request, load_member_snapshots,
+                                        run_history_query)
         snapshots = {}
         for metric in self.metrics:
             if token.is_cancelled:
@@ -458,7 +491,14 @@ class TaskAnalysisWorker(BackgroundTask):
             request = build_request(self.task_id, metric, ANALYSIS_RANGE_KEY,
                                     analysis=self.analysis)
             snapshots[metric] = run_history_query(self.db, request)
-        return TaskAnalysis(self.task_id, ANALYSIS_RANGE_KEY, snapshots)
+        # 进程组任务的成员序列（pid 任务没有，得到空字典）
+        members = load_member_snapshots(self.db, self.task_id, self.metrics, ANALYSIS_RANGE_KEY,
+                                        analysis=self.analysis,
+                                        is_cancelled=lambda: token.is_cancelled)
+        if members is None:
+            return None
+        return TaskAnalysis(self.task_id, ANALYSIS_RANGE_KEY, snapshots,
+                            member_snapshots=members)
 
 
 # ---------- 延迟回复 ----------
@@ -879,6 +919,8 @@ class CommandDispatcher(QObject):
         return {
             'task_id': info.task_id, 'pid': info.pid, 'name': info.process_name,
             'metrics': list(info.metric_types), 'interval': info.interval, 'note': info.note,
+            'target_kind': getattr(info, 'target_kind', TARGET_PID),
+            'members_truncated': bool(getattr(info, 'members_truncated', False)),
             'status': str(info.status), 'paused': info.is_paused, 'stopping': info.is_stopping,
             'start_time': _iso(info.start_time), 'end_time': _iso(info.end_time),
             'rounds': self._rounds(info.task_id),
@@ -929,16 +971,29 @@ class CommandDispatcher(QObject):
 
     # ---------- 命令：开始 ----------
 
-    def _parse_metrics(self, args) -> Tuple[str, ...]:
-        from utils.metrics import all_metric_types, canonical_metric_type
+    def _parse_metrics(self, args, target_kind: str = TARGET_PID) -> Tuple[str, ...]:
+        from utils.metrics import (all_metric_types, canonical_metric_type, filter_group_metrics,
+                                   get_metric_display_name, group_selectable_metrics,
+                                   group_unsupported_metrics)
+        group = target_kind != TARGET_PID
         value = args.get('metrics')
         if value is None:
             metrics = list(self.settings.default_metrics())
+            if group:
+                # 缺省指标来自界面的选择，里面可能有对组不适用的：自动剔除，不报错
+                metrics = filter_group_metrics(metrics)
         else:
             if not isinstance(value, list) or not all(isinstance(m, str) for m in value):
                 raise CommandError(ERR_INVALID_ARGS,
                                    MSG_ARG_TYPE.format(name='metrics', kind="字符串数组"))
-            known = set(all_metric_types())
+            known = set(group_selectable_metrics() if group else all_metric_types())
+            # 对组不适用的指标是"已知但不能用"，与"未知"分开报，免得用户以为拼错了
+            inapplicable = group_unsupported_metrics(
+                [canonical_metric_type(m.strip()) for m in value])
+            if group and inapplicable:
+                raise CommandError(ERR_INVALID_ARGS, MSG_GROUP_METRICS.format(
+                    metrics="、".join(dict.fromkeys(
+                        get_metric_display_name(m) for m in inapplicable))))
             metrics, unknown = [], []
             for item in value:
                 key = canonical_metric_type(item.strip())
@@ -979,18 +1034,35 @@ class CommandDispatcher(QObject):
             raise CommandError(ERR_INVALID_ARGS, MSG_PLAN_INVALID.format(detail="；".join(errors)))
         return None if plan.is_empty() else plan
 
+    @staticmethod
+    def _parse_target_kind(args) -> str:
+        value = _string(args, 'target_kind', default=TARGET_PID)
+        kind = (value or TARGET_PID).strip().lower()
+        if kind not in TARGET_KINDS:
+            raise CommandError(ERR_INVALID_ARGS,
+                               MSG_TARGET_KIND.format(kinds=" / ".join(TARGET_KINDS)))
+        return kind
+
     def _cmd_start(self, conn, request):
         args = request.args
+        target_kind = self._parse_target_kind(args)
         if args.get('launch') is not None:
-            return self._start_launch(args)
+            return self._start_launch(args, target_kind)
         pid = _integer(args, 'pid')
         name = _string(args, 'name')
-        if (pid is None) == (name is None or not name.strip()):
+        has_name = name is not None and bool(name.strip())
+        if target_kind == TARGET_NAME:
+            if pid is not None or not has_name:
+                raise CommandError(ERR_INVALID_ARGS, MSG_NAME_KIND_NEEDS_NAME)
+        elif target_kind == TARGET_TREE:
+            if pid is None or name is not None:
+                raise CommandError(ERR_INVALID_ARGS, MSG_TREE_NEEDS_PID)
+        elif (pid is None) == (not has_name):
             raise CommandError(ERR_INVALID_ARGS, MSG_PID_OR_NAME)
         if pid is not None and not 0 < pid <= MAX_PID:
             raise CommandError(ERR_INVALID_ARGS, MSG_ARG_TYPE.format(name='pid', kind="正整数"))
         self._reject_self(pid)
-        metrics = self._parse_metrics(args)
+        metrics = self._parse_metrics(args, target_kind)
         interval = self._parse_interval(args)
         note = self._parse_note(args)
         plan = self._parse_plan(args, interval)
@@ -999,12 +1071,16 @@ class CommandDispatcher(QObject):
         self._reject_if_read_only()
         lookup = self.context.process_lookup
 
+        if target_kind == TARGET_NAME:
+            return self._start_name_group(name.strip(), metrics, interval, note, plan, wait)
+
         if pid is not None:
             identity = lookup.identity_of(pid)
             if identity is None:
                 raise CommandError(ERR_NOT_FOUND, MSG_PROCESS_NOT_FOUND.format(pid=pid))
             process_name, create_time = identity
-            return self._create(pid, process_name, create_time, metrics, interval, note, plan)
+            return self._create(pid, process_name, create_time, metrics, interval, note, plan,
+                                target_kind=target_kind)
 
         name = name.strip()
         found = self._find_by_name(name)
@@ -1020,6 +1096,36 @@ class CommandDispatcher(QObject):
         pending.on_cancel.append(lambda: self._cancel_start_wait(wait_id))
         self._sync_timer()
         return None
+
+    def _start_name_group(self, name: str, metrics: Sequence[str], interval: float, note: str,
+                          plan: Optional[AutomationPlan], wait: bool) -> Dict[str, Any]:
+        """start target_kind=name：监控全部同名进程。不要求唯一（与按名选单个进程不同，这里
+        同名多个正是目标），不能是本程序自身的进程名。当前一个也没有时：wait=true 照样立即
+        开始（成员出现后自动纳入，归零不结束任务），否则回 not_found。"""
+        from core.wait_service import candidate_names
+        candidates = candidate_names(name)
+        self._reject_self_name(candidates)
+        lookup = self.context.process_lookup
+        chosen = next((c for c in candidates if lookup.find_pids_by_name(c)), None)
+        if chosen is None:
+            if not wait:
+                raise CommandError(ERR_NOT_FOUND, MSG_NAME_NOT_FOUND.format(name=name))
+            # 没找到时用带扩展名的写法：Windows 的进程映像名几乎都以 .exe 结尾
+            chosen = candidates[-1]
+        return self._create(0, chosen, None, metrics, interval, note, plan,
+                            target_kind=TARGET_NAME)
+
+    def _reject_self_name(self, names: Sequence[str]) -> None:
+        own = {os.path.basename(sys.executable).lower()}
+        try:
+            identity = self.context.process_lookup.identity_of(os.getpid())
+        except Exception:
+            identity = None
+        if identity is not None and identity[0]:
+            own.add(identity[0].lower())
+        for name in names:
+            if name.strip().lower() in own:
+                raise CommandError(ERR_INVALID_ARGS, MSG_SELF_NAME.format(name=name))
 
     @staticmethod
     def _reject_self(pid: Optional[int]) -> None:
@@ -1040,15 +1146,18 @@ class CommandDispatcher(QObject):
             self._launcher = ProcessLauncher()
         return self._launcher
 
-    def _start_launch(self, args) -> Dict[str, Any]:
+    def _start_launch(self, args, target_kind: str = TARGET_PID) -> Dict[str, Any]:
         """start launch=…：参数全部校验通过、确认能建任务之后才启动程序（不留下没人监控的
-        进程）；启动失败回 invalid_state，不建任务。"""
+        进程）；启动失败回 invalid_state，不建任务。target_kind=tree 时以启动的程序为根，
+        监控它和它的全部子孙进程；name 没有"启动"的含义，不允许。"""
         if args.get('pid') is not None or args.get('name') is not None:
             raise CommandError(ERR_INVALID_ARGS, MSG_TARGET_REQUIRED)
+        if target_kind == TARGET_NAME:
+            raise CommandError(ERR_INVALID_ARGS, MSG_NAME_KIND_NEEDS_NAME)
         spec, close_on_stop = parse_launch(args.get('launch'))
         if _boolean(args, 'wait'):
             raise CommandError(ERR_INVALID_ARGS, MSG_LAUNCH_NO_WAIT)
-        metrics = self._parse_metrics(args)
+        metrics = self._parse_metrics(args, target_kind)
         interval = self._parse_interval(args)
         note = self._parse_note(args)
         plan = self._parse_plan(args, interval)
@@ -1062,7 +1171,7 @@ class CommandDispatcher(QObject):
         if not result.ok:
             raise CommandError(ERR_INVALID_STATE, MSG_LAUNCH_FAILED.format(detail=result.error))
         reply = self._create(result.pid, result.name or spec.name, result.create_time,
-                             metrics, interval, note, plan)
+                             metrics, interval, note, plan, target_kind=target_kind)
         if close_on_stop:
             self._close_on_stop[reply['task_id']] = (result.pid, result.create_time)
         reply['launched'] = True
@@ -1100,14 +1209,16 @@ class CommandDispatcher(QObject):
 
     def _create(self, pid: int, name: str, create_time: Optional[float],
                 metrics: Sequence[str], interval: float, note: str,
-                plan: Optional[AutomationPlan]) -> Dict[str, Any]:
+                plan: Optional[AutomationPlan], *,
+                target_kind: str = TARGET_PID) -> Dict[str, Any]:
         manager = self.context.manager
         if manager.is_maintenance_running():
             raise CommandError(ERR_BUSY, MSG_MAINTENANCE)
         if not manager.can_add_task():
             raise CommandError(ERR_BUSY, MSG_TASK_LIMIT.format(limit=self.settings.task_limit))
+        extra = {} if target_kind == TARGET_PID else {'target_kind': target_kind}
         task_id = manager.create_task(pid, name, list(metrics), interval, note=note,
-                                      create_time=create_time)
+                                      create_time=create_time, **extra)
         if not task_id:
             raise CommandError(ERR_BUSY, MSG_START_FAILED.format(reason="数据库维护中或任务数已满"))
         try:
@@ -1123,9 +1234,10 @@ class CommandDispatcher(QObject):
             self._rollback_task(task_id)
             raise CommandError(ERR_INTERNAL, MSG_START_FAILED.format(
                 reason=str(exc) or type(exc).__name__)) from None
-        logger.info("命令行开始监控: task_id=%s pid=%s name=%s", task_id, pid, name)
+        logger.info("命令行开始监控: task_id=%s pid=%s name=%s target=%s", task_id, pid, name,
+                    target_kind)
         return {'task_id': task_id, 'pid': pid, 'name': name, 'metrics': list(metrics),
-                'interval': interval}
+                'interval': interval, 'target_kind': target_kind}
 
     def _rollback_task(self, task_id: str) -> None:
         self._unsaved_plans.pop(task_id, None)

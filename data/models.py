@@ -66,10 +66,35 @@ class MonitorTask:
     # 被测目标元数据（core.target_info.TargetInfo 的 JSON 文本）；任务开始时探测写入，
     # 旧任务或探测前为 None。数据层只透传不解析；只经 TaskRepo.save_meta 写入，save() 不碰它
     meta_json: Optional[str] = None
+    # 监控目标类型（取值见 TARGET_KINDS）与参数 JSON：pid 为单个进程（默认，旧任务都是它）；
+    # tree 存 {"root_pid", "root_create_time"}；name 存 {"name"}。创建后不再改变，
+    # save() 只在插入时写入
+    target_kind: str = 'pid'
+    target_spec: Optional[str] = None
 
     def is_running(self) -> bool:
         """判断任务是否正在运行"""
         return self.status == 'running'   # 与 TaskStatus.RUNNING 的值一致
+
+
+# 监控目标类型（tasks.target_kind 的合法取值）：单个进程 / 根进程及其全部后代 / 全部同名进程
+TARGET_PID = 'pid'
+TARGET_TREE = 'tree'
+TARGET_NAME = 'name'
+TARGET_KINDS = (TARGET_PID, TARGET_TREE, TARGET_NAME)
+
+
+@dataclass(frozen=True)
+class MemberRecord:
+    """task_members 的一行：进程组任务的一个进程实例。first_ms / last_ms 为 UTC 毫秒
+    （实例首次出现与最后一次见到的时刻；仍在运行的实例在任务结束前 last_ms 等于
+    first_ms，任务结束或实例消失时才更新）。"""
+    task_id: str
+    pid: int
+    create_time: float
+    name: str
+    first_ms: int
+    last_ms: int
 
 
 @dataclass

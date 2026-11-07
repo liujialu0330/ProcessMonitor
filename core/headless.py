@@ -23,7 +23,7 @@ pmctl 在 GUI 不在时以 --background 拉起本程序：不建主窗口与托�
 import logging
 import signal
 import time
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 from PyQt5.QtCore import QCoreApplication, QObject, Qt, QTimer
 
@@ -51,7 +51,8 @@ class HeadlessRuntime(QObject):
                  quit_app: Optional[Callable[[int], None]] = None,
                  coordinator_factory=ShutdownCoordinator,
                  stage_renderer: Optional[Callable] = None,
-                 snapshot_writer: Optional[StageSnapshotWriter] = None):
+                 snapshot_writer: Optional[StageSnapshotWriter] = None,
+                 quit_hooks: Sequence[Callable[[], None]] = ()):
         """
         Args:
             manager: MonitorManager
@@ -64,6 +65,8 @@ class HeadlessRuntime(QObject):
             quit_app: 结束事件循环的函数，默认 QCoreApplication.exit
             stage_renderer: 阶段快照的报告图片渲染函数（见 StageSnapshotWriter 的 renderer）
             snapshot_writer: 阶段快照写入器（测试替换）；None 时按 db / registry / clock 自建
+            quit_hooks: 退出收尾之前依次调用的函数（如停掉存储守卫的定时器与在途作业）；
+                出错只记日志
         """
         super().__init__(parent)
         self.manager = manager
@@ -75,6 +78,7 @@ class HeadlessRuntime(QObject):
         self._quit_app = quit_app or QCoreApplication.exit
         self._coordinator_factory = coordinator_factory
         self._idle_since: Optional[float] = None
+        self._quit_hooks = tuple(quit_hooks)
         self.quitting = False
         self.exit_code: Optional[int] = None
         self.auto_marker = AutoMarkerService(manager, clock, self)
@@ -170,6 +174,11 @@ class HeadlessRuntime(QObject):
             return
         self.quitting = True
         self._tick_timer.stop()
+        for hook in self._quit_hooks:
+            try:
+                hook()
+            except Exception:
+                logger.error("退出前的收尾钩子失败", exc_info=True)
         try:
             coordinator = self._coordinator_factory(self.manager, self.registry, db=self.db)
             if not coordinator.run(on_progress=lambda text: logger.info("退出收尾: %s", text)):
