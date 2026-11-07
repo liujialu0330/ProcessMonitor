@@ -238,12 +238,13 @@ def test_guard_name_derived_from_data_dir(tmp_path):
 
 # ========== 互斥量判定（假接口） ==========
 
-def test_mutex_uses_local_namespace_and_installer_names(qapp, unique_name):
+def test_mutex_uses_global_namespace_and_installer_names(qapp, unique_name):
+    """实例互斥量用全局名（与管道一样跨会话唯一，名字含用户名）"""
     api = _FakeMutexApi()
     guard = SingleInstanceGuard(unique_name, mutex_api_factory=lambda: api)
     assert guard.notify_existing_instance() is False
     assert api.created == [
-        "Local\\" + unique_name,
+        "Global\\" + unique_name,
         "Local\\" + INSTALLER_MUTEX_NAME,
         "Global\\" + INSTALLER_MUTEX_NAME,
     ]
@@ -251,19 +252,19 @@ def test_mutex_uses_local_namespace_and_installer_names(qapp, unique_name):
 
 
 def test_existing_mutex_means_secondary_and_closes_handle(qapp, unique_name, monkeypatch):
-    api = _FakeMutexApi(existing={"Local\\" + unique_name})
+    api = _FakeMutexApi(existing={"Global\\" + unique_name})
     sent = []
     guard = _guard(unique_name, mutex_api_factory=lambda: api)
     monkeypatch.setattr(guard, '_send_activation', lambda: sent.append(1) or True)
     assert guard.notify_existing_instance() is True
     assert sent == [1]
     assert len(api.closed) == 1    # 指向既有互斥量的句柄用完即关
-    assert api.created == ["Local\\" + unique_name]   # 从实例不创建安装器互斥量
+    assert api.created == ["Global\\" + unique_name]   # 从实例不创建安装器互斥量
 
 
 def test_access_denied_means_secondary(qapp, unique_name, monkeypatch, caplog):
     """同名互斥量由更高权限的实例创建、当前进程打不开：按已有实例处理"""
-    api = _FakeMutexApi(fail={"Local\\" + unique_name: ERROR_ACCESS_DENIED})
+    api = _FakeMutexApi(fail={"Global\\" + unique_name: ERROR_ACCESS_DENIED})
     guard = _guard(unique_name, mutex_api_factory=lambda: api)
     monkeypatch.setattr(guard, '_send_activation', lambda: True)
     with caplog.at_level(logging.WARNING, logger="app.single_instance"):
@@ -272,12 +273,55 @@ def test_access_denied_means_secondary(qapp, unique_name, monkeypatch, caplog):
 
 
 def test_other_create_error_allows_start(qapp, unique_name, monkeypatch, caplog):
-    api = _FakeMutexApi(fail={"Local\\" + unique_name: 87})
+    api = _FakeMutexApi(fail={"Global\\" + unique_name: 87, "Local\\" + unique_name: 87})
     guard = _guard(unique_name, mutex_api_factory=lambda: api)
     monkeypatch.setattr(guard, '_send_activation', lambda: pytest.fail("不应连接管道"))
     with caplog.at_level(logging.WARNING, logger="app.single_instance"):
         assert guard.notify_existing_instance() is False
     assert any("创建单实例互斥量失败" in r.getMessage() for r in caplog.records)
+
+
+def test_global_create_failure_falls_back_to_local(qapp, unique_name, caplog):
+    """全局名创建失败（非"已存在"、非"拒绝访问"）：退回会话局部名并记日志"""
+    api = _FakeMutexApi(fail={"Global\\" + unique_name: 87})
+    guard = SingleInstanceGuard(unique_name, mutex_api_factory=lambda: api,
+                                installer_mutex_name=None)
+    with caplog.at_level(logging.WARNING, logger="app.single_instance"):
+        assert guard.notify_existing_instance() is False
+    assert api.created == ["Global\\" + unique_name, "Local\\" + unique_name]
+    assert any("Local" in r.getMessage() or "会话" in r.getMessage() for r in caplog.records)
+    # 退回的局部名已被另一份（同样退回的）实例持有：照常判为从实例
+    other = _FakeMutexApi(fail={"Global\\" + unique_name: 87},
+                          existing={"Local\\" + unique_name})
+    guard = SingleInstanceGuard(unique_name, mutex_api_factory=lambda: other,
+                                installer_mutex_name=None)
+    guard._send_activation = lambda: True
+    assert guard.notify_existing_instance() is True
+
+
+def test_global_access_denied_does_not_fall_back(qapp, unique_name, monkeypatch):
+    """全局名"拒绝访问"说明同名实例已存在（如以管理员运行）：不退回局部名"""
+    api = _FakeMutexApi(fail={"Global\\" + unique_name: ERROR_ACCESS_DENIED})
+    guard = _guard(unique_name, mutex_api_factory=lambda: api)
+    monkeypatch.setattr(guard, '_send_activation', lambda: True)
+    assert guard.notify_existing_instance() is True
+    assert api.created == ["Global\\" + unique_name]
+
+
+def test_real_mutex_is_global_and_visible_to_pmctl(qapp, unique_name):
+    """真实 Win32：主实例持有的是 Global\\ 名，pmctl 的 OpenMutexW 用同一名字能看到"""
+    if sys.platform != 'win32':
+        pytest.skip("只在 Windows 上有命名互斥量")
+    from core.ipc.client import instance_starting, mutex_exists
+    guard = SingleInstanceGuard(unique_name, installer_mutex_name=None)
+    assert guard.notify_existing_instance(activate=False) is False
+    try:
+        assert mutex_exists("Global\\" + unique_name) is True
+        assert mutex_exists("Local\\" + unique_name) is False
+        assert instance_starting(unique_name, mutex_exists) is True
+    finally:
+        import ctypes
+        ctypes.WinDLL('kernel32').CloseHandle(ctypes.c_void_p(guard._instance_mutex))
 
 
 def test_installer_mutex_failures_are_ignored(qapp, unique_name):
@@ -325,7 +369,7 @@ def test_non_windows_falls_back_to_pipe_criterion(qapp, unique_name, monkeypatch
 
 def _secondary_with_fake_time(name, monkeypatch, results):
     """互斥量已存在的从实例；_send_activation 依次返回 results（用完后一直 False）"""
-    api = _FakeMutexApi(existing={"Local\\" + name})
+    api = _FakeMutexApi(existing={"Global\\" + name})
     fake = _FakeTime()
     guard = _guard(name, mutex_api_factory=lambda: api, sleep=fake.sleep, clock=fake.clock)
     calls = []
@@ -430,3 +474,67 @@ def test_main_module_is_thin_entry():
                           env=dict(os.environ, QT_QPA_PLATFORM='offscreen'),
                           capture_output=True, timeout=60)
     assert proc.returncode == 0, proc.stderr.decode('utf-8', 'replace')
+
+
+# ========== 2.0：JSON 激活请求、无窗口模式 ==========
+
+def test_activate_request_is_a_protocol_request():
+    from core.ipc import protocol
+    from app.single_instance import ACTIVATE_REQUEST
+    assert ACTIVATE_REQUEST.endswith(b'\n') and ACTIVATE_REQUEST.count(b'\n') == 1
+    request = protocol.parse_request(protocol.decode_line(ACTIVATE_REQUEST[:-1]))
+    assert request.cmd == 'activate' and request.version == protocol.PROTOCOL_VERSION
+
+
+def test_background_secondary_does_not_notify(qapp, unique_name):
+    """--background 的从实例只判定、不发激活消息，也不做连接重试"""
+    primary = _guard(unique_name)
+    primary.listen()
+    activations = []
+    primary.activation_requested.connect(lambda: activations.append(1))
+    fake = _FakeTime()
+    secondary = _guard(unique_name, sleep=fake.sleep, clock=fake.clock,
+                       mutex_api_factory=lambda: _FakeMutexApi(
+                           existing={'Global\\' + unique_name}))
+    assert secondary.notify_existing_instance(activate=False) is True
+    QTest.qWait(200)
+    assert activations == [] and fake.sleeps_ms == []
+
+
+def _activation_error_from_other_process(name: str) -> str:
+    """另起进程发激活请求，返回它读到的 activation_error（字符串化）"""
+    code = os.linesep.join([
+        'from PyQt5.QtWidgets import QApplication',
+        'app = QApplication([])',
+        'from app.single_instance import SingleInstanceGuard',
+        f'guard = SingleInstanceGuard({name!r}, installer_mutex_name=None)',
+        'print(guard._send_activation(), guard.activation_error)',
+    ])
+    env = dict(os.environ, QT_QPA_PLATFORM='offscreen', PYTHONIOENCODING='utf-8')
+    return subprocess.Popen([sys.executable, '-c', code], cwd=PROJECT_ROOT, env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+
+@pytest.mark.parametrize('background, expected', [(False, 'True None'),
+                                                  (True, 'True invalid_state')])
+def test_secondary_reads_activation_reply(qapp, unique_name, background, expected):
+    """主实例是无窗口模式时回 invalid_state（组合根据此提示用户），有窗口时激活成功"""
+    primary = _guard(unique_name, background=background)
+    assert primary.listen() is True
+    assert primary.dispatcher.headless is background
+    activations = []
+    primary.activation_requested.connect(lambda: activations.append(1))
+    proc = _activation_error_from_other_process(unique_name)
+    assert _process_events_until(lambda: proc.poll() is not None, timeout=30)
+    assert proc.stdout.read().decode('utf-8').strip().splitlines()[-1] == expected
+    assert activations == ([] if background else [1])
+
+
+def test_listen_creates_dispatcher_and_server(qapp, unique_name):
+    guard = _guard(unique_name, app_version='9.8.7')
+    assert guard.listen() is True
+    assert guard.server.is_listening()
+    assert guard.dispatcher.app_version == '9.8.7'
+    assert guard.dispatcher.pid == os.getpid()
+    assert guard.dispatcher.identity is guard.server.identity
+    assert guard.dispatcher.ready is False      # 组合根给上下文之前回 not_ready

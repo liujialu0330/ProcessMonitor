@@ -6,7 +6,9 @@ run() 的顺序是固定的，调整前先确认每一步的前置条件：
    只在默认日志目录记一条错误并返回 EXIT_DATA_DIR_UNAVAILABLE，绝不回退到别的目录（那会让
    数据悄悄写到别处）；打包的窗口程序没有控制台，另弹原生错误框说明路径与原因
 → 2. 日志与全局异常兜底（必须早于 ui/core/data 的导入，这些模块导入期的异常也要能落日志）
-→ 3. QApplication → 4. 单实例（已有实例则通知后退出）
+→ 3. QApplication → 4. 单实例（已有实例则通知后退出；--background 的从实例不通知），
+   随即开始 IPC 监听（激活消息与 pmctl 命令同一条管道；组装完成前除 ping / activate 外
+   的命令回 not_ready）
 → 5. 应用配置、主题、排版（页面构造时就会读配置；进度窗口也要跟随主题）
 → 6. 迁移数据库：探测（不写入）→ 待搬迁的行数或库文件超过阈值时先显示进度窗口、迁移在
    工作线程执行，否则在界面线程同步迁移 → 结果为 FAILED_KEPT（旧库没能回到原路径）时弹
@@ -16,9 +18,26 @@ run() 的顺序是固定的，调整前先确认每一步的前置条件：
    schema_mismatch——本版本的读写都按 v5 结构写成，不能在旧结构上写；构造 Database（不再在
    构造时迁移）→ 8. 启动校正（任何任务启动之前；只读库跳过）。其中导回回退 1.4.1 期间写入的
    数据一步：待导回行数超过 MIGRATION_PROGRESS_THRESHOLD_ROWS 时经进度窗口在工作线程执行
-→ 9. 线程登记表、界面服务、阻止睡眠守卫 → 10. 主窗口（托盘由主窗口创建并持有；迁移结果与只读状态由主窗口
-按 Database 的标志提示；数据目录在同步盘上时交给主窗口显示一次提示）→ 11. 事件循环
-→ 12. 结束进程
+→ 9. 线程登记表、界面服务、阻止睡眠守卫、自身监控 → 10. 主窗口（托盘由主窗口创建并持有；迁移结果与只读状态由主窗口
+按 Database 的标志提示；数据目录在同步盘上时交给主窗口显示一次提示；设置页的诊断信息经
+diagnostics_provider 取本上下文）→ 10a. 窗口显示后在界面线程安装界面卡死看门狗（主窗口真退出
+时先停掉它，收尾期间界面线程会阻塞）、自身监控每 60 秒采一次 → 10b. 把命令处理器的上下文交给
+IPC（自动打点服务用监控页 Presenter 持有的那一份，全程只有一个；启动被测程序的 launcher 与
+监控页共用 services.launcher）→ 11. 事件循环 → 12. 结束进程
+
+无窗口模式另外：未捕获异常不弹框（utils.crash_handler.set_headless）；设置里关闭了"允许
+命令行与脚本控制"时记日志并以 0 退出（pmctl 看到拉起的实例退出码 0 即提示用户去设置里打开）；
+会话结束（注销/关机）由 HeadlessRuntime 接管收尾。
+
+--startup-trace：各阶段末尾记一次单调时钟（core.diagnostics.StartupTrace），启动完成（窗口
+显示或无窗口模式就绪）后把各阶段耗时写一条 INFO 日志。
+
+无窗口模式（--background，pmctl 在 GUI 不在时拉起）走 _run_headless：第 1~4 步相同，之后
+只加载配置（不设主题与排版、不导入 ui.main_window），同步迁移（不显示进度窗口），
+build_context，HeadlessRuntime 持有自动打点服务并每秒驱动（阶段快照的报告图片用同一渲染函数
+离屏绘制），自身监控每 60 秒采一次，把上下文交给 IPC，进入事件循环；不建任何顶层窗口、托盘、
+全局快捷键与界面看门狗。quit 命令、Ctrl+C 或 --idle-exit-s 空闲到时经
+ShutdownCoordinator 收尾后退出，退出码 0。
 
 退出收尾（停任务、等线程、关闭数据库）只在主窗口的真退出路径里经 ShutdownCoordinator
 做一次，这里不再重复关闭数据库。
@@ -29,8 +48,9 @@ build_context() 是第 7~9 步（未传入迁移报告时先在这里同步迁�
 import logging
 import os
 import sys
+import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
 
 import config
 from app.paths import (
@@ -41,6 +61,7 @@ if TYPE_CHECKING:
     from core.maintenance_service import MaintenanceService, ReconcileResult
     from core.monitor_manager import MonitorManager
     from core.power_guard import PowerGuard
+    from core.self_monitor import SelfMonitor
     from core.shutdown import ThreadRegistry
     from data.database import Database
     from data.db.migrations.runner import MigrationReport, MigrationRunner, ProbeResult
@@ -53,6 +74,23 @@ logger = logging.getLogger(__name__)
 EXIT_DATA_DIR_UNAVAILABLE = 2
 # 数据库升级失败且旧库没能回到原路径（FAILED_KEPT）时 run() 的返回码
 EXIT_MIGRATION_FAILED = 3
+# 无窗口模式没能开始 IPC 监听时 run() 的返回码：没有管道就收不到任何命令（包括 quit），
+# 留着只会成为一个关不掉的后台进程
+EXIT_IPC_UNAVAILABLE = 4
+# 无窗口模式启动时发现设置里关闭了"允许命令行与脚本控制"：正常退出（0），pmctl 据此提示
+EXIT_AUTOMATION_DISABLED = 0
+
+# 无窗口模式的命令行参数
+BACKGROUND_ARG = "--background"
+IDLE_EXIT_ARG = "--idle-exit-s"
+# 启动阶段计时：各阶段耗时写一条 INFO 日志
+STARTUP_TRACE_ARG = "--startup-trace"
+# 自身监控的采样间隔（毫秒）
+SELF_MONITOR_INTERVAL_MS = 60_000
+# 已有实例在无窗口模式运行时，再从开始菜单启动的提示（从实例随即退出）
+BACKGROUND_RUNNING_TEXT = (
+    "进程监控助手正在后台（无窗口模式，由 pmctl 启动）运行同一个数据目录。\n\n"
+    "请先用 “pmctl quit” 结束它，再打开主界面。")
 
 # 迁移前先显示进度窗口的阈值：待搬迁的数据点行数超过它，或库文件（含 -wal）超过字节阈值。
 # 启动校正导回降级数据时同样按行数阈值决定是否显示进度窗口
@@ -90,6 +128,16 @@ class AppContext:
     window: Optional["MainWindow"] = None
     # 监控期间阻止系统空闲睡眠（跟随 cfg.keep_awake_while_monitoring）
     power_guard: Optional["PowerGuard"] = None
+    # 本程序自身的资源占用（每 60 秒一次，24 小时环形缓冲；诊断信息用）与驱动它的定时器
+    self_monitor: Optional["SelfMonitor"] = None
+    self_monitor_timer: Any = None
+    # 界面卡死看门狗（只在有窗口模式、窗口显示后安装；诊断信息用）
+    watchdog: Any = None
+
+    @property
+    def hub(self):
+        """全系统快照中心（诊断信息用）"""
+        return getattr(self.manager, 'snapshot_hub', None)
 
 
 def build_context(paths: AppPaths, *, registry=None,
@@ -150,9 +198,10 @@ def build_context(paths: AppPaths, *, registry=None,
     from app_config import cfg
     from core.power_guard import PowerGuard
     power_guard = PowerGuard.from_config_item(manager, cfg.keep_awake_while_monitoring)
+    from core.self_monitor import SelfMonitor
     return AppContext(paths=paths, db=db, manager=manager, services=services,
                       registry=registry, maintenance=maintenance, reconcile=reconcile,
-                      power_guard=power_guard)
+                      power_guard=power_guard, self_monitor=SelfMonitor())
 
 
 def schema_not_upgraded(report: "MigrationReport") -> bool:
@@ -349,6 +398,196 @@ def _report_data_dir_failure(exc: Exception) -> None:
             pass
 
 
+def _parse_idle_exit(argv: List[str]) -> float:
+    """--idle-exit-s N / --idle-exit-s=N（秒，缺省或非法为 0 = 不因空闲退出）"""
+    value = None
+    args = list(argv[1:])
+    for i, arg in enumerate(args):
+        if arg == IDLE_EXIT_ARG and i + 1 < len(args):
+            value = args[i + 1]
+        elif arg.startswith(IDLE_EXIT_ARG + "="):
+            value = arg[len(IDLE_EXIT_ARG) + 1:]
+    try:
+        return max(0.0, float(value)) if value is not None else 0.0
+    except ValueError:
+        logger.warning("忽略非法的 %s 取值: %r", IDLE_EXIT_ARG, value)
+        return 0.0
+
+
+def strip_background_args(argv: List[str]) -> List[str]:
+    """去掉 --background 与 --idle-exit-s（及其值）后的命令行参数（交给 QApplication）"""
+    result: List[str] = []
+    skip_next = False
+    for i, arg in enumerate(argv):
+        if skip_next:
+            skip_next = False
+            continue
+        if i > 0 and arg == BACKGROUND_ARG:
+            continue
+        if i > 0 and arg == IDLE_EXIT_ARG:
+            skip_next = True
+            continue
+        if i > 0 and arg.startswith(IDLE_EXIT_ARG + "="):
+            continue
+        result.append(arg)
+    return result
+
+
+def command_settings():
+    """IPC 命令处理器读取的用户设置（自动化开关、默认指标与采集间隔），都在用时现读"""
+    from app_config import cfg, interval_range
+    from core.ipc.commands import CommandSettings
+    return CommandSettings(
+        automation_enabled=lambda: bool(cfg.get(cfg.automation_enabled)),
+        default_metrics=lambda: list(cfg.get(cfg.last_metrics)),
+        default_interval=lambda: float(cfg.get(cfg.default_interval)),
+        interval_range=lambda: tuple(float(v) for v in interval_range()),
+        task_limit=config.MAX_MONITOR_TASKS)
+
+
+def render_report_image_for_ipc(task, analysis, generated_at):
+    """命令行导出的报告图片：与分析页"导出报告"同一条离屏渲染管线（范围为"全部"，
+    时间轴为绝对时间）。在界面线程调用；只用 QImage/QPainter 与不显示的控件，
+    无窗口模式下也不出现可见窗口。"""
+    from ui.viewmodels.analysis_vm import range_text
+    from ui.widgets.analysis.report_sheet import render_report_for
+    return render_report_for(task, analysis, generated_at, range_text(analysis.range_key))
+
+
+def render_stage_snapshot_image(task, analysis, generated_at, range_desc):
+    """阶段快照的报告图片（StageSnapshotWriter 的 renderer）：同一条离屏渲染管线，范围文案
+    由写入器给出（"全部（运行中第 N 次阶段快照）"）。在界面线程调用，无窗口模式也可用。"""
+    from ui.widgets.analysis.report_sheet import render_report_for
+    return render_report_for(task, analysis, generated_at, range_desc)
+
+
+def start_self_monitor(ctx: AppContext, interval_ms: int = SELF_MONITOR_INTERVAL_MS):
+    """自身监控：马上采一次（诊断信息里立刻有值），之后每 interval_ms 采一次。定时器在
+    界面线程，挂在 ctx 上（持有引用）；没有自身监控对象时什么都不做。"""
+    from PyQt5.QtCore import QTimer
+    monitor = ctx.self_monitor
+    if monitor is None:
+        return None
+    timer = QTimer()
+    timer.setInterval(interval_ms)
+    timer.timeout.connect(monitor.tick)
+    timer.start()
+    QTimer.singleShot(0, monitor.tick)
+    ctx.self_monitor_timer = timer
+    return timer
+
+
+def install_watchdog(app, ctx: AppContext, window) -> None:
+    """界面卡死看门狗：窗口显示后在界面线程安装，交给主窗口（真退出时先停掉它）。
+    没有 crash.log 等原因装不上时只记日志。"""
+    from utils.crash_handler import install_ui_watchdog
+    watchdog = install_ui_watchdog(app)
+    ctx.watchdog = watchdog
+    if watchdog is not None:
+        window.attach_watchdog(watchdog)
+
+
+def _parse_startup_trace(argv: List[str]) -> bool:
+    return STARTUP_TRACE_ARG in argv[1:]
+
+
+def _new_trace(origin: float):
+    from core.diagnostics import StartupTrace
+    return StartupTrace(origin=origin)
+
+
+def _report_trace(trace) -> None:
+    if trace is not None:
+        logger.info("%s", trace.report().rstrip())
+
+
+def _attach_ipc_to_window(guard, ctx: AppContext, window) -> None:
+    """有窗口模式：把命令处理器的上下文交给 IPC。自动打点服务用监控页 Presenter 持有的
+    那一份（全程只有一个），quit 等价于托盘"退出"。守卫没有处理器（监听失败、测试替身）
+    时跳过。"""
+    dispatcher = getattr(guard, 'dispatcher', None)
+    if dispatcher is None:
+        return
+    from core.ipc.commands import CommandContext
+    presenter = window.monitor_page.presenter
+    dispatcher.set_settings(command_settings())
+    dispatcher.set_context(CommandContext(
+        manager=ctx.manager, db=ctx.db, auto_marker=presenter.auto_marker,
+        registry=ctx.registry, clock=ctx.services.clock, quit=window.request_quit,
+        report_renderer=render_report_image_for_ipc,
+        launcher=getattr(ctx.services, "launcher", None)))
+    logger.info("命令行控制已就绪（有窗口模式）")
+
+
+def _run_headless(app, guard, paths: AppPaths, idle_exit_s: float, *,
+                  exit_process: Callable[[int], None], trace=None) -> int:
+    """
+    无窗口模式（--background）：加载配置 → 同步迁移 → build_context → HeadlessRuntime
+    → 把上下文交给 IPC → 事件循环。不导入 ui.main_window，不建窗口、托盘与全局快捷键；
+    迁移不显示进度窗口（没有窗口可依附，pmctl 会一直等到就绪或超时）。
+    """
+    from app_config import load_app_config
+    from core.headless import HeadlessRuntime
+    from core.ipc.commands import CommandContext
+    from data.db.migrations.runner import MigrationOutcome
+
+    load_app_config(paths)
+    _mark(trace, "配置")
+    if not _automation_enabled():
+        # 无窗口实例只能经命令行控制：开关关着时留下来既收不到命令、也没有界面可用
+        logger.warning("设置里已关闭“允许命令行与脚本控制”，无窗口模式不启动，直接退出")
+        return EXIT_AUTOMATION_DISABLED
+    report = new_migration_runner(paths).migrate()
+    if report.outcome is MigrationOutcome.FAILED_KEPT:
+        logger.error("数据库升级失败，原文件在 %s，无窗口模式退出", _kept_db_path(report, paths))
+        return EXIT_MIGRATION_FAILED
+    _mark(trace, "迁移")
+    ctx = build_context(paths, report=report)
+    _mark(trace, "组装")
+    dispatcher = getattr(guard, 'dispatcher', None)
+    runtime = HeadlessRuntime(
+        ctx.manager, ctx.registry, ctx.db, idle_exit_s=idle_exit_s,
+        busy=(dispatcher.has_pending if dispatcher is not None else None),
+        stage_renderer=render_stage_snapshot_image)
+    if dispatcher is not None:
+        dispatcher.set_settings(command_settings())
+        dispatcher.set_context(CommandContext(
+            manager=ctx.manager, db=ctx.db, auto_marker=runtime.auto_marker,
+            registry=ctx.registry, clock=ctx.services.clock, quit=runtime.quit,
+            report_renderer=render_report_image_for_ipc, handle_auto_export=True,
+            launcher=getattr(ctx.services, "launcher", None)))
+    runtime.start()
+    start_self_monitor(ctx)
+    logger.info("无窗口模式已就绪（空闲退出：%s）",
+                f"{idle_exit_s:g} 秒" if idle_exit_s > 0 else "不退出")
+    _mark(trace, "就绪")
+    _report_trace(trace)
+
+    exit_code = app.exec_()
+    logger.info("无窗口模式退出，退出码=%d", exit_code)
+    exit_process(exit_code)
+    return exit_code
+
+
+def _automation_enabled() -> bool:
+    """设置里的"允许命令行与脚本控制"（读失败按开启处理：不能因读配置出错让 pmctl 无从诊断）"""
+    try:
+        return bool(command_settings().automation_enabled())
+    except Exception:
+        logger.error("读取命令行控制开关失败，按开启处理", exc_info=True)
+        return True
+
+
+def _mark(trace, stage: str) -> None:
+    if trace is not None:
+        trace.mark(stage)
+
+
+def strip_startup_trace_arg(argv: List[str]) -> List[str]:
+    """去掉 --startup-trace 后的命令行参数（交给 QApplication）"""
+    return [arg for i, arg in enumerate(argv) if i == 0 or arg != STARTUP_TRACE_ARG]
+
+
 def run(argv: List[str], *, exit_process: Callable[[int], None] = os._exit,
         message_box: Callable[[str, str], None] = show_native_message_box) -> int:
     """
@@ -362,8 +601,11 @@ def run(argv: List[str], *, exit_process: Callable[[int], None] = os._exit,
 
     Returns:
         事件循环的退出码；已有实例时为 0；数据目录不可用时为 EXIT_DATA_DIR_UNAVAILABLE；
-        数据库升级失败且旧库没能回到原路径时为 EXIT_MIGRATION_FAILED
+        数据库升级失败且旧库没能回到原路径时为 EXIT_MIGRATION_FAILED；无窗口模式没能开始
+        IPC 监听时为 EXIT_IPC_UNAVAILABLE
     """
+    # 启动计时的起点尽量早；StartupTrace 要等日志初始化之后才导入（见下）
+    started_at = time.monotonic()
     try:
         paths = AppPaths.resolve(argv=argv)
         paths.ensure_dirs()
@@ -382,19 +624,49 @@ def run(argv: List[str], *, exit_process: Callable[[int], None] = os._exit,
     install_excepthook(log_dir)
     logger.info("数据目录: %s（来源: %s）", paths.data_dir,
                 _SOURCE_LOG_NAMES.get(paths.source, paths.source))
+    trace = _new_trace(started_at) if _parse_startup_trace(argv) else None
+    _mark(trace, "路径与日志")
 
-    app = _create_application(strip_data_dir_args(argv))
+    background = BACKGROUND_ARG in argv[1:]
+    idle_exit_s = _parse_idle_exit(argv)
+    if background:
+        # 无窗口模式没有人看得到弹框，模态框还会卡住界面线程：未捕获异常只记日志
+        from utils.crash_handler import set_headless
+        set_headless(True)
+    app = _create_application(
+        strip_startup_trace_arg(strip_background_args(strip_data_dir_args(argv))))
+    _mark(trace, "QApplication")
 
     # 单实例：已有实例时通知其激活窗口后直接返回；此时尚未创建任何线程与窗口，
-    # 正常结束解释器即可。实例按"用户 + 数据目录"区分，不同数据目录可以并存
+    # 正常结束解释器即可。实例按"用户 + 数据目录"区分，不同数据目录可以并存。
+    # 无窗口模式的从实例不发激活消息（不能把用户的窗口拉到前台）
     from app.single_instance import SingleInstanceGuard, activate_main_window
-    guard = SingleInstanceGuard(data_dir=paths.data_dir)
-    if guard.notify_existing_instance():
-        logger.info("检测到已运行的实例，已通知其激活窗口，本进程退出")
-        return 0
-    guard.listen()
+    if background:
+        guard = SingleInstanceGuard(data_dir=paths.data_dir, background=True)
+        if guard.notify_existing_instance(activate=False):
+            logger.info("检测到已运行的实例，无窗口模式的本进程直接退出")
+            return 0
+    else:
+        guard = SingleInstanceGuard(data_dir=paths.data_dir)
+        if guard.notify_existing_instance():
+            logger.info("检测到已运行的实例，已通知其激活窗口，本进程退出")
+            if getattr(guard, 'activation_error', None) == 'invalid_state':
+                # 已运行的是无窗口模式：没有窗口可激活，不提示的话用户会以为"打不开"
+                message_box(MESSAGE_BOX_TITLE, BACKGROUND_RUNNING_TEXT)
+            return 0
+    # 尽早开始 IPC 监听：pmctl 拉起后台实例后马上就会连，组装完成前回 not_ready
+    listening = guard.listen()
+    _mark(trace, "单实例与命令行监听")
+
+    if background:
+        if not listening:
+            logger.error("无窗口模式无法开始 IPC 监听，退出（否则没有办法控制或结束它）")
+            return EXIT_IPC_UNAVAILABLE
+        return _run_headless(app, guard, paths, idle_exit_s, exit_process=exit_process,
+                             trace=trace)
 
     _apply_preferences(app, paths)
+    _mark(trace, "配置与主题")
 
     from data.db.migrations.runner import MigrationOutcome
     report = _migrate_database(paths)
@@ -406,19 +678,29 @@ def run(argv: List[str], *, exit_process: Callable[[int], None] = os._exit,
         message_box(MESSAGE_BOX_TITLE, MIGRATION_FAILED_TEXT.format(
             path=kept, name=os.path.basename(paths.db_path)))
         return EXIT_MIGRATION_FAILED
+    _mark(trace, "迁移")
 
     ctx = build_context(paths, report=report, legacy_importer=import_legacy_with_progress)
+    _mark(trace, "组装")
 
     from ui.main_window import MainWindow
     hotkey = _create_marker_hotkey(app, ctx.services)
-    window = MainWindow(ctx.db, ctx.manager, ctx.services, hotkey=hotkey)
+    window = MainWindow(ctx.db, ctx.manager, ctx.services, hotkey=hotkey,
+                        diagnostics_provider=lambda: ctx)
     ctx.window = window
+    _mark(trace, "主窗口")
     window.show()
+    _mark(trace, "显示")
+    install_watchdog(app, ctx, window)
+    start_self_monitor(ctx)
     guard.activation_requested.connect(lambda: activate_main_window(window))
+    _attach_ipc_to_window(guard, ctx, window)
     hint = sync_dir_hint(paths.data_dir)
     if hint:
         logger.warning("%s: %s", hint, paths.data_dir)
         window.show_sync_dir_warning(hint)
+    _mark(trace, "就绪")
+    _report_trace(trace)
 
     exit_code = app.exec_()
 

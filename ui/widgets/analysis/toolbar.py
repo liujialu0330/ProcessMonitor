@@ -1,7 +1,7 @@
 """
 分析页工具条（卡片）
 
-第 0 行：任务选择槽位 · [对比任务] · [导出报告 ▾ 报告/CSV/图片/复制图片] · [刷新] · [更多 ▾]
+第 0 行：任务选择槽位 · [对比任务] · [导出报告 ▾ 报告/证据包/CSV/图片/复制图片] · [刷新] · [更多 ▾]
 第 1 行：范围分段（自基线 / 10分钟 / 1小时 / 6小时 / 24小时 / 全部 / 自定义）
         · 视图 [小倍数 | 叠加Δ%] · [绝对 | 相对时间]；窄宽度时视图切换换到第 2 行。
 
@@ -36,8 +36,10 @@ EXPORT_REPORT = 'report'
 EXPORT_CSV = 'csv'
 EXPORT_IMAGE = 'image'
 EXPORT_COPY = 'copy'
+EXPORT_EVIDENCE = 'evidence'
 EXPORT_ITEMS = (
     (EXPORT_REPORT, FluentIcon.DOCUMENT, "报告（图片 + CSV + 摘要）"),
+    (EXPORT_EVIDENCE, FluentIcon.ZIP_FOLDER, "证据包（.zip）"),
     (EXPORT_CSV, FluentIcon.SAVE, "CSV 明细"),
     (EXPORT_IMAGE, FluentIcon.PHOTO, "报告图片"),
     (EXPORT_COPY, FluentIcon.COPY, "复制报告图片"),

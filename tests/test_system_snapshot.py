@@ -9,6 +9,7 @@ import ctypes
 import logging
 import os
 import sys
+import threading
 
 import pytest
 
@@ -359,3 +360,122 @@ def test_real_snapshot_contains_self():
     assert snap.context_switches(os.getpid()) > 0
     assert 0 in snap.processes
     assert snap.taken_at.wall > 0
+
+
+# ========== 评审修复：条目步长、32 位、线程步长自检 ==========
+
+def _with_first_next_offset(value):
+    """好缓冲区的首条目 NextEntryOffset 改成 value"""
+    buffer, length = _hand_buffer()
+    ctypes.c_ulong.from_buffer(buffer, 0).value = value
+    return buffer, length
+
+
+@pytest.mark.parametrize("bad_offset", [1, 100, ctypes.sizeof(SPI) - 1])
+def test_next_entry_offset_between_zero_and_header_size_is_layout_error(bad_offset):
+    """NextEntryOffset 落在 (0, 条目头大小) 之间：步长不可能这么短，按解析错误抛出"""
+    buffer, length = _with_first_next_offset(bad_offset)
+    with pytest.raises(ss._LayoutError, match="NextEntryOffset"):
+        parse_buffer(buffer, length, build_layout())
+
+
+def test_bad_next_entry_offset_after_self_check_disables_snapshot_and_collector_falls_back():
+    """自检之后某次快照的步长异常：快照永久禁用，采集器回退 psutil 且数据照常"""
+    from core.process_collector import ProcessCollector
+    from core.snapshot_hub import SnapshotHub
+    from tests.test_samplers import _FAKE_PID, _fake_process
+    from utils.metrics import MetricType
+
+    good = FakeQuery()
+    state = {'bad': False}
+
+    def query(buffer, size):
+        status, length = good(buffer, size)
+        if state['bad'] and status == 0:
+            ctypes.c_ulong.from_buffer(buffer, 0).value = 100
+        return status, length
+
+    snapper = NtProcessSnapshotter(query, own_pid=OWN_PID)
+    assert snapper.available() is True
+    state['bad'] = True
+    collector = ProcessCollector(_FAKE_PID, hub=SnapshotHub(snapper))
+    collector._process = _fake_process()
+    assert collector.collect_metrics([MetricType.NUM_THREADS]) == {MetricType.NUM_THREADS: 17.0}
+    assert collector.last_source == 'psutil'
+    assert snapper.available() is False
+    assert "NextEntryOffset" in snapper.unavailable_reason
+
+
+def test_32bit_pointer_disables_snapshot_without_querying_and_logs_once(monkeypatch, caplog):
+    """指针 4 字节（32 位 Python / WOW64）：结构布局未验证，不调用系统接口，直接禁用并回退"""
+    from core.process_collector import ProcessCollector
+    from core.snapshot_hub import SnapshotHub
+    from tests.test_samplers import _FAKE_PID, _fake_process
+    from utils.metrics import MetricType
+
+    monkeypatch.setattr(ss, "_pointer_size", lambda: 4)
+    query = FakeQuery()
+    snapper = NtProcessSnapshotter(query, own_pid=OWN_PID)
+    with caplog.at_level(logging.WARNING, logger=ss.__name__):
+        assert snapper.available() is False
+        assert snapper.available() is False
+        with pytest.raises(SnapshotUnavailable):
+            snapper.snapshot()
+    assert query.sizes == []
+    assert "32 位" in snapper.unavailable_reason
+    assert len([r for r in caplog.records if "已禁用" in r.getMessage()]) == 1
+
+    collector = ProcessCollector(_FAKE_PID, hub=SnapshotHub(snapper))
+    collector._process = _fake_process()
+    assert collector.collect_metrics([MetricType.NUM_THREADS]) == {MetricType.NUM_THREADS: 17.0}
+    assert collector.last_source == 'psutil'
+
+
+def test_check_layout_reports_whether_thread_stride_was_verified():
+    single = [DEFAULT_ENTRIES[0], {**DEFAULT_ENTRIES[1], 'threads': [5]}]
+    buffer, length = _hand_buffer(single)
+    info = check_layout(buffer, length, build_layout(), OWN_PID)
+    assert (info['own_threads'], info['thread_stride_verified']) == (1, False)
+    buffer, length = _hand_buffer()
+    info = check_layout(buffer, length, build_layout(), OWN_PID)
+    assert (info['own_threads'], info['thread_stride_verified']) == (2, True)
+
+
+def _own_process_query(thread_count_of, seen):
+    """本进程（真实 PID）的线程数由 thread_count_of() 决定的 NtQuerySystemInformation 替身"""
+    def query(buffer, size):
+        count = thread_count_of()
+        seen.append(count)
+        entries = [DEFAULT_ENTRIES[0], entry(os.getpid(), "本进程.exe", threads=[5] * count)]
+        return 0, write_entries(buffer, entries)
+    return query
+
+
+def test_self_check_starts_idle_thread_when_own_process_has_one_thread():
+    """本进程只有一个线程时线程结构步长验证不到：自检临时起空闲线程再查一遍，查完结束它"""
+    baseline = threading.active_count()
+    seen = []
+    # 假内核：线程数 = 当前 Python 线程数 - 基线 + 1（主线程算 1 个）
+    query = _own_process_query(lambda: threading.active_count() - baseline + 1, seen)
+    snapper = NtProcessSnapshotter(query)
+    assert snapper.available() is True, snapper.unavailable_reason
+    assert seen == [1, 2]
+    assert snapper.diagnostics['thread_stride_verified'] is True
+    assert threading.active_count() == baseline
+    assert not [t for t in threading.enumerate() if t.name == "snapshot-selfcheck-idle"]
+
+
+def test_self_check_does_not_start_thread_when_enough_threads():
+    seen = []
+    snapper = NtProcessSnapshotter(_own_process_query(lambda: 3, seen))
+    assert snapper.available() is True
+    assert seen == [3]
+
+
+def test_self_check_disables_when_stride_still_unverifiable_after_idle_thread():
+    seen = []
+    snapper = NtProcessSnapshotter(_own_process_query(lambda: 1, seen))
+    assert snapper.available() is False
+    assert "线程" in snapper.unavailable_reason and len(seen) == 2
+    assert threading.active_count() >= 1
+    assert not [t for t in threading.enumerate() if t.name == "snapshot-selfcheck-idle"]

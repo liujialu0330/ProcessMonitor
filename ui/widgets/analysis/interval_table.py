@@ -5,13 +5,14 @@
 Δ / 速率 / 峰值 / 与上轮差（文本见 ui.formatting.interval_row_texts）；点击一行发
 interval_activated(start, end)，页面据此把趋势图缩放到该区间。
 
-LowerViews：[打点区间（默认）| 采集明细] 分段 + 堆叠，采集明细复用 ui/widgets/history 的 SampleTable。
+LowerViews：焦点区的页签 [打点区间（默认）| 采集明细] + 堆叠，紧跟判定摘要表、在焦点大图之上
+（1280×820 首屏要能看到区间表前几行）；采集明细复用 ui/widgets/history 的 SampleTable。
 """
 from typing import List, Optional, Sequence
 
 from PyQt5.QtCore import Qt, pyqtSignal
-from PyQt5.QtWidgets import (QHBoxLayout, QHeaderView, QStackedWidget, QTableWidgetItem,
-                             QVBoxLayout, QWidget)
+from PyQt5.QtWidgets import (QHBoxLayout, QHeaderView, QSizePolicy, QStackedWidget,
+                             QTableWidgetItem, QVBoxLayout, QWidget)
 from qfluentwidgets import (CaptionLabel, CardWidget, SegmentedWidget, StrongBodyLabel,
                             TableWidget)
 
@@ -23,7 +24,9 @@ from ui.widgets.history.sample_table import SampleTable
 from utils.metrics import get_metric_display_name
 
 ROW_HEIGHT = 36
-TABLE_MIN_HEIGHT = 240
+HEADER_HEIGHT = 36
+# 表格高度随行数（页面整体滚动），最多摊开这么多行，再多在表内滚动
+MAX_VISIBLE_ROWS = 10
 EMPTY_HINT = "没有打点时整段为一个区间；在趋势图上右键可补加打点"
 
 VIEW_INTERVALS = 'intervals'
@@ -48,6 +51,7 @@ class IntervalTable(CardWidget):
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeToContents)
         header.setStretchLastSection(True)
+        header.setFixedHeight(HEADER_HEIGHT)
         self.table.verticalHeader().hide()
         self.table.verticalHeader().setDefaultSectionSize(ROW_HEIGHT)
         self.table.setEditTriggers(TableWidget.NoEditTriggers)
@@ -56,7 +60,7 @@ class IntervalTable(CardWidget):
         self.table.setWordWrap(False)
         self.table.setBorderVisible(True)
         self.table.setBorderRadius(8)
-        self.table.setMinimumHeight(TABLE_MIN_HEIGHT)
+        self._fit_height()
         self.table.cellClicked.connect(self._on_cell_clicked)
         self.table.setToolTip("点击一行把趋势图缩放到该区间")
 
@@ -94,6 +98,12 @@ class IntervalTable(CardWidget):
                     table.setItem(r, c, cell)
         finally:
             table.setUpdatesEnabled(True)
+        self._fit_height()
+
+    def _fit_height(self) -> None:
+        # 高度贴合行数：区间只有几段时不留大片空白，焦点区下面的大图随之上移
+        rows = min(max(1, self.table.rowCount()), MAX_VISIBLE_ROWS)
+        self.table.setFixedHeight(HEADER_HEIGHT + rows * ROW_HEIGHT + 4)
 
     def clear(self) -> None:
         self.set_intervals(None, [])
@@ -117,7 +127,7 @@ class IntervalTable(CardWidget):
 
 
 class LowerViews(QWidget):
-    """趋势图下方的子视图：[打点区间 | 采集明细]。"""
+    """焦点区的子视图：[打点区间 | 采集明细]。"""
 
     view_changed = pyqtSignal(str)
 
@@ -133,6 +143,7 @@ class LowerViews(QWidget):
         self.stack = QStackedWidget(self)
         self.stack.addWidget(self.interval_table)
         self.stack.addWidget(self.sample_table)
+        self._on_changed(VIEW_INTERVALS)
 
         bar = QHBoxLayout()
         bar.addWidget(self.segmented)
@@ -151,8 +162,13 @@ class LowerViews(QWidget):
         self._on_changed(key)
 
     def _on_changed(self, key: str) -> None:
-        self.stack.setCurrentWidget(
-            self.interval_table if key == VIEW_INTERVALS else self.sample_table)
+        current = self.interval_table if key == VIEW_INTERVALS else self.sample_table
+        # 堆叠默认按最高的一页（采集明细）留高度；不显示的一页纵向策略设为 Ignored，
+        # 区间表只有几行时焦点区就不会多出一大块空白
+        for page in (self.interval_table, self.sample_table):
+            page.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred
+                               if page is current else QSizePolicy.Ignored)
+        self.stack.setCurrentWidget(current)
         self.view_changed.emit(key)
 
     def clear(self) -> None:

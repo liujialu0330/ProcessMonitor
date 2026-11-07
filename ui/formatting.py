@@ -264,7 +264,7 @@ def object_usage_text(metric_type: Optional[str], value: Optional[float]) -> str
     return f"已用 {value / limit * 100:.1f}%（上限 {limit}）"
 
 
-BADGE_BASELINE = "基"
+BADGE_BASELINE = "基线"
 _CIRCLED_MAX = 20
 
 
@@ -334,11 +334,13 @@ SUMMARY_HEADERS = {
 
 @dataclass(frozen=True)
 class SummaryRow:
-    """判定摘要表的一行：各列文本（键见 SUMMARY_COLUMNS）、各列 tooltip、是否置灰。"""
+    """判定摘要表的一行：各列文本（键见 SUMMARY_COLUMNS）、各列 tooltip、是否置灰；
+    note 非空时判定胶囊后加 ⓘ，note 即其 tooltip（样本不足的原因）。"""
     metric: str
     texts: dict
     tooltips: dict
     dimmed: bool = False
+    note: str = ""
 
     def text(self, column: str) -> str:
         return self.texts.get(column, STAT_EMPTY)
@@ -433,7 +435,165 @@ def build_summary_row(metric: str, snapshot: Optional["HistorySnapshot"]) -> Sum
     return SummaryRow(metric, texts, tips, dimmed=dimmed)
 
 
-INTERVAL_HEADERS = ("区间", "时长", "起值", "终值", "Δ", "速率", "峰值", "与上轮差")
+# ---------- 分析页摘要表的显示规则（报告与安全网仍用 build_summary_row 的原文） ----------
+
+# 平稳行的"增速""每轮均增"写这个（平稳就不必再读数），原文放 tooltip
+STABLE_DASH = "—"
+STABLE_TIP_PREFIX = "判定平稳，不列出该值；原值："
+# 样本不足的行在判定胶囊后加的标记
+INFO_MARK = "ⓘ"
+NO_DATA_NOTE = "所选范围内没有该指标的数据"
+
+
+def usage_percent_text(value: float, limit: float) -> str:
+    """上限占比只写百分比，如 "62%"；不足 10% 时保留至多两位小数（"3%"、"0.45%"）。"""
+    percent = value / limit * 100
+    return f"{percent:.0f}%" if percent >= 10 else f"{_plain_number(percent)}%"
+
+
+def build_table_row(metric: str, snapshot: Optional["HistorySnapshot"]) -> SummaryRow:
+    """分析页判定摘要表的一行：在 build_summary_row 的基础上——平稳行的增速、每轮均增
+    写 "—"；上限占比只写百分比（原文 "62.0% / 10000" 进 tooltip）；样本不足的行带
+    note（判定胶囊后的 ⓘ，tooltip 写原因）。"""
+    row = build_summary_row(metric, snapshot)
+    texts, tips = dict(row.texts), dict(row.tooltips)
+    if texts["verdict"] == verdict_text(Verdict.STABLE):
+        for column in ("rate", "per_round"):
+            original = texts[column]
+            if original != STAT_EMPTY:
+                detail = tips.get(column)
+                tips[column] = STABLE_TIP_PREFIX + original + (f"\n{detail}" if detail else "")
+            texts[column] = STABLE_DASH
+    stats = snapshot.stats if snapshot is not None else None
+    limit = object_count_limit(metric)
+    if texts["usage"] and limit is not None and stats:
+        tips["usage"] = f"{texts['usage']}\n{tips.get('usage', '')}".rstrip()
+        texts["usage"] = usage_percent_text(stats['last'], limit)
+    note = ""
+    if row.dimmed:
+        if not stats:
+            note = NO_DATA_NOTE
+        else:
+            interval = snapshot.interval_seconds
+            note = (insufficient_text(stats['span_seconds'], stats['count'], interval)
+                    + "；" + insufficient_hint(interval))
+    return SummaryRow(metric, texts, tips, dimmed=row.dimmed, note=note)
+
+
+# ---------- 分析页结论条 ----------
+
+@dataclass(frozen=True)
+class VerdictSummary:
+    """结论条内容：verdict 为左侧胶囊的判定文案（没有可判定的指标时为空串），
+    sentence 为主句，tooltip 列出各判定下的全部指标。"""
+    verdict: str
+    sentence: str
+    tooltip: str = ""
+
+
+# 主句里最多点名几个指标，其余写"等 N 项"
+BANNER_MAX_NAMES = 3
+BANNER_RISING = "{count} / {total} 项持续上涨：{items}"
+BANNER_ALSO_FLUCTUATING = "；另 {count} 项波动"
+BANNER_FLUCTUATING = "{count} / {total} 项波动：{items}"
+BANNER_ALL_STABLE = "{count} 项指标均平稳"
+BANNER_STABLE_PARTIAL = "{stable} 项平稳，{insufficient} 项数据不足"
+BANNER_SHORT_SPAN = "数据不足：已采 {span} / 需 ≥ {need}"
+BANNER_FEW_POINTS = "数据不足：仅 {count} 点 / 需 ≥ {need} 点"
+BANNER_NO_DATA = "数据不足：所选范围内没有数据"
+BANNER_UNJUDGED = "所选指标均为累计量或峰值类，不做趋势判定"
+BANNER_MORE = "等 {count} 项"
+AUTO_REFRESH_STATUS = "自动刷新 · {ago}"
+
+
+def rate_brief(metric: str, rate: RateText) -> str:
+    """结论条里的增速：不带置信区间，如 "+35 MB/小时"。"""
+    return format_rate_text(metric, RateText(rate.value, None, rate.unit_suffix,
+                                             rate.unit_seconds))
+
+
+def _name_list(parts: Sequence[str]) -> str:
+    if len(parts) <= BANNER_MAX_NAMES:
+        return "、".join(parts)
+    rest = len(parts) - BANNER_MAX_NAMES
+    return "、".join(parts[:BANNER_MAX_NAMES]) + BANNER_MORE.format(count=rest)
+
+
+def verdict_summary(items: Sequence) -> VerdictSummary:
+    """结论条文案。items 为按严重程度排好序的 (指标, 快照或 None)。
+
+    规则（自上而下取第一条成立的）：有持续上涨 → "2 / 5 项持续上涨：私有字节 +35 MB/小时、
+    句柄数 +120 个/小时"（另有波动时追加"；另 N 项波动"）；有波动 → "N / 总数 项波动：…"；
+    全部平稳 → "5 项指标均平稳"；平稳与数据不足并存 → "3 项平稳，2 项数据不足"；
+    全部数据不足 → "数据不足：已采 8分钟 / 需 ≥ 10分钟"（时长够而点数不够时写点数）。
+    累计量与峰值类不做趋势判定，只计入总数。"""
+    groups = {verdict: [] for verdict in Verdict}
+    total = len(items)
+    for metric, snapshot in items:
+        if snapshot is None or not snapshot.stats:
+            groups[Verdict.INSUFFICIENT].append((metric, snapshot))
+        elif snapshot.judgement is not None:
+            groups[Verdict(snapshot.judgement.verdict)].append((metric, snapshot))
+    rising, fluctuating = groups[Verdict.RISING], groups[Verdict.FLUCTUATING]
+    stable, insufficient = groups[Verdict.STABLE], groups[Verdict.INSUFFICIENT]
+    tooltip = "\n".join(
+        f"{verdict_text(verdict)}：{'、'.join(get_metric_display_name(m) for m, _ in members)}"
+        for verdict, members in groups.items() if members)
+
+    def described(members) -> str:
+        parts = []
+        for metric, snapshot in members:
+            name = get_metric_display_name(metric)
+            parts.append(f"{name} {rate_brief(metric, snapshot.rate)}"
+                         if snapshot.rate is not None else name)
+        return _name_list(parts)
+
+    if rising:
+        sentence = BANNER_RISING.format(count=len(rising), total=total, items=described(rising))
+        if fluctuating:
+            sentence += BANNER_ALSO_FLUCTUATING.format(count=len(fluctuating))
+        return VerdictSummary(verdict_text(Verdict.RISING), sentence, tooltip)
+    if fluctuating:
+        return VerdictSummary(verdict_text(Verdict.FLUCTUATING), BANNER_FLUCTUATING.format(
+            count=len(fluctuating), total=total,
+            items=_name_list([get_metric_display_name(m) for m, _ in fluctuating])), tooltip)
+    if stable and not insufficient:
+        return VerdictSummary(verdict_text(Verdict.STABLE),
+                              BANNER_ALL_STABLE.format(count=len(stable)), tooltip)
+    if stable:
+        return VerdictSummary(verdict_text(Verdict.STABLE), BANNER_STABLE_PARTIAL.format(
+            stable=len(stable), insufficient=len(insufficient)), tooltip)
+    if insufficient:
+        return VerdictSummary(verdict_text(Verdict.INSUFFICIENT),
+                              _insufficient_sentence(insufficient), tooltip)
+    return VerdictSummary("", BANNER_UNJUDGED if total else "", tooltip)
+
+
+def _insufficient_sentence(members) -> str:
+    """全部数据不足时的主句：取统计跨度最长的一个指标说明还差什么。"""
+    with_stats = [s for _m, s in members if s is not None and s.stats]
+    if not with_stats:
+        return BANNER_NO_DATA
+    snapshot = max(with_stats, key=lambda s: s.stats['span_seconds'])
+    span, need = snapshot.stats['span_seconds'], min_span_for(snapshot.interval_seconds)
+    if span < need:
+        return BANNER_SHORT_SPAN.format(span=format_duration(span), need=format_duration(need))
+    return BANNER_FEW_POINTS.format(count=f"{snapshot.stats['count']:,}", need=MIN_POINTS)
+
+
+def refresh_status_text(seconds_ago: float) -> str:
+    """运行中任务的自动刷新状态，如 "自动刷新 · 15 秒前"。"""
+    seconds = max(0, int(seconds_ago))
+    if seconds < 1:
+        ago = "刚刚"
+    elif seconds < 60:
+        ago = f"{seconds} 秒前"
+    else:
+        ago = f"{seconds // 60} 分钟前"
+    return AUTO_REFRESH_STATUS.format(ago=ago)
+
+
+INTERVAL_HEADERS =("区间", "时长", "起值", "终值", "Δ", "速率", "峰值", "与上轮差")
 
 
 def interval_row_texts(metric: str, item, span: Sequence[str],
@@ -553,6 +713,11 @@ AUTO_EXPORT_NO_DATABASE = "未连接数据库，未能自动导出"
 # 自动导出的 CSV 元数据"范围"一行
 AUTO_EXPORT_RANGE_TEXT = "全部（任务结束后自动导出）"
 PLAN_INVALID_TITLE = "自动化设置有误"
+STAGE_SNAPSHOT_SUMMARY_TEMPLATE = "每 {hours} 小时写阶段快照"
+STAGE_SNAPSHOT_DONE_TITLE = "已写阶段快照"
+STAGE_SNAPSHOT_FAILED_TITLE = "阶段快照写入失败"
+# 失败只提示一次：说明采集不受影响、之后不再提示
+STAGE_SNAPSHOT_FAILED_TEMPLATE = "{name}：{message}。采集照常进行，之后的快照失败不再提示（见日志）"
 
 
 def plan_span_text(seconds: int) -> str:
@@ -582,7 +747,20 @@ def plan_summary(plan) -> str:
         parts.append(f"满 {plan.stop_after_rounds} 轮停止")
     if plan.export_on_stop:
         parts.append("停止后自动导出")
+    hours = getattr(plan, 'stage_snapshot_hours', None)
+    if hours is not None and getattr(plan, 'stage_snapshot_dir', None):
+        parts.append(stage_snapshot_summary(hours))
     return " · ".join(parts)
+
+
+def stage_snapshot_summary(hours: float) -> str:
+    """阶段快照的简述，如"每 6 小时写阶段快照"（小数小时保留原样，如 0.5）。"""
+    return STAGE_SNAPSHOT_SUMMARY_TEMPLATE.format(hours=f"{float(hours):g}")
+
+
+def stage_snapshot_failed_text(name: str, message: str) -> str:
+    """阶段快照失败提示的正文（每个任务只提示一次）。"""
+    return STAGE_SNAPSHOT_FAILED_TEMPLATE.format(name=name, message=message.rstrip('。'))
 
 
 def auto_stop_text(reason: str, plan=None) -> str:

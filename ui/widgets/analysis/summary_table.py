@@ -3,8 +3,10 @@
 
 列：指标 / 基线 / 当前 / 较基线(Δ, %) / 每轮均增 / 增速±CI · R² / 末段趋势 / 判定 / 上限占比
 （没有带上限的指标时整列隐藏）；
-文本与 tooltip 由 ui.formatting.build_summary_row 生成。表格上方的依据行如
-"基线 16:37:33 起 · 2小时15分 · 8,100 点"；样本不足的行整行置灰。
+文本与 tooltip 由 ui.formatting 生成（分析页用 build_table_row：平稳行增速写"—"、上限占比
+只写百分比）；行序由调用方决定（分析页按判定严重程度排好再传入）。表格上方的标题与依据行如
+"基线 16:37:33 起 · 2小时15分 · 8,100 点"（分析页把依据并入结论条，不显示这一行）；
+样本不足的行整行置灰，判定胶囊后加 ⓘ（tooltip 写原因）。
 点击某行把该指标设为焦点（明细表、区间表与概览条跟随）。
 
 列宽：任何列都不截断。各列按内容定宽，"指标"列另有内容下限；表宽有富余时多出的宽度
@@ -13,13 +15,13 @@
 from typing import List, Optional, Sequence
 
 from PyQt5.QtCore import QEvent, Qt, pyqtSignal
-from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (QHBoxLayout, QHeaderView, QLabel, QTableWidgetItem,
                              QVBoxLayout)
 from qfluentwidgets import (CaptionLabel, CardWidget, StrongBodyLabel, TableWidget,
-                            isDarkTheme, qconfig, setCustomStyleSheet)
+                            qconfig, setCustomStyleSheet)
 
-from ui.formatting import SUMMARY_COLUMNS, SUMMARY_HEADERS, SummaryRow
+from ui.formatting import INFO_MARK, SUMMARY_COLUMNS, SUMMARY_HEADERS, SummaryRow
+from ui import theme_tokens as tokens
 from ui.typography import TypeScale, data_font
 from ui.widgets.history.common import CARD_PADDING_H
 
@@ -34,27 +36,15 @@ METRIC_COLUMN_PADDING = 16
 # qfluentwidgets 表格不用原生横向滚动条，而是在表格底边上浮一条 12px 高、距底 1px 的
 # 滚动条；它出现时表格多留这么高，免得盖住最后一行
 H_SCROLLBAR_SPACE = 14
-# 置灰行文字色（浅色 / 深色主题）
-DIMMED_LIGHT = QColor(0, 0, 0, 100)
-DIMMED_DARK = QColor(255, 255, 255, 100)
-# 判定胶囊配色：(浅色背景, 深色背景)；其余判定用中性色
-PILL_COLORS = {
-    "持续上涨": ("rgba(196, 43, 28, 0.14)", "rgba(255, 153, 164, 0.22)"),
-    "平稳": ("rgba(15, 123, 15, 0.14)", "rgba(108, 203, 95, 0.22)"),
-    "波动": ("rgba(157, 93, 0, 0.14)", "rgba(252, 225, 0, 0.20)"),
-}
-NEUTRAL_PILL = ("rgba(0, 0, 0, 0.06)", "rgba(255, 255, 255, 0.10)")
-# 胶囊文字色：(浅色主题, 深色主题)。显式写进样式而不用 setEnabled 置灰——
-# 禁用态 QLabel 走调色板的 disabled 文字色，在深色主题的半透明胶囊底上几乎看不清
-PILL_TEXT = ("rgba(0, 0, 0, 0.85)", "rgba(255, 255, 255, 0.90)")
-PILL_TEXT_DIMMED = ("rgba(0, 0, 0, 0.45)", "rgba(255, 255, 255, 0.55)")
+# 置灰行文字色与判定胶囊配色统一在 ui.theme_tokens（DIMMED_TEXT、PILL_*、VERDICT_TONES），
+# 与任务卡片状态胶囊同源；胶囊文字色显式写进样式而不用 setEnabled 置灰——禁用态 QLabel
+# 走调色板的 disabled 文字色，在深色主题的半透明胶囊底上几乎看不清
 
 
-def _pill_style(text: str, dimmed: bool = False) -> str:
-    """判定胶囊样式：底色按判定取，文字色按主题与是否置灰取。"""
-    dark = isDarkTheme()
-    background = PILL_COLORS.get(text, NEUTRAL_PILL)[1 if dark else 0]
-    color = (PILL_TEXT_DIMMED if dimmed else PILL_TEXT)[1 if dark else 0]
+def pill_style(text: str, dimmed: bool = False) -> str:
+    """判定胶囊样式：底色按判定的语气取，文字色按主题与是否置灰取（结论条、折叠行共用）。"""
+    background = tokens.pill_background(tokens.verdict_tone(text))
+    color = tokens.pick(tokens.PILL_TEXT_DIMMED if dimmed else tokens.PILL_TEXT)
     return ("QLabel{border-radius: 10px; padding: 2px 10px; font-size: 12px;"
             f"background: {background}; color: {color};}}")
 
@@ -64,7 +54,9 @@ class SummaryTable(CardWidget):
 
     metric_selected = pyqtSignal(str)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, show_header: bool = True):
+        """show_header=False 时不显示"判定摘要"标题与依据行（分析页由结论条承担），
+        省出一行高度；依据文本仍记在 basis() 里。"""
         super().__init__(parent)
         self._rows: List[SummaryRow] = []
         self._font = data_font(TypeScale.BODY)
@@ -102,14 +94,20 @@ class SummaryTable(CardWidget):
         setCustomStyleSheet(self.table, cell_qss, cell_qss)
         self.table.cellClicked.connect(self._on_cell_clicked)
 
+        self.title_label = StrongBodyLabel("判定摘要", self)
         title_row = QHBoxLayout()
-        title_row.addWidget(StrongBodyLabel("判定摘要", self))
+        title_row.addWidget(self.title_label)
         title_row.addStretch()
         title_row.addWidget(self.basis_label)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(CARD_PADDING_H, 12, CARD_PADDING_H, 16)
         layout.setSpacing(8)
-        layout.addLayout(title_row)
+        if show_header:
+            layout.setContentsMargins(CARD_PADDING_H, 12, CARD_PADDING_H, 16)
+            layout.addLayout(title_row)
+        else:
+            layout.setContentsMargins(CARD_PADDING_H, 12, CARD_PADDING_H, 12)
+            self.title_label.setVisible(False)
+            self.basis_label.setVisible(False)
         layout.addWidget(self.table)
         self._fit_height()
         qconfig.themeChanged.connect(self._on_theme_changed)
@@ -135,9 +133,12 @@ class SummaryTable(CardWidget):
                     item.setTextAlignment(Qt.AlignVCenter | (
                         Qt.AlignLeft if c == 0 else Qt.AlignRight))
                     table.setItem(r, c, item)
-                pill = QLabel(row.text("verdict"))
+                # 样本不足：胶囊里判定文字后跟 ⓘ，悬停说明还差什么
+                verdict = row.text("verdict")
+                pill = QLabel(f"{verdict} {INFO_MARK}" if row.note else verdict)
                 pill.setAlignment(Qt.AlignCenter)
-                pill.setToolTip(row.tooltips.get("verdict", ""))
+                pill.setToolTip("\n".join(
+                    t for t in (row.note, row.tooltips.get("verdict", "")) if t))
                 table.setCellWidget(r, VERDICT_COLUMN, pill)
             self._apply_theme_colors()
             # 没有任何指标有上限（未选 GDI/USER 对象）时整列隐藏，把宽度留给其它列
@@ -152,7 +153,7 @@ class SummaryTable(CardWidget):
     def _apply_theme_colors(self) -> None:
         """按当前主题给置灰行文字与判定胶囊上色（建表与主题切换共用）。
         只改已有单元格与胶囊的颜色，不重建行，选中行与键盘焦点保持不变。"""
-        dimmed_color = DIMMED_DARK if isDarkTheme() else DIMMED_LIGHT
+        dimmed_color = tokens.qcolor(tokens.DIMMED_TEXT)
         table = self.table
         for r, row in enumerate(self._rows):
             if row.dimmed:
@@ -162,10 +163,17 @@ class SummaryTable(CardWidget):
                         item.setForeground(dimmed_color)
             pill = table.cellWidget(r, VERDICT_COLUMN)
             if pill is not None:
-                pill.setStyleSheet(_pill_style(row.text("verdict"), row.dimmed))
+                pill.setStyleSheet(pill_style(row.text("verdict"), row.dimmed))
 
     def _on_theme_changed(self, _theme) -> None:
-        self._apply_theme_colors()
+        # 无父对象的表格可能 C++ 端已删除而 Python 对象还在：遇到就退订，不再跟随主题
+        try:
+            self._apply_theme_colors()
+        except RuntimeError:
+            try:
+                qconfig.themeChanged.disconnect(self._on_theme_changed)
+            except TypeError:
+                pass
 
     def clear(self) -> None:
         self.set_rows([], "")
@@ -257,6 +265,14 @@ class SummaryTable(CardWidget):
 
     def dimmed_metrics(self) -> List[str]:
         return [row.metric for row in self._rows if row.dimmed]
+
+    def metrics(self) -> List[str]:
+        """各行的指标（显示顺序）。"""
+        return [row.metric for row in self._rows]
+
+    def pill_text(self, row: int) -> str:
+        pill = self.table.cellWidget(row, VERDICT_COLUMN)
+        return pill.text() if pill is not None else ""
 
     def selected_metric(self) -> Optional[str]:
         rows = self.table.selectionModel().selectedRows()

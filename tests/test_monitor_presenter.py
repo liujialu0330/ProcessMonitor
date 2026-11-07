@@ -18,6 +18,7 @@ from PyQt5.QtWidgets import QWidget
 from core.automation.plan import AutomationPlan
 from core.contracts import StopReason, TaskInfo, TaskStatus, UnavailableReason
 from core.monitor_manager import BASELINE_LABEL, BaselineSamples, round_label
+from core.process_launcher import LaunchSpec
 from core.report_worker import ReportResult, ReportWorker
 from data.errors import StorageError
 from data.models import Marker, MonitorTask
@@ -53,6 +54,9 @@ class FakeManager(QObject):
     metrics_unavailable = pyqtSignal(str, dict)
     task_limit_reached = pyqtSignal()
     markers_changed = pyqtSignal(str)
+    # 与真实 manager 一致：暂停 / 恢复成功后同步发出
+    task_paused = pyqtSignal(str)
+    task_resumed = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
@@ -105,10 +109,14 @@ class FakeManager(QObject):
 
     def pause_task(self, task_id):
         self.commands.append(("pause", task_id))
+        if self.pause_result:
+            self.task_paused.emit(task_id)
         return self.pause_result
 
     def resume_task(self, task_id):
         self.commands.append(("resume", task_id))
+        if self.resume_result:
+            self.task_resumed.emit(task_id)
         return self.resume_result
 
     def is_task_paused(self, task_id):
@@ -264,6 +272,9 @@ class FakeForm(QObject):
     choose_metrics_requested = pyqtSignal()
     browse_log_requested = pyqtSignal()
     browse_export_dir_requested = pyqtSignal()
+    browse_snapshot_dir_requested = pyqtSignal()
+    browse_exe_requested = pyqtSignal()
+    browse_cwd_requested = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -276,6 +287,10 @@ class FakeForm(QObject):
         self.automation_plans: List[object] = []
         self.log_path_value = ''
         self.export_dir_value = ''
+        self.snapshot_dir_value = ''
+        self.launch_exe_value = ''
+        self.launch_cwd_value = ''
+        self.launch_errors: List[str] = []
 
     def set_metrics_summary(self, metrics):
         self._metrics = list(metrics)
@@ -313,6 +328,27 @@ class FakeForm(QObject):
 
     def set_export_dir(self, path):
         self.export_dir_value = path
+
+    def snapshot_dir(self):
+        return self.snapshot_dir_value
+
+    def set_snapshot_dir(self, path):
+        self.snapshot_dir_value = path
+
+    def launch_exe(self):
+        return self.launch_exe_value
+
+    def set_launch_exe(self, path):
+        self.launch_exe_value = path
+
+    def launch_cwd(self):
+        return self.launch_cwd_value
+
+    def set_launch_cwd(self, path):
+        self.launch_cwd_value = path
+
+    def show_launch_error(self, text):
+        self.launch_errors.append(text)
 
 
 # ---------------------------------------------------------------- fixtures
@@ -1366,3 +1402,237 @@ def test_export_writes_real_csv(db, manager, services, form, board, host, tmp_pa
         services.notifier.messages())
     text = (tmp_path / "alpha_1001_20260101_120000.csv").read_text(encoding="utf-8-sig")
     assert "进程: alpha.exe (PID 1001)" in text
+
+
+# ---------------------------------------------------------------- 暂停 / 恢复同步
+
+
+def test_external_pause_and_resume_update_card(presenter, manager, board):
+    """命令行、托盘等别处直接调 manager 暂停 / 恢复：卡片跟着变。"""
+    task_id = _add_task(manager)
+
+    manager.pause_task(task_id)
+    manager.resume_task(task_id)
+
+    assert board.cards[task_id].calls == [("set_paused", True), ("set_paused", False)]
+
+
+def test_external_pause_for_unknown_task_is_ignored(presenter, manager, board):
+    manager.task_paused.emit("unknown")
+    assert board.cards == {}
+
+
+# ---------------------------------------------------------------- 启动被测程序
+
+LAUNCH_SPEC = LaunchSpec(exe=r"D:\app\demo.exe", args=("--mode", "soak"), cwd=r"D:\app")
+
+
+def _launch_request(close_on_stop=False, note=""):
+    return replace(_request(pid=0, name="demo.exe", create_time=None, note=note),
+                   launch=LAUNCH_SPEC, close_on_stop=close_on_stop)
+
+
+def _pump_until(condition, timeout=5.0):
+    from PyQt5.QtWidgets import QApplication
+    from tests.helpers import poll_until
+    return poll_until(lambda: (QApplication.processEvents(), condition())[1], timeout=timeout)
+
+
+def test_launch_success_creates_task_with_launched_identity(presenter, manager, services):
+    task_id = presenter.start_monitoring(_launch_request())
+
+    assert services.launcher.launched == [LAUNCH_SPEC]
+    # 用启动结果（PID 5001、创建时间 5001.5）建任务，而不是表单里的占位 0
+    assert manager.created == [(5001, "demo.exe", list(METRICS), 1.0, "", 5001.5)]
+    assert manager.commands == [("start", task_id)]
+    assert presenter.is_launched(task_id)
+
+
+def test_form_launch_request_goes_through_start_requested(presenter, manager, services, form):
+    form.start_requested.emit(_launch_request())
+
+    assert services.launcher.launched == [LAUNCH_SPEC]
+    assert manager.created[0][0] == 5001
+
+
+def test_launch_failure_creates_no_task_and_shows_error_near_form(
+        presenter, manager, services, form):
+    services.launcher.fail("找不到程序：D:\\app\\demo.exe")
+
+    assert presenter.start_monitoring(_launch_request()) is None
+
+    assert manager.created == []
+    assert form.launch_errors == ["找不到程序：D:\\app\\demo.exe"]
+    # 就近显示，不另弹提示条
+    assert services.notifier.notices == []
+
+
+def test_launch_skips_duplicate_pid_confirmation(presenter, manager, services):
+    manager.running_pids.add(5001)
+    presenter.start_monitoring(_launch_request())
+    assert services.dialogs.calls_of("confirm") == []
+
+
+def test_launch_refused_during_maintenance_launches_nothing(presenter, manager, services):
+    manager.maintenance = True
+
+    assert presenter.start_monitoring(_launch_request()) is None
+
+    assert services.launcher.launched == []
+    assert services.notifier.last().level == "warning"
+
+
+def test_launch_refused_when_task_limit_reached(presenter, manager, services):
+    manager.can_add_task = lambda: False
+
+    assert presenter.start_monitoring(_launch_request()) is None
+
+    assert services.launcher.launched == []
+    assert manager.created == []
+
+
+def test_launched_but_create_failed_warns_program_still_running(presenter, manager, services):
+    manager.create_ok = False
+
+    assert presenter.start_monitoring(_launch_request()) is None
+
+    assert services.notifier.last().level == "warning"
+    assert "5001" in services.notifier.last().content
+
+
+def test_close_on_stop_closes_program_after_user_stop(presenter, manager, services):
+    task_id = presenter.start_monitoring(_launch_request(close_on_stop=True))
+
+    manager.task_stopped.emit(task_id, StopReason.USER)
+
+    assert _pump_until(lambda: services.launcher.terminated)
+    assert services.launcher.terminated == [(5001, 5001.5)]
+
+
+def test_close_on_stop_leaves_program_alone_when_it_exits_by_itself(
+        presenter, manager, services):
+    task_id = presenter.start_monitoring(_launch_request(close_on_stop=True))
+
+    manager.task_stopped.emit(task_id, StopReason.PROCESS_EXITED)
+
+    assert not _pump_until(lambda: services.launcher.terminated, timeout=0.3)
+
+
+def test_without_close_on_stop_user_stop_leaves_program_running(presenter, manager, services):
+    task_id = presenter.start_monitoring(_launch_request(close_on_stop=False))
+
+    manager.task_stopped.emit(task_id, StopReason.USER)
+
+    assert not _pump_until(lambda: services.launcher.terminated, timeout=0.3)
+
+
+def test_restart_of_launched_task_relaunches_program(presenter, manager, board, services):
+    task_id = presenter.start_monitoring(_launch_request(close_on_stop=True, note="第一轮"))
+    manager.task_stopped.emit(task_id, StopReason.PROCESS_EXITED)
+    manager.created.clear()
+
+    new_id = presenter.on_restart(task_id)
+
+    assert services.launcher.launched == [LAUNCH_SPEC, LAUNCH_SPEC]
+    assert manager.created == [(5002, "demo.exe", list(METRICS), 1.0, "第一轮", 5002.5)]
+    assert presenter.is_launched(new_id)
+    # 新任务沿用"停止时关闭"
+    manager.task_stopped.emit(new_id, StopReason.USER)
+    assert _pump_until(lambda: services.launcher.terminated)
+    assert services.launcher.terminated == [(5002, 5002.5)]
+
+
+def test_browse_exe_and_cwd_go_through_dialogs(presenter, services, form):
+    services.dialogs.push('ask_open_file', r"D:\app\demo.exe")
+    services.dialogs.push('ask_directory', r"D:\work", None)
+
+    form.browse_exe_requested.emit()
+    form.browse_cwd_requested.emit()
+    form.browse_cwd_requested.emit()            # 取消：不改
+
+    assert form.launch_exe_value == r"D:\app\demo.exe"
+    assert form.launch_cwd_value == r"D:\work"
+    # 工作目录对话框从程序所在目录开始
+    assert services.dialogs.calls_of('ask_directory')[0]['start_dir'] == r"D:\app"
+
+
+# ---------------------------------------------------------------- 阶段快照
+
+
+class FakeSnapshotWriter(QObject):
+    written = pyqtSignal(str, object)
+    failed = pyqtSignal(str, str)
+
+    def __init__(self):
+        super().__init__()
+        self.writes: List[tuple] = []
+        self.forgotten: List[str] = []
+
+    def write(self, task_id, directory, index):
+        self.writes.append((task_id, directory, index))
+        return True
+
+    def forget(self, task_id):
+        self.forgotten.append(task_id)
+
+
+@pytest.fixture
+def snap_writer():
+    return FakeSnapshotWriter()
+
+
+@pytest.fixture
+def snap_presenter(manager, services, form, board, host, snap_writer):
+    return MonitorPresenter(manager, services, form, board, host, snapshot_writer=snap_writer)
+
+
+def test_stage_snapshot_due_is_written_by_writer(snap_presenter, snap_writer):
+    snap_presenter.auto_marker.stage_snapshot_due.emit("t1", r"D:\snap", 3)
+    assert snap_writer.writes == [("t1", r"D:\snap", 3)]
+
+
+def test_stage_snapshot_failure_warns_with_task_name(snap_presenter, manager, snap_writer,
+                                                     services):
+    task_id = _add_task(manager, name="demo.exe")
+
+    snap_writer.failed.emit(task_id, "磁盘已满")
+
+    notice = services.notifier.last()
+    assert notice.level == "warning"
+    assert "demo.exe" in notice.content and "磁盘已满" in notice.content
+
+
+def test_stage_snapshot_written_is_reported(snap_presenter, manager, snap_writer, services):
+    task_id = _add_task(manager, name="demo.exe")
+
+    snap_writer.written.emit(task_id, [r"D:\snap\stage_01.png", r"D:\snap\stage_01.csv"])
+
+    assert services.notifier.last().level == "info"
+    assert "stage_01.png" in services.notifier.last().content
+
+
+def test_closing_cards_forgets_snapshot_state(snap_presenter, manager, board, snap_writer):
+    first = _add_task(manager)
+    second = _add_task(manager)
+    manager.task_stopped.emit(first, StopReason.USER)
+    manager.task_stopped.emit(second, StopReason.USER)
+
+    board.close_requested.emit(first)
+    board.clear_finished_requested.emit()
+
+    assert snap_writer.forgotten == [first, second]
+
+
+def test_browse_snapshot_dir_goes_through_dialogs(snap_presenter, services, form):
+    services.dialogs.push('ask_directory', r"D:\snap")
+    form.snapshot_dir_value = r"D:\old"
+
+    form.browse_snapshot_dir_requested.emit()
+
+    assert form.snapshot_dir_value == r"D:\snap"
+    assert services.dialogs.last_call('ask_directory')['start_dir'] == r"D:\old"
+
+
+def test_default_snapshot_writer_renders_with_report_sheet(presenter):
+    from ui.widgets.analysis.report_sheet import render_report_for
+    assert presenter.snapshot_writer._renderer is render_report_for

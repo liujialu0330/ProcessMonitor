@@ -251,3 +251,39 @@ class ManualDefer:
     def run(self):
         while self.queue:
             self.queue.pop(0)()
+
+
+def qt_quit_pending() -> bool:
+    """本线程是否带着"已请求退出"的残留状态。
+
+    QCoreApplication.quit()/exit() 在没有主事件循环（QCoreApplication.exec）运行时调用，
+    Qt 5 会把线程数据里的 quitNow 置位，且只有下一次 QCoreApplication.exec 才清除；
+    置位期间任何新建 QEventLoop 的 exec_() 都立即返回 -1。pytest-qt 的 waitSignal /
+    waitUntil 都靠这种局部循环等待，于是后台线程发来的信号还没送达就"超时"了。
+    探测用一个 0 毫秒定时器退出的局部循环：正常时返回 0，残留时返回 -1。
+    """
+    from PyQt5.QtCore import QEventLoop, QTimer
+
+    loop = QEventLoop()
+    timer = QTimer()
+    timer.setSingleShot(True)
+    timer.timeout.connect(loop.quit)
+    timer.start(0)
+    rc = loop.exec_()
+    timer.stop()
+    return rc == -1
+
+
+def reset_qt_quit_state() -> bool:
+    """清除 qt_quit_pending 描述的残留退出状态；返回清除前是否有残留。
+
+    跑一轮立即退出的 QCoreApplication.exec_()：Qt 在它开头和结尾都会清掉 quitNow。
+    """
+    from PyQt5.QtCore import QCoreApplication, QTimer
+
+    if not qt_quit_pending():
+        return False
+    app = QCoreApplication.instance()
+    QTimer.singleShot(0, app.quit)
+    app.exec_()
+    return True

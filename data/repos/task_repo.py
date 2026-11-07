@@ -4,15 +4,17 @@
 sample_count / last_sample_at 不归这里写：它们只由 PointRepo.append（写入时累加）与
 PointRepo.recount（重算）维护，save() 刻意不覆盖，避免重复保存任务时把累计值清零。
 v5 为后续版本预留的列（target_kind 等）模型尚未携带，save() 同样不碰它们；plan_json
-（自动化方案）模型会读出，但只经 save_plan 写入，save() 也不碰它。
+（自动化方案）模型会读出，但只经 save_plan 写入，save() 也不碰它；meta_json（被测目标
+元数据）同理，只经 save_meta 写入；数据质量列（planned_cycles 等）同理，只经 save_quality 写入。
 """
 import logging
 import sqlite3
 from datetime import datetime
 from typing import Any, List, Optional
 
-from data.mappers import dump_metric_types, row_to_task, to_iso, to_iso_or_none
-from data.models import MonitorTask
+from data.mappers import (QUALITY_COLUMNS, dump_metric_types, quality_params, row_to_quality,
+                          row_to_task, to_iso, to_iso_or_none)
+from data.models import MonitorTask, QualityStats
 from data.repos import rollup, series_cache
 from data.repos._guard import storage_errors
 from data.repos._samples import delete_series_rows
@@ -135,6 +137,51 @@ class TaskRepo:
                 row = conn.execute('SELECT plan_json FROM tasks WHERE task_id = ?',
                                    (task_id,)).fetchone()
                 return (row[0] or None) if row else None
+
+    def save_meta(self, task_id: str, meta_json: Optional[str]) -> bool:
+        """
+        写入（或以 None 清除）任务的被测目标元数据 tasks.meta_json（JSON 文本，这里不解析）。
+        只更新已有任务行：任务行由采集线程启动时写入，之前调用返回 False，应稍后重试。
+
+        Returns:
+            bool: 是否命中了任务行
+        """
+        with storage_errors(f"保存被测元数据 {task_id} "):
+            with self._factory.connect() as conn:
+                return conn.execute('UPDATE tasks SET meta_json = ? WHERE task_id = ?',
+                                    (meta_json or None, task_id)).rowcount > 0
+
+    def load_meta(self, task_id: str) -> Optional[str]:
+        """任务的被测目标元数据 JSON 文本；任务不存在或没有元数据返回 None。"""
+        with storage_errors(f"读取被测元数据 {task_id} "):
+            with self._factory.connect() as conn:
+                row = conn.execute('SELECT meta_json FROM tasks WHERE task_id = ?',
+                                   (task_id,)).fetchone()
+                return (row[0] or None) if row else None
+
+    def save_quality(self, task_id: str, quality: QualityStats) -> bool:
+        """
+        写入任务的采集数据质量（tasks 的 planned_cycles / done_cycles / missed_cycles /
+        lag_p95_ms / collect_p95_ms 五列；write_p95_ms 没有列，不存）。只更新已有任务行，
+        由采集线程收尾时调用；重复调用以最后一次为准。
+
+        Returns:
+            bool: 是否命中了任务行
+        """
+        assignments = ', '.join(f'{column} = ?' for column in QUALITY_COLUMNS)
+        with storage_errors(f"保存数据质量 {task_id} "):
+            with self._factory.connect() as conn:
+                return conn.execute(f'UPDATE tasks SET {assignments} WHERE task_id = ?',
+                                    (*quality_params(quality), task_id)).rowcount > 0
+
+    def load_quality(self, task_id: str) -> Optional[QualityStats]:
+        """任务的采集数据质量；任务不存在或尚未写入时返回 None。"""
+        columns = ', '.join(QUALITY_COLUMNS)
+        with storage_errors(f"读取数据质量 {task_id} "):
+            with self._factory.connect() as conn:
+                row = conn.execute(f'SELECT {columns} FROM tasks WHERE task_id = ?',
+                                   (task_id,)).fetchone()
+                return row_to_quality(row) if row else None
 
     def get(self, task_id: str) -> Optional[MonitorTask]:
         """按 ID 取任务；不存在返回 None。"""

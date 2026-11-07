@@ -2,7 +2,7 @@
 模态对话框与系统交互（Dialogs）
 
 确认框、打点标签输入、指标选择、保存路径、选择文件/文件夹、关窗三选一，以及打开文件夹/网址、
-复制图片到剪贴板，统一经由注入的 Dialogs：页面测试换成脚本化替身即可预设
+复制图片与文本到剪贴板，统一经由注入的 Dialogs：页面测试换成脚本化替身即可预设
 "用户的选择"，不会弹出阻塞的模态对话框，也不会真的拉起资源管理器或浏览器。
 
 parent 约定：对话框类方法的 parent 由页面传 self.window()（遮罩覆盖整个主窗口，
@@ -94,6 +94,10 @@ class Dialogs(Protocol):
         """把图片放入系统剪贴板。"""
         ...
 
+    def copy_text(self, text: str) -> None:
+        """把文本放入系统剪贴板。"""
+        ...
+
 
 class QtDialogs:
     """生产实现：真实的 Fluent 对话框与系统调用。
@@ -175,3 +179,7 @@ class QtDialogs:
     def copy_pixmap(self, pixmap: QPixmap) -> None:
         """图片放入剪贴板。"""
         QApplication.clipboard().setPixmap(pixmap)
+
+    def copy_text(self, text: str) -> None:
+        """文本放入剪贴板。"""
+        QApplication.clipboard().setText(text)

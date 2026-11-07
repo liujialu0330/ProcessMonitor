@@ -6,6 +6,8 @@
 - 注入 SnapshotHub 时，MetricSpec.cost 为 'snapshot' 的指标从全系统进程快照取
   （SNAPSHOT_FIELDS 与 SNAPSHOT_DERIVED），其余（GDI/USER、USS、优先级）仍逐进程调用；
   快照不可用或本周期取失败时整周期回退 psutil；
+  CPU 使用率两条路径共用同一个差分起点 _cpu_prev（user+kernel 时间 / 单调时钟），
+  回退周期与快照周期口径一致，不会因偶发回退而变成"自预热以来的平均"；
 - 不注入 hub 时全部走 psutil（SAMPLERS），与旧版行为一致。
 """
 import contextlib
@@ -14,12 +16,14 @@ import logging
 import math
 import operator
 import sys
+import time
+import weakref
 from ctypes import wintypes
 import psutil
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 from core import process_catalog
 from core.contracts import UnavailableReason
-from core.system_snapshot import ProcessSample, SystemSnapshot
+from core.system_snapshot import ProcessSample, SnapshotUnavailable, SystemSnapshot
 from utils.metrics import COST_SNAPSHOT, REGISTRY, MetricType
 
 if TYPE_CHECKING:
@@ -242,7 +246,7 @@ _SNAPSHOT_READERS: Dict[str, Callable[[ProcessSample], float]] = {
     key: _snapshot_reader(key, attr) for key, attr in SNAPSHOT_FIELDS.items()
 }
 
-# 未注入 hub 时缺省的快照最大年龄（秒），与 1 秒周期的 SnapshotHub.max_age_for 一致
+# 未给出截止时间时向 hub 取快照允许的最大年龄（秒），与 1 秒周期的 SnapshotHub.max_age_for 一致
 DEFAULT_SNAPSHOT_MAX_AGE_S = 0.5
 # 快照与进程身份的创建时间允许误差（秒），与 MonitorWorker 启动时的比对口径相同
 _CREATE_TIME_TOLERANCE = 0.01
@@ -269,6 +273,15 @@ def _uses_snapshot(metric_type: str) -> bool:
 _FALLBACK = object()
 
 
+def _monotonic() -> float:
+    """回退路径的差分时钟，与快照的 TakenAt.monotonic 同一时钟（time.monotonic）。"""
+    return time.monotonic()
+
+
+class _NoCpuBaseline(Exception):
+    """CPU 使用率没有可用的差分起点（或窗口长度不是正数）：本周期该指标记为不可用。"""
+
+
 class ProcessCollector:
     """进程信息采集器"""
 
@@ -281,7 +294,8 @@ class ProcessCollector:
             pid: 进程ID
             hub: 快照中心（可选）。注入后 cost 为 'snapshot' 的指标从全系统快照取；
                 None 时全部走 psutil
-            max_age_s: 向 hub 取快照时允许的最大年龄（秒），见 SnapshotHub.max_age_for
+            max_age_s: 没有 snapshot_not_before 时向 hub 取快照允许的最大年龄（秒），
+                见 SnapshotHub.max_age_for
         """
         self.pid = pid
         self._process: Optional[psutil.Process] = None
@@ -292,6 +306,12 @@ class ProcessCollector:
         self._logged_failures = set()
         self._hub = hub
         self._max_age_s = max_age_s
+        # 本周期可接受的最早快照时刻（hub 时钟），由 MonitorWorker 每周期设置，见
+        # SnapshotHub.not_before_for；None 时退回按 max_age_s 判年龄
+        self.snapshot_not_before: Optional[float] = None
+        # 上一次取用的快照（弱引用，不拖住大缓冲区）：再次拿到同一份就强制取新的，
+        # 否则累计量会在两个时间戳上写同一个值，速率曲线出现 0 与翻倍
+        self._last_snapshot: Optional[weakref.ref] = None
         # 进程身份：首次在快照里见到本进程时确定的创建时间（psutil 已绑定进程时以它为准）
         self._identity_create_time: Optional[float] = None
         # CPU 使用率差分的上一个点：(user+kernel 秒, 快照单调时刻)
@@ -355,6 +375,8 @@ class ProcessCollector:
         """
         if self._process is None:
             self._process = psutil.Process(self.pid)
+        if metric_type == MetricType.CPU_PERCENT and self._hub is not None:
+            return self._cpu_percent_from_times(self._process)
         sampler = SAMPLERS.get(metric_type)
         if sampler is None:
             # 未知指标类型（如更高版本写入的键）：跳过，不写入结果
@@ -363,28 +385,43 @@ class ProcessCollector:
 
     def prime_cpu(self):
         """
-        预热CPU采集
-        cpu_percent(interval=None)首次调用固定返回0，
-        监控含CPU指标的任务前先调用一次，丢弃首个无效值。
-        注入了 hub 时同时记下快照里的 CPU 时间作为差分起点（快照路径自行计算使用率）。
+        预热CPU采集：记下 CPU 使用率的差分起点，监控含CPU指标的任务前先调用一次。
+
+        不注入 hub：cpu_percent(interval=None)首次调用固定返回0，丢弃首个无效值。
+        注入 hub（快照路径与回退 psutil 路径共用差分起点）：起点取自快照；目标进程比
+        缓存的快照还新（快照里没有它）时强制取一份新的；仍然没有就不设起点，首个 CPU
+        点按不可用处理（不写 0.0）。快照不可用或取失败时改用 psutil 的 cpu_times() 作起点。
         """
-        try:
-            if self._process is None:
-                self._process = psutil.Process(self.pid)
-            self._process.cpu_percent(interval=None)
-        except psutil.Error:
-            # 预热失败不影响主流程，采集时会再次处理异常
-            pass
-        if self._hub is not None:
+        if self._hub is None:
             try:
-                if self._hub.available():
-                    snapshot = self._hub.get(self._max_age_s)
-                    sample = snapshot.processes.get(self.pid)
-                    if sample is not None:
-                        self._cpu_prev = (sample.user_time + sample.kernel_time,
-                                          snapshot.taken_at.monotonic)
-            except Exception:
-                # 同上：预热失败不影响主流程，首次采集按"无起点"返回 0
+                if self._process is None:
+                    self._process = psutil.Process(self.pid)
+                self._process.cpu_percent(interval=None)
+            except psutil.Error:
+                # 预热失败不影响主流程，采集时会再次处理异常
+                pass
+            return
+        self._cpu_prev = None
+        try:
+            if not self._hub.available():
+                raise SnapshotUnavailable(self._hub.unavailable_reason)
+            snapshot = self._acquire_snapshot()
+            sample = snapshot.processes.get(self.pid)
+            if sample is None:
+                snapshot = self._hub.refresh()
+                self._remember_snapshot(snapshot)
+                sample = snapshot.processes.get(self.pid)
+            if sample is not None:
+                self._cpu_prev = (sample.user_time + sample.kernel_time,
+                                  snapshot.taken_at.monotonic)
+        except Exception:
+            # 快照取不到：用 psutil 的 cpu_times() 作起点；再失败则采集时按"无起点"处理
+            try:
+                if self._process is None:
+                    self._process = psutil.Process(self.pid)
+                times = self._process.cpu_times()
+                self._cpu_prev = (times.user + times.system, _monotonic())
+            except psutil.Error:
                 pass
 
     def collect_metrics(self, metric_types: List[str]) -> Optional[Dict[str, float]]:
@@ -458,6 +495,9 @@ class ProcessCollector:
             # 指标对该进程不适用（非权限问题），跳过且不提示提权
             self.last_unavailable[metric_type] = e.reason
             return True
+        except _NoCpuBaseline:
+            self.last_unavailable[metric_type] = UnavailableReason.ERROR
+            return True
         except Exception:
             # 其他异常，进程可能仍存在，跳过该指标继续
             if metric_type not in self._logged_failures:
@@ -479,6 +519,33 @@ class ProcessCollector:
             self._fallback_logged = True
             logger.warning(message, *args, exc_info=exc_info)
 
+    def _acquire_snapshot(self) -> SystemSnapshot:
+        """
+        向 hub 取本周期的快照。
+
+        按截止时间取（snapshot_not_before 已设置，即监控线程的采样周期）时，hub 给出的
+        恰是本采集器上次用过的那一份（如本周期落后太多、命中了自己上次取的快照）要强制取
+        新的：否则累计量会在两个时间戳上写同一个值，速率曲线出现 0 与翻倍。按年龄取
+        （没有截止时间）的调用方明确接受复用，不做这个检查。
+        """
+        hub = self._hub
+        not_before = self.snapshot_not_before
+        if not_before is None:
+            snapshot = hub.get(self._max_age_s)
+        else:
+            snapshot = hub.get(self._max_age_s, not_before=not_before)
+            last = self._last_snapshot() if self._last_snapshot is not None else None
+            if last is snapshot:
+                snapshot = hub.refresh()
+        self._remember_snapshot(snapshot)
+        return snapshot
+
+    def _remember_snapshot(self, snapshot: SystemSnapshot) -> None:
+        try:
+            self._last_snapshot = weakref.ref(snapshot)
+        except TypeError:
+            self._last_snapshot = None
+
     def _collect_from_snapshot(self, metric_types: List[str]):
         """
         快照路径。返回值同 collect_metrics；返回 _FALLBACK 表示本周期改走 psutil
@@ -491,7 +558,7 @@ class ProcessCollector:
                     "PID %s：全系统快照不可用（%s），改用 psutil 逐项采集",
                     self.pid, hub.unavailable_reason)
                 return _FALLBACK
-            snapshot = hub.get(self._max_age_s)
+            snapshot = self._acquire_snapshot()
         except Exception:
             self._log_fallback_once(
                 "PID %s：取全系统快照失败，本周期改用 psutil 逐项采集（之后不再重复记录）",
@@ -570,27 +637,39 @@ class ProcessCollector:
             return 0.0
         return None
 
-    def _cpu_percent_from(self, snapshot: SystemSnapshot, sample: ProcessSample) -> float:
+    def _cpu_percent_from(self, snapshot: SystemSnapshot,
+                          sample: ProcessSample) -> Optional[float]:
+        """快照路径的 CPU 使用率；无差分起点或窗口不是正数时返回 None（记为不可用）。"""
+        return self._cpu_percent_step(sample.user_time + sample.kernel_time,
+                                      snapshot.taken_at.monotonic)
+
+    def _cpu_percent_from_times(self, process: psutil.Process) -> float:
+        """回退 psutil 周期的 CPU 使用率：cpu_times() 加单调时钟，与快照路径共用差分起点。"""
+        times = process.cpu_times()
+        percent = self._cpu_percent_step(times.user + times.system, _monotonic())
+        if percent is None:
+            raise _NoCpuBaseline()
+        return percent
+
+    def _cpu_percent_step(self, total: float, now: float) -> Optional[float]:
         """
         CPU 使用率 = (user+kernel 时间增量) / 墙钟间隔 × 100，保留 1 位小数。
 
         与 psutil.Process.cpu_percent(interval=None) 同口径：按单核计，多线程可超过
-        100%（psutil 先除以 核数 × 间隔 再乘回核数，结果相同）；没有起点（未预热的
-        首次调用）或间隔为 0 时返回 0.0。
+        100%（psutil 先除以 核数 × 间隔 再乘回核数，结果相同）。没有起点（未预热且
+        目标进程不在快照里）时记下本点作起点并返回 None；窗口长度不是正数（同一时刻
+        的两份快照）时保留原起点、返回 None，下次仍按完整窗口计算——都不写 0.0。
         """
-        total = sample.user_time + sample.kernel_time
-        now = snapshot.taken_at.monotonic
-        previous, self._cpu_prev = self._cpu_prev, (total, now)
+        previous = self._cpu_prev
         if previous is None:
-            return 0.0
+            self._cpu_prev = (total, now)
+            return None
         elapsed = now - previous[1]
         if elapsed <= 0:
-            if elapsed == 0:
-                # 同一份快照被用了两次：保留原起点，下次仍按完整窗口计算
-                self._cpu_prev = previous
-            return 0.0
+            return None
+        self._cpu_prev = (total, now)
         percent = max(0.0, total - previous[0]) / elapsed * 100
-        return round(percent, 1) if math.isfinite(percent) else 0.0
+        return round(percent, 1) if math.isfinite(percent) else None
 
     def collect_metric(self, metric_type: str) -> Optional[float]:
         """

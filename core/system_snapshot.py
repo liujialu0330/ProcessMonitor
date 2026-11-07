@@ -11,11 +11,15 @@ struct.unpack_from 一次取出整个条目头（比逐字段访问 ctypes 属�
 
 启动自检（首次使用时做一次）任一项不符即永久禁用快照，available() 为 False，
 调用方回退 psutil：
+- 指针宽度必须为 8 字节：32 位 Python（含 WOW64）下的结构布局没有在真机上验证过，
+  不冒险解析，直接禁用；
 - sizeof(SYSTEM_PROCESS_INFORMATION) 必须为 256（64 位）/ 184（32 位，含 WOW64），
   sizeof(SYSTEM_THREAD_INFORMATION) 必须为 80 / 64，struct 格式串长度与之相同；
 - 首个条目的 NextEntryOffset 减去 线程数 × 线程结构大小 不得小于条目头大小；
 - 本进程的条目必须存在，其线程数组（紧跟条目头）里每个线程的 ClientId.UniqueProcess
   都必须等于本进程 PID——这同时验证了条目头大小、线程结构大小与 PID 字段偏移。
+  只有一个线程时验证不到线程结构的步长（第 0 个线程的偏移与步长无关），所以自检
+  发现本进程线程数不足 2 个时，临时起一个空闲线程再检查一遍，检查完结束它。
 新版 Windows 在线程数组与映像名之间还有一段附加数据（本机 Windows 11 26200 为 368
 字节），因此条目步长只按 NextEntryOffset 走，不用 sizeof + 线程数推算。
 """
@@ -54,6 +58,11 @@ _TICKS_PER_SECOND = 10_000_000
 # psutil 对 PID 0（空闲进程）与 4（System）的 create_time() 返回 0.0，进程列表的
 # 现状口径也是 0.0；快照里这两个条目带的是开机时刻，按 psutil 口径改为 0.0
 _ZERO_CREATE_TIME_PIDS = frozenset({0, 4})
+
+
+def _pointer_size() -> int:
+    """当前 Python 的指针宽度（字节）；单独成函数以便测试替换。"""
+    return ctypes.sizeof(ctypes.c_void_p)
 
 
 # ---------------------------------------------------------------- 结构声明
@@ -336,6 +345,8 @@ def parse_buffer(buffer, length: int, layout: Layout,
          pagefile, peak_pagefile, private_bytes, read_count, write_count, other_count,
          read_bytes, write_bytes, other_bytes) = unpack(view, pos)
 
+        if next_offset and next_offset < header_size:
+            raise _LayoutError(f"NextEntryOffset {next_offset} 小于条目头大小 {header_size}")
         end = pos + next_offset if next_offset else length
         threads_end = pos + header_size + num_threads * thread_size
         if threads_end > end:
@@ -364,8 +375,6 @@ def parse_buffer(buffer, length: int, layout: Layout,
 
         if not next_offset:
             break
-        if next_offset < header_size:
-            raise _LayoutError(f"NextEntryOffset {next_offset} 小于条目头大小 {header_size}")
         pos += next_offset
 
     return SystemSnapshot(taken_at=taken_at, processes=processes, _threads=threads,
@@ -377,7 +386,7 @@ def check_layout(buffer, length: int, layout: Layout, own_pid: int) -> Dict[str,
     对一份真实缓冲区做结构自检，通过时返回诊断信息（首条目步长等），否则抛 _LayoutError。
     见模块说明的三项检查。
     """
-    pointer_size = ctypes.sizeof(ctypes.c_void_p)
+    pointer_size = _pointer_size()
     expected_header = EXPECTED_PROCESS_INFO_SIZE.get(pointer_size)
     expected_thread = EXPECTED_THREAD_INFO_SIZE.get(pointer_size)
     if layout.header_size != expected_header or layout.thread_size != expected_thread:
@@ -412,6 +421,9 @@ def check_layout(buffer, length: int, layout: Layout, own_pid: int) -> Dict[str,
                 f"本进程第 {index} 个线程的 ClientId.UniqueProcess 为 {owner}，期望 {own_pid}")
     return {
         'pointer_size': pointer_size,
+        'own_threads': count,
+        # 本进程至少两个线程时，线程结构大小（数组步长）才真正被验证过
+        'thread_stride_verified': count >= 2,
         'process_info_size': layout.header_size,
         'thread_info_size': layout.thread_size,
         'first_next_entry_offset': first_next,
@@ -507,6 +519,10 @@ class NtProcessSnapshotter:
         if self._query is None and self._platform != "win32":
             self._disable("非 Windows 平台")
             return
+        if _pointer_size() != 8:
+            self._disable(f"当前为 {_pointer_size() * 8} 位 Python（含 WOW64），"
+                          "全系统进程快照的结构布局只在 64 位下验证过")
+            return
         try:
             self._layout = build_layout()
         except Exception as e:   # 结构声明本身有问题
@@ -521,6 +537,8 @@ class NtProcessSnapshotter:
         try:
             buffer, length = self._fill_buffer_locked()
             self.diagnostics = check_layout(buffer, length, self._layout, self._own_pid)
+            if not self.diagnostics['thread_stride_verified'] and self._own_pid == os.getpid():
+                self.diagnostics = self._check_with_idle_thread_locked()
         except _LayoutError as e:
             self._disable(f"结构自检不通过：{e}")
         except SnapshotError as e:
@@ -529,6 +547,23 @@ class NtProcessSnapshotter:
             self._disable(f"自检异常：{e}", exc_info=True)
         else:
             logger.info("全系统进程快照自检通过：%s", self.diagnostics)
+
+    def _check_with_idle_thread_locked(self) -> Dict[str, int]:
+        """本进程线程数不足 2 个：临时起一个空闲线程，让快照里本进程有两个以上的线程
+        再检查一遍（否则验证不到线程结构的步长），检查完结束该线程。"""
+        stop = threading.Event()
+        idle = threading.Thread(target=stop.wait, name="snapshot-selfcheck-idle", daemon=True)
+        idle.start()
+        try:
+            buffer, length = self._fill_buffer_locked()
+            diagnostics = check_layout(buffer, length, self._layout, self._own_pid)
+        finally:
+            stop.set()
+            idle.join(1.0)
+        if not diagnostics['thread_stride_verified']:
+            raise _LayoutError(
+                f"本进程只有 {diagnostics['own_threads']} 个线程，无法验证线程结构大小")
+        return diagnostics
 
     # ---------- 取快照 ----------
 

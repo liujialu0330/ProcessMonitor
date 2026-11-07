@@ -1,11 +1,14 @@
 """
 新建监控任务表单
 
-进程选择 + 采集间隔 + 测试备注 + 指标摘要/选指标 + "等待进程启动后自动开始" +
-"自动化"折叠区（自动打点与停止条件，见 automation_options）+ 开始按钮。
+进程选择 + 采集间隔 + 测试备注 + 指标摘要/选指标（旁边按指标数与采集间隔实时提示存储
+增长，见 core.storage_estimate）+ "等待进程启动后自动开始" + "自动化"折叠区（自动打点、
+停止条件与阶段快照，见 automation_options）+ "启动被测程序"折叠区（先启动程序再监控，见
+launch_options）+ 开始按钮。
 表单只收集输入、发出请求，不调用 manager，也不弹对话框：选指标、选日志文件与导出目录、
 校验文案、重复 PID 确认、等待进程启动的轮询等流程都在 MonitorPresenter 里；只有自动化
-方案的校验在提交时就地完成，错误显示在自动化区下方。
+方案的校验在提交时就地完成，错误显示在自动化区下方；启动程序的错误（没填程序、启动失败）
+显示在启动区下方。勾选了"开始时先启动程序"时不看进程选择、也不走等待进程启动。
 
 已有任务时表单可折叠成一行（只剩进程选择与开始按钮），把纵向空间让给任务卡片；
 行尾的展开按钮可随时展开其余字段。
@@ -21,15 +24,19 @@ from qfluentwidgets import (
 )
 
 from core.automation.plan import AutomationPlan
+from core.process_launcher import LaunchSpec
+from core.storage_estimate import estimate, estimate_tooltip, format_estimate
 from ui.services.preferences import MonitorPreferences
 from ui.services.process_query import ProcessQuery
 from ui.widgets.monitor.automation_options import AutomationOptions
+from ui.widgets.monitor.launch_options import LaunchOptions
 from ui.widgets.monitor.process_picker import ProcessPicker, ResolveError
 from utils.metrics import LEAK_CHECK_PRESET, get_metric_display_name
 
 NOTE_MAX_LENGTH = 100
 START_TEXT = "开始监控"
 WAIT_START_TEXT = "等待并开始"
+LAUNCH_START_TEXT = "启动并监控"
 WAIT_OPTION_TEXT = "等待进程启动后自动开始"
 
 
@@ -44,6 +51,10 @@ class TaskRequest:
     note: str = ''
     # 自动化方案；没有设置任何自动化时为 None
     plan: Optional[AutomationPlan] = None
+    # 先启动被测程序再监控（此时 pid / create_time 由启动结果填入，表单里先给 0 / None）
+    launch: Optional[LaunchSpec] = None
+    # 用户停止任务后关闭由 launch 启动的程序
+    close_on_stop: bool = False
 
 
 @dataclass(frozen=True)
@@ -76,6 +87,9 @@ class NewTaskForm(CardWidget):
         choose_metrics_requested(): 点击"选择指标"
         browse_log_requested(): "自动化"区日志文件的"浏览…"
         browse_export_dir_requested(): "自动化"区导出目录的"选择…"
+        browse_snapshot_dir_requested(): "自动化"区阶段快照目录的"选择…"
+        browse_exe_requested(): "启动被测程序"区程序路径的"浏览…"
+        browse_cwd_requested(): "启动被测程序"区工作目录的"选择…"
     """
 
     start_requested = pyqtSignal(object)
@@ -84,6 +98,9 @@ class NewTaskForm(CardWidget):
     choose_metrics_requested = pyqtSignal()
     browse_log_requested = pyqtSignal()
     browse_export_dir_requested = pyqtSignal()
+    browse_snapshot_dir_requested = pyqtSignal()
+    browse_exe_requested = pyqtSignal()
+    browse_cwd_requested = pyqtSignal()
 
     def __init__(self, process_query: ProcessQuery, preferences: MonitorPreferences,
                  parent=None):
@@ -136,8 +153,16 @@ class NewTaskForm(CardWidget):
         self.metric_button.setFixedWidth(112)
         self.metric_button.clicked.connect(self.choose_metrics_requested)
         grid.addWidget(self.metric_button, 0, 2)
+        # 指标摘要 + 存储预估（"已选 5 项    每小时约 18,000 行 · 12 小时约 4 MB"）
+        metric_info = QHBoxLayout()
+        metric_info.setSpacing(16)
         self.metric_summary_label = CaptionLabel(self.details)
-        grid.addWidget(self.metric_summary_label, 0, 3)
+        metric_info.addWidget(self.metric_summary_label)
+        self.storage_label = CaptionLabel(self.details)
+        # 窄宽度下允许截断（完整说明在悬停提示里），不撑大表单的最小宽度
+        self.storage_label.setMinimumWidth(1)
+        metric_info.addWidget(self.storage_label, 1)
+        grid.addLayout(metric_info, 0, 3)
         grid.setColumnStretch(3, 1)
 
         # 测试备注：随任务落库，分析页用它区分各次测试
@@ -160,18 +185,28 @@ class NewTaskForm(CardWidget):
         self.automation = AutomationOptions(self.details)
         self.automation.browse_log_requested.connect(self.browse_log_requested)
         self.automation.browse_export_dir_requested.connect(self.browse_export_dir_requested)
+        self.automation.browse_snapshot_dir_requested.connect(
+            self.browse_snapshot_dir_requested)
         grid.addWidget(self.automation, 3, 0, 1, 4)
+
+        # 启动被测程序：先启动再监控（默认折叠）
+        self.launch_options = LaunchOptions(self.details)
+        self.launch_options.browse_exe_requested.connect(self.browse_exe_requested)
+        self.launch_options.browse_cwd_requested.connect(self.browse_cwd_requested)
+        self.launch_options.changed.connect(self._on_launch_changed)
+        grid.addWidget(self.launch_options, 4, 0, 1, 4)
         layout.addWidget(self.details)
 
+        self.interval_spinbox.valueChanged.connect(self._refresh_storage_estimate)
         self.set_metrics_summary([])
         self._declare_tab_order()
 
     def _declare_tab_order(self) -> None:
-        """Tab 顺序：进程 → 间隔 → 指标 → 备注 → 等待选项 → 开始 → 展开按钮 → 自动化区。
-        开始按钮紧跟常用字段（填完回车/Tab 即到），自动化区放在最后。"""
+        """Tab 顺序：进程 → 间隔 → 指标 → 备注 → 等待选项 → 开始 → 展开按钮 → 自动化区 →
+        启动区。开始按钮紧跟常用字段（填完回车/Tab 即到），两个折叠区按显示顺序放在最后。"""
         chain = [self.picker.combo.line_edit, self.interval_spinbox, self.metric_button,
                  self.note_input, self.wait_checkbox, self.start_button, self.expand_button,
-                 *self.automation.focus_chain()]
+                 *self.automation.focus_chain(), *self.launch_options.focus_chain()]
         for first, second in zip(chain, chain[1:]):
             QWidget.setTabOrder(first, second)
 
@@ -183,9 +218,19 @@ class NewTaskForm(CardWidget):
         summary, details = metric_summary(self._metrics)
         self.metric_summary_label.setText(summary)
         self.metric_summary_label.setToolTip(details)
+        self._refresh_storage_estimate()
 
     def metrics(self) -> List[str]:
         return list(self._metrics)
+
+    def storage_estimate_text(self) -> str:
+        return self.storage_label.text()
+
+    def _refresh_storage_estimate(self, *_args) -> None:
+        """按当前指标数与采集间隔刷新存储预估；没选指标时清空。"""
+        count, interval = len(self._metrics), self.interval()
+        self.storage_label.setText(format_estimate(estimate(count, interval)))
+        self.storage_label.setToolTip(estimate_tooltip(count, interval))
 
     # ========== 其他字段 ==========
 
@@ -208,17 +253,67 @@ class NewTaskForm(CardWidget):
         self.wait_checkbox.setChecked(enabled)
 
     def _on_wait_toggled(self, checked: bool) -> None:
-        # 等待中的进程本来就不在列表里，不提示"未找到"
-        self.picker.set_no_match_hint_enabled(not checked)
-        self.start_button.setText(WAIT_START_TEXT if checked else START_TEXT)
+        self._sync_start_mode()
+
+    def _sync_start_mode(self) -> None:
+        """按"启动程序 / 等待进程 / 直接开始"三种方式同步开始按钮文案与进程选择的提示。
+        启动程序优先：勾选它时等待选项不可用（程序由本次启动，用不着等）。"""
+        launching = self.launch_enabled()
+        self.wait_checkbox.setEnabled(not launching)
+        waiting = self.wait_enabled() and not launching
+        # 等待中的进程本来就不在列表里、启动的程序还没运行：都不提示"未找到"
+        self.picker.set_no_match_hint_enabled(not waiting and not launching)
+        if launching:
+            self.start_button.setText(LAUNCH_START_TEXT)
+        else:
+            self.start_button.setText(WAIT_START_TEXT if waiting else START_TEXT)
         self._sync_start_tooltip()
 
     def _sync_start_tooltip(self) -> None:
         if self._start_blocked:
             self.start_button.setToolTip(self._start_blocked)
+        elif self.launch_enabled():
+            self.start_button.setToolTip("先启动所填的程序，再监控它")
         else:
             self.start_button.setToolTip(
                 "进程出现后自动开始记录" if self.wait_enabled() else "")
+
+    # ========== 启动被测程序 ==========
+
+    def launch_enabled(self) -> bool:
+        """本次开始是否先启动程序：其余字段折叠时不算（藏起来的设置不生效）。"""
+        return not self.is_collapsed() and self.launch_options.is_enabled()
+
+    def launch_exe(self) -> str:
+        return self.launch_options.exe()
+
+    def set_launch_exe(self, path: str) -> None:
+        self.launch_options.set_exe(path)
+
+    def launch_cwd(self) -> str:
+        return self.launch_options.cwd()
+
+    def set_launch_cwd(self, path: str) -> None:
+        self.launch_options.set_cwd(path)
+
+    def set_launch_spec(self, spec: Optional[LaunchSpec], close_on_stop: bool = False) -> None:
+        """回填启动设置；有设置时展开其余字段与启动区，让下一次"开始"看得见它。"""
+        self.launch_options.set_spec(spec, close_on_stop)
+        if spec is not None:
+            self._show_details(True)
+            self.launch_options.set_expanded(True)
+
+    def show_launch_error(self, text: str) -> None:
+        """在启动区下方就近显示启动错误（并展开它）。"""
+        if self.is_collapsed():
+            self._show_details(True)
+        self.launch_options.set_error(text)
+
+    def launch_error_text(self) -> str:
+        return self.launch_options.error_text()
+
+    def _on_launch_changed(self) -> None:
+        self._sync_start_mode()
 
     # ========== 自动化 ==========
 
@@ -249,6 +344,12 @@ class NewTaskForm(CardWidget):
 
     def set_export_dir(self, path: str) -> None:
         self.automation.set_export_dir(path)
+
+    def set_snapshot_dir(self, path: str) -> None:
+        self.automation.set_snapshot_dir(path)
+
+    def snapshot_dir(self) -> str:
+        return self.automation.snapshot_dir()
 
     def log_path(self) -> str:
         return self.automation.log_path()
@@ -286,7 +387,11 @@ class NewTaskForm(CardWidget):
 
     def submit(self) -> None:
         """按当前输入发出开始请求（勾选等待时发出等待请求）；目标无效时发出 target_invalid，
-        自动化设置有误时在自动化区就近显示错误、不发请求。"""
+        自动化设置有误时在自动化区就近显示错误、不发请求。勾选了"开始时先启动程序"时发出
+        带 launch 的开始请求（不看进程选择），没填程序就近提示。"""
+        if self.launch_enabled():
+            self._submit_launch()
+            return
         if self.wait_enabled():
             name = self.picker.resolve_name()
             if isinstance(name, ResolveError):
@@ -311,6 +416,20 @@ class NewTaskForm(CardWidget):
             metrics=tuple(self._metrics), interval=self.interval(), note=self.note(),
             plan=plan))
 
+    def _submit_launch(self) -> None:
+        spec, error = self.launch_options.spec()
+        if spec is None:
+            self.show_launch_error(error or "")
+            return
+        ok, plan = self._checked_plan()
+        if not ok:
+            return
+        self.launch_options.clear_error()
+        self.start_requested.emit(TaskRequest(
+            pid=0, name=spec.name, create_time=None,
+            metrics=tuple(self._metrics), interval=self.interval(), note=self.note(),
+            plan=plan, launch=spec, close_on_stop=self.launch_options.close_on_stop()))
+
     def show_error(self, text: str) -> None:
         self.picker.set_error(text)
 
@@ -328,7 +447,7 @@ class NewTaskForm(CardWidget):
     def set_collapsed(self, collapsed: bool) -> None:
         """有任务时折叠成一行（只显示进程选择与开始），行尾的展开按钮可展开其余字段；
         没有任务时完整展开且不显示展开按钮。折叠时取消"等待进程启动"：选项藏起来后
-        仍生效会让下一次"开始"的行为出人意料。"""
+        仍生效会让下一次"开始"的行为出人意料（"启动被测程序"在折叠时同样不生效）。"""
         if collapsed:
             self.set_wait_enabled(False)
         self.expand_button.setVisible(collapsed)
@@ -343,6 +462,7 @@ class NewTaskForm(CardWidget):
     def _show_details(self, visible: bool) -> None:
         self.details.setVisible(visible)
         self.title_label.setVisible(visible)
+        self._sync_start_mode()
         self.expand_button.setIcon(
             FluentIcon.UP if visible else FluentIcon.CHEVRON_DOWN_MED)
         self.expand_button.setToolTip(

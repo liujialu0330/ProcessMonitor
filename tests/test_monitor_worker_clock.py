@@ -7,7 +7,8 @@ MonitorWorker 时钟注入：用假时钟驱动采集线程，不真实睡眠。
 路径本身，而不是绕开线程的副本。
 
 覆盖：50 个周期落库 50 条且间隔恒等于周期；含 CPU 指标时首采推迟一个周期；暂停期间
-不采样、恢复后立即采；停止后 _teardown 恰好一次、task_stopped 恰好一次。
+不采样、恢复后立即采；停止后 _teardown 恰好一次、task_stopped 恰好一次；收尾写入的
+数据质量（计划 / 完成周期）与上述时间线一致。
 """
 import os
 import threading
@@ -208,6 +209,10 @@ def test_fake_clock_drives_50_cycles_with_exact_spacing(db, started):
     assert worker.teardowns == [StopReason.USER]
     assert worker.stops == [StopReason.USER]
     assert worker.state is WorkerState.STOPPED
+    # 周期统计：准点的 50 个周期全部完成，收尾写入数据质量列
+    quality = db.tasks.load_quality(worker.task_id)
+    assert (quality.planned_cycles, quality.done_cycles, quality.missed_cycles) == (50, 50, 0)
+    assert quality.lag_p95_ms == 1
     # 模拟 245 秒，真实耗时只取决于落库
     assert elapsed < 10
 
@@ -227,6 +232,9 @@ def test_cpu_metric_delays_first_sample_by_one_interval(db, started):
     assert worker.collector.primed == 1
     stamps = _timestamps(db, worker.task_id, 'cpu_percent')
     assert stamps == [T0 + timedelta(seconds=2.0 * k) for k in range(1, 6)]
+    # 计划周期从首个截止时间（预热后一个周期）算起：预热那段不算缺采
+    quality = db.tasks.load_quality(worker.task_id)
+    assert (quality.planned_cycles, quality.done_cycles) == (5, 5)
 
 
 # ========== 暂停 ==========
@@ -268,6 +276,9 @@ def test_pause_stops_sampling_and_resume_samples_immediately(db, started):
     assert db.analytics.gaps(worker.task_id, 1.0) == [(pause_at, resume_at)]
     assert db.tasks.get(worker.task_id).sample_count == 50
     assert worker.teardowns == [StopReason.USER]
+    # 暂停的 30 秒不计入计划周期：[0,19] 20 个 + [49,78] 30 个
+    quality = db.tasks.load_quality(worker.task_id)
+    assert (quality.planned_cycles, quality.done_cycles, quality.missed_cycles) == (50, 50, 0)
 
 
 # ========== 停止与收尾 ==========
@@ -308,3 +319,6 @@ def test_process_exit_tears_down_exactly_once(db, started):
     assert worker.teardowns == [StopReason.PROCESS_EXITED]
     assert worker.stops == [StopReason.PROCESS_EXITED]
     assert db.tasks.get(worker.task_id).sample_count == 50
+    # 发现进程退出的那次采集也算执行完的周期
+    quality = db.tasks.load_quality(worker.task_id)
+    assert (quality.planned_cycles, quality.done_cycles) == (51, 51)

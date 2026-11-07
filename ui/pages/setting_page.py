@@ -4,22 +4,25 @@
 三个分组：
 - 常规：应用主题 · 默认采集间隔 · 关闭行为 · 监控期间阻止睡眠 · 打点快捷键
 - 数据：历史数据保留 · 压缩数据库（按保留策略决定是否同时清理过期任务）· 重建分钟汇总 · 数据目录
+  · 报告配色（导出的报告图片固定浅色 / 跟随主题）· 诊断信息（复制诊断信息到剪贴板 / 在后台导出 zip 诊断包）
 - 关于与更新：版本与项目主页 · 检查更新（原"关于"页并入，见 ui/pages/about_update）
 """
 import logging
 import os
-from typing import TYPE_CHECKING, Optional
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QKeySequence
 from PyQt5.QtWidgets import QWidget
 from qfluentwidgets import (
-    ScrollArea, ExpandLayout, SettingCardGroup, OptionsSettingCard,
-    PushSettingCard, SettingCard, StateToolTip, LineEdit, TransparentToolButton,
+    ScrollArea, ExpandLayout, SettingCardGroup, OptionsSettingCard, ComboBoxSettingCard,
+    PushSettingCard, SettingCard, StateToolTip, LineEdit, TransparentToolButton, PushButton,
     FluentIcon as FIF, setTheme, qconfig, Theme
 )
 
 from app_config import cfg
+from core.diagnostics import collect_diagnostics, write_diagnostic_bundle
 from core.maintenance_service import (
     BUSY_EXPORT_RUNNING, BUSY_MAINTENANCE_RUNNING, BUSY_TASKS_RUNNING,
     MaintenanceBusy, MaintenanceService,
@@ -49,6 +52,28 @@ REBUILD_TEXT = "重建汇总"
 HOTKEY_PLACEHOLDER = "点击后按下组合键"
 KEEP_AWAKE_TITLE = "监控期间阻止电脑睡眠"
 KEEP_AWAKE_CONTENT = "有运行中任务时阻止系统因空闲进入睡眠；挡不住合上盖子、手动睡眠与电源按钮"
+AUTOMATION_TITLE = "允许命令行与脚本控制"
+AUTOMATION_CONTENT = "允许 pmctl 与脚本经本机管道开始/停止监控、打点和导出；只对当前用户开放"
+# 报告配色卡片：选项文案与 app_config.REPORT_COLOR_SCHEMES（light / follow）逐一对应
+REPORT_COLOR_TITLE = "报告配色"
+REPORT_COLOR_CONTENT = "导出的报告图片默认用浅色，便于贴进文档与邮件；也可跟随当前界面主题"
+REPORT_COLOR_TEXTS = ("固定浅色", "跟随主题")
+# 诊断信息卡片
+DIAGNOSTICS_TITLE = "诊断信息"
+DIAGNOSTICS_CONTENT = "反馈问题时附上：版本与环境、数据库、各任务数据质量、本程序资源占用与最近日志"
+COPY_DIAGNOSTICS_TEXT = "复制诊断信息"
+EXPORT_DIAGNOSTICS_TEXT = "导出诊断包…"
+DIAGNOSTICS_COPIED_TITLE = "已复制"
+DIAGNOSTICS_COPIED_CONTENT = "诊断信息已复制到剪贴板，可直接粘贴到问题反馈里"
+DIAGNOSTICS_COPY_FAILED_TITLE = "复制诊断信息失败"
+DIAGNOSTICS_DIALOG_TITLE = "选择诊断包的保存位置"
+DIAGNOSTICS_EXPORTING_TEXT = "正在导出…"
+DIAGNOSTICS_EXPORTED_TITLE = "诊断包已导出"
+DIAGNOSTICS_EXPORT_FAILED_TITLE = "导出诊断包失败"
+OPEN_FOLDER_TEXT = "打开文件夹"
+OPEN_FOLDER_FAILED_TITLE = "无法打开文件夹"
+DIAGNOSTICS_THREAD_NAME = "导出诊断包"
+DIAGNOSTICS_EXPORTED_INFOBAR_MS = 8000
 # "数据目录"卡片末尾显示的数据目录来源
 DATA_DIR_SOURCE_TEXTS = {
     config.DATA_DIR_SOURCE_CLI: "命令行指定",
@@ -93,6 +118,20 @@ _REBUILD_BUSY_TEXTS = {
     BUSY_MAINTENANCE_RUNNING: "数据库正在维护中，请稍候",
 }
 _REBUILD_BUSY_FALLBACK_TEXT = "数据库正忙，请稍后再重建汇总"
+
+
+class DiagnosticBundleWorker(BackgroundTask):
+    """"导出诊断包"后台线程：读日志末尾、读库、压缩成 zip，不放界面线程。
+    结果为 zip 路径；失败（目录不可写等）经 failed 发出。包只有几 MB，不提供取消。"""
+
+    def __init__(self, directory: str, parts: Any, clock=None, parent=None):
+        super().__init__(parent)
+        self.directory = directory
+        self.parts = parts
+        self.clock = clock
+
+    def execute(self, token: CancelToken) -> str:
+        return write_diagnostic_bundle(self.directory, self.parts, clock=self.clock)
 
 
 class RebuildRollupsWorker(BackgroundTask):
@@ -175,7 +214,8 @@ class SettingPage(ScrollArea):
     def __init__(self, db: Database, manager: "MonitorManager",
                  services: UiServices, parent=None, *,
                  maintenance: Optional[MaintenanceService] = None,
-                 hotkey: Optional[MarkerHotkey] = None):
+                 hotkey: Optional[MarkerHotkey] = None,
+                 diagnostics_provider: Optional[Callable[[], Any]] = None):
         """初始化页面
 
         设置卡片直接绑定 cfg 的 ConfigItem（卡片自身负责读写与落盘）；
@@ -192,6 +232,9 @@ class SettingPage(ScrollArea):
                 二者之上的无状态薄层）
             hotkey: 全局打点快捷键服务；没有时（测试、未接线）快捷键卡片显示"快捷键不可用"，
                 改键只记入偏好
+            diagnostics_provider: 返回诊断部件（带 paths / db / manager / self_monitor /
+                watchdog 等属性的对象，组合根给 AppContext）的函数；None 时只用本页的 db 与
+                manager
         """
         super().__init__(parent)
         self.setObjectName("settingPage")
@@ -206,6 +249,9 @@ class SettingPage(ScrollArea):
         self._rebuild_worker: Optional[RebuildRollupsWorker] = None
         self._rebuild_tooltip: Optional[StateToolTip] = None
         self._state_tooltip: StateToolTip = None
+        self._diagnostics_provider = diagnostics_provider
+        self._bundle_worker: Optional[DiagnosticBundleWorker] = None
+        self.open_bundle_folder_button: Optional[PushButton] = None
 
         # 承载各设置分组的滚动内容容器
         self.scroll_widget = QWidget()
@@ -255,6 +301,12 @@ class SettingPage(ScrollArea):
             configItem=cfg.keep_awake_while_monitoring, parent=self.general_group)
         self.general_group.addSettingCard(self.keep_awake_card)
 
+        # 命令处理器每条请求都现读该配置项，切换即生效
+        self.automation_card = CnSwitchSettingCard(
+            FIF.COMMAND_PROMPT, AUTOMATION_TITLE, AUTOMATION_CONTENT,
+            configItem=cfg.automation_enabled, parent=self.general_group)
+        self.general_group.addSettingCard(self.automation_card)
+
         # 打点快捷键：录入框 + 恢复默认；说明行显示当前状态（可用 / 不可用的原因）
         self.hotkey_card = SettingCard(
             FIF.TAG, "打点快捷键", hotkey_status_text(None), parent=self.general_group)
@@ -269,7 +321,7 @@ class SettingPage(ScrollArea):
         self.general_group.addSettingCard(self.hotkey_card)
 
     def _init_data_group(self):
-        """数据：历史数据保留 · 压缩数据库 · 重建汇总 · 数据目录"""
+        """数据：历史数据保留 · 压缩数据库 · 重建汇总 · 数据目录 · 报告配色 · 诊断信息"""
         self.data_group = SettingCardGroup("数据", self.scroll_widget)
         # 选项文案与 ConfigItem 校验器的可选值逐一对应：可选值只在应用配置里定义一份
         retention_texts = [_retention_text(days)
@@ -308,6 +360,25 @@ class SettingPage(ScrollArea):
         self.open_dir_card.contentLabel.setToolTip(normalized_path)
         self.open_dir_card.button.setToolTip(normalized_path)
         self.data_group.addSettingCard(self.open_dir_card)
+
+        # 报告配色：卡片只写配置，报告渲染时现读（ui/widgets/analysis/report_sheet）
+        self.report_color_card = ComboBoxSettingCard(
+            cfg.report_color_scheme, FIF.PALETTE, REPORT_COLOR_TITLE, REPORT_COLOR_CONTENT,
+            texts=list(REPORT_COLOR_TEXTS), parent=self.data_group)
+        self.data_group.addSettingCard(self.report_color_card)
+
+        # 诊断信息：复制到剪贴板（同步，几十毫秒）/ 导出 zip 诊断包（后台线程）
+        self.diagnostics_card = SettingCard(
+            FIF.DEVELOPER_TOOLS, DIAGNOSTICS_TITLE, DIAGNOSTICS_CONTENT, parent=self.data_group)
+        self.copy_diagnostics_button = PushButton(COPY_DIAGNOSTICS_TEXT, self.diagnostics_card)
+        self.export_diagnostics_button = PushButton(
+            EXPORT_DIAGNOSTICS_TEXT, self.diagnostics_card)
+        self.diagnostics_card.hBoxLayout.addWidget(self.copy_diagnostics_button, 0, Qt.AlignRight)
+        self.diagnostics_card.hBoxLayout.addSpacing(8)
+        self.diagnostics_card.hBoxLayout.addWidget(
+            self.export_diagnostics_button, 0, Qt.AlignRight)
+        self.diagnostics_card.hBoxLayout.addSpacing(16)
+        self.data_group.addSettingCard(self.diagnostics_card)
 
     def _init_layout(self):
         """整体布局：ScrollArea + ExpandLayout 承载各分组
@@ -355,6 +426,8 @@ class SettingPage(ScrollArea):
         self.cleanup_card.clicked.connect(self._on_cleanup_clicked)
         self.rebuild_card.clicked.connect(self._on_rebuild_clicked)
         self.open_dir_card.clicked.connect(self._on_open_data_dir_clicked)
+        self.copy_diagnostics_button.clicked.connect(self.copy_diagnostics)
+        self.export_diagnostics_button.clicked.connect(self.export_diagnostics)
         # 保留策略一改，维护按钮文案（压缩 / 清理并压缩）随之变化
         cfg.retention_days.valueChanged.connect(self._on_retention_changed)
         # 任务启停时刷新维护按钮的可用状态（不再只依赖页面显示事件）
@@ -388,6 +461,74 @@ class SettingPage(ScrollArea):
     def scroll_to_about(self) -> None:
         """滚动到"关于与更新"分组（托盘/提示条"查看更新"跳转过来时用）。"""
         self.verticalScrollBar().setValue(self.about_group.y())
+
+    # ========== 诊断信息 ==========
+
+    def _diagnostic_parts(self) -> Any:
+        if self._diagnostics_provider is not None:
+            parts = self._diagnostics_provider()
+            if parts is not None:
+                return parts
+        return SimpleNamespace(db=self.db, manager=self.manager)
+
+    def copy_diagnostics(self) -> Optional[str]:
+        """"复制诊断信息"：收集诊断文本放进剪贴板并提示；返回复制的文本（失败为 None）。"""
+        try:
+            text = collect_diagnostics(self._diagnostic_parts(), clock=self.services.clock)
+            self.services.dialogs.copy_text(text)
+        except Exception as e:
+            logger.error("复制诊断信息失败", exc_info=True)
+            self.services.notifier.error(self.window(), DIAGNOSTICS_COPY_FAILED_TITLE, str(e))
+            return None
+        self.services.notifier.success(
+            self.window(), DIAGNOSTICS_COPIED_TITLE, DIAGNOSTICS_COPIED_CONTENT, duration=3000)
+        return text
+
+    def export_diagnostics(self) -> Optional[DiagnosticBundleWorker]:
+        """"导出诊断包…"：选目录 → 后台线程打包 → 完成提示带"打开文件夹"（不自动打开）。
+        返回启动的线程（取消选择或上一次还在导出时为 None）。"""
+        if self._bundle_worker is not None:
+            return None
+        directory = self.services.dialogs.ask_directory(
+            self.window(), DIAGNOSTICS_DIALOG_TITLE, os.path.expanduser('~'))
+        if not directory:
+            return None
+        worker = DiagnosticBundleWorker(directory, self._diagnostic_parts(), self.services.clock)
+        worker.result.connect(self._on_bundle_written)
+        worker.failed.connect(self._on_bundle_failed)
+        worker.finished.connect(lambda w=worker: self._on_bundle_thread_finished(w))
+        # 打包只读文件、写一个 zip，退出时等它一小会儿即可
+        self.services.threads.register(worker, name=DIAGNOSTICS_THREAD_NAME, timeout_ms=3000)
+        self._bundle_worker = worker
+        self.export_diagnostics_button.setEnabled(False)
+        self.export_diagnostics_button.setText(DIAGNOSTICS_EXPORTING_TEXT)
+        worker.start()
+        return worker
+
+    def _on_bundle_written(self, path: str) -> None:
+        folder = os.path.dirname(path)
+        bar = self.services.notifier.success(
+            self.window(), DIAGNOSTICS_EXPORTED_TITLE, path,
+            duration=DIAGNOSTICS_EXPORTED_INFOBAR_MS)
+        self.open_bundle_folder_button = PushButton(OPEN_FOLDER_TEXT)
+        self.open_bundle_folder_button.clicked.connect(lambda: self._open_folder(folder))
+        if bar is not None:
+            bar.addWidget(self.open_bundle_folder_button)
+
+    def _open_folder(self, folder: str) -> None:
+        try:
+            self.services.dialogs.open_folder(folder)
+        except OSError as e:
+            self.services.notifier.error(self.window(), OPEN_FOLDER_FAILED_TITLE, str(e))
+
+    def _on_bundle_failed(self, reason: str) -> None:
+        self.services.notifier.error(self.window(), DIAGNOSTICS_EXPORT_FAILED_TITLE, reason)
+
+    def _on_bundle_thread_finished(self, worker) -> None:
+        if self._bundle_worker is worker:
+            self._bundle_worker = None
+        self.export_diagnostics_button.setEnabled(True)
+        self.export_diagnostics_button.setText(EXPORT_DIAGNOSTICS_TEXT)
 
     # ========== 打点快捷键 ==========
 

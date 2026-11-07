@@ -11,7 +11,7 @@ FluentWindow 外壳：侧栏 监控 / 分析 / 设置（底部），窗口宽度
 """
 import logging
 import os
-from typing import List, Optional
+from typing import Any, Callable, List, Optional
 
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QIcon
@@ -27,6 +27,7 @@ from ui.pages.monitor_page import MonitorPage
 from ui.pages.setting_page import SettingPage
 from ui.presenters.monitor_presenter import QUICK_MARKER_OK
 from ui.services import CLOSE_ACTION_CANCEL, CLOSE_ACTION_TRAY, UiServices
+from ui.theme_follow import SystemThemeWatcher
 from ui.tray import TrayController
 from core.monitor_manager import MonitorManager
 from data.database import Database
@@ -55,7 +56,8 @@ class MainWindow(FluentWindow):
     """主窗口类"""
 
     def __init__(self, db: Database, manager: MonitorManager, services: UiServices, *,
-                 hotkey: Optional[MarkerHotkey] = None):
+                 hotkey: Optional[MarkerHotkey] = None,
+                 diagnostics_provider: Optional[Callable[[], Any]] = None):
         """初始化主窗口
 
         三项依赖都由组合根（app.bootstrap）构造后注入，主窗口不再自建；测试注入隔离的
@@ -67,6 +69,8 @@ class MainWindow(FluentWindow):
             services: 界面服务（提示、对话框、时钟、进程查询、任务状态、用户偏好）
             hotkey: 全局打点快捷键（组合根创建、安装并绑定）；为 None 时不接全局快捷键，
                 设置页显示"快捷键不可用"——测试默认如此，绝不在桌面上注册真实热键
+            diagnostics_provider: 设置页"复制诊断信息 / 导出诊断包"取诊断部件的函数（组合根
+                传返回 AppContext 的函数）；None 时设置页只用 db 与 manager
         """
         super().__init__()
 
@@ -74,6 +78,10 @@ class MainWindow(FluentWindow):
         self.monitor_manager = manager
         self.services = services
         self.hotkey = hotkey
+        self.diagnostics_provider = diagnostics_provider
+        # 界面卡死看门狗（组合根在窗口显示后安装并交给这里）：真退出收尾会阻塞界面线程，
+        # 收尾前必须先停掉它，否则会把正常的收尾当成卡死转储
+        self.watchdog = None
 
         # 托盘驻留相关状态：必须在 _init_tray()/closeEvent 用到之前初始化完毕。
         # - _really_quit：托盘菜单"退出"、设置页"立即安装"与会话结束会置 True，
@@ -97,11 +105,20 @@ class MainWindow(FluentWindow):
         # 只读库的常驻横幅（窗口显示后创建；可写库为 None）
         self.read_only_banner = None
 
+        # 被测目标元数据里的显示缩放只有界面层读得到：交给 manager，任务启动时读一次
+        dpi_scale = getattr(services, 'dpi_scale', None)
+        set_dpi_provider = getattr(manager, 'set_dpi_scale_provider', None)
+        if dpi_scale is not None and set_dpi_provider is not None:
+            set_dpi_provider(dpi_scale)
+
         # 初始化界面
         self._init_window()
         self._init_navigation()
         self._init_tray()
         self._init_hotkey()
+
+        # "跟随系统"主题：系统切换深浅色后界面跟上（只在 AUTO 模式下生效，见 ui.theme_follow）
+        self.theme_watcher = SystemThemeWatcher(self).start()
 
         # 注销/关机：系统会话结束时 closeEvent 的三选确认对话框会阻塞关机，
         # 这里在会话结束时置真退出标志并直接 close()，跳过确认走真退出流程。
@@ -252,7 +269,7 @@ class MainWindow(FluentWindow):
         # 是否有运行中任务决定清理按钮是否可用）；快捷键卡片需要快捷键服务
         self.setting_page = SettingPage(
             self.db, self.monitor_manager, self.services, parent=self,
-            hotkey=self.hotkey)
+            hotkey=self.hotkey, diagnostics_provider=self.diagnostics_provider)
         # 原"关于"页已并入设置页；about_group 指向该分组（更新流程的入口都在它上面）
         self.about_group = self.setting_page.about_group
 
@@ -277,6 +294,18 @@ class MainWindow(FluentWindow):
 
         # 默认显示监控页面
         self.switchTo(self.monitor_page)
+
+    def attach_watchdog(self, watchdog) -> None:
+        """组合根装好界面看门狗后交给主窗口：真退出时先停掉它。"""
+        self.watchdog = watchdog
+
+    def _stop_watchdog(self) -> None:
+        if self.watchdog is None:
+            return
+        try:
+            self.watchdog.stop()
+        except Exception:
+            logger.warning("停止界面看门狗失败", exc_info=True)
 
     def _init_tray(self) -> None:
         """创建托盘控制器（图标常驻；托盘不可用时 is_available() 为 False）"""
@@ -352,6 +381,10 @@ class MainWindow(FluentWindow):
         走同一条真退出路径）"""
         self._really_quit = True
         self.close()
+
+    def request_quit(self) -> None:
+        """命令行 quit（IPC）：与托盘菜单"退出"走同一条真退出路径。"""
+        self._quit_from_tray()
 
     def quit_for_install(self) -> None:
         """更新安装流程（install_requested）：无论"关闭时最小化到托盘"是否
@@ -497,6 +530,10 @@ class MainWindow(FluentWindow):
         # 拆掉了"closeEvent 异常也能退出"的隐性保险丝，退出全靠这里显式调用 quit()；
         # 收尾中途抛异常又不放 finally，事件循环不会退出而窗口已隐藏，用户无从恢复。
         self._shutdown_started = True
+        # 收尾会阻塞界面线程（最长 30 秒），看门狗不能把它当成卡死
+        self._stop_watchdog()
+        # 收尾期间不再切主题（窗口已隐藏，重刷样式表只会拖慢退出）
+        self.theme_watcher.stop()
         try:
             self._run_shutdown()
             # 收尾完成才显式 accept；异常路径下 QCloseEvent 默认已是 accepted，

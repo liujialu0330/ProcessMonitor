@@ -951,3 +951,40 @@ def test_join_all_real_stuck_thread_times_out(manager):
     gate.set()
     assert manager.join_all(timeout_ms=5000) is True
     assert task.isFinished()
+
+
+# ========== 数据质量快照与暂停 / 恢复信号 ==========
+
+def test_task_info_carries_live_quality(manager):
+    task_id, task = _start_task_with_collector(manager, _SlowCollector(), interval=0.05)
+    assert poll_until(lambda: (manager.get_task_info(task_id).quality is not None
+                               and manager.get_task_info(task_id).quality.done_cycles >= 2),
+                      timeout=10)
+    quality = manager.get_task_info(task_id).quality
+    assert quality.planned_cycles >= quality.done_cycles - 1
+
+
+def test_task_info_quality_failure_does_not_break_info(manager, monkeypatch):
+    task_id = manager.create_task(os.getpid(), "t.exe", ["memory_rss"], 1.0)
+
+    def boom():
+        raise RuntimeError("坏了")
+
+    monkeypatch.setattr(manager.get_task(task_id), "quality_snapshot", boom)
+
+    info = manager.get_task_info(task_id)
+    assert info is not None and info.quality is None
+
+
+def test_pause_and_resume_emit_signals_only_on_success(manager):
+    task_id, task = _start_task_with_collector(manager, _SlowCollector(), interval=0.05)
+    assert poll_until(lambda: task.state is WorkerState.RUNNING, timeout=10)
+    events = []
+    manager.task_paused.connect(lambda tid: events.append(("paused", tid)))
+    manager.task_resumed.connect(lambda tid: events.append(("resumed", tid)))
+
+    assert manager.pause_task(task_id)
+    assert not manager.pause_task("unknown")
+    assert manager.resume_task(task_id)
+
+    assert events == [("paused", task_id), ("resumed", task_id)]

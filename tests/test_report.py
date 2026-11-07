@@ -352,3 +352,174 @@ def test_report_text_and_png(qapp, db, tmp_path):
     assert inked > 1000          # 不是一张空白图：文字、坐标轴与曲线
     path = tmp_path / "r.png"
     assert image.save(str(path)) and QImage(str(path)).width() == 1200
+
+
+# ---------------------------------------------------------------- 数据质量
+
+
+def test_quality_text_and_metadata_line():
+    from core.report import quality_text
+    from data.models import QualityStats
+    assert quality_text(None) == ""
+    assert quality_text(QualityStats(0, 0, 0)) == ""
+    assert (quality_text(QualityStats(12370, 12345, 0, 12, 5))
+            == "采集完成率 99.8%（12,345 / 12,370 周期，调度延迟 p95 12 ms）")
+    # 有缺采时舍入不会显示成满分；有跳过时注明
+    assert (quality_text(QualityStats(100000, 99999, 1, None, None))
+            == "采集完成率 99.9%（99,999 / 100,000 周期，跳过 1）")
+    assert quality_text(QualityStats(50, 50, 0, 1, 1)).startswith("采集完成率 100.0%")
+
+    task = _task()
+    plain = metadata_lines(task, exported_at=BASE, range_text="全部")
+    assert not any("数据质量" in line for line in plain)
+    task.quality = QualityStats(12370, 12345, 0, 12, 5)
+    lines = metadata_lines(task, exported_at=BASE, range_text="全部", sample_count=12345)
+    assert ("# 数据质量: 采集完成率 99.8%（12,345 / 12,370 周期，调度延迟 p95 12 ms）"
+            in lines)
+    # 位置：采集次数之后、导出时间之前
+    assert [line.split(":")[0] for line in lines[-4:]] == [
+        "# 采集次数", "# 数据质量", "# 导出时间", "# 说明"]
+
+
+# ---------------------------------------------------------------- 被测目标元数据
+
+
+def test_metadata_lines_append_target_info_when_present():
+    from core.target_info import TargetInfo
+    task = _task()
+    plain = metadata_lines(task, exported_at=BASE, range_text="全部")
+    assert not any(line.startswith(("# 被测程序", "# 命令行", "# 环境")) for line in plain)
+
+    task.meta_json = TargetInfo(exe_path=r"C:\Demo\demo.exe", file_version="1.2.3.4",
+                                cmdline=("demo.exe", "--auto"), os_version="Windows 11 10.0.26200",
+                                logical_cores=16, total_memory_bytes=32 * 1024 ** 3,
+                                tool_version="2.0.0-beta.1", tool_is_admin=True).to_json()
+    lines = metadata_lines(task, exported_at=BASE, range_text="全部", sample_count=10,
+                           extra=["依据: 基线之后"])
+    assert lines[-6:] == [
+        "# 依据: 基线之后",
+        r"# 被测程序: C:\Demo\demo.exe（文件版本 1.2.3.4）",
+        "# 命令行: demo.exe --auto",
+        "# 环境: Windows 11 10.0.26200 · 16 核 · 32 GB · 工具 2.0.0-beta.1（管理员）",
+        "# 导出时间: 2026-07-16 16:00:00",
+        lines[-1],
+    ]
+    assert lines[-1].startswith("# 说明: ")
+    # 解析失败忽略，其余元数据照常
+    task.meta_json = "{坏"
+    assert metadata_lines(task, exported_at=BASE, range_text="全部") == plain
+
+
+def test_report_image_info_line_appends_quality(qapp, db):
+    """报告图片信息行（依据行）末尾追加数据质量一句话；没有质量数据时不追加。"""
+    from data.models import QualityStats
+    from ui.widgets.analysis.report_sheet import build_report_text, render_report_for
+    task = _seed(db)
+    analysis = _analysis(db, task)
+    stored = db.get_task(task.task_id)
+    plain = build_report_text(stored, analysis, "全部", BASE + timedelta(hours=1))
+    assert "采集完成率" not in plain.info
+
+    stored.quality = QualityStats(12370, 12345, 0, 12, 5)
+    text = build_report_text(stored, analysis, "全部", BASE + timedelta(hours=1))
+
+    assert text.info == (plain.info + " · 采集完成率 99.8%（12,345 / 12,370 周期，"
+                         "调度延迟 p95 12 ms）")
+    image = render_report_for(stored, analysis, BASE + timedelta(hours=1), "全部")
+    assert not image.isNull()
+
+
+# ---------------------------------------------------------------- 报告图片的结构化数据
+
+
+def _seed_rounds(db, markers):
+    """每秒一个点、线性上涨（私有字节每秒 +1、句柄数每秒 +2），按 markers 打点。"""
+    task = _task()
+    db.save_task(task)
+    points = []
+    for s in range(100):
+        ts = BASE + timedelta(seconds=s)
+        points.append(DataPoint(task.task_id, ts, 100.0 + s, MEM))
+        points.append(DataPoint(task.task_id, ts, 50.0 + 2 * s, HANDLES))
+    db.save_data_points(points)
+    for offset, label, kind in markers:
+        db.markers.add(task.task_id, BASE + timedelta(seconds=offset), label, kind=kind)
+    return task
+
+
+def test_round_delta_rows_one_row_per_round_between_markers(db):
+    from core.report import round_delta_rows
+    task = _seed_rounds(db, ((10, "基线", 'baseline'), (40, "第 1 轮", 'user'),
+                             (70, "第 2 轮", 'user'), (90, "第 3 轮", 'user')))
+    rows = round_delta_rows(_analysis(db, task))
+
+    # 预热段（开始 → 基线）与末段（第 3 轮 → 结束）不是"一轮"，不出行
+    assert [row.label for row in rows] == ["基线 → 第 1 轮", "第 1 轮 → 第 2 轮",
+                                         "第 2 轮 → 第 3 轮"]
+    assert [row.duration_seconds for row in rows] == [30.0, 30.0, 20.0]
+    # 口径同打点区间表：左闭右开，Δ = 区间内末个样本 - 首个样本
+    assert [row.deltas[MEM] for row in rows] == [29.0, 29.0, 19.0]
+    assert [row.deltas[HANDLES] for row in rows] == [58.0, 58.0, 38.0]
+    assert list(rows[0].deltas) == [MEM, HANDLES]
+    # 与上轮差相对表内上一行；第一轮没有上一轮
+    assert rows[0].vs_previous == {MEM: None, HANDLES: None}
+    assert rows[1].vs_previous == {MEM: 0.0, HANDLES: 0.0}
+    assert rows[2].vs_previous == {MEM: -10.0, HANDLES: -20.0}
+    # 与分析页打点区间表同一份数据
+    snapshot = _analysis(db, task).snapshots[MEM]
+    by_start = {item.start: item for item in snapshot.intervals}
+    for row in rows:
+        assert by_start[row.start].delta == row.deltas[MEM]
+        assert by_start[row.start].end == row.end
+
+
+def test_round_delta_rows_need_two_markers(db):
+    from core.report import round_delta_rows
+    no_markers = _seed_rounds(db, ())
+    assert round_delta_rows(_analysis(db, no_markers)) == []
+    one = _seed_rounds(db, ((10, "基线", 'baseline'),))
+    assert round_delta_rows(_analysis(db, one)) == []
+    # 没有基线时用户打点之间同样是一轮；暂停/恢复不是区间边界
+    users = _seed_rounds(db, ((20, "A", 'user'), (30, "暂停", 'pause'), (50, "B", 'user')))
+    rows = round_delta_rows(_analysis(db, users))
+    assert [row.label for row in rows] == ["A → B"]
+
+
+def test_metadata_items_fields_and_optional_parts(db):
+    from core.report import metadata_items
+    from core.target_info import TargetInfo
+    from data.models import QualityStats
+    task = _seed_rounds(db, ())
+    analysis = _analysis(db, task)
+    stored = db.get_task(task.task_id)
+
+    items = metadata_items(stored, analysis)
+    assert items == [
+        ("开始", "2026-07-16 16:00:00"),
+        ("结束", "2026-07-16 16:10:00"),
+        ("时长", "1分钟"),
+        ("采集周期", "1 秒"),
+        ("指标数", "2 项：私有字节、句柄数"),
+        ("点数", "100"),
+    ]
+
+    stored.end_time = None
+    stored.quality = QualityStats(12370, 12345, 0, 12, 5)
+    stored.meta_json = TargetInfo(exe_path=r"C:\Demo\demo.exe", file_version="1.2.3.4",
+                                  cmdline=("demo.exe", "--auto"), os_version="Windows 11",
+                                  logical_cores=16, total_memory_bytes=32 * 1024 ** 3,
+                                  tool_version="2.0.0", tool_is_admin=False).to_json()
+    items = dict(metadata_items(stored, analysis))
+    assert items["结束"] == "进行中"
+    assert items["数据质量"].startswith("采集完成率 99.8%")
+    assert items["被测程序"] == r"C:\Demo\demo.exe（文件版本 1.2.3.4）"
+    assert items["环境"].startswith("Windows 11 · 16 核")
+    # 命令行只进 CSV 元数据，不进报告图片
+    assert "命令行" not in items
+
+
+def test_duration_text_matches_ui_format_duration():
+    from core.report import duration_text
+    from ui.formatting import format_duration
+    for seconds in (0, 45, 59.9, 60, 754, 3600, 8100, 86399, 86400, 97200, -5):
+        assert duration_text(seconds) == format_duration(seconds)

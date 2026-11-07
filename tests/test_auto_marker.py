@@ -5,6 +5,7 @@ AutoMarkerService：假时钟 + 假 manager（test_monitor_presenter.FakeManager
 - 轮数 / 时长到达即请求停止并发 auto_stopped，之后不再打点；
 - 任务结束自动解除跟踪，带"停止后自动导出"时发 export_requested；
 - 同一时刻定时与日志同时触发各打一次（data_updated 与每秒 tick 都调用也不重复）；
+- 阶段快照按期发 stage_snapshot_due（序号从 1 起），暂停不发不累计，落后只发一次；
 - 与真实 MonitorManager 一起：自动与手动打点共用编号序列。
 """
 import os
@@ -40,6 +41,8 @@ def service(manager, clock):
     svc.stopped, svc.exports = [], []
     svc.auto_stopped.connect(lambda tid, reason: svc.stopped.append((tid, reason)))
     svc.export_requested.connect(lambda tid, d: svc.exports.append((tid, d)))
+    svc.snapshots = []
+    svc.stage_snapshot_due.connect(lambda tid, d, i: svc.snapshots.append((tid, d, i, clock.now())))
     return svc
 
 
@@ -286,6 +289,90 @@ def test_failed_marker_write_does_not_break_schedule(service, manager, clock):
     assert len(manager.list_markers(task_id)) == 1
 
 
+# ---------------------------------------------------------------- 阶段快照
+
+SNAP_DIR = "D:\\快照"
+HOURS = 2
+H = timedelta(hours=HOURS)
+
+
+def _snapshot_plan(**extra):
+    return AutomationPlan(stage_snapshot_hours=HOURS, stage_snapshot_dir=SNAP_DIR, **extra)
+
+
+def test_stage_snapshot_due_on_schedule_with_index(service, manager, clock):
+    t0 = clock.now()
+    task_id = _start(service, manager, _snapshot_plan())
+    _run(service, clock, 3 * H.total_seconds() + 30, step=30)
+    assert service.snapshots == [
+        (task_id, SNAP_DIR, 1, t0 + H), (task_id, SNAP_DIR, 2, t0 + 2 * H),
+        (task_id, SNAP_DIR, 3, t0 + 3 * H)]
+    # 只发信号：不打点、不停止任务
+    assert manager.list_markers(task_id) == [] and service.stopped == []
+
+
+def test_stage_snapshot_counts_from_attach_without_start(service, manager, clock):
+    task_id = _task(manager)
+    attached = clock.now()
+    assert service.attach(task_id, _snapshot_plan())
+    assert service.next_snapshot_due(task_id) == attached + H
+    clock.advance(H)
+    service.tick()
+    assert [(i, at) for _t, _d, i, at in service.snapshots] == [(1, attached + H)]
+
+
+def test_stage_snapshot_restarts_when_task_starts(service, manager, clock):
+    task_id = _task(manager)
+    service.attach(task_id, _snapshot_plan())
+    clock.advance(600)
+    manager.task_started.emit(task_id)
+    assert service.next_snapshot_due(task_id) == clock.now() + H
+
+
+def test_stage_snapshot_pause_does_not_fire_or_accumulate(service, manager, clock):
+    task_id = _start(service, manager, _snapshot_plan())
+    _run(service, clock, 1800, step=60)            # 暂停前跑了半小时
+    manager.paused_ids.add(task_id)
+    service.process(task_id)
+    _run(service, clock, 5 * H.total_seconds(), step=60)
+    assert service.snapshots == [] and service.next_snapshot_due(task_id) is None
+
+    manager.paused_ids.discard(task_id)
+    service.process(task_id)
+    resumed = clock.now()
+    _run(service, clock, H.total_seconds() - 60, step=60)
+    assert service.snapshots == []                 # 暂停前的半小时不累计
+    _run(service, clock, 60, step=60)
+    assert [(i, at) for _t, _d, i, at in service.snapshots] == [(1, resumed + H)]
+
+
+def test_stage_snapshot_late_fires_once_then_restarts(service, manager, clock):
+    task_id = _start(service, manager, _snapshot_plan())
+    clock.advance(3.5 * H)                         # 休眠唤醒：错过了三次
+    service.tick()
+    service.tick()
+    assert [(i, at) for _t, _d, i, at in service.snapshots] == [(1, clock.now())]
+    assert service.next_snapshot_due(task_id) == clock.now() + H
+    clock.advance(H)
+    service.tick()
+    assert [i for _t, _d, i, _at in service.snapshots] == [1, 2]
+
+
+def test_stage_snapshot_stops_after_auto_stop(service, manager, clock):
+    task_id = _start(service, manager, _snapshot_plan(stop_after_seconds=int(H.total_seconds())))
+    _run(service, clock, 3 * H.total_seconds(), step=60)
+    # 到期与停止同一刻：快照照发一次（最后的阶段），之后已请求停止不再发
+    assert [i for _t, _d, i, _at in service.snapshots] == [1]
+    assert service.stopped == [(task_id, AUTO_STOP_DURATION)]
+
+
+def test_stage_snapshot_ends_with_task(service, manager, clock):
+    task_id = _start(service, manager, _snapshot_plan())
+    manager.task_stopped.emit(task_id, StopReason.USER)
+    _run(service, clock, 2 * H.total_seconds(), step=60)
+    assert service.snapshots == []
+
+
 # ---------------------------------------------------------------- 真实 manager
 
 
@@ -317,9 +404,51 @@ def test_automation_and_form_sources_take_time_from_injected_clock():
     import core.automation.auto_marker as auto_marker_module
     import core.automation.log_watcher as log_watcher_module
     import core.automation.plan as plan_module
+    import core.automation.stage_snapshot as stage_snapshot_module
     import core.automation.stop_conditions as stop_module
     import ui.widgets.monitor.automation_options as options_module
     for module in (auto_marker_module, log_watcher_module, plan_module, stop_module,
-                   options_module):
+                   options_module, stage_snapshot_module):
         source = inspect.getsource(module)
         assert "datetime.now" not in source and "time.monotonic" not in source, module
+
+
+
+# ---------------------------------------------------------------- 评审修复：任务间隔离、溢出兜底
+
+
+def test_one_task_failure_does_not_block_others_and_logs_once(service, manager, clock, caplog):
+    import logging
+    bad = _start(service, manager, AutomationPlan(timed_marker_seconds=N))
+    good = _start(service, manager, AutomationPlan(timed_marker_seconds=N))
+    original = manager.next_marker_label
+
+    def broken(task_id):
+        if task_id == bad:
+            raise RuntimeError("数据库坏了")
+        return original(task_id)
+
+    manager.next_marker_label = broken
+    with caplog.at_level(logging.ERROR, logger="core.automation.auto_marker"):
+        _run(service, clock, 3 * N)
+        manager.data_updated.emit(bad, {})
+    assert len(manager.list_markers(good)) == 3        # 坏任务不影响好任务
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR and bad in r.getMessage()]
+    assert len(errors) == 1                            # 同一任务只记一次 ERROR
+    # 解除跟踪后再出错会重新记录
+    service.detach(bad)
+    assert bad not in service._failed
+
+
+def test_unvalidated_huge_plan_does_not_crash_attach(service, manager, clock, caplog):
+    """绕过校验的超大间隔（如手改库里的方案）：挂接不抛 OverflowError，放弃定时打点。"""
+    import logging
+    task_id = _task(manager)
+    plan = AutomationPlan(timed_marker_seconds=10 ** 15, stage_snapshot_hours=10.0 ** 12,
+                          stage_snapshot_dir=SNAP_DIR)
+    with caplog.at_level(logging.ERROR, logger="core.automation.auto_marker"):
+        assert service.attach(task_id, plan)
+        manager.task_started.emit(task_id)
+        _run(service, clock, 3)
+    assert service.next_due(task_id) is None and service.next_snapshot_due(task_id) is None
+    assert "超出范围" in caplog.text

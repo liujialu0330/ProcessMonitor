@@ -27,7 +27,7 @@ import sqlite3
 from datetime import datetime
 from typing import List, Optional, Sequence
 
-from data.models import DataPoint, Marker, MonitorTask
+from data.models import DataPoint, Marker, MonitorTask, QualityStats
 
 
 def to_iso(dt: datetime) -> str:
@@ -130,11 +130,39 @@ def _has(row: sqlite3.Row, column: str) -> bool:
     return column in row.keys()
 
 
+# tasks 表的数据质量列（v5 预留，write_p95_ms 没有列）
+QUALITY_COLUMNS = ('planned_cycles', 'done_cycles', 'missed_cycles',
+                   'lag_p95_ms', 'collect_p95_ms')
+
+
+def row_to_quality(row: sqlite3.Row) -> Optional[QualityStats]:
+    """tasks 行的数据质量列 → QualityStats；列不存在（旧库）或尚未写入（planned_cycles
+    为 NULL）时为 None。"""
+    if not _has(row, 'planned_cycles') or row['planned_cycles'] is None:
+        return None
+    return QualityStats(
+        planned_cycles=int(row['planned_cycles']),
+        done_cycles=int(row['done_cycles'] or 0),
+        missed_cycles=int(row['missed_cycles'] or 0),
+        lag_p95_ms=row['lag_p95_ms'],
+        collect_p95_ms=row['collect_p95_ms'],
+    )
+
+
+def quality_params(quality: QualityStats) -> tuple:
+    """QualityStats → 与 QUALITY_COLUMNS 顺序一致的落库参数（毫秒值取整）。"""
+    def _int(value):
+        return None if value is None else int(round(value))
+    return (int(quality.planned_cycles), int(quality.done_cycles),
+            int(quality.missed_cycles), _int(quality.lag_p95_ms),
+            _int(quality.collect_p95_ms))
+
+
 def row_to_task(row: sqlite3.Row) -> MonitorTask:
     """tasks 表的一行 → MonitorTask。
 
-    后加的列（v3 的 note/sample_count/last_sample_at、v4 的 create_time、v5 的 plan_json）
-    缺失时取默认值，兼容迁移失败后仍停留在旧版本的库。
+    后加的列（v3 的 note/sample_count/last_sample_at、v4 的 create_time、v5 的 plan_json、
+    meta_json 与数据质量列）缺失时取默认值，兼容迁移失败后仍停留在旧版本的库。
     """
     return MonitorTask(
         task_id=row['task_id'],
@@ -150,6 +178,8 @@ def row_to_task(row: sqlite3.Row) -> MonitorTask:
         last_sample_at=from_iso(row['last_sample_at']) if _has(row, 'last_sample_at') else None,
         create_time=row['create_time'] if _has(row, 'create_time') else None,
         plan_json=(row['plan_json'] or None) if _has(row, 'plan_json') else None,
+        quality=row_to_quality(row),
+        meta_json=(row['meta_json'] or None) if _has(row, 'meta_json') else None,
     )
 
 

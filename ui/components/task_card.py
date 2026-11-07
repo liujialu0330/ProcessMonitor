@@ -17,11 +17,12 @@ from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                              QGridLayout, QSizePolicy)
 from qfluentwidgets import (
     PushButton, CardWidget, FluentIcon, CaptionLabel, StrongBodyLabel, Theme,
-    TransparentToolButton, isDarkTheme, themeColor
+    TransparentToolButton, isDarkTheme
 )
 from qfluentwidgets.common.icon import FluentIconBase, SvgIconEngine, drawSvgIcon
 
 from core.contracts import StopReason, UnavailableReason
+from ui import theme_tokens as tokens
 from ui.components.sparkline import SparklineWidget
 from ui.formatting import (
     is_abnormal_stop, stop_reason_text, task_status_text, truncate_text, unavailable_reason_text,
@@ -33,25 +34,27 @@ from utils.metrics import (
 )
 
 # 状态胶囊：(文案, 浅色主题色, 深色主题色)。CaptionLabel.setTextColor 只需设置一次
-# 即可自动跟随主题切换（FluentLabelBase 内部已连接 qconfig.themeChanged）
+# 即可自动跟随主题切换（FluentLabelBase 内部已连接 qconfig.themeChanged）。
+# 颜色取自 ui.theme_tokens，与分析页判定胶囊同源（运行中=平稳=成功色，暂停=波动=注意色，
+# 异常结束=持续上涨=危险色）
 STATUS_RUNNING = 'running'
 STATUS_PAUSED = 'paused'
 STATUS_STOPPING = 'stopping'
 STATUS_FINISHED = 'finished'      # 用户停止（正常结束）
 STATUS_ABNORMAL = 'abnormal'      # 被测进程退出、内部错误等（异常结束）
 
-_TERTIARY_LIGHT = QColor("#8D8D8D")
-_TERTIARY_DARK = QColor("#9E9E9E")
 STATUS_STYLES = {
-    STATUS_RUNNING: (task_status_text(True), QColor("#0F7B0F"), QColor("#6CCB5F")),
-    STATUS_PAUSED: (task_status_text(True, paused=True), QColor("#9D5D00"), QColor("#FCE100")),
-    STATUS_STOPPING: ("正在停止…", _TERTIARY_LIGHT, _TERTIARY_DARK),
-    STATUS_FINISHED: (task_status_text(False), _TERTIARY_LIGHT, _TERTIARY_DARK),
-    STATUS_ABNORMAL: (task_status_text(False, abnormal=True), QColor("#C42B1C"), QColor("#FF99A4")),
+    STATUS_RUNNING: (task_status_text(True), *tokens.colors(tokens.SUCCESS)),
+    STATUS_PAUSED: (task_status_text(True, paused=True), *tokens.colors(tokens.CAUTION)),
+    STATUS_STOPPING: ("正在停止…", *tokens.colors(tokens.TERTIARY)),
+    STATUS_FINISHED: (task_status_text(False), *tokens.colors(tokens.TERTIARY)),
+    STATUS_ABNORMAL: (task_status_text(False, abnormal=True), *tokens.colors(tokens.CRITICAL)),
 }
 
 # 卡片身份行里备注的最大显示字数（完整内容放 tooltip）
 NOTE_DISPLAY_CHARS = 40
+# 卡片悬停提示里各段（方案摘要、被测目标）之间空一行
+TOOLTIP_SECTION_SEPARATOR = "\n\n"
 
 BASELINE_SAMPLING_TEXT = "基线采样中"
 # 6 列时指标格最窄："比开始时（12 分钟前）+85.23 MB"会被截断，改为"较开始 +85.23 MB"
@@ -219,12 +222,11 @@ class MetricCell(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         painter.setPen(Qt.NoPen)
-        fill = QColor(255, 255, 255, 13) if isDarkTheme() else QColor(0, 0, 0, 8)
-        painter.setBrush(fill)
+        painter.setBrush(tokens.qcolor(tokens.CELL_HIGHLIGHT))
         painter.drawRoundedRect(QRectF(self.rect()), 4, 4)
         if self._selected:
-            # 选中态：左缘强调色竖条（强调色只用于选中态与主按钮）
-            painter.setBrush(themeColor())
+            # 选中态：左缘强调色竖条（强调色只用于选中态与主按钮；对底色不足 3:1 时自动加深）
+            painter.setBrush(tokens.selection_bar_color())
             painter.drawRoundedRect(QRectF(0, 6, 3, max(0, self.height() - 12)), 1.5, 1.5)
         painter.end()
 
@@ -300,6 +302,10 @@ class TaskCard(CardWidget):
 
         # 迷你趋势图当前显示的指标（默认首指标，点击指标格切换）
         self.trend_metric: Optional[str] = self.metric_types[0] if self.metric_types else None
+
+        # 卡片悬停提示 = 调用方给的内容（如自动化方案摘要）+ 被测目标摘要行
+        self._base_tooltip = ''
+        self._target_lines: List[str] = []
 
         self._init_ui()
         self._apply_status(STATUS_RUNNING)
@@ -720,6 +726,24 @@ class TaskCard(CardWidget):
         self.sparkline.set_markers([(m.timestamp, m.kind) for m in markers])
 
     # ========== 状态切换 ==========
+
+    def setToolTip(self, text: str) -> None:
+        """设置卡片自身的悬停提示（如自动化方案摘要）；被测目标摘要行始终追加在其后，
+        两者谁先到都不会互相覆盖。"""
+        self._base_tooltip = text or ''
+        self._apply_card_tooltip()
+
+    def set_target_summary(self, lines: Iterable[str]) -> None:
+        """被测目标元数据的摘要行（TargetInfo.summary_lines()），追加到悬停提示末尾。"""
+        self._target_lines = [line for line in lines if line]
+        self._apply_card_tooltip()
+
+    def target_summary(self) -> List[str]:
+        return list(self._target_lines)
+
+    def _apply_card_tooltip(self) -> None:
+        parts = [self._base_tooltip, '\n'.join(self._target_lines)]
+        super().setToolTip(TOOLTIP_SECTION_SEPARATOR.join(p for p in parts if p))
 
     def _on_pause_button_clicked(self):
         """

@@ -1,9 +1,10 @@
 """
 新建任务表单的"自动化"折叠区
 
-定时打点、日志触发打点、停止条件（运行时长 / 轮数）与停止后自动导出。控件只收集输入并
-拼成 AutomationPlan，不弹对话框："浏览…"/"选择…"只发信号，由 MonitorPresenter 经
-services.dialogs 选好路径后再 set_log_path / set_export_dir 填回来。
+定时打点、日志触发打点、停止条件（运行时长 / 轮数）、停止后自动导出与每 N 小时写阶段
+快照。控件只收集输入并拼成 AutomationPlan，不弹对话框："浏览…"/"选择…"只发信号，由
+MonitorPresenter 经 services.dialogs 选好路径后再 set_log_path / set_export_dir /
+set_snapshot_dir 填回来。
 
 默认折叠：标题行显示当前方案的简述（未设置时为"未启用"），点击标题行展开。
 各项由前面的勾选框启用，未勾选时其输入控件置灰、不进方案。
@@ -13,11 +14,12 @@ from typing import List, Optional
 from PyQt5.QtCore import pyqtSignal
 from PyQt5.QtWidgets import QGridLayout, QHBoxLayout, QVBoxLayout, QWidget
 from qfluentwidgets import (
-    BodyLabel, CaptionLabel, CheckBox, ComboBox, FluentIcon, LineEdit, PushButton, SpinBox,
-    TransparentToolButton,
+    BodyLabel, CaptionLabel, CheckBox, ComboBox, DoubleSpinBox, FluentIcon, LineEdit,
+    PushButton, SpinBox, TransparentToolButton,
 )
 
-from core.automation.plan import DEFAULT_LOG_ENCODING, AutomationPlan
+from core.automation.plan import (DEFAULT_LOG_ENCODING, SNAPSHOT_HOURS_MAX, SNAPSHOT_HOURS_MIN,
+                                  AutomationPlan)
 from ui.formatting import plan_summary
 from ui.widgets.monitor.process_picker import ERROR_DARK, ERROR_LIGHT
 
@@ -44,6 +46,12 @@ STOP_ROUNDS_TOOLTIP = "轮数按打点计（手动与自动合计，不含基线
 EXPORT_CHECK_TEXT = "停止后自动导出明细 CSV 到"
 EXPORT_DIR_PLACEHOLDER = "导出目录"
 CHOOSE_DIR_TEXT = "选择…"
+SNAPSHOT_CHECK_TEXT = "阶段快照，每"
+SNAPSHOT_UNIT_TEXT = "小时写一次到"
+SNAPSHOT_DIR_PLACEHOLDER = "快照目录"
+SNAPSHOT_TOOLTIP = ("运行中每隔这么久把报告图片与摘要 CSV 写到所选目录（不含明细 CSV），"
+                    "不必停止任务也能看到阶段进展。\n"
+                    "暂停期间不计时；写失败只提示一次，不影响采集。")
 
 # 编码选项 (显示文本, 编码名)
 ENCODING_CHOICES = (("UTF-8", DEFAULT_LOG_ENCODING), ("GBK", 'gbk'))
@@ -54,6 +62,9 @@ STOP_MINUTES_RANGE = (1, 30 * 24 * 60)
 STOP_MINUTES_DEFAULT = 120
 STOP_ROUNDS_RANGE = (1, 100000)
 STOP_ROUNDS_DEFAULT = 10
+SNAPSHOT_HOURS_DEFAULT = 6.0
+SNAPSHOT_HOURS_STEP = 0.5
+SNAPSHOT_HOURS_DECIMALS = 1
 
 
 class AutomationOptions(QWidget):
@@ -62,11 +73,13 @@ class AutomationOptions(QWidget):
     信号：
         browse_log_requested(): 点击日志文件的"浏览…"
         browse_export_dir_requested(): 点击导出目录的"选择…"
+        browse_snapshot_dir_requested(): 点击阶段快照目录的"选择…"
         changed(): 任一输入变化（标题行简述随之刷新）
     """
 
     browse_log_requested = pyqtSignal()
     browse_export_dir_requested = pyqtSignal()
+    browse_snapshot_dir_requested = pyqtSignal()
     changed = pyqtSignal()
 
     def __init__(self, parent=None):
@@ -152,6 +165,28 @@ class AutomationOptions(QWidget):
         grid.addWidget(self.export_check, 5, 0)
         grid.addWidget(self.export_dir_edit, 5, 1)
         grid.addWidget(self.export_browse_button, 5, 2)
+
+        # 阶段快照：每 N 小时写报告图片与摘要 CSV
+        self.snapshot_check = CheckBox(SNAPSHOT_CHECK_TEXT, self.body)
+        self.snapshot_check.setToolTip(SNAPSHOT_TOOLTIP)
+        self.snapshot_hours_spin = DoubleSpinBox(self.body)
+        self.snapshot_hours_spin.setDecimals(SNAPSHOT_HOURS_DECIMALS)
+        self.snapshot_hours_spin.setRange(SNAPSHOT_HOURS_MIN, SNAPSHOT_HOURS_MAX)
+        self.snapshot_hours_spin.setSingleStep(SNAPSHOT_HOURS_STEP)
+        self.snapshot_hours_spin.setValue(SNAPSHOT_HOURS_DEFAULT)
+        self.snapshot_dir_edit = LineEdit(self.body)
+        self.snapshot_dir_edit.setPlaceholderText(SNAPSHOT_DIR_PLACEHOLDER)
+        self.snapshot_dir_edit.setClearButtonEnabled(True)
+        self.snapshot_browse_button = PushButton(CHOOSE_DIR_TEXT, self.body)
+        self.snapshot_browse_button.clicked.connect(self.browse_snapshot_dir_requested)
+        snapshot_row = QHBoxLayout()
+        snapshot_row.setSpacing(8)
+        snapshot_row.addWidget(self.snapshot_hours_spin)
+        snapshot_row.addWidget(CaptionLabel(SNAPSHOT_UNIT_TEXT, self.body))
+        snapshot_row.addWidget(self.snapshot_dir_edit, 1)
+        grid.addWidget(self.snapshot_check, 6, 0)
+        grid.addLayout(snapshot_row, 6, 1)
+        grid.addWidget(self.snapshot_browse_button, 6, 2)
         grid.setColumnStretch(1, 1)
 
         # 校验错误：就近显示在本区下方（与进程选择的字段错误同一配色）
@@ -159,14 +194,16 @@ class AutomationOptions(QWidget):
         self.error_label.setTextColor(ERROR_LIGHT, ERROR_DARK)
         self.error_label.setWordWrap(True)
         self.error_label.hide()
-        grid.addWidget(self.error_label, 6, 0, 1, 4)
+        grid.addWidget(self.error_label, 7, 0, 1, 4)
         layout.addWidget(self.body)
 
         for check in self._checks():
             check.toggled.connect(self._on_input_changed)
-        for spin in (self.timed_spin, self.stop_minutes_spin, self.stop_rounds_spin):
+        for spin in (self.timed_spin, self.stop_minutes_spin, self.stop_rounds_spin,
+                     self.snapshot_hours_spin):
             spin.valueChanged.connect(self._on_input_changed)
-        for edit in (self.log_path_edit, self.log_pattern_edit, self.export_dir_edit):
+        for edit in (self.log_path_edit, self.log_pattern_edit, self.export_dir_edit,
+                     self.snapshot_dir_edit):
             edit.textChanged.connect(self._on_input_changed)
         self.log_encoding_combo.currentIndexChanged.connect(self._on_input_changed)
 
@@ -184,7 +221,7 @@ class AutomationOptions(QWidget):
 
     def _checks(self) -> List[CheckBox]:
         return [self.timed_check, self.log_check, self.stop_time_check,
-                self.stop_rounds_check, self.export_check]
+                self.stop_rounds_check, self.export_check, self.snapshot_check]
 
     def focus_chain(self) -> List[QWidget]:
         """本区可获得焦点的控件，按视觉顺序（表单据此声明 Tab 顺序）。"""
@@ -193,7 +230,9 @@ class AutomationOptions(QWidget):
                 self.log_encoding_combo, self.log_pattern_edit,
                 self.stop_time_check, self.stop_minutes_spin,
                 self.stop_rounds_check, self.stop_rounds_spin,
-                self.export_check, self.export_dir_edit, self.export_browse_button]
+                self.export_check, self.export_dir_edit, self.export_browse_button,
+                self.snapshot_check, self.snapshot_hours_spin, self.snapshot_dir_edit,
+                self.snapshot_browse_button]
 
     # ========== 折叠 ==========
 
@@ -215,6 +254,7 @@ class AutomationOptions(QWidget):
         """按当前输入拼出方案（未勾选的项不进方案；路径与规则去首尾空白）。"""
         log_on = self.log_check.isChecked()
         export_on = self.export_check.isChecked()
+        snapshot_on = self.snapshot_check.isChecked()
         return AutomationPlan(
             timed_marker_seconds=(self.timed_spin.value()
                                   if self.timed_check.isChecked() else None),
@@ -227,6 +267,10 @@ class AutomationOptions(QWidget):
                                if self.stop_rounds_check.isChecked() else None),
             export_on_stop=export_on,
             export_dir=(self.export_dir_edit.text().strip() or None) if export_on else None,
+            stage_snapshot_hours=(float(self.snapshot_hours_spin.value())
+                                  if snapshot_on else None),
+            stage_snapshot_dir=((self.snapshot_dir_edit.text().strip() or None)
+                                if snapshot_on else None),
         )
 
     def set_plan(self, plan: Optional[AutomationPlan]) -> None:
@@ -248,6 +292,11 @@ class AutomationOptions(QWidget):
             self.stop_rounds_spin.setValue(plan.stop_after_rounds)
         self.export_check.setChecked(plan.export_on_stop)
         self.export_dir_edit.setText(plan.export_dir or '')
+        self.snapshot_check.setChecked(plan.stage_snapshot_hours is not None
+                                       or bool(plan.stage_snapshot_dir))
+        if plan.stage_snapshot_hours is not None:
+            self.snapshot_hours_spin.setValue(plan.stage_snapshot_hours)
+        self.snapshot_dir_edit.setText(plan.stage_snapshot_dir or '')
         self.clear_error()
 
     def set_log_path(self, path: str) -> None:
@@ -265,6 +314,14 @@ class AutomationOptions(QWidget):
 
     def export_dir(self) -> str:
         return self.export_dir_edit.text().strip()
+
+    def set_snapshot_dir(self, path: str) -> None:
+        """填入阶段快照目录（"选择…"选好后）并勾选阶段快照。"""
+        self.snapshot_dir_edit.setText(path)
+        self.snapshot_check.setChecked(True)
+
+    def snapshot_dir(self) -> str:
+        return self.snapshot_dir_edit.text().strip()
 
     def _current_encoding(self) -> str:
         return self.log_encoding_combo.currentData() or DEFAULT_LOG_ENCODING
@@ -315,6 +372,10 @@ class AutomationOptions(QWidget):
         export_on = self.export_check.isChecked()
         self.export_dir_edit.setEnabled(export_on)
         self.export_browse_button.setEnabled(export_on)
+        snapshot_on = self.snapshot_check.isChecked()
+        for widget in (self.snapshot_hours_spin, self.snapshot_dir_edit,
+                       self.snapshot_browse_button):
+            widget.setEnabled(snapshot_on)
 
     def _refresh_summary(self) -> None:
         text = plan_summary(self.plan()) or SECTION_OFF_TEXT

@@ -91,6 +91,83 @@ def test_availability_passthrough():
     assert hub.unavailable_reason == "测试原因"
 
 
+# ========== not_before：按截止时间判断缓存是否够新 ==========
+
+class _SteppedSource:
+    """快照来源替身：取一次快照要花 cost 秒（推进假时钟）；快照的单调时刻记为"开始取"的时刻"""
+
+    unavailable_reason = None
+
+    def __init__(self, clock, cost=0.015):
+        self.clock = clock
+        self.cost = cost
+        self.calls = 0
+
+    def available(self):
+        return True
+
+    def snapshot(self):
+        self.calls += 1
+        snap = fake_system_snapshot(monotonic=self.clock.monotonic())
+        self.clock.advance(self.cost)
+        return snap
+
+
+def test_not_before_for_uses_small_tolerance_capped_by_quarter_period():
+    assert SnapshotHub.not_before_for(10.0, 1.0) == pytest.approx(9.95)
+    assert SnapshotHub.not_before_for(10.0, 60.0) == pytest.approx(9.95)
+    assert SnapshotHub.not_before_for(10.0, 0.1) == pytest.approx(10.0 - 0.025)
+
+
+def test_not_before_hits_only_when_cached_snapshot_is_not_older():
+    clock = ManualMonotonic(1000.0)
+    hub, source = _hub(clock)
+    first = hub.get(0.5)                                     # 取得时刻 1000.0
+    assert hub.get(0.0, not_before=1000.0) is first          # 给了 not_before 就不按年龄判
+    clock.advance(0.5)
+    second = hub.get(10.0, not_before=1000.45)               # 年龄再宽也不行：快照早于 not_before
+    assert second is not first and source.calls == 2
+    assert hub.get(0.0, not_before=1000.45) is second        # 恰在 not_before 之后：命中
+    assert hub.stats().hits == 2
+
+
+def test_cache_time_is_when_the_system_call_began():
+    """内核在调用期间采集数据，取得时刻记调用开始：取样耗时再长也不会把旧数据当新的"""
+    clock = ManualMonotonic(1000.0)
+    source = _SteppedSource(clock, cost=0.2)
+    hub = SnapshotHub(source, clock=clock)
+    first = hub.get(0.5)
+    assert clock.monotonic() == pytest.approx(1000.2)
+    assert hub.get(99, not_before=1000.0) is first
+    assert hub.get(99, not_before=1000.1) is not first       # 完成时刻 1000.2 不算数
+
+
+def test_age_semantics_unchanged_without_not_before():
+    clock = ManualMonotonic(1000.0)
+    source = _SteppedSource(clock, cost=0.0)
+    hub = SnapshotHub(source, clock=clock)
+    first = hub.get(0.5)
+    clock.advance(0.5)
+    assert hub.get(0.5) is first
+    clock.advance(0.01)
+    assert hub.get(0.5) is not first
+
+
+def test_list_snapshot_at_arbitrary_phase_is_not_reused_by_grid_sample():
+    """进程列表等没有截止时间的调用方在任意相位放进缓存的快照，网格采样不会拿去用"""
+    clock = ManualMonotonic(1000.0)
+    source = _SteppedSource(clock)
+    hub = SnapshotHub(source, clock=clock)
+    clock.advance(1.6)
+    listed = hub.get(0.5)                                    # 列表刷新：1001.6 取的快照
+    clock.value = 1002.0                                     # 周期 1 秒的任务在网格点醒来
+    sampled = hub.get(SnapshotHub.max_age_for(1.0),
+                      not_before=SnapshotHub.not_before_for(1002.0, 1.0))
+    assert sampled is not listed                             # 按年龄 0.4 <= 0.5 会误命中
+    # 反过来：列表可以复用刚由采样取得的快照
+    assert hub.get(0.5) is sampled
+
+
 # ========== 并发 ==========
 
 def test_concurrent_get_takes_single_snapshot():
@@ -228,6 +305,116 @@ def test_resume_samples_immediately_then_returns_to_grid(db, qapp):
     after = [o for o in offsets if o > resume_at]
     assert after and all(o % 2 == 0 for o in after)     # 之后回到 2 秒网格
     assert after[0] - resume_at >= 1.0                  # 不会紧挨着再采
+
+
+# ========== MonitorWorker 的快照新鲜度（假时钟） ==========
+
+class _HubCollector(ScriptedCollector):
+    """经 hub 取快照的采集器替身：记录每次采集收到的 not_before 与拿到的快照"""
+
+    def __init__(self, metrics, hub, max_age, after_collect=None):
+        super().__init__(metrics, after_collect=after_collect)
+        self.hub = hub
+        self.max_age = max_age
+        self.snapshot_not_before = None
+        self.used = []
+
+    def collect_metrics(self, metric_types):
+        not_before = self.snapshot_not_before
+        if not_before is None:
+            snapshot = self.hub.get(self.max_age)
+        else:
+            snapshot = self.hub.get(self.max_age, not_before=not_before)
+        self.used.append((not_before, snapshot))
+        return super().collect_metrics(metric_types)
+
+
+def _worker_with_hub_collector(db, clock, hub, interval, n):
+    ref = []
+    worker = MonitorWorker(pid=os.getpid(), process_name='hub.exe', metric_types=['num_handles'],
+                           interval=interval, db=db, clock=clock, hub=hub)
+    worker.collector = _HubCollector(['num_handles'], hub, SnapshotHub.max_age_for(interval),
+                                     after_collect=stop_after(ref, n))
+    ref.append(worker)
+    return worker
+
+
+class _InterleavedClock(SteppingClock):
+    """假时钟：任务 A 等待的途中，穿插"另一个任务 B"在自己的网格点（原点 + k × 周期）取快照"""
+
+    def __init__(self, other_interval, mono0=1000.0):
+        super().__init__(mono0=mono0)
+        self.other_interval = other_interval
+        self.next_other = mono0 + other_interval
+        self.hub = None
+
+    def _set(self, value):
+        with self.lock:
+            self.mono = max(self.mono, value)
+
+    def wait(self, event, timeout=None):
+        self.waits += 1
+        if event.is_set():
+            return True
+        if timeout is None:
+            raise AssertionError("暂停等待无人唤醒")
+        target = self.monotonic() + timeout
+        while self.next_other <= target:
+            self._set(self.next_other)
+            interval = self.other_interval
+            self.hub.get(SnapshotHub.max_age_for(interval),
+                         not_before=SnapshotHub.not_before_for(self.next_other, interval))
+            self.next_other += interval
+        self._set(target)
+        return False
+
+
+def test_different_interval_tasks_never_get_snapshot_from_before_their_cycle(db, qapp):
+    """周期 1 s 的任务 A 与周期 1.5 s 的任务 B 共用 hub：B 在 origin+1.5 取的快照（完成
+    时刻约 +15 ms）不能被 A 在 origin+2.0 拿去用——否则 A 的这一点比真实时刻早 0.5 s，
+    速率曲线出现周期性锯齿"""
+    clock = _InterleavedClock(other_interval=1.5)
+    source = _SteppedSource(clock, cost=0.015)
+    hub = SnapshotHub(source, clock=clock)
+    clock.hub = hub
+    worker = _worker_with_hub_collector(db, clock, hub, 1.0, 13)
+    _run(worker)
+
+    used = worker.collector.used
+    assert len(used) == 13
+    for not_before, snapshot in used:
+        deadline = not_before + 0.05
+        assert deadline == pytest.approx(round(deadline))     # 都在 A 的 1 秒网格上
+        assert snapshot.taken_at.monotonic >= not_before, (deadline, snapshot.taken_at)
+    # 同一网格点上 A 与 B 共用快照（3.0、6.0、...）：取样次数少于两者采样次数之和
+    assert source.calls < 13 + 8
+
+
+def test_cycle_after_resume_does_not_reuse_its_own_previous_snapshot(db, qapp):
+    """恢复后立即采的那次不在网格上（落在半个周期处）：下一周期必须取新快照。
+    否则 elapsed 为 0，CPU% 被写成 0.0，累计量写两遍同一个值"""
+    clock = SteppingClock(mono0=1000.0)
+    hub = SnapshotHub(_SteppedSource(clock, cost=0.015), clock=clock)
+    worker = _worker_with_hub_collector(db, clock, hub, 1.0, 12)
+
+    def on_wait(event, timeout):
+        if timeout is None:
+            clock.advance(1011.5 - clock.monotonic())        # 恰在网格点之后半个周期恢复
+            assert worker.resume() is True
+        elif worker.collector.calls == 5 and not worker.is_paused():
+            assert worker.pause() is True
+    clock.on_wait = on_wait
+    _run(worker)
+
+    used = worker.collector.used
+    snapshots = [snapshot for _, snapshot in used]
+    assert len(snapshots) == 12
+    for earlier, later in zip(snapshots, snapshots[1:]):
+        assert earlier is not later
+    resume_index = next(i for i, (nb, _) in enumerate(used) if abs(nb + 0.05 - 1011.5) < 1e-6)
+    after = used[resume_index + 1][0] + 0.05
+    assert after == pytest.approx(1012.0)                    # 之后回到网格
+    assert snapshots[resume_index + 1].taken_at.monotonic >= 1011.95
 
 
 # ========== 真实时钟：同周期任务共用快照 ==========

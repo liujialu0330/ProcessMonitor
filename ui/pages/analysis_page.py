@@ -1,13 +1,16 @@
 """
 分析页（历史数据 + 导出合并）
 
-只做组装与连线：
+只做组装与连线。结论优先，自上而下：
 - 工具条：任务选择（可搜索下拉）· 对比任务 · 导出报告 ▾ · 刷新 · 更多；范围（含刷选出的
   "自定义"）与视图切换（小倍数 | 叠加Δ%，绝对 | 相对时间）；
-- 判定摘要表：每个指标一行结论，点击行切换焦点指标；
+- 结论条：判定胶囊 + "2 / 5 项持续上涨：…"，右侧是统计依据与运行中任务的自动刷新状态；
+- 判定摘要表：按判定严重程度排序，每个指标一行，点击行切换焦点指标；
 - 任务对比（可选）：叠加曲线 + 并排分轮增量表；
-- 趋势面板：小倍数或叠加 Δ%，min/max 带，打点竖线，右键编辑打点，底部概览条刷选；
-- 下方子视图：打点区间（点击行缩放趋势图）| 采集明细。
+- 焦点区：[打点区间（点击行缩放趋势图）| 采集明细] 页签，其下焦点指标大图与概览条刷选；
+- 其余指标：持续上涨 / 波动的小倍数图，平稳与数据不足的折叠为一行（点一行设为焦点），
+  或叠加 Δ%；右键编辑打点。
+1280×820 窗口首屏能同时看到结论条、摘要表与区间表前 3 行。
 业务状态与查询在 AnalysisViewModel（异步、多指标并行、过期丢弃）；导出交互在
 AnalysisExportFlow，右键打点编辑在 MarkerEditFlow；页面只把信号接到一起。
 """
@@ -20,13 +23,13 @@ from PyQt5.QtWidgets import QSizePolicy, QStackedWidget, QVBoxLayout, QWidget
 from qfluentwidgets import CaptionLabel, FluentIcon, IndeterminateProgressBar
 
 from core.history_query import CUSTOM_RANGE_KEY, HistorySnapshot, TaskAnalysis
-from ui.formatting import basis_text, build_summary_row
+from ui.formatting import basis_text, build_table_row, refresh_status_text, verdict_summary
 from ui.models.task_options import TaskOptionsModel
 from ui.services import UiServices
 from ui.viewmodels.analysis_vm import (
     TIME_RELATIVE, AnalysisViewModel, analysis_origin, range_text)
 from ui.viewmodels.history_auto_refresh import HistoryAutoRefresh
-from ui.viewmodels.history_vm import EMPTY_NO_TASKS, HistoryRunner
+from ui.viewmodels.history_vm import EMPTY_NO_TASKS, HistoryRunner, ordered_metrics
 from ui.widgets.analysis.compare_panel import ComparePanel
 from ui.widgets.analysis.export_flow import AnalysisExportFlow
 from ui.widgets.analysis.interval_table import LowerViews
@@ -35,6 +38,7 @@ from ui.widgets.analysis.report_sheet import build_report_text, render_report_im
 from ui.widgets.analysis.summary_table import SummaryTable
 from ui.widgets.analysis.toolbar import AnalysisToolbar
 from ui.widgets.analysis.trend_panel import TrendPanel, center_line
+from ui.widgets.analysis.verdict_banner import VerdictBanner
 from ui.widgets.empty_state import EmptyStateCard
 from ui.widgets.history.chart_view import chart_display_unit
 from ui.widgets.history.common import VIEWPORT_TO_CONTENT_OFFSET
@@ -51,6 +55,8 @@ logger = logging.getLogger(__name__)
 SECTION_SPACING = 16
 CARD_SPACING = 12
 BUSY_INDICATOR_DELAY_MS = 300
+# 结论条"自动刷新 · N 秒前"的走字间隔
+REFRESH_STATUS_TICK_MS = 1000
 TASK_HAS_NO_DATA = ("提示", "该任务暂无采样数据")
 
 
@@ -71,6 +77,8 @@ class AnalysisPage(PageScaffold):
             parent=self, **vm_options)
         self._task_options = TaskOptionsModel()
         self._compare_options = TaskOptionsModel()
+        # 最近一次拿到分析结果的时刻（结论条的"N 秒前"）
+        self._analysis_at = None
         self._init_ui()
         self.auto_refresh = HistoryAutoRefresh(self.vm, self._should_skip_refresh, parent=self)
         self.marker_flow = MarkerEditFlow(self.vm, services, self, parent=self)
@@ -89,20 +97,23 @@ class AnalysisPage(PageScaffold):
         self.export_status_label.setVisible(False)
         self.add_section(self.export_status_label)
 
-        self.summary_table = SummaryTable()
+        self.verdict_banner = VerdictBanner()
+        # 依据并入结论条，摘要表不再单列标题与依据行
+        self.summary_table = SummaryTable(show_header=False)
         self.compare_panel = ComparePanel()
         self.compare_panel.setVisible(False)
-        self.trend_panel = TrendPanel()
         self.lower_views = LowerViews()
         self.interval_table = self.lower_views.interval_table
         self.sample_table = self.lower_views.sample_table
+        self.trend_panel = TrendPanel()
 
         self.body = QWidget()
         body_layout = QVBoxLayout(self.body)
         body_layout.setContentsMargins(0, 0, 0, 0)
         body_layout.setSpacing(CARD_SPACING)
-        for widget, stretch in ((self.summary_table, 0), (self.compare_panel, 0),
-                                (self.trend_panel, 1), (self.lower_views, 0)):
+        for widget, stretch in ((self.verdict_banner, 0), (self.summary_table, 0),
+                                (self.compare_panel, 0), (self.lower_views, 0),
+                                (self.trend_panel, 1)):
             body_layout.addWidget(widget, stretch)
 
         self.empty_state_card = EmptyStateCard(FluentIcon.HISTORY, *EMPTY_NO_TASKS)
@@ -120,6 +131,9 @@ class AnalysisPage(PageScaffold):
         self._busy_timer.setSingleShot(True)
         self._busy_timer.setInterval(BUSY_INDICATOR_DELAY_MS)
         self._busy_timer.timeout.connect(self._show_busy_bar)
+        self._refresh_status_timer = QTimer(self)
+        self._refresh_status_timer.setInterval(REFRESH_STATUS_TICK_MS)
+        self._refresh_status_timer.timeout.connect(self.update_refresh_status)
 
         content = QWidget()
         content_layout = QVBoxLayout(content)
@@ -146,6 +160,7 @@ class AnalysisPage(PageScaffold):
         self.compare_panel.close_requested.connect(lambda: self._set_compare_open(False))
         trend.region_selected.connect(vm.set_custom_range)
         trend.context_menu_requested.connect(self.marker_flow.show_menu)
+        trend.metric_activated.connect(vm.select_metric)
         self.interval_table.interval_activated.connect(
             lambda start, end: trend.zoom_to(start.timestamp(), end.timestamp()))
         self.export_flow.status_changed.connect(self._on_export_status)
@@ -254,16 +269,24 @@ class AnalysisPage(PageScaffold):
         return origin.timestamp() if origin is not None else None
 
     def _on_analysis(self, analysis: TaskAnalysis) -> None:
-        snapshots = [(m, s) for m, s in analysis.snapshots.items() if m]
-        rows = [build_summary_row(m, s) for m, s in snapshots]
+        order = ordered_metrics(analysis)
+        snapshots = [(m, analysis.snapshots[m]) for m in order]
+        rows = [build_table_row(m, s) for m, s in snapshots]
         basis = next((basis_text(s) for _m, s in snapshots if s.stats), "")
         self.summary_table.set_rows(rows, basis, focus=self.vm.current_metric)
+        self.verdict_banner.set_summary(
+            verdict_summary([(m, s if s.points else None) for m, s in snapshots]))
+        self.verdict_banner.set_basis(basis)
+        self._analysis_at = self.services.clock.now()
+        self.update_refresh_status()
         self.trend_panel.set_relative_origin(self._origin_epoch())
-        self.trend_panel.set_analysis(analysis, keep_view=analysis.auto_refresh)
         self.trend_panel.update_columns(self._content_width())
+        self.trend_panel.set_analysis(analysis, keep_view=analysis.auto_refresh,
+                                      order=order, focus=self.vm.current_metric)
 
     def _on_snapshot(self, snapshot: HistorySnapshot) -> None:
         metric = snapshot.request.metric
+        self.trend_panel.set_focus(metric)
         chart = self.trend_panel.charts().get(metric)
         if chart is not None and not chart.is_rate:
             unit = chart.display_unit
@@ -282,6 +305,8 @@ class AnalysisPage(PageScaffold):
         self.content_stack.setCurrentWidget(self.body)
 
     def _on_empty_state(self, title: str, hint: str) -> None:
+        self._analysis_at = None
+        self.verdict_banner.clear()
         self.summary_table.clear()
         self.trend_panel.clear()
         self.lower_views.clear()
@@ -313,6 +338,16 @@ class AnalysisPage(PageScaffold):
             self._busy_timer.stop()
             self.busy_bar.stop()
             self.busy_bar.setVisible(False)
+
+    def update_refresh_status(self) -> None:
+        """结论条右侧的"自动刷新 · N 秒前"：只对运行中任务显示（定时走字，结果到达时也更新）。"""
+        vm = self.vm
+        running = vm.current_task_id is not None and vm.current_task_id in vm.running_ids
+        if not running or self._analysis_at is None:
+            self.verdict_banner.set_refresh_status("")
+            return
+        elapsed = (self.services.clock.now() - self._analysis_at).total_seconds()
+        self.verdict_banner.set_refresh_status(refresh_status_text(elapsed))
 
     def _show_busy_bar(self) -> None:
         self.busy_bar.setVisible(True)
@@ -358,9 +393,11 @@ class AnalysisPage(PageScaffold):
         super().showEvent(event)
         self.vm.reload_tasks()
         self.auto_refresh.start()
+        self._refresh_status_timer.start()
 
     def hideEvent(self, event):
         """隐藏时停止自动刷新，并让在途查询作废（不阻塞等待线程）。"""
         super().hideEvent(event)
         self.auto_refresh.stop()
+        self._refresh_status_timer.stop()
 

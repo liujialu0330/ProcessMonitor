@@ -320,3 +320,44 @@ def test_range_text_and_origin(qapp, db, manager, services):
     vm.reload_tasks()
     assert analysis_origin(vm.last_snapshot) == BASE
     assert analysis_origin(None) is None
+
+
+# ---------------------------------------------------------------- 排序与折叠口径（纯函数）
+
+
+def _judged(metric, verdict=None, slope_per_hour=0.0, first=100.0, stats=True):
+    """合成快照：verdict 为 None 时不做趋势判定（累计量 / 峰值类）。"""
+    from core.analysis.trend import Judgement, LinearFit
+    from core.history_query import HistorySnapshot, build_request
+    judgement = None
+    if verdict is not None:
+        judgement = Judgement(verdict, LinearFit(slope_per_hour / 3600.0, first, 0.9, 0.0),
+                              'x', 0.5)
+    stat = {'count': 100, 'first': first, 'last': first, 'span_seconds': 1200.0} if stats else None
+    return HistorySnapshot(request=build_request("t", metric, 'all'), stats=stat,
+                           judgement=judgement)
+
+
+def test_ordered_metrics_by_verdict_then_relative_rate():
+    from core.analysis.trend import Verdict
+    from ui.viewmodels.history_vm import is_anomalous, ordered_metrics, relative_rate
+    io = MetricType.IO_READ_BYTES
+    threads = MetricType.NUM_THREADS
+    snapshots = {
+        GDI: _judged(GDI, Verdict.STABLE),
+        io: _judged(io),                                              # 不判定：排最后
+        threads: _judged(threads, stats=False),                       # 没有数据：按数据不足
+        HANDLES: _judged(HANDLES, Verdict.RISING, slope_per_hour=120, first=800),   # 15%/时
+        MEM: _judged(MEM, Verdict.RISING, slope_per_hour=36000, first=512000),      # 7%/时
+        MetricType.NUM_USER_OBJECTS: _judged(MetricType.NUM_USER_OBJECTS, Verdict.FLUCTUATING),
+    }
+    analysis = TaskAnalysis("t", 'all', snapshots)
+    # 同为持续上涨时比相对增速：句柄 120/800 > 私有字节 36000/512000，不比绝对斜率
+    assert ordered_metrics(analysis) == [
+        HANDLES, MEM, MetricType.NUM_USER_OBJECTS, GDI, threads, io]
+    assert relative_rate(snapshots[HANDLES]) == pytest.approx(0.15)
+    assert [m for m in snapshots if is_anomalous(snapshots[m])] == [
+        HANDLES, MEM, MetricType.NUM_USER_OBJECTS]
+    # 起点为 0 的上涨排在同组最前
+    zero = _judged(GDI, Verdict.RISING, slope_per_hour=1, first=0.0)
+    assert relative_rate(zero) == float('inf')

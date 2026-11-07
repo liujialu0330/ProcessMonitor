@@ -11,6 +11,33 @@ if TYPE_CHECKING:
     from core.contracts import TaskStatus
 
 
+@dataclass(frozen=True)
+class QualityStats:
+    """
+    一个任务的采集数据质量（由 core.cycle_stats.CycleStats 汇总，收尾时写入 tasks 的同名列）。
+
+    - planned_cycles：按时钟应当采集的周期数（暂停段不算）；
+    - done_cycles：实际执行完采集的周期数（采集抛异常的不算）；
+    - missed_cycles：调度落后超过一个周期、重置截止时间时跳过的周期数；
+    - lag_p95_ms / collect_p95_ms / write_p95_ms：调度延迟、采集耗时、写库耗时的 p95
+      （定长直方图估算，取所在桶的上界，毫秒整数；没有样本为 None）。
+      write_p95_ms 在 tasks 表里没有列，不落库，只在内存快照中有值。
+    """
+    planned_cycles: int
+    done_cycles: int
+    missed_cycles: int
+    lag_p95_ms: Optional[int] = None
+    collect_p95_ms: Optional[int] = None
+    write_p95_ms: Optional[int] = None
+
+    @property
+    def completion_ratio(self) -> Optional[float]:
+        """采集完成率 done / planned（0~1，超过 1 截为 1）；没有计划周期时为 None"""
+        if self.planned_cycles <= 0:
+            return None
+        return min(1.0, self.done_cycles / self.planned_cycles)
+
+
 @dataclass
 class MonitorTask:
     """监控任务模型"""
@@ -33,6 +60,12 @@ class MonitorTask:
     # 自动化方案（core.automation.AutomationPlan 的 JSON 文本）；没有方案为 None。
     # 只经 TaskRepo.save_plan 写入，save() 不碰它（UPSERT 不会把它清掉）
     plan_json: Optional[str] = None
+    # 采集数据质量（tasks 的数据质量列）；任务尚未收尾、或由旧版本写入时为 None。
+    # 只经 TaskRepo.save_quality 写入，save() 不碰它
+    quality: Optional[QualityStats] = None
+    # 被测目标元数据（core.target_info.TargetInfo 的 JSON 文本）；任务开始时探测写入，
+    # 旧任务或探测前为 None。数据层只透传不解析；只经 TaskRepo.save_meta 写入，save() 不碰它
+    meta_json: Optional[str] = None
 
     def is_running(self) -> bool:
         """判断任务是否正在运行"""

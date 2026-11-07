@@ -279,3 +279,190 @@ def test_automation_comes_after_start_in_tab_order(form):
         while widget is not second and widget is not first and widget.parent() is first:
             widget = widget.nextInFocusChain()
         assert widget is second, (first, second)
+
+
+# ---------- 阶段快照 ----------
+
+
+def test_stage_snapshot_row_builds_plan_and_summary(form):
+    form.picker.set_text("1001")
+    auto = form.automation
+    assert not auto.snapshot_hours_spin.isEnabled() and not auto.snapshot_dir_edit.isEnabled()
+    auto.snapshot_check.setChecked(True)
+    assert auto.snapshot_hours_spin.isEnabled() and auto.snapshot_browse_button.isEnabled()
+    auto.snapshot_hours_spin.setValue(6)
+    auto.snapshot_dir_edit.setText("  D:\快照 ")
+
+    form.start_button.click()
+
+    [request] = form.requests
+    assert request.plan == AutomationPlan(stage_snapshot_hours=6.0,
+                                          stage_snapshot_dir="D:\快照")
+    assert auto.summary_label.text() == "每 6 小时写阶段快照"
+
+
+def test_stage_snapshot_unchecked_does_not_enter_plan(form):
+    form.automation.snapshot_dir_edit.setText("D:\快照")
+    assert form.automation_plan() is None
+
+
+def test_stage_snapshot_without_dir_shows_error_near_section(form):
+    form.show()
+    form.picker.set_text("1001")
+    form.automation.snapshot_check.setChecked(True)
+    form.start_button.click()
+    assert form.requests == []
+    assert form.automation.error_text() == "已勾选阶段快照，请选择快照目录"
+    assert form.automation.error_label.isVisible()
+
+
+def test_stage_snapshot_set_plan_round_trip(form):
+    plan = AutomationPlan(stage_snapshot_hours=0.5, stage_snapshot_dir="D:\快照")
+    form.set_automation_plan(plan)
+    assert form.automation.snapshot_check.isChecked()
+    assert form.automation_plan() == plan
+    form.set_automation_plan(None)
+    assert not form.automation.snapshot_check.isChecked()
+
+
+def test_browse_snapshot_dir_only_emits_and_fill_checks_option(form):
+    received = []
+    form.browse_snapshot_dir_requested.connect(lambda: received.append("snap"))
+    form.automation.snapshot_check.setChecked(True)
+    form.automation.snapshot_browse_button.click()
+    assert received == ["snap"]
+    form.automation.snapshot_check.setChecked(False)
+    form.set_snapshot_dir("D:\快照")
+    assert form.snapshot_dir() == "D:\快照" and form.automation.snapshot_check.isChecked()
+
+
+# ---------- 存储预估 ----------
+
+
+def test_storage_estimate_follows_metrics_and_interval(form):
+    assert form.storage_estimate_text() == ""          # 没选指标：不提示
+    metrics = [MetricType.MEMORY_PRIVATE, MetricType.NUM_HANDLES, MetricType.NUM_THREADS,
+               MetricType.NUM_GDI_OBJECTS, MetricType.NUM_USER_OBJECTS]
+    form.interval_spinbox.setValue(1)
+    form.set_metrics_summary(metrics)
+    assert form.storage_estimate_text() == "每小时约 18,000 行 · 12 小时约 4 MB"
+    assert "24 小时约 8 MB" in form.storage_label.toolTip()
+
+    form.interval_spinbox.setValue(2)                  # 改间隔：实时刷新
+    assert form.storage_estimate_text() == "每小时约 9,000 行 · 12 小时约 2 MB"
+    form.set_metrics_summary(metrics[:1])              # 改指标数：实时刷新
+    assert form.storage_estimate_text() == "每小时约 1,800 行 · 12 小时约 464 KB"
+    form.set_metrics_summary([])
+    assert form.storage_estimate_text() == "" and form.storage_label.toolTip() == ""
+
+
+def test_storage_estimate_sits_next_to_metric_summary(form):
+    form.show()
+    form.set_metrics_summary(LEAK_CHECK_PRESET)
+    assert form.storage_label.isVisible() and form.storage_label.text()
+    summary = form.metric_summary_label.geometry()
+    estimate_geometry = form.storage_label.geometry()
+    assert estimate_geometry.left() >= summary.right()
+    assert abs(estimate_geometry.center().y() - summary.center().y()) <= 2
+
+
+# ---------- 启动被测程序 ----------
+
+def test_launch_section_is_collapsed_and_off_by_default(form):
+    assert not form.launch_options.is_expanded()
+    assert not form.launch_enabled()
+    assert form.launch_options.summary_text() == "未启用"
+    assert form.start_button.text() == "开始监控"
+
+
+def test_launch_submit_sends_spec_instead_of_picked_process(form):
+    from core.process_launcher import LaunchSpec
+    form.picker.set_text("1001")
+    form.set_launch_exe(r"D:\app\demo.exe")
+    form.launch_options.args_edit.setText('--mode soak "C:\\Program Files\\x"')
+    form.set_launch_cwd(r"D:\work")
+    form.launch_options.close_check.setChecked(True)
+
+    assert form.start_button.text() == "启动并监控"
+    # 先启动程序时用不着等待进程
+    assert not form.wait_checkbox.isEnabled()
+    form.submit()
+
+    [request] = form.requests
+    assert request.launch == LaunchSpec(
+        exe=r"D:\app\demo.exe", args=("--mode", "soak", "C:\\Program Files\\x"),
+        cwd=r"D:\work")
+    assert request.close_on_stop is True
+    assert request.pid == 0 and request.create_time is None
+    assert request.name == "demo.exe"
+    assert request.interval == 3
+
+
+def test_launch_without_exe_shows_error_in_section(form):
+    form.launch_options.set_enabled(True)
+
+    form.submit()
+
+    assert form.requests == [] and form.invalid == []
+    assert form.launch_error_text() == "请填写要启动的程序"
+    assert form.launch_options.is_expanded()
+
+
+def test_launch_error_clears_when_input_changes(form):
+    form.set_launch_exe(r"D:\app\demo.exe")
+    form.show_launch_error("找不到程序")
+    assert form.launch_error_text() == "找不到程序"
+
+    form.launch_options.args_edit.setText("-v")
+
+    assert form.launch_error_text() == ""
+
+
+def test_unchecking_launch_restores_normal_start(form):
+    form.set_launch_exe(r"D:\app\demo.exe")
+    form.launch_options.set_enabled(False)
+    form.picker.set_text("1001")
+
+    form.submit()
+
+    assert form.start_button.text() == "开始监控"
+    assert form.wait_checkbox.isEnabled()
+    [request] = form.requests
+    assert request.launch is None and request.pid == 1001
+
+
+def test_collapsed_form_ignores_launch_settings(form):
+    """折叠后藏起来的启动设置不生效（与"等待进程启动"一致）。"""
+    form.set_launch_exe(r"D:\app\demo.exe")
+    form.set_collapsed(True)
+    form.picker.set_text("1001")
+
+    form.submit()
+
+    [request] = form.requests
+    assert request.launch is None
+
+
+def test_set_launch_spec_fills_section_and_expands(form):
+    from core.process_launcher import LaunchSpec
+    form.set_collapsed(True)
+    spec = LaunchSpec(exe=r"D:\app\demo.exe", args=("a b", "c"), cwd=None)
+
+    form.set_launch_spec(spec, close_on_stop=True)
+
+    assert not form.is_collapsed() and form.launch_options.is_expanded()
+    assert form.launch_options.spec() == (spec, None)
+    assert form.launch_options.close_on_stop()
+    assert form.launch_options.summary_text() == "开始时启动 demo.exe · 停止时关闭"
+
+
+def test_launch_browse_buttons_only_emit_signals(form):
+    received = []
+    form.browse_exe_requested.connect(lambda: received.append("exe"))
+    form.browse_cwd_requested.connect(lambda: received.append("cwd"))
+    form.launch_options.set_enabled(True)
+
+    form.launch_options.exe_browse_button.click()
+    form.launch_options.cwd_browse_button.click()
+
+    assert received == ["exe", "cwd"]

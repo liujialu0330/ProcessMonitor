@@ -268,3 +268,96 @@ def test_plan_methods_wrap_storage_errors(tmp_path):
             repo.save_plan('x', PLAN_JSON)
         with pytest.raises(StorageError):
             repo.load_plan('x')
+
+
+# ---------- 数据质量列（planned_cycles 等） ----------
+
+def test_save_and_load_quality(repo):
+    from data.models import QualityStats
+    task = _task()
+    repo.save(task)
+    assert repo.load_quality(task.task_id) is None
+    assert repo.get(task.task_id).quality is None
+
+    quality = QualityStats(12370, 12345, 20, 12, 5, write_p95_ms=2)
+    assert repo.save_quality(task.task_id, quality) is True
+    # write_p95_ms 没有列：读回为 None，其余五列原样
+    expected = QualityStats(12370, 12345, 20, 12, 5, None)
+    assert repo.load_quality(task.task_id) == expected
+    assert repo.get(task.task_id).quality == expected
+    assert [t.quality for t in repo.list_all()] == [expected]
+
+    # 重复写以最后一次为准；p95 为空照样可存
+    assert repo.save_quality(task.task_id, QualityStats(3, 3, 0)) is True
+    assert repo.load_quality(task.task_id) == QualityStats(3, 3, 0, None, None)
+
+
+def test_save_quality_before_task_row_exists_reports_miss(repo):
+    from data.models import QualityStats
+    assert repo.save_quality('missing', QualityStats(1, 1, 0)) is False
+    assert repo.load_quality('missing') is None
+
+
+def test_upsert_does_not_clear_quality(repo):
+    from data.models import QualityStats
+    task = _task()
+    repo.save(task)
+    repo.save_quality(task.task_id, QualityStats(10, 9, 1, 2, 3))
+    repo.save(replace(task, status='stopped', end_time=BASE + timedelta(hours=1)))
+    assert repo.load_quality(task.task_id) == QualityStats(10, 9, 1, 2, 3)
+
+
+def test_quality_methods_wrap_storage_errors(tmp_path):
+    from data.models import QualityStats
+    for factory in make_broken_factories(str(tmp_path)):
+        repo = TaskRepo(factory)
+        with pytest.raises(StorageError):
+            repo.save_quality('x', QualityStats(1, 1, 0))
+        with pytest.raises(StorageError):
+            repo.load_quality('x')
+
+
+# ---------- meta_json（被测目标元数据） ----------
+
+META_JSON = '{"schema_version": 1, "exe_path": "C:\\\\演示\\\\app.exe", "file_version": "1.2.3.4"}'
+
+
+def test_save_and_load_meta(repo):
+    task = _task()
+    repo.save(task)
+    assert repo.load_meta(task.task_id) is None
+    assert repo.get(task.task_id).meta_json is None
+
+    assert repo.save_meta(task.task_id, META_JSON) is True
+    assert repo.load_meta(task.task_id) == META_JSON
+    assert repo.get(task.task_id).meta_json == META_JSON
+    assert [t.meta_json for t in repo.list_all()] == [META_JSON]
+
+    assert repo.save_meta(task.task_id, None) is True
+    assert repo.load_meta(task.task_id) is None
+
+
+def test_save_meta_before_task_row_exists_reports_miss(repo):
+    assert repo.save_meta('not-yet', META_JSON) is False
+    assert repo.get('not-yet') is None
+    assert repo.load_meta('not-yet') is None
+
+
+def test_upsert_does_not_clear_meta(repo):
+    task = _task()
+    repo.save(task)
+    repo.save_meta(task.task_id, META_JSON)
+    repo.save(replace(task, status='stopped', end_time=BASE + timedelta(hours=1)))
+    assert repo.load_meta(task.task_id) == META_JSON
+    # 模型带着别的值也不会经 save 覆盖：元数据只经 save_meta 写
+    repo.save(replace(task, meta_json='{"exe_path": "x"}'))
+    assert repo.load_meta(task.task_id) == META_JSON
+
+
+def test_meta_methods_wrap_storage_errors(tmp_path):
+    for factory in make_broken_factories(str(tmp_path)):
+        repo = TaskRepo(factory)
+        with pytest.raises(StorageError):
+            repo.save_meta('x', META_JSON)
+        with pytest.raises(StorageError):
+            repo.load_meta('x')

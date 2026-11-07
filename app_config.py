@@ -144,6 +144,12 @@ def migrate_config(data: dict) -> Tuple[dict, List[str]]:
     return result, steps
 
 
+# 报告图片配色：固定浅色（默认，与界面主题无关）/ 跟随当前界面主题
+REPORT_SCHEME_LIGHT = "light"
+REPORT_SCHEME_FOLLOW = "follow"
+REPORT_COLOR_SCHEMES = [REPORT_SCHEME_LIGHT, REPORT_SCHEME_FOLLOW]
+
+
 class AppConfig(QConfig):
     """应用级用户偏好配置"""
 
@@ -170,6 +176,10 @@ class AppConfig(QConfig):
     keep_awake_while_monitoring = ConfigItem(
         "Monitor", "KeepAwakeWhileMonitoring", True, BoolValidator())
 
+    # 允许命令行与脚本控制（pmctl / 本地 IPC）：关闭后除 ping / activate 外的命令一律回
+    # disabled；设置页开关控制，默认开启
+    automation_enabled = ConfigItem("Automation", "Enabled", True, BoolValidator())
+
     # 监控页上次选择的指标：新建任务时沿用，默认"泄漏排查"预设
     last_metrics = ConfigItem(
         "Monitor", "LastMetrics", list(LEAK_CHECK_PRESET), MetricListValidator())
@@ -182,6 +192,11 @@ class AppConfig(QConfig):
     # 写法是否合法、能否注册由 ui/hotkey 判断，这里只保证是不太长的字符串
     marker_hotkey = ConfigItem(
         "Behavior", "MarkerHotkey", DEFAULT_MARKER_HOTKEY, MarkerHotkeyValidator())
+
+    # 报告图片配色：报告常被贴进文档与邮件，默认固定浅色；设置页可改为跟随界面主题
+    report_color_scheme = OptionsConfigItem(
+        "Export", "ReportColorScheme", REPORT_SCHEME_LIGHT,
+        OptionsValidator(REPORT_COLOR_SCHEMES))
 
     def __init__(self):
         super().__init__()
