@@ -131,10 +131,13 @@ def test_same_create_time_tolerance():
 # ========== SnapshotTreeSource：快照路径 ==========
 
 class FakeSnapshot:
+    """rows 为 (pid, 父 pid, 名称, 创建时间[, 线程数])；线程数缺省 1，0 表示已退出但仍被句柄握着。"""
+
     def __init__(self, rows, mono=50.0):
         self.processes = {
             r[0]: SimpleNamespace(pid=r[0], parent_pid=r[1], name=r[2], create_time=r[3],
-                                  user_time=1.0, kernel_time=0.5)
+                                  user_time=1.0, kernel_time=0.5,
+                                  num_threads=r[4] if len(r) > 4 else 1)
             for r in rows}
         self.taken_at = SimpleNamespace(monotonic=mono)
 
@@ -177,6 +180,35 @@ def test_snapshot_source_reports_root_exit_and_pid_reuse():
     gone = SnapshotTreeSource(FakeHub(FakeSnapshot([])), exclude_pids=[]).observe(
         GroupSpec.tree(10, 100.0), [], root_create_time=None)
     assert not gone.root_alive
+
+
+def test_snapshot_source_zombie_root_counts_as_exited():
+    """根进程已退出、只是被句柄握着（快照里线程数为 0）：按根已退出处理，成员清空"""
+    source = SnapshotTreeSource(FakeHub(FakeSnapshot([(10, 1, 'root.exe', 100.0, 0),
+                                                      (11, 10, 'a.exe', 101.0)])),
+                                exclude_pids=[])
+    observation = source.observe(GroupSpec.tree(10, 100.0), [], root_create_time=100.0)
+    assert not observation.root_alive
+    assert observation.instances == ()
+    assert observation.root_create_time is None
+
+
+def test_snapshot_source_zombie_member_is_not_counted():
+    source = SnapshotTreeSource(FakeHub(FakeSnapshot([(10, 1, 'root.exe', 100.0),
+                                                      (11, 10, 'dead.exe', 101.0, 0),
+                                                      (12, 10, 'live.exe', 102.0)])),
+                                exclude_pids=[])
+    observation = source.observe(GroupSpec.tree(10, 100.0), [], root_create_time=100.0)
+    assert observation.root_alive
+    assert [i.pid for i in observation.instances] == [10, 12]
+
+
+def test_snapshot_source_zombie_name_instance_is_not_counted():
+    source = SnapshotTreeSource(FakeHub(FakeSnapshot([(20, 1, 'x.exe', 1.0, 0),
+                                                      (21, 1, 'x.exe', 2.0)])),
+                                exclude_pids=[])
+    observation = source.observe(GroupSpec.by_name('x.exe'), [])
+    assert [i.pid for i in observation.instances] == [21]
 
 
 def test_snapshot_source_name_group_is_always_alive_even_when_empty():

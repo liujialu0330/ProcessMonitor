@@ -6,6 +6,10 @@
   "自定义"）与视图切换（小倍数 | 叠加Δ%，绝对 | 相对时间）；
 - 结论条：判定胶囊 + "2 / 5 项持续上涨：…"，右侧是统计依据与运行中任务的自动刷新状态；
 - 判定摘要表：按判定严重程度排序，每个指标一行，点击行切换焦点指标；
+- 进程组任务（进程树 / 同名进程）：工具条多一个"成员"下拉（合计 · 各成员），选中某成员后
+  整页（结论条、摘要表、焦点图、区间表、小图）改用 指标@成员键 的序列；合计视图下摘要表下方
+  有"成员结论"折叠区（每个成员一行，点击切到该成员），结论条把持续上涨的成员一并点名；
+  上限占比对进程组合计与多实例成员写"—"；
 - 任务对比（可选）：叠加曲线 + 并排分轮增量表；
 - 焦点区：[打点区间（点击行缩放趋势图）| 采集明细] 页签，其下焦点指标大图与概览条刷选；
 - 其余指标：持续上涨 / 波动的小倍数图，平稳与数据不足的折叠为一行（点一行设为焦点），
@@ -14,8 +18,9 @@
 业务状态与查询在 AnalysisViewModel（异步、多指标并行、过期丢弃）；导出交互在
 AnalysisExportFlow，右键打点编辑在 MarkerEditFlow；页面只把信号接到一起。
 """
+import dataclasses
 import logging
-from typing import TYPE_CHECKING, Callable, Optional, Set
+from typing import TYPE_CHECKING, Callable, List, Optional, Set
 
 from PyQt5.QtCore import QTimer
 from PyQt5.QtGui import QImage
@@ -23,7 +28,10 @@ from PyQt5.QtWidgets import QSizePolicy, QStackedWidget, QVBoxLayout, QWidget
 from qfluentwidgets import CaptionLabel, FluentIcon, IndeterminateProgressBar
 
 from core.history_query import CUSTOM_RANGE_KEY, HistorySnapshot, TaskAnalysis
-from ui.formatting import basis_text, build_table_row, refresh_status_text, verdict_summary
+from ui.formatting import (
+    GROUP_USAGE_NOTE, MEMBER_USAGE_NOTE, basis_text, build_member_rows, build_table_row,
+    group_verdict_summary, member_view_summary, overall_summary, refresh_status_text,
+    task_overall_verdict, task_title_text, verdict_summary)
 from ui.models.task_options import TaskOptionsModel
 from ui.services import UiServices
 from ui.viewmodels.analysis_vm import (
@@ -34,6 +42,8 @@ from ui.widgets.analysis.compare_panel import ComparePanel
 from ui.widgets.analysis.export_flow import AnalysisExportFlow
 from ui.widgets.analysis.interval_table import LowerViews
 from ui.widgets.analysis.marker_menu import MarkerEditFlow
+from ui.widgets.analysis.member_selector import MemberSelector
+from ui.widgets.analysis.member_verdicts import MemberVerdictPanel
 from ui.widgets.analysis.report_sheet import build_report_text, render_report_image
 from ui.widgets.analysis.summary_table import SummaryTable
 from ui.widgets.analysis.toolbar import AnalysisToolbar
@@ -44,7 +54,7 @@ from ui.widgets.history.chart_view import chart_display_unit
 from ui.widgets.history.common import VIEWPORT_TO_CONTENT_OFFSET
 from ui.widgets.page_scaffold import PageScaffold
 from ui.widgets.task_selector import TaskSelector
-from utils.metrics import VALUE_CLASS_RATE
+from utils.metrics import PROCESS_COUNT, VALUE_CLASS_RATE, split_member_key
 
 if TYPE_CHECKING:
     from core.monitor_manager import MonitorManager
@@ -92,6 +102,8 @@ class AnalysisPage(PageScaffold):
         self.task_selector = TaskSelector(placeholder="选择要分析的监控任务")
         self.toolbar = AnalysisToolbar()
         self.toolbar.set_task_selector(self.task_selector)
+        self.member_selector = MemberSelector()
+        self.toolbar.set_member_selector(self.member_selector)
         self.add_section(self.toolbar)
         self.export_status_label = CaptionLabel("")
         self.export_status_label.setVisible(False)
@@ -100,6 +112,7 @@ class AnalysisPage(PageScaffold):
         self.verdict_banner = VerdictBanner()
         # 依据并入结论条，摘要表不再单列标题与依据行
         self.summary_table = SummaryTable(show_header=False)
+        self.member_panel = MemberVerdictPanel()
         self.compare_panel = ComparePanel()
         self.compare_panel.setVisible(False)
         self.lower_views = LowerViews()
@@ -112,7 +125,7 @@ class AnalysisPage(PageScaffold):
         body_layout.setContentsMargins(0, 0, 0, 0)
         body_layout.setSpacing(CARD_SPACING)
         for widget, stretch in ((self.verdict_banner, 0), (self.summary_table, 0),
-                                (self.compare_panel, 0), (self.lower_views, 0),
+                                (self.member_panel, 0), (self.compare_panel, 0), (self.lower_views, 0),
                                 (self.trend_panel, 1)):
             body_layout.addWidget(widget, stretch)
 
@@ -156,6 +169,8 @@ class AnalysisPage(PageScaffold):
         bar.raw_values_toggled.connect(self.sample_table.set_raw_values)
         bar.delete_clicked.connect(self._on_delete_clicked)
         self.summary_table.metric_selected.connect(vm.select_metric)
+        self.member_selector.member_selected.connect(vm.select_member)
+        self.member_panel.member_selected.connect(vm.select_member)
         self.compare_panel.task_selected.connect(vm.set_compare_task)
         self.compare_panel.close_requested.connect(lambda: self._set_compare_open(False))
         trend.region_selected.connect(vm.set_custom_range)
@@ -169,6 +184,8 @@ class AnalysisPage(PageScaffold):
         vm.tasks_refreshed.connect(self._on_tasks_refreshed)
         vm.selection_changed.connect(self._on_selection_changed)
         vm.analysis_ready.connect(self._on_analysis)
+        vm.members_changed.connect(self._on_members_changed)
+        vm.member_selection_changed.connect(self._on_member_selection)
         vm.snapshot_ready.connect(self._on_snapshot)
         vm.empty_state.connect(self._on_empty_state)
         vm.busy.connect(self._on_busy)
@@ -255,8 +272,16 @@ class AnalysisPage(PageScaffold):
     def _on_selection_changed(self, task_id: Optional[str], metric: Optional[str],
                               _explicit: bool) -> None:
         self.task_selector.select_by_id(task_id, silent=True)
-        self.summary_table.select_metric(metric)
+        self.summary_table.select_metric(self.vm.series_key(metric))
+        self.toolbar.set_members_visible(self.vm.is_group_task)
         self._sync_delete_state()
+
+    def _on_members_changed(self, options: list) -> None:
+        self.member_selector.set_options(options, keep=self.vm.current_member)
+        self.toolbar.set_members_visible(self.vm.is_group_task)
+
+    def _on_member_selection(self, member: Optional[str]) -> None:
+        self.member_selector.select(member)
 
     def _sync_delete_state(self) -> None:
         self.toolbar.set_delete_enabled(self.vm.can_delete, self.vm.delete_hint)
@@ -264,27 +289,77 @@ class AnalysisPage(PageScaffold):
     def _origin_epoch(self) -> Optional[float]:
         if self.vm.time_mode != TIME_RELATIVE or self.vm.last_analysis is None:
             return None
-        snapshot = next((s for s in self.vm.chart_snapshots()), None)
+        snapshot = next((s for s in self.vm.shown_snapshots()), None)
         origin = analysis_origin(snapshot)
         return origin.timestamp() if origin is not None else None
 
     def _on_analysis(self, analysis: TaskAnalysis) -> None:
+        """analysis 是当前视图的结果：合计视图的指标键是指标本身，成员视图是 指标@成员键。"""
+        vm = self.vm
         order = ordered_metrics(analysis)
         snapshots = [(m, analysis.snapshots[m]) for m in order]
-        rows = [build_table_row(m, s) for m, s in snapshots]
         basis = next((basis_text(s) for _m, s in snapshots if s.stats), "")
-        self.summary_table.set_rows(rows, basis, focus=self.vm.current_metric)
-        self.verdict_banner.set_summary(
-            verdict_summary([(m, s if s.points else None) for m, s in snapshots]))
+        rows = self._table_rows(snapshots, analysis)
+        focus = vm.series_key(vm.current_metric)
+        self.summary_table.set_rows(rows, basis, focus=focus)
+        self.verdict_banner.set_summary(self._banner_summary(snapshots, analysis))
         self.verdict_banner.set_basis(basis)
         self._analysis_at = self.services.clock.now()
         self.update_refresh_status()
         self.trend_panel.set_relative_origin(self._origin_epoch())
         self.trend_panel.update_columns(self._content_width())
         self.trend_panel.set_analysis(analysis, keep_view=analysis.auto_refresh,
-                                      order=order, focus=self.vm.current_metric)
+                                      order=order, focus=focus)
+
+    def _table_rows(self, snapshots: list, analysis: TaskAnalysis) -> list:
+        """摘要表各行。进程组的上限占比写"—"（GDI/USER 的 10000 是单个进程的口径）：合计
+        一律如此，成员在有多个实例时如此；单实例成员保留单进程口径。成员视图的行用
+        指标@成员键作 metric，点击与焦点就都落在成员的序列上。"""
+        vm = self.vm
+        member = vm.current_member
+        if member is None:
+            note = GROUP_USAGE_NOTE if vm.is_group_task else None
+            return [build_table_row(m, s, usage_note=note) for m, s in snapshots]
+        count = self._member_instance_count(analysis, member)
+        note = MEMBER_USAGE_NOTE.format(count=count) if count > 1 else None
+        return [dataclasses.replace(
+                    build_table_row(split_member_key(m)[0], s, usage_note=note), metric=m)
+                for m, s in snapshots]
+
+    def _member_instance_count(self, analysis: TaskAnalysis, member: str) -> int:
+        """成员当前的实例数：取"进程总数@成员"最后一个值；任务没采这个指标时退回出现过
+        的实例数（偏保守：宁可不写占比也不拿合计去比单进程上限）。"""
+        snapshot = analysis.snapshot(f"{PROCESS_COUNT}@{member}")
+        if snapshot is not None and snapshot.stats:
+            return int(round(snapshot.stats['last']))
+        return self.vm.member_instances(member) or 1
+
+    def _banner_summary(self, snapshots: list, analysis: TaskAnalysis):
+        """结论条：合计视图在组任务里并入成员结论（合计或任一成员持续上涨即算上涨，点名
+        上涨的成员）；成员视图在主句前点名成员；pid 任务不变。合计视图最后再叠加整体判定
+        （逐启动段、中途崩溃，与 pmctl、证据包同一口径）。"""
+        vm = self.vm
+        items = [(split_member_key(m)[0], s if s.points else None) for m, s in snapshots]
+        summary = verdict_summary(items)
+        if vm.current_member is not None:
+            self.member_panel.clear()
+            return member_view_summary(vm.member_name(vm.current_member), summary)
+        if vm.is_group_task:
+            rows = self._member_rows()
+            self.member_panel.set_rows(rows)
+            summary = group_verdict_summary(summary, rows)
+        else:
+            self.member_panel.clear()
+        return overall_summary(summary, analysis, task_overall_verdict(vm.current_task, analysis))
+
+    def _member_rows(self) -> list:
+        vm = self.vm
+        names = {o.key: o.name for o in vm.member_options}
+        instances = {o.key: o.instances for o in vm.member_options}
+        return build_member_rows(vm.last_analysis, names, instances)
 
     def _on_snapshot(self, snapshot: HistorySnapshot) -> None:
+        """snapshot 的指标键在成员视图里是 指标@成员键。"""
         metric = snapshot.request.metric
         self.trend_panel.set_focus(metric)
         chart = self.trend_panel.charts().get(metric)
@@ -308,6 +383,7 @@ class AnalysisPage(PageScaffold):
         self._analysis_at = None
         self.verdict_banner.clear()
         self.summary_table.clear()
+        self.member_panel.clear()
         self.trend_panel.clear()
         self.lower_views.clear()
         self.empty_state_card.set_message(title, hint)
@@ -369,13 +445,20 @@ class AnalysisPage(PageScaffold):
             return
         if not self.services.dialogs.confirm(
                 self.window(), "确认删除",
-                f"确定要删除任务「{task.process_name} (PID: {task.pid})」的全部历史数据吗？"
+                f"确定要删除任务「{self._delete_title(task)}」的全部历史数据吗？"
                 "此操作不可恢复。", "删除"):
             return
         if self.vm.delete_current():
             notifier.success(self, "删除成功", "该任务的历史数据已删除")
         else:
             notifier.error(self, "删除失败", "删除任务数据失败，请查看日志")
+
+    @staticmethod
+    def _delete_title(task) -> str:
+        """确认框里的任务称呼：pid 任务沿用"进程名 (PID: n)"，进程组任务写目标类型。"""
+        if getattr(task, 'target_kind', 'pid') == 'pid':
+            return f"{task.process_name} (PID: {task.pid})"
+        return task_title_text(task)
 
     # ========== 事件 ==========
 

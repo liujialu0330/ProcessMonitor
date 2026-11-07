@@ -52,7 +52,8 @@ class HeadlessRuntime(QObject):
                  coordinator_factory=ShutdownCoordinator,
                  stage_renderer: Optional[Callable] = None,
                  snapshot_writer: Optional[StageSnapshotWriter] = None,
-                 quit_hooks: Sequence[Callable[[], None]] = ()):
+                 quit_hooks: Sequence[Callable[[], None]] = (),
+                 exit_hooks: Sequence[Callable[[], None]] = ()):
         """
         Args:
             manager: MonitorManager
@@ -67,6 +68,8 @@ class HeadlessRuntime(QObject):
             snapshot_writer: 阶段快照写入器（测试替换）；None 时按 db / registry / clock 自建
             quit_hooks: 退出收尾之前依次调用的函数（如停掉存储守卫的定时器与在途作业）；
                 出错只记日志
+            exit_hooks: 退出收尾完成之后、结束事件循环之前依次调用的函数（如删除会话锁：
+                锁只在收尾走完之后才能删，否则收尾中途被杀会被误判为正常退出）；出错只记日志
         """
         super().__init__(parent)
         self.manager = manager
@@ -79,6 +82,7 @@ class HeadlessRuntime(QObject):
         self._coordinator_factory = coordinator_factory
         self._idle_since: Optional[float] = None
         self._quit_hooks = tuple(quit_hooks)
+        self._exit_hooks = tuple(exit_hooks)
         self.quitting = False
         self.exit_code: Optional[int] = None
         self.auto_marker = AutoMarkerService(manager, clock, self)
@@ -186,5 +190,10 @@ class HeadlessRuntime(QObject):
         except Exception:
             logger.error("无窗口模式退出收尾失败", exc_info=True)
         finally:
+            for hook in self._exit_hooks:
+                try:
+                    hook()
+                except Exception:
+                    logger.error("退出后的收尾钩子失败", exc_info=True)
             self.exit_code = EXIT_OK
             self._quit_app(EXIT_OK)

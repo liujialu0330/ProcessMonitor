@@ -18,7 +18,7 @@ label / note 有长度上限，超出回 invalid_args。处理器中途抛出任
 |---|---|---|
 | ping | — | proto, app_version, pid, ready, automation_enabled, headless |
 | activate | — | 显示主窗口；无窗口模式回 invalid_state |
-| status | — | tasks（快照 + 方案 + 当前轮次 + 数据质量）、finished（含数据质量）、waits |
+| status | — | tasks（快照 + 方案 + 当前轮次 + 数据质量 + 等待重启 / 续接次数 / 退出码）、finished（含数据质量与退出码）、waits |
 | start | pid / name / launch 三选一，target_kind?（pid / tree / name），metrics?, interval?, note?, plan?, wait?, wait_timeout_s? | task_id, target_kind |
 | marker | task_id（或 "all"），label? | markers |
 | pause / resume / stop | task_id | — |
@@ -37,6 +37,10 @@ launch = {exe, args?, cwd?, close_on_stop?}：先启动被测程序（exe 与 cw
 PID 与创建时间建任务；close_on_stop 为真时，任务因用户停止（stop 命令、方案的停止条件）结束后
 在后台关闭该程序（先 WM_CLOSE，等不到再结束进程，PID 已被复用则不动）。
 
+export 的 evidence=true 产出一个证据包 zip（报告图片、明细与摘要 CSV、task.json、README、日志
+摘录；kinds 被忽略），paths 只有这个 zip；停止原因取内存里记下的，没有（任务结束在本实例启动
+之前）时取任务记录里保存的，被测进程异常退出等会反映到整体判定里。
+
 wait、export、verdict 与 start（等待进程启动时）是延迟回复：回复前每 5 秒发一行心跳事件，
 客户端断开即取消。全部在界面线程执行（与 MonitorManager 同线程），读库与写文件在后台线程。
 """
@@ -54,6 +58,7 @@ from PyQt5.QtCore import QObject, QTimer, pyqtSignal
 from core import verdict as verdict_rules
 from core.automation.plan import AutomationPlan, PlanFormatError, is_absolute_path
 from core.contracts import StopReason, TaskStatus
+from core.exit_forensics import format_exit_code
 from core.ipc import protocol
 from core.ipc.protocol import (
     ERR_BUSY, ERR_DISABLED, ERR_FORBIDDEN, ERR_INTERNAL, ERR_INVALID_ARGS, ERR_INVALID_STATE,
@@ -180,7 +185,7 @@ MSG_STOP_FAILED = "任务 {task_id} 已在停止或已结束"
 MSG_UNTIL_INVALID = "until 只能是 stopped、rounds>=N 或 elapsed>=S"
 MSG_WAIT_START_TIMEOUT = "等待进程 {name} 启动超时"
 MSG_EXPORT_KINDS = "kinds 只能取 csv、report、summary（至少一项）"
-MSG_EVIDENCE_UNSUPPORTED = "尚未支持证据包（evidence）"
+MSG_EVIDENCE_NO_RENDERER = "当前实例不能渲染报告图片，无法生成证据包"
 MSG_PATH_NOT_ABSOLUTE = "{name} 必须是完整的绝对路径"
 MSG_EXPORT_BUSY = "上一次命令行导出尚未完成"
 MSG_EXPORT_NO_DATA = "任务 {task_id} 还没有采集到数据"
@@ -254,9 +259,12 @@ class CommandContext:
     handle_auto_export: bool = False
     # 启动 / 关闭被测程序（core.process_launcher.ProcessLauncher 或替身）；None 时现建生产实现
     launcher: Any = None
+    # 取 app.log 路径的函数（证据包收录日志摘录；None 表示不收录）
+    log_path: Optional[Callable[[], Optional[str]]] = None
     # 后台线程工厂（测试替换）
     analysis_worker_factory: Optional[Callable[..., Any]] = None
     export_worker_factory: Optional[Callable[..., Any]] = None
+    evidence_worker_factory: Optional[Callable[..., Any]] = None
 
 
 # ---------- 参数校验 ----------
@@ -315,6 +323,13 @@ def _positive_seconds(args: Dict[str, Any], name: str) -> Optional[float]:
     if value is not None and value <= 0:
         raise CommandError(ERR_INVALID_ARGS, MSG_ARG_TYPE.format(name=name, kind="正数"))
     return value
+
+
+def _exit_fields(code: Optional[int]) -> Dict[str, Any]:
+    """状态里的退出信息：退出码与中文说明；没有退出码时两项为 None。"""
+    if code is None:
+        return {'exit_code': None, 'exit_text': None}
+    return {'exit_code': code, 'exit_text': format_exit_code(code)}
 
 
 def _boolean(args: Dict[str, Any], name: str, default: bool = False) -> bool:
@@ -405,8 +420,15 @@ def compute_verdict(analysis, stop_reason: Optional[StopReason] = None, *,
                     stopped_before_condition: bool = True) -> Dict[str, Any]:
     """
     由 TaskAnalysis 汇总判定（只回字符串，退出码由客户端映射；规则在 core.verdict）：
-    被测进程在停止条件达成之前退出 → target_exited（优先）；任一指标"持续上涨" → rising；
-    没有任何指标得出平稳/波动的结论（全部数据不足或无判定）→ insufficient；否则 stable。
+    被测进程在停止条件达成之前退出，或中途异常退出过（崩溃后被续接）→ target_exited（优先）；
+    重启续接过的任务逐启动段判定、整体取最差的一段（rising > insufficient > stable）；
+    否则任一指标"持续上涨" → rising；没有任何指标得出平稳/波动的结论（全部数据不足或
+    无判定）→ insufficient；否则 stable。
+
+    任务有多个启动段或中途异常退出时另附：segments = [{number, start, end, verdict,
+    rising_metrics, rising_names, samples}]、mid_run_crashes = [{timestamp, label}]、
+    conclusion（纯文本摘要，如"中途异常退出 2 次（最近一次 0xC0000017（…））；各段判定：…"）。
+    metrics / members 里的数值仍是最后一段的。
 
     stopped_before_condition：被测进程退出时停止条件是否尚未满足（处理器按任务的方案、
     时长与轮数算出后传入）；缺省为真——不知道方案时，被测进程退出一律按异常退出处理。
@@ -425,6 +447,9 @@ def compute_verdict(analysis, stop_reason: Optional[StopReason] = None, *,
             raise CommandError(ERR_INTERNAL, MSG_ANALYSIS_FAILED.format(detail=snapshot.error))
         stats = snapshot.stats or {}
         baseline = snapshot.baseline.value if snapshot.baseline is not None else None
+        comparable = getattr(snapshot, 'baseline_comparable', True)
+        if not comparable:
+            baseline = None     # 基线在别的启动段，不是本段的参照
         return {
             'key': key,
             'name': get_metric_display_name(key),
@@ -434,6 +459,7 @@ def compute_verdict(analysis, stop_reason: Optional[StopReason] = None, *,
             'first': _clean_number(stats.get('first')),
             'last': _clean_number(stats.get('last')),
             'baseline': _clean_number(baseline),
+            'baseline_note': getattr(snapshot, 'baseline_note', ""),
             'rate_per_hour': _clean_number(stats.get('slope_per_hour')),
             'rate_per_round': _clean_number(mean_round_delta(snapshot.rounds)),
             'rounds': len(snapshot.rounds),
@@ -465,6 +491,17 @@ def compute_verdict(analysis, stop_reason: Optional[StopReason] = None, *,
               'target_exit': target_exit}
     if members:
         result['members'] = members
+    first = next(iter(analysis.snapshots.values()), None)
+    if first is not None and getattr(first, 'segment_count', 1) > 1:
+        # 被测进程重启续接过：判定只用最后一次启动之后的数据
+        from core.history_query import segment_note
+        result['segment'] = {'number': first.segment_number, 'count': first.segment_count,
+                             'note': segment_note(first)}
+    summary = verdict_rules.segments_summary(analysis)
+    if summary:
+        result['segments'] = verdict_rules.segments_payload(analysis)
+        result['mid_run_crashes'] = verdict_rules.crashes_payload(analysis)
+        result['conclusion'] = summary
     return result
 
 
@@ -483,7 +520,7 @@ class TaskAnalysisWorker(BackgroundTask):
 
     def execute(self, token: CancelToken):
         from core.history_query import (TaskAnalysis, build_request, load_member_snapshots,
-                                        run_history_query)
+                                        load_segments, run_history_query)
         snapshots = {}
         for metric in self.metrics:
             if token.is_cancelled:
@@ -497,8 +534,13 @@ class TaskAnalysisWorker(BackgroundTask):
                                         is_cancelled=lambda: token.is_cancelled)
         if members is None:
             return None
+        # 逐启动段判定：重启续接过的任务，更早的段各查一遍（没有重启不多查）
+        segments = load_segments(self.db, self.task_id, self.metrics, snapshots, members,
+                                 is_cancelled=lambda: token.is_cancelled)
+        if segments is None:
+            return None
         return TaskAnalysis(self.task_id, ANALYSIS_RANGE_KEY, snapshots,
-                            member_snapshots=members)
+                            member_snapshots=members, segments=segments)
 
 
 # ---------- 延迟回复 ----------
@@ -589,11 +631,15 @@ class ExportRun:
 
     def __init__(self, dispatcher: "CommandDispatcher", task, directory: str,
                  kinds: Sequence[str], on_done: Callable[[Dict[str, Any]], None],
-                 on_failed: Callable[[str, str], None]):
+                 on_failed: Callable[[str, str], None], *, evidence: bool = False,
+                 stop_reason: Any = None):
         self.dispatcher = dispatcher
         self.task = task
         self.directory = directory
-        self.kinds = list(kinds)
+        # 证据包：三件套写到临时目录再连同 task.json 等打成一个 zip，kinds 固定为三件套
+        self.evidence = evidence
+        self.stop_reason = stop_reason
+        self.kinds = list(EXPORT_KINDS) if evidence else list(kinds)
         self.on_done = on_done
         self.on_failed = on_failed
         self.cancelled = False
@@ -605,7 +651,7 @@ class ExportRun:
         return self.dispatcher.context
 
     def start(self) -> None:
-        if EXPORT_KIND_REPORT in self.kinds or EXPORT_KIND_SUMMARY in self.kinds:
+        if self.evidence or EXPORT_KIND_REPORT in self.kinds or EXPORT_KIND_SUMMARY in self.kinds:
             factory = self.ctx.analysis_worker_factory or TaskAnalysisWorker
             worker = factory(self.ctx.db, self.task.task_id, self.task.metric_types,
                              analysis=True)
@@ -690,11 +736,37 @@ class ExportRun:
                         image_path=paths.get(EXPORT_KIND_REPORT), image=image,
                         metadata=tuple(metadata), summary_rows=tuple(tuple(r) for r in rows),
                         gap_seconds=gap_threshold_seconds(task.interval))
-        factory = ctx.export_worker_factory or ReportWorker
-        worker = factory(ctx.db, job)
+        if self.evidence:
+            worker = self._evidence_worker(job, analysis)
+        else:
+            factory = ctx.export_worker_factory or ReportWorker
+            worker = factory(ctx.db, job)
         worker.result.connect(self._on_written)
         worker.failed.connect(lambda message: self._fail(ERR_INTERNAL, message))
         self._launch(worker, EXPORT_THREAD_NAME)
+
+    def _evidence_worker(self, job, analysis):
+        """证据包线程：三件套写到临时目录后与 task.json、README、日志摘录一起打成 zip；
+        zip 放在目标目录里，不覆盖已有文件（重名加编号）。"""
+        from core.evidence import EVIDENCE_SUFFIX, evidence_filename
+        from core.evidence_worker import EvidenceWorker
+        ctx = self.ctx
+        name = evidence_filename(self.task, ctx.clock)
+        stem = name[:-len(EVIDENCE_SUFFIX)] if name.lower().endswith(EVIDENCE_SUFFIX) else name
+        out_path = os.path.join(self.directory, stem + EVIDENCE_SUFFIX)
+        n = 1
+        while os.path.exists(out_path):
+            n += 1
+            out_path = os.path.join(self.directory, f"{stem}_{n}{EVIDENCE_SUFFIX}")
+        log_path = None
+        if ctx.log_path is not None:
+            try:
+                log_path = ctx.log_path() or None
+            except Exception:
+                logger.warning("取日志路径失败，证据包不收录日志摘录", exc_info=True)
+        factory = ctx.evidence_worker_factory or EvidenceWorker
+        return factory(ctx.db, job, analysis=analysis, out_path=out_path, log_path=log_path,
+                       clock=ctx.clock, stop_reason=self.stop_reason)
 
     def _on_written(self, result) -> None:
         try:
@@ -906,6 +978,26 @@ class CommandDispatcher(QObject):
         if reason:
             raise CommandError(ERR_INVALID_STATE, MSG_READ_ONLY.format(reason=reason))
 
+    def _stop_reason_of(self, task_id: str, task=None):
+        """任务的停止原因：优先取本实例记下的；任务在本实例启动之前就结束了（或实例重启过）
+        时取任务记录里保存的（TaskRepo.save_stop）。都没有为 None。"""
+        reason = self._stop_reasons.get(task_id)
+        if reason is not None:
+            return reason
+        if task is None:
+            try:
+                task = self.context.db.get_task(task_id)
+            except Exception:
+                logger.error("读取任务停止原因失败: task_id=%s", task_id, exc_info=True)
+                return None
+        stored = getattr(task, 'stop_reason', None) if task is not None else None
+        if not stored:
+            return None
+        try:
+            return StopReason(stored)
+        except ValueError:
+            return None
+
     def _rounds(self, task_id: str) -> int:
         return sum(1 for m in self.context.manager.list_markers(task_id) if m.kind == 'user')
 
@@ -926,6 +1018,10 @@ class CommandDispatcher(QObject):
             'rounds': self._rounds(info.task_id),
             'plan': plan.to_dict() if plan is not None else None,
             'quality': quality_dict(info.quality),
+            'waiting_restart': bool(getattr(info, 'waiting_restart', False)),
+            'restart_count': int(getattr(info, 'restart_count', 0) or 0),
+            'restart_limit': int(getattr(info, 'restart_limit', 0) or 0),
+            **_exit_fields(getattr(info, 'exit_code', None)),
         }
 
     def _stored_quality(self, task_id: str) -> Optional[Dict[str, Any]]:
@@ -936,6 +1032,15 @@ class CommandDispatcher(QObject):
             logger.error("读取任务数据质量失败: task_id=%s", task_id, exc_info=True)
             return None
         return quality_dict(getattr(task, 'quality', None)) if task is not None else None
+
+    def _stored_exit_code(self, task_id: str) -> Optional[int]:
+        """已结束任务收尾时写进库的被测进程退出码；读不到为 None（不影响 status 回复）。"""
+        try:
+            task = self.context.db.get_task(task_id)
+        except Exception:
+            logger.error("读取任务退出码失败: task_id=%s", task_id, exc_info=True)
+            return None
+        return getattr(task, 'exit_code', None) if task is not None else None
 
     def _sync_timer(self) -> None:
         active = bool(self._wait_jobs) or bool(self.wait_service and self.wait_service.has_waits())
@@ -962,7 +1067,8 @@ class CommandDispatcher(QObject):
         tasks = [self._task_dict(info) for info in manager.list_task_infos()]
         live = {t['task_id'] for t in tasks}
         finished = [{'task_id': task_id, 'stop_reason': reason.value,
-                     'quality': self._stored_quality(task_id)}
+                     'quality': self._stored_quality(task_id),
+                     **_exit_fields(self._stored_exit_code(task_id))}
                     for task_id, reason in self._stop_reasons.items() if task_id not in live]
         waits = [{'wait_id': wait_id, 'name': self.wait_service.request_of(wait_id).name}
                  for wait_id in self.wait_service.wait_ids()]
@@ -1474,23 +1580,27 @@ class CommandDispatcher(QObject):
                 or not all(isinstance(k, str) and k in EXPORT_KINDS for k in kinds)):
             raise CommandError(ERR_INVALID_ARGS, MSG_EXPORT_KINDS)
         kinds = [k for k in EXPORT_KINDS if k in kinds]
-        if _boolean(args, 'evidence'):
-            raise CommandError(ERR_INVALID_ARGS, MSG_EVIDENCE_UNSUPPORTED)
-        if EXPORT_KIND_REPORT in kinds and self.context.report_renderer is None:
+        evidence = _boolean(args, 'evidence')
+        if evidence and self.context.report_renderer is None:
+            raise CommandError(ERR_INVALID_STATE, MSG_EVIDENCE_NO_RENDERER)
+        if not evidence and EXPORT_KIND_REPORT in kinds and self.context.report_renderer is None:
             raise CommandError(ERR_INVALID_STATE, MSG_EXPORT_NO_RENDERER)
         if any(not run.finished for run in self._exports):
             raise CommandError(ERR_BUSY, MSG_EXPORT_BUSY)
         pending = self._new_pending(conn, request, CMD_EXPORT)
         # start_export 失败（含意外异常）时由 handle() 取消这条延迟回复
         run = self.start_export(task_id, directory, kinds, on_done=pending.ok,
-                                on_failed=lambda code, message: pending.error(code, message))
+                                on_failed=lambda code, message: pending.error(code, message),
+                                evidence=evidence)
         pending.on_cancel.append(run.cancel)
         return None
 
     def start_export(self, task_id: str, directory: str, kinds: Sequence[str], *,
                      on_done: Callable[[Dict[str, Any]], None],
-                     on_failed: Callable[[str, str], None]) -> ExportRun:
-        """开始一次导出（命令行 export 与无窗口模式的自动导出共用）；前置检查失败抛 CommandError。"""
+                     on_failed: Callable[[str, str], None],
+                     evidence: bool = False) -> ExportRun:
+        """开始一次导出（命令行 export 与无窗口模式的自动导出共用）；前置检查失败抛 CommandError。
+        evidence 为真时导出证据包 zip（停止原因取内存里的，没有取库里保存的）。"""
         manager = self.context.manager
         task = self.context.db.get_task(task_id)
         if task is None:
@@ -1503,7 +1613,8 @@ class CommandDispatcher(QObject):
             raise CommandError(ERR_INVALID_ARGS, MSG_EXPORT_DIR_FAILED.format(detail=exc)) from None
         if manager.is_maintenance_running() or not manager.begin_export():
             raise CommandError(ERR_BUSY, MSG_EXPORT_MAINTENANCE)
-        run = ExportRun(self, task, directory, kinds, on_done, on_failed)
+        run = ExportRun(self, task, directory, kinds, on_done, on_failed, evidence=evidence,
+                        stop_reason=self._stop_reason_of(task_id, task) if evidence else None)
         self._exports.append(run)
         try:
             run.start()
@@ -1544,8 +1655,9 @@ class CommandDispatcher(QObject):
         running = sum(1 for p in self._pending if p.kind == CMD_VERDICT)
         if running >= MAX_CONCURRENT_VERDICTS:
             raise CommandError(ERR_BUSY, MSG_VERDICT_BUSY.format(limit=MAX_CONCURRENT_VERDICTS))
-        reason = self._stop_reasons.get(task_id)
+        reason = self._stop_reason_of(task_id, task)
         before_condition = self._exited_before_condition(task_id, task, reason)
+        exit_code = getattr(task, 'exit_code', None) if task is not None else None
         pending = self._new_pending(conn, request, CMD_VERDICT)
         factory = self.context.analysis_worker_factory or TaskAnalysisWorker
         worker = factory(self.context.db, task_id, metrics, analysis=False)
@@ -1554,6 +1666,8 @@ class CommandDispatcher(QObject):
             try:
                 result = compute_verdict(analysis, reason,
                                          stopped_before_condition=before_condition)
+                if exit_code is not None and result.get('target_exit') is not None:
+                    result['target_exit'].update(_exit_fields(exit_code))
                 result['task_id'] = task_id
                 pending.ok(result)
             except CommandError as exc:
@@ -1621,9 +1735,10 @@ class CommandDispatcher(QObject):
             if isinstance(reason, StopReason):
                 self._stop_reasons[task_id] = reason
             self._close_launched(task_id, reason)
+            # 任务行由采集线程写入，任务在它之前就结束时存不进库；方案留在内存里，之后的
+            # 数据更新补存，判定（_plan_of）也要靠它判断停止条件是否达成
             if task_id in self._unsaved_plans:
                 self._save_plan(task_id)
-                self._unsaved_plans.pop(task_id, None)
             for job in list(self._wait_jobs):
                 if job.task_id == task_id:
                     self._check_wait(job)

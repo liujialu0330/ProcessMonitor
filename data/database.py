@@ -17,8 +17,9 @@ data.db.meta.reader_blocked）；或升级失败、库仍是旧结构时（schem
 """
 import logging
 import os
+import threading
 from datetime import datetime
-from typing import Iterator, List, Optional
+from typing import Collection, Iterator, List, Optional
 
 import config
 from data.db.connection import ConnectionFactory
@@ -87,6 +88,9 @@ class Database:
         self.migrated_from: Optional[int] = None
         self.backup_path: Optional[str] = None
         self._save_failures = 0   # save_data_points 连续失败次数（日志节流用）
+        # 本线程最近一次 save_data_points 失败的原因（成功为 None）：采集线程据此区分
+        # "磁盘已满"（保留缓冲、暂停等空间）与其他失败（照旧重试），不改变返回值的口径
+        self._save_result = threading.local()
         if migrate and not read_only:
             self._init_database()
         elif migration_report is not None:
@@ -129,10 +133,12 @@ class Database:
 
     # ========== 启动校正（调用方须在任何新任务启动前显式调用一次） ==========
 
-    def reconcile_orphan_tasks(self) -> int:
-        """遗留的 running 任务校正为 stopped（见 TaskRepo.reconcile_orphans）；失败返回 0"""
+    def reconcile_orphan_tasks(self, *, exclude: Collection[str] = (),
+                               only: Optional[Collection[str]] = None) -> int:
+        """遗留的 running 任务校正为 stopped（见 TaskRepo.reconcile_orphans）；失败返回 0。
+        exclude / only 用于启动时保留待续采的任务、之后再校正用户放弃的那些"""
         try:
-            return self.tasks.reconcile_orphans()
+            return self.tasks.reconcile_orphans(exclude=exclude, only=only)
         except StorageError:
             logger.error("孤儿任务校正失败", exc_info=True)
             return 0
@@ -255,11 +261,13 @@ class Database:
 
     def save_data_points(self, data_points: List[DataPoint]) -> bool:
         """批量保存数据点（同一事务内维护采样计数）；返回是否成功，持续失败时日志节流"""
+        self._save_result.failure = None
         try:
             self.points.append(data_points)
             self._save_failures = 0
             return True
-        except StorageError:
+        except StorageError as exc:
+            self._save_result.failure = exc
             # 持续失败（如磁盘满）时每个采集周期都会走到这里：
             # 首次记完整堆栈，之后每 SAVE_FAILURE_LOG_INTERVAL 次记一条累计次数
             self._save_failures += 1
@@ -268,6 +276,12 @@ class Database:
             elif self._save_failures % SAVE_FAILURE_LOG_INTERVAL == 0:
                 logger.error("批量保存数据点持续失败，累计连续失败 %d 次", self._save_failures)
             return False
+
+    @property
+    def last_save_failure(self) -> Optional[StorageError]:
+        """调用线程最近一次 save_data_points 失败的异常（StorageFullError 表示磁盘已满）；
+        上次成功或还没调用过为 None。按线程隔离：各任务线程互不影响。"""
+        return getattr(self._save_result, 'failure', None)
 
     def get_task_data_points(self, task_id: str, metric_type: Optional[str] = None,
                              limit: Optional[int] = None,

@@ -8,13 +8,14 @@ v5 为后续版本预留的列中，target_kind / target_spec 只在插入时写
 （自动化方案）模型会读出，但只经 save_plan 写入，save() 也不碰它；meta_json（被测目标
 元数据）同理，只经 save_meta 写入；数据质量列（planned_cycles 等）同理，只经 save_quality 写入。
 """
+import json
 import logging
 import sqlite3
 from datetime import datetime
-from typing import Any, List, Optional
+from typing import Any, Collection, List, Optional, Tuple
 
-from data.mappers import (QUALITY_COLUMNS, dump_metric_types, quality_params, row_to_quality,
-                          row_to_task, to_iso, to_iso_or_none)
+from data.mappers import (QUALITY_COLUMNS, STOP_KEY, dump_metric_types, quality_params,
+                          row_to_quality, row_to_task, to_iso, to_iso_or_none)
 from data.models import MonitorTask, QualityStats
 from data.repos import rollup, series_cache
 from data.repos._guard import storage_errors
@@ -26,6 +27,41 @@ logger = logging.getLogger(__name__)
 def status_value(status: Any) -> str:
     """TaskStatus（str 枚举）或普通字符串 → 落库的原始字符串。"""
     return getattr(status, 'value', status)
+
+
+def restart_policy_of(plan_json: Optional[str]) -> Tuple[bool, int]:
+    """方案 JSON 里的续接策略 (是否续接, 次数上限)。方案缺失、损坏或没开续接为 (False, 0)。
+
+    数据层不能依赖 core，这里只按字段名读 JSON（字段名是方案的持久化契约）。"""
+    if not plan_json:
+        return False, 0
+    try:
+        data = json.loads(plan_json)
+    except ValueError:
+        return False, 0
+    if not isinstance(data, dict) or data.get('resume_on_restart') is not True:
+        return False, 0
+    limit = data.get('restart_limit', 3)
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+        return False, 0
+    return True, limit
+
+
+def _merge_stop_key(existing: Optional[str], new: Optional[str]) -> Optional[str]:
+    """写 meta_json 时保留已记录的停止原因：新元数据不含 stop 键而旧值里有，就带过去。
+    新值不是 JSON 对象（不该发生）时原样写入。"""
+    if not existing or f'"{STOP_KEY}"' not in existing:
+        return new or None
+    try:
+        old = json.loads(existing)
+        old_stop = old.get(STOP_KEY) if isinstance(old, dict) else None
+        merged = json.loads(new) if new else {}
+    except ValueError:
+        return new or None
+    if old_stop is None or not isinstance(merged, dict) or STOP_KEY in merged:
+        return new or None
+    merged[STOP_KEY] = old_stop
+    return json.dumps(merged, ensure_ascii=False)
 
 
 def delete_task_rows(cursor: sqlite3.Cursor, task_id: str) -> int:
@@ -128,10 +164,25 @@ class TaskRepo:
         Returns:
             bool: 是否命中了任务行
         """
+        resume, limit = restart_policy_of(plan_json)
         with storage_errors(f"保存任务方案 {task_id} "):
             with self._factory.connect() as conn:
-                return conn.execute('UPDATE tasks SET plan_json = ? WHERE task_id = ?',
-                                    (plan_json or None, task_id)).rowcount > 0
+                # 续接策略同步进专用列：采集线程在被测进程退出时读它，不必解析方案
+                return conn.execute(
+                    'UPDATE tasks SET plan_json = ?, resume_on_restart = ?, restart_limit = ? '
+                    'WHERE task_id = ?',
+                    (plan_json or None, int(resume), limit, task_id)).rowcount > 0
+
+    def load_restart_policy(self, task_id: str) -> Tuple[bool, int]:
+        """任务的续接策略 (是否续接, 次数上限)；任务不存在为 (False, 0)。"""
+        with storage_errors(f"读取续接策略 {task_id} "):
+            with self._factory.connect() as conn:
+                row = conn.execute(
+                    'SELECT resume_on_restart, restart_limit FROM tasks WHERE task_id = ?',
+                    (task_id,)).fetchone()
+                if row is None or not row[0]:
+                    return False, 0
+                return True, int(row[1] or 0)
 
     def load_plan(self, task_id: str) -> Optional[str]:
         """任务的自动化方案 JSON 文本；任务不存在或没有方案返回 None。"""
@@ -150,9 +201,55 @@ class TaskRepo:
             bool: 是否命中了任务行
         """
         with storage_errors(f"保存被测元数据 {task_id} "):
-            with self._factory.connect() as conn:
-                return conn.execute('UPDATE tasks SET meta_json = ? WHERE task_id = ?',
-                                    (meta_json or None, task_id)).rowcount > 0
+            with self._factory.transaction() as cursor:
+                row = cursor.execute('SELECT meta_json FROM tasks WHERE task_id = ?',
+                                     (task_id,)).fetchone()
+                if row is None:
+                    return False
+                # 停止原因与被测元数据同住 meta_json：后写元数据不能把它冲掉
+                merged = _merge_stop_key(row[0], meta_json)
+                cursor.execute('UPDATE tasks SET meta_json = ? WHERE task_id = ?',
+                               (merged, task_id))
+                return True
+
+    def save_stop(self, task_id: str, reason: Optional[str], exit_code: Optional[int],
+                  text: Optional[str] = None, *, clear_exit_code: bool = False) -> bool:
+        """
+        记录任务的退出信息：被测进程的退出码写 tasks.exit_code，停止原因（StopReason 的值）
+        与说明文字写进 meta_json 的 "stop" 键（读改写在同一事务内，与被测元数据互不覆盖）。
+        不另加列：v5 结构不再变化。reason 为 None 时只记退出码（进程退出后正在等待重启的
+        中间状态）；exit_code 为 None 时不动已有退出码，除非 clear_exit_code（被测进程重启
+        续接后，上一个进程的退出码不能留给新进程）。
+
+        Returns:
+            bool: 是否命中了任务行
+        """
+        with storage_errors(f"保存任务停止信息 {task_id} "):
+            with self._factory.transaction() as cursor:
+                row = cursor.execute('SELECT meta_json FROM tasks WHERE task_id = ?',
+                                     (task_id,)).fetchone()
+                if row is None:
+                    return False
+                if exit_code is not None:
+                    cursor.execute('UPDATE tasks SET exit_code = ? WHERE task_id = ?',
+                                   (int(exit_code), task_id))
+                elif clear_exit_code:
+                    cursor.execute('UPDATE tasks SET exit_code = NULL WHERE task_id = ?',
+                                   (task_id,))
+                if reason is not None:
+                    try:
+                        meta = json.loads(row[0]) if row[0] else {}
+                    except ValueError:
+                        meta = {}
+                    if not isinstance(meta, dict):
+                        meta = {}
+                    stop = {'reason': reason}
+                    if text:
+                        stop['text'] = text
+                    meta[STOP_KEY] = stop
+                    cursor.execute('UPDATE tasks SET meta_json = ? WHERE task_id = ?',
+                                   (json.dumps(meta, ensure_ascii=False), task_id))
+                return True
 
     def load_meta(self, task_id: str) -> Optional[str]:
         """任务的被测目标元数据 JSON 文本；任务不存在或没有元数据返回 None。"""
@@ -263,24 +360,50 @@ class TaskRepo:
                 delete_task_rows(cursor, task_id)
                 return existed
 
-    def reconcile_orphans(self) -> int:
+    def list_running(self) -> List[MonitorTask]:
+        """库里仍是 status='running' 的任务（上次运行未正常收尾遗留的），按开始时间升序。"""
+        with storage_errors("读取遗留的运行中任务"):
+            with self._factory.connect() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM tasks WHERE status = 'running' ORDER BY start_time"
+                ).fetchall()
+                return [row_to_task(row) for row in rows]
+
+    def reconcile_orphans(self, *, exclude: Collection[str] = (),
+                          only: Optional[Collection[str]] = None) -> int:
         """
         把上次运行未正常退出而遗留的 status='running' 任务校正为 stopped；
         结束时间取最后一次采样时间（为空再用原结束时间、最后用当前时间），
         而不是"下次启动的时刻"。必须在任何新任务启动前由调用方显式调用一次。
 
+        Args:
+            exclude: 不校正的任务 ID（等待用户决定是否续采的任务）
+            only: 只校正这些任务 ID（用户放弃续采的任务）；None 表示不限
+
         Returns:
             int: 被校正的任务条数
         """
         now = to_iso(datetime.now())
+        conditions = ["status = 'running'"]
+        params: List[Any] = [now]
+        if exclude:
+            ids = list(exclude)
+            conditions.append(f"task_id NOT IN ({','.join('?' * len(ids))})")
+            params.extend(ids)
+        if only is not None:
+            ids = list(only)
+            if not ids:
+                return 0
+            conditions.append(f"task_id IN ({','.join('?' * len(ids))})")
+            params.extend(ids)
         with storage_errors("孤儿任务校正"):
             with self._factory.connect() as conn:
-                count = conn.execute('''
+                count = conn.execute(f'''
                     UPDATE tasks
                     SET status = 'stopped',
                         end_time = COALESCE(last_sample_at, end_time, ?)
-                    WHERE status = 'running'
-                ''', (now,)).rowcount
+                    WHERE {' AND '.join(conditions)}
+                ''', params).rowcount
         if count:
             logger.warning("孤儿任务校正: %d 条 running 状态任务被校正为 stopped", count)
         return count

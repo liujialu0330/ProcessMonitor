@@ -55,6 +55,8 @@ def test_json_shape_is_stable():
         "export_dir": r"D:\导出",
         "stage_snapshot_hours": 6.0,
         "stage_snapshot_dir": r"D:\快照",
+        "resume_on_restart": False,
+        "restart_limit": 3,
     }
     # 中文不转义，人能直接读
     assert "日志" in FULL.to_json()

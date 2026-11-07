@@ -7,6 +7,9 @@
 - 打点：用户打点画注意色虚线、顶部横排编号徽标 ①②③，基线画注意色实线、徽标"基线"，
   标签放在 tooltip 与悬停读数里；屏幕上挨得太近的徽标错开高度（badge_positions），
   缩放/平移/改变窗口大小后重新排；暂停/恢复是系统打点，画在底部的浅色短竖线、不编号；
+- 系统事件打点（被测进程异常退出 crash / 重启续接 restart / 工具重启后续采 recover）：贯穿整个
+  高度的点划线，红 / 绿 / 蓝三色（颜色取自 ui.theme_tokens）、底部带短文字标签、悬停提示写明事件与
+  时刻；不编号，也不能在右键菜单里改名或删除；
 - 累计类指标由调用方传入每秒速率序列（rate=True），纵轴标题为"每秒 X"。
 
 分析页用到的扩展点：标题（小倍数各图的指标名）、小图模式（compact，不显示轴标题）、隐藏保存/复制
@@ -42,7 +45,7 @@ from ui.typography import DataCaptionLabel, TypeScale, data_font, ui_font
 from ui.widgets.history.common import CARD_PADDING_H, DETAIL_TIME_FORMAT
 from utils.metrics import (
     VALUE_CLASS_RATE, format_metric_value, get_metric_display_name,
-    get_metric_display_unit, is_integer_metric)
+    get_metric_display_unit, is_integer_metric, split_member_key)
 
 # 保留约 360px 的有效读图高度，同时允许高窗口自动拉伸
 CHART_MIN_HEIGHT = 340
@@ -67,6 +70,23 @@ MARKER_USER = 'user'
 MARKER_BASELINE = 'baseline'
 SYSTEM_MARKER_KINDS = ('pause', 'resume')
 SYSTEM_MARKER_TEXTS = {'pause': '暂停', 'resume': '恢复'}
+# 系统事件打点：线上的短标签、悬停提示里的事件名，以及图表配色表（ui.chart_theme）里的键
+EVENT_MARKER_KINDS = ('crash', 'restart', 'recover')
+EVENT_MARKER_LABELS = {'crash': '异常退出', 'restart': '重启', 'recover': '续采'}
+EVENT_MARKER_TEXTS = {'crash': '被测进程异常退出', 'restart': '被测进程重启并续接',
+                      'recover': '工具重启后继续监控'}
+EVENT_MARKER_COLOR_KEYS = {'crash': 'crash_marker', 'restart': 'restart_marker',
+                           'recover': 'recover_marker'}
+# 事件标签在竖线上的纵向位置（0 底、1 顶）：贴近底部，避开顶部的编号徽标。相邻事件（崩溃后
+# 几十秒就重启）的标签在屏幕上不足 EVENT_LABEL_MIN_GAP_PX 像素时依次上移 EVENT_LABEL_STEP 错开，
+# 最多 EVENT_LABEL_ROWS 层
+EVENT_LABEL_POSITION = 0.10
+EVENT_LABEL_TOP = 0.25
+EVENT_LABEL_STEP = 0.075
+EVENT_LABEL_ROWS = 3
+EVENT_LABEL_MIN_GAP_PX = 64
+# 右键与悬停读数都不把这些打点当作可编辑的"轮次边界"
+NON_EDITABLE_MARKER_KINDS = SYSTEM_MARKER_KINDS + EVENT_MARKER_KINDS
 # 徽标在竖线上的纵向位置（0 底、1 顶）；系统打点短竖线占绘图区高度的比例
 BADGE_POSITION = 0.94
 SYSTEM_MARKER_SPAN = 0.08
@@ -84,7 +104,8 @@ def value_axis_title(metric_type: Optional[str], display_unit: str,
     """纵轴标题：指标名（显示单位）；速率序列为"每秒指标名（单位）"；无指标时为 "值"。"""
     if not metric_type:
         return DEFAULT_VALUE_AXIS_TITLE
-    name = get_metric_display_name(metric_type)
+    # 成员序列（指标@成员键）的轴标题只写指标名：成员名放在图的标题里，轴上写不下
+    name = get_metric_display_name(split_member_key(metric_type)[0])
     if rate:
         name = f"每秒{name}"
     return f"{name}（{display_unit}）" if display_unit else name
@@ -105,19 +126,28 @@ def gap_label_text(start: datetime, end: datetime) -> str:
 
 def marker_badges(markers: Sequence) -> List[Optional[str]]:
     """与 markers 等长的徽标：用户打点按时间顺序编号 ①②③，基线为"基线"，
-    系统打点（暂停/恢复）为 None。markers 须按时间升序。"""
+    系统打点（暂停/恢复）与系统事件（异常退出/重启/续采）为 None。markers 须按时间升序。"""
     badges: List[Optional[str]] = []
     number = 0
     for marker in markers:
         kind = getattr(marker, 'kind', MARKER_USER)
         if kind == MARKER_BASELINE:
             badges.append(BADGE_BASELINE)
-        elif kind in SYSTEM_MARKER_KINDS:
+        elif kind in NON_EDITABLE_MARKER_KINDS:
             badges.append(None)
         else:
             number += 1
             badges.append(marker_badge(number))
     return badges
+
+
+def event_marker_tooltip(kind: str, label: str, time_text: str) -> str:
+    """系统事件竖线的悬停提示："被测进程异常退出：异常退出 0xC0000005（访问冲突） · 11-07 10:30:00"。
+    打点名称里已经带事件名（如"异常退出 …"）时不重复写。"""
+    text = EVENT_MARKER_TEXTS.get(kind, kind)
+    if label and label.startswith(EVENT_MARKER_LABELS.get(kind, text)):
+        return f"{label} · {time_text}"
+    return f"{text}：{label} · {time_text}" if label else f"{text} · {time_text}"
 
 
 def badge_positions(pixel_xs: Sequence[float], min_gap_px: float, top: float,
@@ -297,6 +327,11 @@ class ChartView(CardWidget):
         """本次绘制的打点竖线：[(kind, 徽标或 None, InfiniteLine)]，按时间升序。"""
         return list(self._marker_items)
 
+    def event_label_layout(self) -> List[float]:
+        """系统事件短标签当前的纵向位置（0 底、1 顶），按时间升序（紧凑图没有标签，不计）。"""
+        return [line.label.orthoPos for kind, _badge, line in self._marker_items
+                if kind in EVENT_MARKER_KINDS and getattr(line, 'label', None) is not None]
+
     def badge_layout(self) -> List[float]:
         """带徽标竖线的标签当前纵向位置（0 底、1 顶），按时间升序（系统打点不计）。"""
         return [line.label.orthoPos for _kind, badge, line in self._marker_items
@@ -438,7 +473,7 @@ class ChartView(CardWidget):
         pixel = self.chart_widget.getPlotItem().vb.viewPixelSize()[0] or 0.0
         best, best_dist = None, None
         for marker in self._markers:
-            if getattr(marker, 'kind', MARKER_USER) in SYSTEM_MARKER_KINDS:
+            if getattr(marker, 'kind', MARKER_USER) in NON_EDITABLE_MARKER_KINDS:
                 continue
             dist = abs(marker.timestamp.timestamp() - x)
             if dist <= tolerance_px * pixel and (best_dist is None or dist < best_dist):
@@ -568,7 +603,8 @@ class ChartView(CardWidget):
         return low, high
 
     def _draw_markers(self, colors: dict) -> None:
-        """打点竖线：用户打点虚线 + 编号徽标，基线实线 + "基线"，暂停/恢复底部浅色短线。"""
+        """打点竖线：用户打点虚线 + 编号徽标，基线实线 + "基线"，暂停/恢复底部浅色短线，
+        系统事件（异常退出/重启/续采）彩色点划线 + 底部短标签。"""
         marker_color = colors['marker']
         user_pen = pg.mkPen(color=marker_color, width=1, style=Qt.DashLine)
         baseline_pen = pg.mkPen(color=marker_color, width=2)
@@ -577,7 +613,20 @@ class ChartView(CardWidget):
             kind = getattr(marker, 'kind', MARKER_USER)
             pos = marker.timestamp.timestamp()
             time_text = marker.timestamp.strftime(DETAIL_TIME_FORMAT)
-            if badge is None:
+            if kind in EVENT_MARKER_KINDS:
+                color = colors[EVENT_MARKER_COLOR_KEYS[kind]]
+                tooltip = event_marker_tooltip(kind, marker.label, time_text)
+                opts = {'position': EVENT_LABEL_POSITION, 'color': color, 'movable': False,
+                        'anchors': [(0, 1), (0, 1)]}
+                line = pg.InfiniteLine(
+                    pos=pos, angle=90, movable=False,
+                    pen=pg.mkPen(color=color, width=2, style=Qt.DashDotLine),
+                    label=None if self._compact else EVENT_MARKER_LABELS[kind], labelOpts=opts)
+                tag = getattr(line, 'label', None)
+                if tag is not None:
+                    tag.setFont(ui_font(TypeScale.CAPTION))
+                    tag.setToolTip(tooltip)
+            elif badge is None:
                 tooltip = f"{SYSTEM_MARKER_TEXTS.get(kind, kind)} · {time_text}"
                 line = pg.InfiniteLine(pos=pos, angle=90, movable=False, pen=system_pen,
                                        span=(0, SYSTEM_MARKER_SPAN))
@@ -597,19 +646,26 @@ class ChartView(CardWidget):
         self._layout_badges()
 
     def _layout_badges(self, *_args) -> None:
-        """按徽标在屏幕上的横向距离错开高度，避免相隔几秒的打点徽标重叠。
-        只改标签位置，不改视图范围，不会反过来触发 sigXRangeChanged。"""
-        lines = [line for _kind, badge, line in self._marker_items if badge is not None]
+        """按徽标在屏幕上的横向距离错开高度，避免相隔几秒的打点徽标重叠；系统事件的短标签
+        同理（各自一组，互不影响）。只改标签位置，不改视图范围，不会反过来触发 sigXRangeChanged。"""
+        badge_lines = [line for _kind, badge, line in self._marker_items if badge is not None]
+        event_lines = [line for kind, _badge, line in self._marker_items
+                       if kind in EVENT_MARKER_KINDS and getattr(line, 'label', None) is not None]
+        self._stagger(badge_lines, BADGE_MIN_GAP_PX, BADGE_POSITION, BADGE_STEP, BADGE_ROWS)
+        self._stagger(event_lines, EVENT_LABEL_MIN_GAP_PX, EVENT_LABEL_TOP, EVENT_LABEL_STEP,
+                      EVENT_LABEL_ROWS)
+
+    def _stagger(self, lines: list, min_gap_px: float, top: float, step: float,
+                 rows: int) -> None:
         if not lines:
             return
         view_box = self.chart_widget.getPlotItem().vb
         pixel_xs = [view_box.mapViewToScene(QPointF(line.value(), 0)).x() for line in lines]
         if not all(np.isfinite(pixel_xs)):
             # 视图尚未布局（尺寸为零等）时映射无意义，先放回顶层，sigResized 后再排
-            positions = [BADGE_POSITION] * len(lines)
+            positions = [top] * len(lines)
         else:
-            positions = badge_positions(
-                pixel_xs, BADGE_MIN_GAP_PX, BADGE_POSITION, BADGE_STEP, BADGE_ROWS)
+            positions = badge_positions(pixel_xs, min_gap_px, top, step, rows)
         for line, position in zip(lines, positions):
             line.label.setPosition(position)
 

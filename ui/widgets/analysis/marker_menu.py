@@ -11,13 +11,15 @@ from typing import Callable, List, Optional, Tuple
 from PyQt5.QtCore import QObject
 from qfluentwidgets import Action, FluentIcon, RoundMenu
 
+from ui.widgets.history.chart_view import NON_EDITABLE_MARKER_KINDS
 from ui.widgets.history.common import DETAIL_TIME_FORMAT
 
 ADD_TEXT = "在此处打点"
 BASELINE_TEXT = "设为基线"
 RENAME_TEXT = "重命名"
 DELETE_TEXT = "删除"
-SYSTEM_KINDS = ('pause', 'resume')
+# 暂停 / 恢复与系统事件（异常退出、重启、续采）是系统记录，不能改名、设基线或删除
+SYSTEM_KINDS = NON_EDITABLE_MARKER_KINDS
 
 MenuItem = Tuple[str, Callable[[], bool], bool]
 

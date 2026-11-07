@@ -180,6 +180,32 @@ def test_duration_reached_stops_even_while_paused(service, manager, clock):
     assert ("stop", task_id) in manager.commands
 
 
+def test_resumed_task_counts_duration_from_its_original_start(service, manager, clock):
+    """工具重启后续采：停止时长按墙钟从任务原来的开始时间算，不能从续采时刻重新起算
+    （否则按时长停止的任务每重启一次就多跑一轮），续采线程随后发的 task_started 也不改它"""
+    task_id = _task(manager)
+    original_start = clock.now() - timedelta(seconds=25)
+    assert service.attach(task_id, AutomationPlan(stop_after_seconds=30),
+                          started_at=original_start)
+    manager.task_started.emit(task_id)
+    _run(service, clock, 4)
+    assert service.stopped == []
+    _run(service, clock, 1)
+    assert service.stopped == [(task_id, AUTO_STOP_DURATION)]
+
+
+def test_fresh_task_still_counts_duration_from_start_event(service, manager, clock):
+    """对照：没给 started_at 时仍从 task_started 的时刻起算"""
+    task_id = _task(manager)
+    service.attach(task_id, AutomationPlan(stop_after_seconds=30))
+    clock.advance(25)
+    manager.task_started.emit(task_id)
+    _run(service, clock, 29)
+    assert service.stopped == []
+    _run(service, clock, 1)
+    assert service.stopped == [(task_id, AUTO_STOP_DURATION)]
+
+
 def test_stop_request_refused_does_not_emit(service, manager, clock):
     manager.stop_result = False
     task_id = _start(service, manager, AutomationPlan(stop_after_seconds=5))

@@ -117,6 +117,32 @@ def _snapshot_hub(*samples, fail=None):
     return SnapshotHub(FakeSnapshotSource(snapshots=snapshots))
 
 
+def test_find_instances_by_name_reports_parent_and_skips_exited_entries(monkeypatch):
+    """重启查找用：返回 (pid, 创建时间, 父进程 pid)；快照里线程数为 0 的条目（已退出、仍被
+    句柄握着）不算在运行的进程；按名不区分大小写"""
+    from tests.doubles import fake_process_sample
+    monkeypatch.setattr(process_catalog.psutil, 'process_iter',
+                        lambda *_a, **_k: pytest.fail("快照可用时不应遍历 psutil"))
+    hub = _snapshot_hub(
+        fake_process_sample(31, name='App.EXE', parent_pid=8, create_time=4.0),
+        fake_process_sample(30, name='app.exe', parent_pid=7, create_time=3.0),
+        fake_process_sample(32, name='app.exe', parent_pid=7, create_time=5.0, num_threads=0),
+        fake_process_sample(33, name='other.exe', parent_pid=1, create_time=6.0),
+    )
+    assert process_catalog.find_instances_by_name('app.exe', exclude_self=False, hub=hub) == [
+        (30, 3.0, 7), (31, 4.0, 8)]
+
+
+def test_find_instances_by_name_excludes_own_process_by_default(monkeypatch):
+    import os
+    from tests.doubles import fake_process_sample
+    hub = _snapshot_hub(
+        fake_process_sample(os.getpid(), name='app.exe', create_time=3.0),
+        fake_process_sample(os.getpid() + 100000, name='app.exe', create_time=4.0))
+    found = process_catalog.find_instances_by_name('app.exe', hub=hub)
+    assert [item[0] for item in found] == [os.getpid() + 100000]
+
+
 def test_list_from_snapshot_same_contract(monkeypatch):
     """口径与 psutil 路径相同：空名跳过、按名排序、PID 0 用 psutil 的固定名、带创建时间；
     不调用 psutil 遍历"""

@@ -130,7 +130,11 @@ class TaskBoard(QWidget):
             parent=self,
             interval=info.interval,
             note=info.note,
+            target_kind=info.target_kind,
+            members_truncated=info.members_truncated,
         )
+        if getattr(info, 'waiting_restart', False):
+            card.set_waiting_restart(True, info.restart_count, info.restart_limit, info.exit_code)
         self.add_card(card)
         return card
 
@@ -168,12 +172,17 @@ class TaskBoard(QWidget):
         """已结束卡片的任务 ID（按加入顺序）。"""
         return [task_id for task_id, card in self._cards.items() if card.is_finished]
 
-    def finish_card(self, task_id: str, reason: StopReason, end_time: datetime) -> None:
-        """卡片转为"已结束"并移到下方分组（最近结束的在最上面）。"""
+    def finish_card(self, task_id: str, reason: StopReason, end_time: datetime,
+                    exit_code: Optional[int] = None) -> None:
+        """卡片转为"已结束"并移到下方分组（最近结束的在最上面）；exit_code 是被测进程最近一次
+        退出的退出码（异常退出的卡片据此写"访问冲突 0xC0000005"）。"""
         card = self._cards.get(task_id)
         if card is None:
             return
-        card.set_finished(reason, end_time)
+        if exit_code is None:
+            card.set_finished(reason, end_time)
+        else:
+            card.set_finished(reason, end_time, exit_code)
         self._running_layout.removeWidget(card)
         self._finished_layout.insertWidget(0, card)
         self._refresh()

@@ -837,6 +837,23 @@ def test_verdict_target_exit_relative_to_stop_condition(fast_dispatcher, manager
     assert result['target_exit'] == {'reason': 'process_exited', 'before_stop_condition': before}
 
 
+def test_stop_before_task_row_keeps_plan_for_verdict(fast_dispatcher, manager, sleeper,
+                                                     monkeypatch):
+    """任务在采集线程写入任务行之前就结束：方案存不进库，必须留在内存里，否则判定拿不到
+    停止条件，会把"条件已达成后才退出"误判成 target_exited（曾是间歇失败的根因）。"""
+    from core.automation.plan import AutomationPlan
+    from core.contracts import StopReason
+    d = fast_dispatcher
+    task_id = _call(d, 'start', {'pid': sleeper.pid})['result']['task_id']
+    plan = AutomationPlan(stop_after_rounds=2)
+    d._unsaved_plans[task_id] = plan
+    monkeypatch.setattr(d.context.db.tasks, 'save_plan', lambda *_a, **_k: False)
+    monkeypatch.setattr(d, '_rounds', lambda _tid: 2)
+    d._on_task_stopped(task_id, StopReason.PROCESS_EXITED)
+    assert d._plan_of(task_id) is plan
+    assert d._exited_before_condition(task_id, None, StopReason.PROCESS_EXITED) is False
+
+
 # ---------- R3：方案挂接失败时回滚任务 ----------
 
 def test_create_rolls_back_when_plan_attach_fails(manager, db, sleeper):

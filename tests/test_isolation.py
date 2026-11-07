@@ -2,6 +2,8 @@
 import os
 import sys
 
+import pytest
+
 import app_config
 import config
 from data.database import Database
@@ -91,3 +93,37 @@ def test_empty_env_var_is_ignored(monkeypatch):
     monkeypatch.setenv(config.DATA_DIR_ENV, "")
     monkeypatch.setattr(sys, 'frozen', False, raising=False)
     assert config.DATA_DIR == os.path.join(config.BASE_DIR, "data")
+
+
+# ========== 退出码句柄隔离 ==========
+
+def _worker_on_foreign_pid(db):
+    """把当前测试进程的父进程当作"假 pid"：它是本机真实存在的进程，创建时间必然与伪造的
+    预期值不符，等价于假 PID 恰好被真实进程占用。"""
+    from core.monitor_task import MonitorWorker
+    return MonitorWorker(pid=os.getppid(), process_name='fake.exe', metric_types=['memory_rss'],
+                         interval=1.0, db=db, create_time=1.0)
+
+
+def test_fake_pid_held_by_real_process_is_not_judged_pid_reused(db):
+    """默认的空探针让假 PID 恰好被真实进程占用时不会被误判为 PID 已复用（全量里偶发的
+    PID_REUSED 误判）。去掉 conftest 的 _no_real_exit_probe 后本用例会失败。"""
+    from core.exit_forensics import NullExitCodeProbe
+    worker = _worker_on_foreign_pid(db)
+    assert worker._open_forensics() is True
+    assert isinstance(worker._exit_probe, NullExitCodeProbe)
+    worker._close_probe()
+
+
+@pytest.mark.real_exit_probe
+def test_real_exit_probe_marker_keeps_the_production_probe(db):
+    """带 real_exit_probe 标记的用例保留真实探针：同样的伪造创建时间会被它识破。"""
+    from core.exit_forensics import Win32ExitCodeProbe
+    if sys.platform != 'win32':
+        pytest.skip("退出码句柄是 Win32 实现")
+    worker = _worker_on_foreign_pid(db)
+    try:
+        assert worker._open_forensics() is False
+    finally:
+        worker._close_probe()
+    assert Win32ExitCodeProbe(os.getppid()).available

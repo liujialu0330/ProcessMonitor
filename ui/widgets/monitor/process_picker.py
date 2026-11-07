@@ -63,6 +63,7 @@ ERROR_NO_MATCH = 'no_match'            # 文本与进程列表任何一项都不
 ERROR_NOT_A_NUMBER = 'not_a_number'    # 形似数字但不是合法 PID
 ERROR_NOT_FOUND = 'not_found'          # 输入的 PID 对应的进程不存在或无权访问
 ERROR_WAIT_NEEDS_NAME = 'wait_needs_name'   # 等待进程启动只能按进程名（空或纯数字）
+ERROR_GROUP_NEEDS_NAME = 'group_needs_name'  # 同名进程任务只能按进程名（空或纯数字）
 
 # 自动刷新的节流间隔（秒）：展开下拉、获得焦点、窗口激活可能接连发生，只读一次
 REFRESH_THROTTLE_SECONDS = 2.0
@@ -145,6 +146,7 @@ class ProcessPicker(QWidget):
         self._rerun = False          # 读取进行中又被请求刷新：结束后再读一次
         self._loading = False
         self._applying = False       # set_entries 改写输入框期间，文本变化不算用户编辑
+        self._placeholder = SEARCH_PLACEHOLDER
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -271,7 +273,7 @@ class ProcessPicker(QWidget):
         if loading and self.combo.count() == 0:
             self.combo.line_edit.setPlaceholderText(LOADING_PLACEHOLDER)
         elif not loading:
-            self.combo.line_edit.setPlaceholderText(SEARCH_PLACEHOLDER)
+            self.combo.line_edit.setPlaceholderText(self._placeholder)
         self.loading_changed.emit(loading)
 
     def refresh_if_stale(self) -> bool:
@@ -319,15 +321,23 @@ class ProcessPicker(QWidget):
             return ResolveError(ERROR_NOT_A_NUMBER, text)
         return ResolveError(ERROR_NO_MATCH, text)
 
-    def resolve_name(self) -> Union[str, ResolveError]:
-        """等待进程启动用的进程名：选中项取其进程名，否则取输入文本；
-        空或纯数字（PID 等不到"启动"）给出 ERROR_WAIT_NEEDS_NAME。"""
+    def resolve_name(self, error_kind: str = ERROR_WAIT_NEEDS_NAME) -> Union[str, ResolveError]:
+        """按进程名监控（等待进程启动、同名进程任务）用的进程名：选中项取其进程名，否则取
+        输入文本；空或纯数字（PID 没有"名字"）给出 error_kind 类型的错误。
+
+        输入的名字没写扩展名、而进程列表里恰有 "名字.exe" 时补全为它（如输入 chrome 取
+        chrome.exe）：按名监控是精确匹配，少了 .exe 会一个进程也匹配不到。"""
         target = self.combo.current_data()
         if target is not None:
             return target.name
         text = self.combo.text().strip()
         if not text or text.isdigit():
-            return ResolveError(ERROR_WAIT_NEEDS_NAME, text)
+            return ResolveError(error_kind, text)
+        if '.' not in text:
+            wanted = f"{text}.exe".casefold()
+            for listed in self.targets():
+                if listed.name.casefold() == wanted:
+                    return listed.name
         return text
 
     def current_pid(self) -> Optional[int]:
@@ -351,6 +361,13 @@ class ProcessPicker(QWidget):
 
     def set_text(self, text: str) -> None:
         self.combo.set_text(text)
+
+    def set_placeholder(self, text: Optional[str]) -> None:
+        """搜索框的占位文字（目标类型不同提示不同）；None 恢复默认。读取进程列表期间
+        仍显示"正在读取进程列表…"，结束后恢复到这里设的文字。"""
+        self._placeholder = text or SEARCH_PLACEHOLDER
+        if not (self._loading and self.combo.count() == 0):
+            self.combo.line_edit.setPlaceholderText(self._placeholder)
 
     def text(self) -> str:
         return self.combo.text()

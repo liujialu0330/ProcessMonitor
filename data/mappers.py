@@ -158,6 +158,24 @@ def quality_params(quality: QualityStats) -> tuple:
             _int(quality.collect_p95_ms))
 
 
+# meta_json 里存停止原因的键：{"stop": {"reason": "crashed", "text": "..."}}
+STOP_KEY = 'stop'
+
+
+def stop_reason_of(meta_json: Optional[str]) -> Optional[str]:
+    """从 tasks.meta_json 取停止原因（没有记录或内容损坏返回 None）。"""
+    # 绝大多数任务没有 stop 键：先做子串检查，列表读取时不必为每行都解析 JSON
+    if not meta_json or f'"{STOP_KEY}"' not in meta_json:
+        return None
+    try:
+        data = json.loads(meta_json)
+    except ValueError:
+        return None
+    stop = data.get(STOP_KEY) if isinstance(data, dict) else None
+    reason = stop.get('reason') if isinstance(stop, dict) else None
+    return reason if isinstance(reason, str) and reason else None
+
+
 def row_to_task(row: sqlite3.Row) -> MonitorTask:
     """tasks 表的一行 → MonitorTask。
 
@@ -182,6 +200,10 @@ def row_to_task(row: sqlite3.Row) -> MonitorTask:
         meta_json=(row['meta_json'] or None) if _has(row, 'meta_json') else None,
         target_kind=(row['target_kind'] or 'pid') if _has(row, 'target_kind') else 'pid',
         target_spec=(row['target_spec'] or None) if _has(row, 'target_spec') else None,
+        exit_code=row['exit_code'] if _has(row, 'exit_code') else None,
+        stop_reason=(stop_reason_of(row['meta_json']) if _has(row, 'meta_json') else None),
+        resume_on_restart=bool(row['resume_on_restart']) if _has(row, 'resume_on_restart') else False,
+        restart_limit=(row['restart_limit'] or 0) if _has(row, 'restart_limit') else 0,
     )
 
 

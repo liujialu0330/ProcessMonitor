@@ -29,10 +29,13 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 import config
 from core import verdict as verdict_rules
 from core.analysis.intervals import mean_round_delta
-from core.history_query import HistorySnapshot, TaskAnalysis
+from core.exit_forensics import (CRASH_MARKER_PREFIX, exception_text, format_exit_code,
+                                 is_abnormal_exit)
+from core.history_query import HistorySnapshot, TaskAnalysis, load_segments, segment_note
 from core.report import process_stem, quality_text, safe_filename_part
 from core.target_info import TargetInfo, target_info_from_json_or_none
 from data.models import TARGET_NAME, TARGET_PID, TARGET_TREE, Marker, MonitorTask, QualityStats
+from data.errors import StorageError
 from utils.logger import LOG_BACKUP_COUNT
 from utils.metrics import (VALUE_CLASS_PEAK, VALUE_CLASS_RATE, format_metric_delta,
                            format_metric_rate, format_metric_value,
@@ -84,6 +87,9 @@ OVERALL_RISING = "结论：疑似泄漏——{names}持续上涨"
 OVERALL_STABLE = "结论：未见持续上涨"
 OVERALL_INSUFFICIENT = "结论：数据不足，无法判定（采集时长或样本数不够）"
 OVERALL_TARGET_EXITED = "结论：被测进程在停止条件达成之前退出，测试未完成（以下各指标结论仅供参考）"
+# 中途崩溃过：摘要里已有次数、最近一次退出码与各段判定
+OVERALL_MID_CRASH = "结论：{summary}（以下各指标结论仅供参考）"
+README_SEGMENTS = "分段：{summary}"
 NAME_SEPARATOR = "、"
 PART_SEPARATOR = " · "
 TEXT_RATE = "增速 {rate}"
@@ -93,6 +99,7 @@ TEXT_PER_ROUND = "每轮 {delta}（{count} 轮）"
 TEXT_VS_BASELINE = "较基线 {delta}（{start} → {last}）"
 TEXT_VS_FIRST = "较开始 {delta}（{start} → {last}）"
 TEXT_CURRENT = "当前 {value}"
+TEXT_BASELINE_NOTE = "{note}"
 README_TASK = "任务：{process}（PID {pid}）"
 README_TASK_TREE = "任务：{process}（进程树，根进程 PID {pid}）"
 README_TASK_NAME = "任务：全部名为 {process} 的进程"
@@ -102,6 +109,11 @@ README_NOTE = "备注：{note}"
 README_PERIOD = "时间：{start} ~ {end}"
 README_RUNNING = "进行中"
 README_QUALITY = "数据质量：{text}"
+README_EXIT = "退出：{text}"
+README_RESTARTS = "重启：被测进程重启续接 {count} 次，{note}"
+README_RESTARTS_PLAIN = "重启：被测进程重启续接 {count} 次"
+README_EXIT_NORMAL = "退出码 {code}"
+README_EXIT_UNKNOWN = "被测进程已退出，退出码未知"
 README_FILES_TITLE = "文件清单："
 README_FILE_LINE = "  {name}  —  {desc}"
 README_GENERATED = "生成时间：{time}"
@@ -167,10 +179,12 @@ def _clean(value: Any) -> Any:
 
 
 def _baseline_in_use(snapshot: HistorySnapshot) -> bool:
-    """与分析页摘要表同一口径：有基线值且"只统计基线之后"时以基线为起点。"""
+    """与分析页摘要表同一口径：有基线值且"只统计基线之后"时以基线为起点；基线不在统计所在的
+    启动段时它是另一个进程的值，不能当起点。"""
     baseline = snapshot.baseline
     return (baseline is not None and baseline.value is not None
-            and snapshot.request.baseline_only)
+            and snapshot.request.baseline_only
+            and getattr(snapshot, 'baseline_comparable', True))
 
 
 def metric_verdict(metric: str, snapshot: HistorySnapshot) -> Dict[str, Any]:
@@ -179,7 +193,8 @@ def metric_verdict(metric: str, snapshot: HistorySnapshot) -> Dict[str, Any]:
 
     - verdict / reason / confidence：snapshot.judgement；非水位量为 not_judged，无数据为
       insufficient + no_data；
-    - first / last / samples：统计范围聚合（snapshot.stats）；baseline：基线值；
+    - first / last / samples：统计范围聚合（snapshot.stats）；baseline：基线值（基线在别的
+      启动段时为 None，baseline_note 为"基线在第 N 段，不可比"）；
       start：摘要表"基线"列的取值（有基线用基线值，否则用统计范围首值），delta = last - start；
     - rate_per_hour：回归斜率（stats.slope_per_hour）；ci：其 95% 置信区间半宽（每小时，
       由 snapshot.rate 换算单位）；rate_display：分析页显示的增速原值（单位按跨度为 /分 或 /小时）；
@@ -193,6 +208,9 @@ def metric_verdict(metric: str, snapshot: HistorySnapshot) -> Dict[str, Any]:
     confidence = judgement.confidence if judgement is not None else None
 
     baseline = snapshot.baseline.value if snapshot.baseline is not None else None
+    baseline_note = getattr(snapshot, 'baseline_note', "")
+    if baseline_note:
+        baseline = None     # 基线在别的启动段，不是本段的参照
     last = stats.get('last')
     from_baseline = _baseline_in_use(snapshot)
     start = baseline if from_baseline else stats.get('first')
@@ -216,6 +234,7 @@ def metric_verdict(metric: str, snapshot: HistorySnapshot) -> Dict[str, Any]:
         'first': stats.get('first'),
         'last': last,
         'baseline': baseline,
+        'baseline_note': baseline_note,
         'start': start,
         'start_source': START_BASELINE if from_baseline else START_FIRST,
         'delta': delta,
@@ -261,7 +280,11 @@ def analysis_verdict(analysis: TaskAnalysis, *, stop_reason: Any = None,
     """{overall, metrics: [...]}（给了 stop_reason 时另附 stop_reason）；任一快照查询失败
     抛 EvidenceError。进程组任务另附 members = [{key, verdict, metrics}]：每个成员各指标的
     判定（条目同 metrics，key 为 "指标@成员键"，另有 metric / member）；整体判定把合计与
-    全部成员一起看。pid 任务没有 members 字段。"""
+    全部成员一起看。pid 任务没有 members 字段。
+
+    重启续接过（多个启动段）或中途异常退出过时另附 segments（逐段判定）、mid_run_crashes
+    与 conclusion（纯文本摘要，见 core.verdict.segments_summary）；metrics / members 里的
+    数值是最后一段的，整体判定取各段最差的一段。"""
     metrics = []
     for metric, snapshot in analysis.snapshots.items():
         if snapshot.error is not None:
@@ -287,6 +310,11 @@ def analysis_verdict(analysis: TaskAnalysis, *, stop_reason: Any = None,
         result['members'] = members
     if stop_reason is not None:
         result['stop_reason'] = verdict_rules.stop_reason_value(stop_reason)
+    summary = verdict_rules.segments_summary(analysis)
+    if summary:
+        result['segments'] = verdict_rules.segments_payload(analysis)
+        result['mid_run_crashes'] = verdict_rules.crashes_payload(analysis)
+        result['conclusion'] = summary
     return result
 
 
@@ -336,6 +364,17 @@ def _task_dict(task: MonitorTask) -> Dict[str, Any]:
         # 进程组任务：监控目标的类型与参数（pid 任务沿用旧结构，不加这两个字段）
         result['target_kind'] = task.target_kind
         result['target_spec'] = _plan_value(task.target_spec)[0]
+    code = getattr(task, 'exit_code', None)
+    if code is not None:
+        # 被测进程的退出码：十进制、十六进制与中文说明（异常码如 0xC0000005 访问冲突）
+        result['exit_code'] = code
+        result['exit_code_hex'] = f"0x{code & 0xFFFFFFFF:08X}"
+        result['exit_text'] = format_exit_code(code)
+        if is_abnormal_exit(code):
+            result['exit_exception'] = exception_text(code)
+    reason = getattr(task, 'stop_reason', None)
+    if reason is not None:
+        result['stop_reason'] = reason
     return result
 
 
@@ -346,6 +385,7 @@ def build_task_payload(task: MonitorTask, analysis: TaskAnalysis, *, target: Opt
     退出时整体判定为 target_exited）；None 表示调用方不知道，按普通判定。"""
     plan, plan_raw = _plan_value(task.plan_json)
     first = next(iter(analysis.snapshots.values()), None)
+    restarts = sum(1 for m in markers if m.kind == 'restart')
     payload = {
         'schema_version': EVIDENCE_SCHEMA_VERSION,
         'generated_at': _iso(generated_at),
@@ -366,6 +406,14 @@ def build_task_payload(task: MonitorTask, analysis: TaskAnalysis, *, target: Opt
     }
     if plan_raw is not None:
         payload['plan_raw'] = plan_raw
+    if restarts:
+        # 被测进程重启续接过：判定与区间统计只用最后一次启动之后的数据
+        payload['restarts'] = {
+            'count': restarts,
+            'segment_number': first.segment_number if first is not None else restarts + 1,
+            'segment_start': _iso(first.segment_start) if first is not None else None,
+            'note': segment_note(first) if first is not None else '',
+        }
     return _clean(payload)
 
 
@@ -409,6 +457,8 @@ def metric_line(item: Dict[str, Any]) -> str:
                                      last=_value_text(metric, item['last'])))
     elif item['last'] is not None:
         parts.append(TEXT_CURRENT.format(value=_value_text(metric, item['last'])))
+    if item.get('baseline_note'):
+        parts.append(TEXT_BASELINE_NOTE.format(note=item['baseline_note']))
     return f"{name}：{PART_SEPARATOR.join(parts)}"
 
 
@@ -419,12 +469,31 @@ def overall_line(verdict: Dict[str, Any]) -> str:
         names = [m['name'] for m in verdict['metrics'] if m['verdict'] == VERDICT_RISING]
         names += [m['name'] for g in verdict.get('members') or [] for m in g['metrics']
                   if m['verdict'] == VERDICT_RISING]
+        # 上涨可能出在更早的启动段（最后一段 metrics 里没有）：各段的上涨指标一并列出
+        for segment in verdict.get('segments') or []:
+            names += segment.get('rising_names') or []
+        names = list(dict.fromkeys(names))
         return OVERALL_RISING.format(names=NAME_SEPARATOR.join(names))
+    if overall == VERDICT_TARGET_EXITED and verdict.get('mid_run_crashes'):
+        return OVERALL_MID_CRASH.format(summary=verdict['conclusion'])
     if overall == VERDICT_INSUFFICIENT:
         return OVERALL_INSUFFICIENT
     if overall == VERDICT_TARGET_EXITED:
         return OVERALL_TARGET_EXITED
     return OVERALL_STABLE
+
+
+def _exit_text(task: MonitorTask) -> str:
+    """README 的退出说明；没有退出信息（用户停止、仍在运行）为空串。"""
+    code = getattr(task, 'exit_code', None)
+    reason = getattr(task, 'stop_reason', None)
+    if reason == 'crashed' or is_abnormal_exit(code):
+        return f"{CRASH_MARKER_PREFIX} {format_exit_code(code)}"
+    if code is not None:
+        return README_EXIT_NORMAL.format(code=format_exit_code(code))
+    if reason == 'process_exited':
+        return README_EXIT_UNKNOWN
+    return ""
 
 
 def _time_text(value: Optional[datetime]) -> str:
@@ -436,6 +505,8 @@ def readme_text(task: MonitorTask, payload: Dict[str, Any], *, target: Optional[
     """README.txt 全文（CRLF 换行，记事本友好）。files 为 (文件名, 说明)。"""
     verdict = payload['verdict']
     lines = [overall_line(verdict)]
+    if verdict.get('conclusion') and not verdict.get('mid_run_crashes'):
+        lines.append(README_SEGMENTS.format(summary=verdict['conclusion']))
     lines += [metric_line(item) for item in verdict['metrics']]
     for group in verdict.get('members') or []:
         lines.append(README_MEMBER.format(
@@ -452,6 +523,14 @@ def readme_text(task: MonitorTask, payload: Dict[str, Any], *, target: Optional[
     quality = quality_text(task.quality)
     if quality:
         lines.append(README_QUALITY.format(text=quality))
+    exit_text = _exit_text(task)
+    if exit_text:
+        lines.append(README_EXIT.format(text=exit_text))
+    restarts = payload.get('restarts')
+    if restarts:
+        lines.append(README_RESTARTS.format(count=restarts['count'], note=restarts['note'])
+                     if restarts.get('note')
+                     else README_RESTARTS_PLAIN.format(count=restarts['count']))
     if target is not None:
         lines += target.summary_lines()
     lines.append('')
@@ -541,7 +620,8 @@ def _zip_info(name: str, at: datetime) -> zipfile.ZipInfo:
 def _merge_stored(task: MonitorTask, db) -> MonitorTask:
     """调用方手里的任务对象可能是旧的（如刚开始时缓存的）：元数据、方案与数据质量缺失时
     从库里补上。读库失败只记日志，按手里的对象继续。"""
-    if db is None or (task.meta_json and task.plan_json and task.quality):
+    if db is None or (task.meta_json and task.plan_json and task.quality
+                      and task.stop_reason is not None):
         return task
     try:
         stored = db.tasks.get(task.task_id)
@@ -554,7 +634,24 @@ def _merge_stored(task: MonitorTask, db) -> MonitorTask:
     return replace(task,
                    meta_json=task.meta_json or stored.meta_json,
                    plan_json=task.plan_json or stored.plan_json,
-                   quality=task.quality or stored.quality)
+                   quality=task.quality or stored.quality,
+                   exit_code=task.exit_code if task.exit_code is not None else stored.exit_code,
+                   stop_reason=task.stop_reason or stored.stop_reason)
+
+
+def _with_segments(db, analysis: TaskAnalysis) -> TaskAnalysis:
+    """分析结果没带分段判定（界面当前显示的分析结果不带）时按库补上：整体判定要逐启动段
+    做，不能只看当前显示的这一段。库不可用或没有快照时原样返回。"""
+    if analysis.segments or db is None or not analysis.snapshots:
+        return analysis
+    if getattr(db, 'markers', None) is None:
+        return analysis
+    try:
+        segments = load_segments(db, analysis.task_id, list(analysis.snapshots),
+                                 analysis.snapshots, analysis.member_snapshots)
+    except StorageError as exc:
+        raise EvidenceError(MSG_ANALYSIS_FAILED.format(detail=exc)) from exc
+    return replace(analysis, segments=segments or [])
 
 
 def build_evidence_package(db, task: MonitorTask, analysis: TaskAnalysis, *,
@@ -574,7 +671,8 @@ def build_evidence_package(db, task: MonitorTask, analysis: TaskAnalysis, *,
         log_path: app.log 路径；为 None 不收录日志摘录
         clock: 时钟（只用 now()）
         stop_reason: 任务的停止原因（StopReason 或其值；由调用方传入）。被测进程在方案的
-            停止条件达成之前退出时整体判定为 target_exited；None 按普通判定
+            停止条件达成之前退出时整体判定为 target_exited；None 时取任务记录里保存的停止
+            原因（TaskRepo.save_stop），仍没有则按普通判定
 
     Raises:
         EvidenceError: 缺文件或分析快照查询失败（什么也不写）
@@ -588,6 +686,11 @@ def build_evidence_package(db, task: MonitorTask, analysis: TaskAnalysis, *,
             raise EvidenceError(MSG_MISSING_FILE.format(path=path))
 
     task = _merge_stored(task, db)
+    analysis = _with_segments(db, analysis)
+    if stop_reason is None:
+        # 调用方没给停止原因（界面导出）：用任务记录里保存的真实原因，被测进程异常退出等
+        # 才会反映到整体判定里
+        stop_reason = task.stop_reason
     target = target_info_from_json_or_none(task.meta_json)
     markers = analysis.markers if analysis.snapshots else (
         db.markers.list(task.task_id) if db is not None else [])

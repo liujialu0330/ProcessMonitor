@@ -22,7 +22,7 @@ quick_check。兜底 checkpoint 经 begin_storage_job() / end_storage_job() 登�
 """
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable, Collection, Optional
 
 import config
 
@@ -87,7 +87,8 @@ class MaintenanceService:
         self._storage_jobs = 0
 
     def startup_reconcile(self, retention_days: int, *,
-                          legacy_importer: Optional[LegacyImporter] = None) -> ReconcileResult:
+                          legacy_importer: Optional[LegacyImporter] = None,
+                          protect_task_ids: Collection[str] = ()) -> ReconcileResult:
         """
         启动校正：必须在任何监控任务启动前、每进程只调用一次。
 
@@ -97,7 +98,8 @@ class MaintenanceService:
            必须在孤儿任务校正之前：1.4.1 不维护 last_sample_at，导回后它才有值，
            遗留 running 任务的结束时间才能取到最后一次采样；
         3. 清理 1.4.1 删任务时留下的孤儿序列（它不认识 series / samples 等表）；
-        4. 把上次未正常退出遗留的 running 任务校正为 stopped；
+        4. 把上次未正常退出遗留的 running 任务校正为 stopped（protect_task_ids 里的任务除外：
+           它们的被测进程仍在运行，等用户决定是否续采，见 core.session_recovery）；
         5. 按样本重算 sample_count=0 的任务（如 1.4.1 对已有任务 INSERT OR REPLACE 清零了计数）；
         6. 最后才按保留天数清理——否则"刚崩溃、其实还新鲜"的任务可能被当作过期任务误删。
         各步失败只记日志（由 Database 门面降级为 0 / False），不阻止启动。
@@ -108,6 +110,8 @@ class MaintenanceService:
             retention_days: 历史数据保留天数，<= 0 表示不自动清理
             legacy_importer: 导回一步的执行方式（组合根用它在行数多时显示进度窗口）；
                 None 时在调用线程里同步导回
+            protect_task_ids: 不在这里校正、留给续采流程处理的 running 任务 ID。续采流程
+                必须随后对它们每一个负责：续采，或按放弃 / 失败校正
         """
         if getattr(self._db, 'schema_mismatch', False):
             logger.warning("数据库仍是旧结构（升级失败），跳过启动校正")
@@ -118,7 +122,8 @@ class MaintenanceService:
         self._db.touch_writer(config.APP_VERSION)
         imported = self._import_legacy(legacy_importer)
         purged = self._db.purge_orphan_series()
-        orphans = self._db.reconcile_orphan_tasks()
+        orphans = (self._db.reconcile_orphan_tasks(exclude=protect_task_ids)
+                   if protect_task_ids else self._db.reconcile_orphan_tasks())
         recounted = self._db.reconcile_sample_counts()
         cleaned = self._db.cleanup_old_tasks(retention_days) if retention_days > 0 else 0
         result = ReconcileResult(orphans=orphans, recounted=recounted, cleaned=cleaned,

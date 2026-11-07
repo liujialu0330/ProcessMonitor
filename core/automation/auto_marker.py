@@ -57,6 +57,9 @@ class _Tracked:
     watcher: Optional[LogWatcher] = None
     # kind='user' 的打点数（手动与自动合计）
     rounds: int = 0
+    # 开始时刻由 attach 指定（工具重启后续采：从任务原来的开始时间算），之后 task_started
+    # 不再把它改成当前时刻
+    fixed_start: bool = False
     # 已因停止条件请求停止：不再打点、不再判断
     stop_reason: Optional[str] = None
     # 下一次阶段快照的计划时刻；不写快照或暂停中为 None
@@ -106,11 +109,17 @@ class AutoMarkerService(QObject):
 
     # ========== 跟踪 ==========
 
-    def attach(self, task_id: str, plan: AutomationPlan) -> bool:
+    def attach(self, task_id: str, plan: AutomationPlan,
+               started_at: Optional[datetime] = None) -> bool:
         """
         开始按方案跟踪任务。计时从此刻起算；任务随后发出 task_started 时以启动时刻
         重新起算（通常在 create_task 之后、start_task 之前 attach）。同一任务再次
         attach 会替换原方案并重新计时。
+
+        started_at：任务的开始时刻，只影响"按时长停止"的计算（墙钟，暂停也算，与
+        core.verdict.stop_condition_reached 同口径）。工具重启后续采的任务传入它的原开始
+        时间，已经过去的时长才不会被清零；此后 task_started 也不会再改它。定时打点与阶段
+        快照的节奏仍从此刻起算。
 
         Returns:
             bool: 是否开始跟踪（方案没有任何自动化内容时不跟踪，返回 False）
@@ -119,7 +128,8 @@ class AutoMarkerService(QObject):
             self._tracked.pop(task_id, None)
             return False
         now = self._clock.now()
-        tracked = _Tracked(plan=plan, started_at=now)
+        tracked = _Tracked(plan=plan, started_at=started_at or now,
+                           fixed_start=started_at is not None)
         if plan.has_log_trigger:
             try:
                 tracked.watcher = self._watcher_factory(
@@ -304,7 +314,8 @@ class AutoMarkerService(QObject):
         if tracked is None:
             return
         now = self._clock.now()
-        tracked.started_at = now
+        if not tracked.fixed_start:
+            tracked.started_at = now
         tracked.paused = False
         self._restart_timer(tracked, now)
 

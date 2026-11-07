@@ -188,3 +188,163 @@ def test_seven_days_accelerated_soak(db, qapp, tmp_path):
     assert leak.judgement is not None
 
     assert elapsed < MAX_REAL_SECONDS, f"加速浸泡耗时 {elapsed:.1f} s 超过 {MAX_REAL_SECONDS} s"
+
+
+# ========== 被测进程崩溃重启、工具被强杀后续采 ==========
+
+class _DelayedFinder:
+    """重启查找替身：进入等待后过 delay 秒（假时钟）才找到下一个实例。"""
+
+    def __init__(self, clock, delay, pids):
+        self.clock = clock
+        self.delay = delay
+        self.pids = list(pids)
+        self._since = None
+        self.found = []
+
+    def __call__(self, target):
+        from core.restart_finder import RestartHit
+        now = self.clock.monotonic()
+        if self._since is None:
+            self._since = now
+        if now - self._since < self.delay or not self.pids:
+            return None
+        self._since = None
+        pid = self.pids.pop(0)
+        self.found.append(pid)
+        return RestartHit(pid, None, 'soak.exe')
+
+
+def _segment_samples(cycles, level, rng):
+    """一段平稳的样本：水平 level 加小噪声。"""
+    return [level + rng.uniform(-20, 20) for _ in range(cycles)]
+
+
+def test_seven_days_with_target_crashes_and_restarts(db, qapp):
+    """7 天里被测进程崩溃 / 退出三次、每次五分钟后重新启动：同一个任务一路记下来。
+
+    各段水平不同（阶梯上升）：整体看像在涨，只统计最后一段则平稳。"""
+    from core.exit_forensics import is_abnormal_exit
+    from tests.soak_doubles import StepClock, build_rig
+    from tests.test_rollup import assert_rollups_consistent
+
+    rng = random.Random(7)
+    day = CYCLES_PER_DAY
+    plan = [(100, 2 * day, 100_000.0, 0xC0000005), (200, 2 * day, 150_000.0, 0),
+            (300, 2 * day, 200_000.0, 0xC0000409), (400, day, 250_000.0, None)]
+    segments = {pid: _segment_samples(cycles, level, rng) for pid, cycles, level, _c in plan}
+    codes = {pid: code for pid, _c, _l, code in plan}
+    clock = StepClock()
+    finder = _DelayedFinder(clock, 300, [200, 300, 400])
+    rig = build_rig(db, segments={pid: s for pid, s in segments.items()},
+                    codes=codes, finder=finder, metrics=METRICS[:1], interval=INTERVAL,
+                    resume=True, limit=3, clock=clock)
+    total = sum(len(s) for s in segments.values())
+    # 最后一段采满后由用户停止（不让它因退出而等待重启）
+    last = rig.collectors[400]
+    last.on_collect = lambda n: rig.worker.stop() if n == len(segments[400]) else None
+
+    begin = time.perf_counter()
+    rig.worker.start()
+    assert rig.worker.wait(int(MAX_REAL_SECONDS * 2 * 1000)), "加速浸泡未在时限内结束"
+    elapsed = time.perf_counter() - begin
+    tid = rig.worker.task_id
+    print(f"\n崩溃重启浸泡：{total} 个周期，真实耗时 {elapsed:.1f} s")
+
+    assert rig.stops == [StopReason.USER]
+    assert rig.restarts == [(200, 1), (300, 2), (400, 3)]
+    assert rig.waiting_changes == [True, False] * 3
+    task = db.tasks.get(tid)
+    assert task.pid == 400 and task.status == 'stopped'
+    assert task.stop_reason == 'user' and task.exit_code is None
+
+    markers = db.markers.list(tid)
+    crashes = [m.label for m in markers if m.kind == 'crash']
+    assert len(crashes) == 2 and all("异常退出" in label for label in crashes)
+    assert [m.label for m in markers if m.kind == 'restart'] == [
+        "第 2 次启动 PID 200", "第 3 次启动 PID 300", "第 4 次启动 PID 400"]
+    assert is_abnormal_exit(0xC0000409)
+
+    # 数据：每个周期一行，无重复、单调；三次空档各 >= 5 分钟，是仅有的空洞
+    stamps = [p.timestamp for p in db.points.fetch(PointQuery(tid, METRICS[0]))]
+    assert len(stamps) == total
+    assert all(b > a for a, b in zip(stamps, stamps[1:]))
+    gaps = db.analytics.gaps(tid, INTERVAL)
+    assert len(gaps) == 3
+    assert all(end - start >= timedelta(seconds=300) for start, end in gaps)
+    assert task.sample_count == total
+    assert assert_rollups_consistent(db.db_path) > 0
+
+    # 等待期间不算计划周期：没有"漏采"；发现进程退出的那三次采集照常算完成周期
+    quality = db.tasks.load_quality(tid)
+    assert quality.missed_cycles == 0
+    assert quality.planned_cycles == quality.done_cycles == total + 3
+
+    # 判定只用最后一段（第 4 次启动之后）
+    snap = run_history_query(db, build_request(tid, METRICS[0], 'all', analysis=True))
+    assert (snap.segment_number, snap.segment_count) == (4, 4)
+    assert snap.stats['count'] == day
+    assert snap.judgement is not None
+    assert snap.judgement.verdict.value != 'rising'
+    assert elapsed < MAX_REAL_SECONDS
+
+
+def test_seven_days_with_tool_killed_and_recovered(db, qapp):
+    """第 3.5 天工具被强杀（任务行仍是 running、没有收尾），20 分钟后重启并续采到第 7 天：
+    沿用 task_id 与开始时间，数据只有一个 20 分钟的空洞，写一个 recover 打点。"""
+    from tests.soak_doubles import SegmentCollector, StepClock
+    from tests.test_rollup import assert_rollups_consistent
+    from core.exit_forensics import NullExitCodeProbe
+    from core.monitor_task import MonitorWorker
+
+    rng = random.Random(11)
+    half = int(3.5 * CYCLES_PER_DAY)
+    clock_a = StepClock()
+    first = SegmentCollector(METRICS[:1], _segment_samples(half + 5, 100_000.0, rng))
+    worker_a = MonitorWorker(
+        pid=os.getpid(), process_name='soak.exe', metric_types=METRICS[:1], interval=INTERVAL,
+        db=db, clock=clock_a, collector_factory=lambda pid, spec: first,
+        exit_probe_factory=lambda pid: NullExitCodeProbe())
+    first.on_collect = lambda n: worker_a.stop() if n == half else None
+    worker_a.start()
+    assert worker_a.wait(int(MAX_REAL_SECONDS * 1000))
+    tid = worker_a.task_id
+    start_time = db.tasks.get(tid).start_time
+    killed_at = clock_a.now()
+
+    # 强杀：线程没来得及收尾，库里仍是 running（用收尾前的状态还原）
+    with db._factory.connect() as conn:
+        conn.execute("UPDATE tasks SET status = 'running', end_time = NULL WHERE task_id = ?",
+                     (tid,))
+    row = db.tasks.get(tid)
+    assert row.status == 'running'
+
+    clock_b = StepClock(start=killed_at + timedelta(minutes=20))
+    second = SegmentCollector(METRICS[:1], _segment_samples(half + 5, 100_000.0, rng))
+    worker_b = MonitorWorker(
+        pid=os.getpid(), process_name='soak.exe', metric_types=METRICS[:1], interval=INTERVAL,
+        task_id=tid, db=db, clock=clock_b, collector_factory=lambda pid, spec: second,
+        exit_probe_factory=lambda pid: NullExitCodeProbe(), recovering=True,
+        start_time=row.start_time)
+    second.on_collect = lambda n: worker_b.stop() if n == half else None
+    begin = time.perf_counter()
+    worker_b.start()
+    assert worker_b.wait(int(MAX_REAL_SECONDS * 1000))
+    elapsed = time.perf_counter() - begin
+
+    task = db.tasks.get(tid)
+    assert task.task_id == tid and task.start_time == start_time
+    assert task.status == 'stopped'
+    assert [m.kind for m in db.markers.list(tid)] == ['recover']
+    stamps = [p.timestamp for p in db.points.fetch(PointQuery(tid, METRICS[0]))]
+    assert len(stamps) == 2 * half
+    assert all(b > a for a, b in zip(stamps, stamps[1:]))
+    gaps = db.analytics.gaps(tid, INTERVAL)
+    assert len(gaps) == 1
+    assert gaps[0][1] - gaps[0][0] >= timedelta(minutes=20)
+    assert task.sample_count == 2 * half
+    assert assert_rollups_consistent(db.db_path) > 0
+    # 续采没有制造重启分段：recover 不切段
+    snap = run_history_query(db, build_request(tid, METRICS[0], 'all', analysis=True))
+    assert snap.segment_count == 1 and snap.stats['count'] == 2 * half
+    assert elapsed < MAX_REAL_SECONDS

@@ -593,6 +593,12 @@ class ProcessCollector:
         sample = snapshot.processes.get(self.pid)
         if sample is None:
             return self._recheck_missing()
+        if sample.num_threads == 0:
+            # 已退出、但还被别的句柄（包括任务自己为取退出码持有的那个）握着的进程：系统
+            # 进程表里仍留着它的条目，线程数为 0。它不是在运行的进程，按已退出处理——
+            # 否则任务会一直采到一份冻结的读数，永远发现不了退出。只影响本采集器对目标的
+            # 判断，进程列表不改（列表里多一个僵尸条目无害，且别处还依赖原样的快照）
+            return None
         if not self._same_process(sample):
             # 快照里这个 PID 的创建时间与绑定的进程不同：PID 已被新进程复用
             return None

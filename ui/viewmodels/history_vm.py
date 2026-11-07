@@ -123,10 +123,8 @@ def relative_rate(snapshot: Optional[HistorySnapshot]) -> float:
     judgement = snapshot.judgement
     if judgement is None or judgement.fit is None:
         return 0.0
-    baseline = snapshot.baseline
-    if (baseline is not None and baseline.value is not None
-            and snapshot.request.baseline_only):
-        reference = baseline.value
+    if snapshot.baseline_in_use:
+        reference = snapshot.baseline.value
     else:
         reference = snapshot.stats['first']
     slope = abs(judgement.fit.slope_per_hour)

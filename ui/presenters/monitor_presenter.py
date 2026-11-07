@@ -13,6 +13,12 @@ StageSnapshotWriter 在后台写报告图片与摘要 CSV（失败每个任务�
 启动被测程序：请求带 launch 时先经 launcher 启动程序，用拿到的 PID 与创建时间建任务
 （启动失败在表单启动区就近提示、不建任务）；勾选"停止时关闭"的任务在用户停止后于后台
 关闭该程序；"同配置再测"对这类任务直接重新启动程序再监控。
+进程组任务（进程树 / 同名进程，见 NewTaskForm 的目标类型）：请求带 target_kind，创建时剔除对组
+不适用的指标；卡片的成员摘要由 manager.group_members 提供，在 members_changed 时刷新，之后每秒
+随 tick 再刷新一次（实例数涨落不发信号）。
+被测进程退出后续接：task_waiting_restart 让卡片显示"等待重启（第 N/M 次）"，task_restarted 把卡片
+的 PID 换成新进程并给一条短暂提示；异常退出（CRASHED）结束时已结束行与提示都带退出码说明。
+这两个信号与 members_changed 一样，替身管理器可以没有。
 暂停 / 恢复：卡片状态跟随 manager 的 task_paused / task_resumed（命令行暂停也同步），
 本页按钮发起的那一次由按钮路径更新，信号回声不重复更新。依赖：
 - manager：只用命令与只读快照接口，不接触任务线程对象；
@@ -41,7 +47,7 @@ import config
 from core.automation.auto_marker import AutoMarkerService
 from core.automation.plan import AutomationPlan
 from core.automation.stage_snapshot import StageSnapshotWriter
-from core.contracts import StopReason, UnavailableReason
+from core.contracts import StopReason, TaskStatus, UnavailableReason
 from core.monitor_manager import BASELINE_SAMPLE_COUNT, default_marker_kind, median_of
 from core.report import DATA_CSV_SUFFIX, gap_threshold_seconds, metadata_lines, task_basename
 from core.report_worker import ReportJob, ReportWorker
@@ -49,22 +55,24 @@ from core.process_launcher import LaunchSpec, ProcessLauncher
 from core.wait_service import WaitMatch, WaitService
 from core.workers.terminate_worker import close_in_background
 from data.errors import StorageError
+from data.models import TARGET_NAME, TARGET_PID, TARGET_TREE
 from ui.formatting import (
-    AUTO_EXPORT_BUSY, AUTO_EXPORT_DONE_TITLE, AUTO_EXPORT_FAILED_TITLE,
+    TARGET_KIND_TEXTS, AUTO_EXPORT_BUSY, AUTO_EXPORT_DONE_TITLE, AUTO_EXPORT_FAILED_TITLE,
     AUTO_EXPORT_NO_DATABASE, AUTO_EXPORT_NO_TASK, AUTO_EXPORT_RANGE_TEXT, AUTO_STOP_TITLE,
-    PLAN_INVALID_TITLE, READ_ONLY_MARKER_BLOCKED, READ_ONLY_TITLE, STAGE_SNAPSHOT_DONE_TITLE,
-    STAGE_SNAPSHOT_FAILED_TITLE, auto_stop_text, plan_summary, stage_snapshot_failed_text,
-    stop_reason_text, truncate_text, unavailable_reason_text,
+    PLAN_INVALID_TITLE, READ_ONLY_MARKER_BLOCKED, READ_ONLY_TITLE, RESTARTED_TITLE,
+    STAGE_SNAPSHOT_DONE_TITLE, STAGE_SNAPSHOT_FAILED_TITLE, auto_stop_text, plan_summary,
+    restarted_hint_text, stage_snapshot_failed_text, stop_detail_text, truncate_text,
+    unavailable_reason_text,
 )
 from ui.services import UiServices
 from ui.storage_notices import SPACE_PAUSE_REASON
 from ui.widgets.analysis.report_sheet import render_report_for
 from ui.widgets.monitor.new_task_form import TaskRequest, WaitRequest
 from ui.widgets.monitor.process_picker import (
-    ERROR_EMPTY, ERROR_NO_MATCH, ERROR_NOT_A_NUMBER, ERROR_NOT_FOUND,
+    ERROR_EMPTY, ERROR_GROUP_NEEDS_NAME, ERROR_NO_MATCH, ERROR_NOT_A_NUMBER, ERROR_NOT_FOUND,
     ERROR_WAIT_NEEDS_NAME, ResolveError,
 )
-from utils.metrics import get_metric_display_name
+from utils.metrics import filter_group_metrics, get_metric_display_name
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +81,8 @@ logger = logging.getLogger(__name__)
 ABNORMAL_STOP_INFOBAR_MS = 15000
 UNAVAILABLE_INFOBAR_MS = 10000
 RESTART_HINT_INFOBAR_MS = 5000
+# 被测进程重启并续接成功的提示：只是告知，几秒后消失
+RESTARTED_INFOBAR_MS = 4000
 # 卡片"已运行"与"（N 分钟前）"的刷新间隔（毫秒）
 TICK_INTERVAL_MS = 1000
 # 等待进程启动的轮询间隔（毫秒）
@@ -120,6 +130,8 @@ def resolve_error_text(error: ResolveError) -> str:
         return "请输入进程名或 PID，或从列表中选择进程"
     if error.kind == ERROR_WAIT_NEEDS_NAME:
         return "等待进程启动需要填写进程名（如 notepad.exe），不能用 PID"
+    if error.kind == ERROR_GROUP_NEEDS_NAME:
+        return "同名进程需要填写进程名（如 chrome.exe），或从列表里选一个进程；不能用 PID"
     raise ValueError(f"未知的进程选择错误：{error.kind!r}")
 
 
@@ -153,19 +165,43 @@ class _TaskEntry:
     # 由本页启动的被测程序（"同配置再测"据此重新启动）；不是启动型任务为 None
     launch: Optional[LaunchSpec] = None
     close_on_stop: bool = False
+    # 监控目标类型：pid / tree / name（后两者是进程组任务）
+    target_kind: str = TARGET_PID
+
+    @property
+    def is_group(self) -> bool:
+        return self.target_kind != TARGET_PID
+
+    @property
+    def pid_text(self) -> str:
+        """"PID 1234"的位置：进程树写根 PID，同名进程没有 PID。"""
+        if self.target_kind == TARGET_TREE:
+            return f"进程树 · 根 PID {self.pid}"
+        if self.target_kind == TARGET_NAME:
+            return TARGET_KIND_TEXTS[TARGET_NAME]
+        return f"PID {self.pid}"
 
     @property
     def display_name(self) -> str:
-        return f"{self.process_name}（PID {self.pid}）"
+        return f"{self.process_name}（{self.pid_text}）"
+
+    @property
+    def marker_pid(self) -> Optional[int]:
+        """打点对话框里显示的 PID：同名进程没有。"""
+        return None if self.target_kind == TARGET_NAME else self.pid
 
     @property
     def active(self) -> bool:
         """还能打点（运行中或已暂停，未结束、未在停止）。"""
         return not self.finished and not self.stopping
 
+    def identity_text(self) -> str:
+        """"demo.exe · PID 1234"（进程组任务把 PID 换成目标类型说明）。"""
+        return f"{self.process_name} · {self.pid_text}"
+
     def target_text(self) -> str:
         """托盘菜单里的任务名："demo.exe · PID 1234 · 备注"。"""
-        text = f"{self.process_name} · PID {self.pid}"
+        text = self.identity_text()
         if self.note:
             text += f" · {truncate_text(self.note, TARGET_NOTE_CHARS)}"
         return text
@@ -266,11 +302,21 @@ class MonitorPresenter(QObject):
         manager.task_limit_reached.connect(self.on_limit_reached)
         manager.task_paused.connect(self.on_task_paused)
         manager.task_resumed.connect(self.on_task_resumed)
+        # 进程组成员变化；替身管理器可以没有这个信号
+        members_changed = getattr(manager, 'members_changed', None)
+        if members_changed is not None:
+            members_changed.connect(self.on_members_changed)
         # 被测目标元数据由 manager 在任务启动后后台探测并落库（无窗口模式同样有）；
         # 这里只把摘要行补进卡片的悬停提示。替身管理器可以没有这个信号
         target_info_ready = getattr(manager, 'target_info_ready', None)
         if target_info_ready is not None:
             target_info_ready.connect(self.on_target_info_ready)
+        # 被测进程退出后等它重启（续接）：进入 / 离开等待、续接成功；替身管理器可以没有这两个信号
+        for signal_name, slot in (('task_waiting_restart', self.on_task_waiting_restart),
+                                  ('task_restarted', self.on_task_restarted)):
+            signal = getattr(manager, signal_name, None)
+            if signal is not None:
+                signal.connect(slot)
 
         # 自动打点与停止条件：每个采集周期经 data_updated、另由每秒的 tick 兜底驱动
         self.auto_marker = (auto_marker if auto_marker is not None
@@ -379,19 +425,34 @@ class MonitorPresenter(QObject):
             card = self.board.card(task_id)
             if card is not None:
                 card.tick(now)
+            if entry.is_group:
+                self._refresh_members(task_id)
         self.auto_marker.tick()
 
     # ========== 新建任务 ==========
 
     def on_choose_metrics(self) -> None:
         """弹出指标多选对话框；确定后记住本次选择。"""
-        selected = self.services.dialogs.choose_metrics(
-            self._dialog_parent(), self.form.metrics())
+        group = self._form_kind() != TARGET_PID
+        if group:
+            # 进程组任务有自己的一份选择：对组不适用的指标在对话框里置灰，不写进"上次的指标"
+            # （那是单进程任务的默认值）
+            selected = self.services.dialogs.choose_metrics(
+                self._dialog_parent(), self.form.metrics(), group=True)
+        else:
+            selected = self.services.dialogs.choose_metrics(
+                self._dialog_parent(), self.form.metrics())
         if selected is None:
             return
         metrics = list(selected)
-        self.services.preferences.remember_last_metrics(metrics)
+        if not group:
+            self.services.preferences.remember_last_metrics(metrics)
         self.form.set_metrics_summary(metrics)
+
+    def _form_kind(self) -> str:
+        """表单当前的目标类型（替身表单没有目标类型时按单个进程）。"""
+        getter = getattr(self.form, 'target_kind', None)
+        return getter() if getter is not None else TARGET_PID
 
     def on_target_invalid(self, error: ResolveError) -> None:
         self.form.show_error(resolve_error_text(error))
@@ -426,12 +487,21 @@ class MonitorPresenter(QObject):
             request = self._launch_target(request)
             if request is None:
                 return None
-        elif (self.manager.has_running_task_for_pid(request.pid)
-                and not self._confirm_duplicate_pid(request)):
+        elif request.target_kind == TARGET_PID:
+            if (self.manager.has_running_task_for_pid(request.pid)
+                    and not self._confirm_duplicate_pid(request)):
+                return None
+        elif self._has_running_group(request) and not self._confirm_duplicate_group(request):
             return None
+        if request.target_kind == TARGET_PID:
+            metrics, extra = list(request.metrics), {}
+        else:
+            # 对组不适用的指标（峰值类、基本优先级）剔除；进程总数由 manager 补上
+            metrics, extra = filter_group_metrics(request.metrics), {
+                'target_kind': request.target_kind}
         task_id = self.manager.create_task(
-            request.pid, request.name, list(request.metrics), request.interval,
-            note=request.note, create_time=request.create_time)
+            request.pid, request.name, metrics, request.interval,
+            note=request.note, create_time=request.create_time, **extra)
         if not task_id:
             if request.launch is not None:
                 logger.warning("被测程序已启动但没能创建任务: pid=%s", request.pid)
@@ -664,6 +734,31 @@ class MonitorPresenter(QObject):
         logger.warning("自动导出未完成: %s：%s", name, message)
         self.services.notifier.error(self.host, AUTO_EXPORT_FAILED_TITLE, f"{name}：{message}")
 
+    def _has_running_group(self, request: TaskRequest) -> bool:
+        """是否已有同一目标的运行中进程组任务：同名进程看进程名，进程树看根 PID。"""
+        list_infos = getattr(self.manager, 'list_task_infos', None)
+        if list_infos is None:
+            return False
+        for info in list_infos():
+            if (info.target_kind != request.target_kind or info.is_stopping
+                    or info.status != TaskStatus.RUNNING):
+                continue
+            if request.target_kind == TARGET_NAME:
+                if info.process_name.casefold() == request.name.casefold():
+                    return True
+            elif info.pid == request.pid:
+                return True
+        return False
+
+    def _confirm_duplicate_group(self, request: TaskRequest) -> bool:
+        if request.target_kind == TARGET_NAME:
+            title, what = "已在监控同名进程", f"全部 {request.name} 进程"
+        else:
+            title, what = "已在监控该进程树", f"{request.name}（PID {request.pid}）的进程树"
+        return self.services.dialogs.confirm(
+            self._dialog_parent(), title,
+            f"{what}已有一个运行中的监控任务。\n仍要再创建一个吗？", "继续创建")
+
     def _confirm_duplicate_pid(self, request: TaskRequest) -> bool:
         return self.services.dialogs.confirm(
             self._dialog_parent(), "已在监控该进程",
@@ -721,7 +816,7 @@ class MonitorPresenter(QObject):
         return self.start_monitoring(TaskRequest(
             pid=match.pid, name=match.name, create_time=match.create_time,
             metrics=request.metrics, interval=request.interval, note=request.note,
-            plan=request.plan))
+            plan=request.plan, target_kind=getattr(request, 'target_kind', TARGET_PID)))
 
     # ========== manager 信号 ==========
 
@@ -732,7 +827,8 @@ class MonitorPresenter(QObject):
         had_tasks = self._has_items()
         self._tasks[task_id] = _TaskEntry(
             task_id=task_id, pid=info.pid, process_name=info.process_name,
-            metric_types=tuple(info.metric_types), interval=info.interval, note=info.note)
+            metric_types=tuple(info.metric_types), interval=info.interval, note=info.note,
+            target_kind=getattr(info, 'target_kind', TARGET_PID))
         self.board.create_card(info)
         self._sync_counts()
         self._set_has_tasks(had_tasks)
@@ -761,6 +857,53 @@ class MonitorPresenter(QObject):
         if card is not None:
             card.setToolTip(plan_summary(plan))
 
+    def on_members_changed(self, task_id: str) -> None:
+        """进程组的成员集合变了：刷新卡片的成员摘要。"""
+        self._refresh_members(task_id)
+
+    def _refresh_members(self, task_id: str) -> None:
+        """把 manager 的成员快照与"成员种类超限"标志交给卡片（卡片只在内容变化时重画）。"""
+        entry = self._tasks.get(task_id)
+        card = self.board.card(task_id)
+        reader = getattr(self.manager, 'group_members', None)
+        if entry is None or entry.finished or card is None or reader is None:
+            return
+        info = self.manager.get_task_info(task_id)
+        card.set_members(reader(task_id), bool(info is not None and info.members_truncated))
+
+    def on_task_waiting_restart(self, task_id: str, waiting: bool) -> None:
+        """被测进程退出后进入 / 离开"等待重启"：卡片写"等待重启（第 N/M 次）"，数字取自
+        manager 的任务快照（已续接次数 + 1 与上限）。"""
+        entry = self._tasks.get(task_id)
+        card = self.board.card(task_id)
+        info = self.manager.get_task_info(task_id)
+        if entry is None or entry.finished or card is None or info is None:
+            return
+        # 离开等待时任务可能回到"暂停"（进入等待前就是暂停的）：以任务快照为准刷新暂停按钮与胶囊
+        card.set_waiting_restart(waiting, getattr(info, 'restart_count', 0),
+                                 getattr(info, 'restart_limit', 0),
+                                 getattr(info, 'exit_code', None),
+                                 **({} if waiting else {'paused': bool(info.is_paused)}))
+
+    def on_task_restarted(self, task_id: str, count: int) -> None:
+        """被测进程已重启、任务续接到新进程：卡片 PID 换成新的（取自任务快照）、退出等待，
+        并给一条短暂提示"已续接：第 N 次启动 PID x"。"""
+        entry = self._tasks.get(task_id)
+        card = self.board.card(task_id)
+        info = self.manager.get_task_info(task_id)
+        if entry is None or entry.finished or card is None:
+            return
+        pid = info.pid if info is not None and info.pid else entry.pid
+        if entry.target_kind != TARGET_NAME:
+            entry.pid = pid
+            card.set_pid(pid)
+        extra = {'paused': bool(info.is_paused)} if info is not None else {}
+        card.set_waiting_restart(False, count, getattr(info, 'restart_limit', 0), **extra)
+        shown_pid = pid if entry.target_kind != TARGET_NAME else None
+        self.services.notifier.info(
+            self.host, RESTARTED_TITLE, f"{entry.process_name}：{restarted_hint_text(count, shown_pid)}",
+            RESTARTED_INFOBAR_MS)
+
     def on_target_info_ready(self, task_id: str, info) -> None:
         """被测目标元数据探测完成：卡片悬停提示追加"被测程序 / 命令行 / 环境"摘要行。"""
         card = self.board.card(task_id)
@@ -776,11 +919,13 @@ class MonitorPresenter(QObject):
         """卡片保留并转为"已结束"，同时请 manager 移除 core 侧任务。remove_task 不阻塞：
         线程若还没退出，manager 会在它 finished 后再释放对象。"""
         entry = self._tasks.get(task_id)
+        # 异常退出（CRASHED）时卡片与提示要写退出码说明；此时任务还在 manager 里（下面才移除）
+        exit_code = self._exit_code_of(task_id) if reason is StopReason.CRASHED else None
         if entry is not None:
             entry.finished = True
             # 任务行此时一定已落库：一个周期都没采到就结束时，方案在这里补存
             self._retry_save_plan(task_id)
-            self.board.finish_card(task_id, reason, self.services.clock.now())
+            self.board.finish_card(task_id, reason, self.services.clock.now(), exit_code)
             self.form.forget_process_if(entry.pid)
             self._sync_tick_timer()
 
@@ -788,7 +933,7 @@ class MonitorPresenter(QObject):
         self._sync_counts()
         self._close_launched(task_id, reason)
 
-        reason_text = stop_reason_text(reason)
+        reason_text = stop_detail_text(reason, exit_code)
         if reason is StopReason.USER:
             # 用户自己点的停止：卡片当场转为已结束，不再弹提示
             return
@@ -799,6 +944,11 @@ class MonitorPresenter(QObject):
         content = f"{name}：{reason_text}"
         self.services.notifier.warning(self.host, title, content, ABNORMAL_STOP_INFOBAR_MS)
         self.task_ended_abnormally.emit(title, content)
+
+    def _exit_code_of(self, task_id: str) -> Optional[int]:
+        """被测进程最近一次退出的退出码（任务快照里取，没有或替身管理器不提供为 None）。"""
+        info = self.manager.get_task_info(task_id)
+        return getattr(info, 'exit_code', None) if info is not None else None
 
     def on_data_updated(self, task_id: str, values: dict) -> None:
         """每采集周期一次：卡片采集次数为内存自增，基线样本在内存里累积，不查库。"""
@@ -978,7 +1128,7 @@ class MonitorPresenter(QObject):
         default_label = self.manager.next_marker_label(task_id)
         label = self.services.dialogs.ask_marker_label(
             self._dialog_parent(), default_label, clicked_at,
-            process_name=entry.process_name, pid=entry.pid)
+            process_name=entry.process_name, pid=entry.marker_pid)
         if label is None:
             return
         if not label.strip():
@@ -1038,7 +1188,7 @@ class MonitorPresenter(QObject):
             entry, marker = added[0]
             self.quick_marker_feedback.emit(
                 QUICK_MARKER_OK, f"已打点：{marker.label} {clock_text}",
-                f"{entry.process_name} · PID {entry.pid}")
+                entry.identity_text())
         elif added:
             self.quick_marker_feedback.emit(
                 QUICK_MARKER_OK, f"已打点：{len(added)} 个任务 {clock_text}",
@@ -1058,7 +1208,16 @@ class MonitorPresenter(QObject):
                 pid=0, name=entry.launch.name, create_time=None,
                 metrics=entry.metric_types,
                 interval=entry.interval or self.form.interval(), note=entry.note,
-                plan=entry.plan, launch=entry.launch, close_on_stop=entry.close_on_stop))
+                plan=entry.plan, launch=entry.launch, close_on_stop=entry.close_on_stop,
+                target_kind=entry.target_kind))
+
+        if entry.target_kind == TARGET_NAME:
+            # 同名进程不依赖某个具体进程：直接按进程名再开一个
+            return self.start_monitoring(TaskRequest(
+                pid=0, name=entry.process_name, create_time=None,
+                metrics=entry.metric_types,
+                interval=entry.interval or self.form.interval(), note=entry.note,
+                plan=entry.plan, target_kind=TARGET_NAME))
 
         # 精确匹配（不区分大小写）并排除本程序自身：被测的同名进程（如 python.exe）
         # 退出后，不能因为只剩本程序同名而自动监控起自己
@@ -1069,8 +1228,11 @@ class MonitorPresenter(QObject):
                 pid=pid, name=entry.process_name, create_time=create_time,
                 metrics=entry.metric_types,
                 interval=entry.interval or self.form.interval(), note=entry.note,
-                plan=entry.plan))
+                plan=entry.plan, target_kind=entry.target_kind))
 
+        set_kind = getattr(self.form, 'set_target_kind', None)
+        if entry.is_group and set_kind is not None:
+            set_kind(entry.target_kind)   # 进程树：交给用户重新选根进程
         self.form.fill_search(entry.process_name)
         if entry.plan is not None:
             # 交给用户自己选进程时，把上次的自动化方案填回表单，"开始"时一并沿用

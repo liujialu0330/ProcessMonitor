@@ -7,7 +7,7 @@
 """
 import os
 import sys
-from typing import Optional
+from typing import Callable, Optional
 
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QIcon
@@ -120,6 +120,9 @@ class AboutUpdateGroup(SettingCardGroup):
         self._checker: Optional[UpdateChecker] = None
         self._downloader: Optional[UpdateDownloader] = None
         self._pending_info = None
+        # 主窗口注入的退出前检查：启动安装程序之前调用，返回 False（如用户不同意丢弃
+        # 因磁盘已满未写入的数据）则不启动安装程序、应用继续运行；None 表示不检查
+        self.exit_guard: Optional[Callable[[], bool]] = None
         # 发布页地址（html_url）：缺少校验信息时"打开发布页"按钮使用
         self._release_url_hint = None
 
@@ -326,6 +329,9 @@ class AboutUpdateGroup(SettingCardGroup):
 
         dialog = InstallConfirmDialog(self.window(), version)
         if dialog.exec():
+            if self.exit_guard is not None and not self.exit_guard():
+                self.status_label.setText(f"已取消安装，安装包已保存：{path}")
+                return
             try:
                 self.services.dialogs.open_file(path)
             except OSError as e:

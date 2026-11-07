@@ -57,12 +57,17 @@ ERR_SNAPSHOT_HOURS_RANGE = "阶段快照间隔须在 {low:g} 到 {high:g} 小时
 ERR_SNAPSHOT_HOURS_MISSING = "已选择阶段快照目录，请同时设置快照间隔（小时）"
 ERR_SNAPSHOT_DIR_MISSING = "已勾选阶段快照，请选择快照目录"
 ERR_SNAPSHOT_DIR_NOT_ABSOLUTE = "阶段快照目录必须是完整的绝对路径"
+ERR_RESTART_LIMIT_RANGE = "重新启动后继续记录的次数上限须在 {low} 到 {high} 之间"
 
 # 阶段快照间隔（小时）的允许范围：太密会让快照文件与后台读库喧宾夺主，超过一周没有意义
 SNAPSHOT_HOURS_MIN = 0.5
 SNAPSHOT_HOURS_MAX = 168.0
 # 定时打点间隔与停止时长（秒）的上限：30 天。再长没有意义，且过大的值会让 timedelta 溢出
 MAX_PLAN_SECONDS = 30 * 24 * 3600
+# 被测进程退出后续接同一任务的次数上限：默认值与允许范围
+DEFAULT_RESTART_LIMIT = 3
+RESTART_LIMIT_MIN = 1
+RESTART_LIMIT_MAX = 20
 
 
 class PlanFormatError(ValueError):
@@ -138,6 +143,9 @@ class AutomationPlan:
         stage_snapshot_hours: 运行中每隔多少小时写一次阶段快照（报告图片 + 摘要 CSV），
             从任务开始或恢复时刻起算、暂停期间不计时；None 表示不写
         stage_snapshot_dir: 阶段快照的目录（绝对路径）；与 stage_snapshot_hours 成对给出
+        resume_on_restart: 被测进程（pid / 进程树）退出后不结束任务，等它重新启动后在同一任务里
+            继续记录；按进程名监控的任务本来就覆盖重启，不适用
+        restart_limit: 最多续接几次（范围 1 到 20）；用完后任务按退出原因结束
     """
     timed_marker_seconds: Optional[int] = None
     log_path: Optional[str] = None
@@ -150,6 +158,8 @@ class AutomationPlan:
     export_dir: Optional[str] = None
     stage_snapshot_hours: Optional[float] = None
     stage_snapshot_dir: Optional[str] = None
+    resume_on_restart: bool = False
+    restart_limit: int = DEFAULT_RESTART_LIMIT
 
     # ---------- 派生判断 ----------
 
@@ -249,6 +259,10 @@ class AutomationPlan:
             errors.append(ERR_SNAPSHOT_HOURS_MISSING)
         if self.stage_snapshot_dir and not is_absolute_path(self.stage_snapshot_dir):
             errors.append(ERR_SNAPSHOT_DIR_NOT_ABSOLUTE)
+
+        if not RESTART_LIMIT_MIN <= self.restart_limit <= RESTART_LIMIT_MAX:
+            errors.append(ERR_RESTART_LIMIT_RANGE.format(low=RESTART_LIMIT_MIN,
+                                                         high=RESTART_LIMIT_MAX))
         return errors
 
     # ---------- JSON 往返 ----------
@@ -301,9 +315,11 @@ class AutomationPlan:
 
 # 字段 -> 允许的取值类型（None 另行允许的见 _NULLABLE）
 _INT_FIELDS = ('timed_marker_seconds', 'stop_after_seconds', 'stop_after_rounds')
+# 不可为 null 的整数字段（缺省值见字段定义）
+_REQUIRED_INT_FIELDS = ('restart_limit',)
 _FLOAT_FIELDS = ('stage_snapshot_hours',)
 _STR_FIELDS = ('log_path', 'log_pattern', 'export_dir', 'stage_snapshot_dir')
-_BOOL_FIELDS = ('stop_when_target_exits', 'export_on_stop')
+_BOOL_FIELDS = ('stop_when_target_exits', 'export_on_stop', 'resume_on_restart')
 
 
 def _check_field(name: str, value: Any) -> Any:
@@ -315,6 +331,14 @@ def _check_field(name: str, value: Any) -> Any:
             value = int(value)
         if isinstance(value, bool) or not isinstance(value, int):
             raise PlanFormatError(f"{name} 必须是整数或 null，收到 {value!r}")
+        return value
+    if name in _REQUIRED_INT_FIELDS:
+        if value is None:
+            return DEFAULT_RESTART_LIMIT
+        if isinstance(value, float) and value.is_integer():
+            value = int(value)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise PlanFormatError(f"{name} 必须是整数，收到 {value!r}")
         return value
     if name in _FLOAT_FIELDS:
         if value is None:

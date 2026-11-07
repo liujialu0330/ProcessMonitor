@@ -14,6 +14,7 @@ import pytest
 from PyQt5.QtCore import Qt
 
 from core.contracts import StopReason
+from core.exit_forensics import NullExitCodeProbe
 from core.monitor_task import (
     FLUSH_FAILURE_LOG_INTERVAL, MonitorWorker,
 )
@@ -415,6 +416,8 @@ def test_create_time_mismatch_stops_before_collecting(make_task, db):
 def test_create_time_match_or_unknown_runs_normally(make_task, expected, actual):
     collector = _IdentityCollector(actual_create_time=actual)
     task = make_task(collector, interval=0.05, create_time=expected)
+    # 这里验证的是采集器的身份比对；真实句柄会拿真实进程的创建时间去核对替身给的假值
+    task._exit_probe_factory = lambda pid: NullExitCodeProbe()
     stopped, errors = _run_inline(task)
 
     task.start()

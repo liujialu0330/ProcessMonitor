@@ -54,9 +54,11 @@ class Dialogs(Protocol):
         空白的名称，取消返回 None。"""
         ...
 
-    def choose_metrics(self, parent: QWidget,
-                       selected: Sequence[str]) -> Optional[List[str]]:
-        """指标选择框（预选 selected）：确定返回所选指标列表（按指标注册表顺序），取消返回 None。"""
+    def choose_metrics(self, parent: QWidget, selected: Sequence[str], *,
+                       group: bool = False) -> Optional[List[str]]:
+        """指标选择框（预选 selected）：确定返回所选指标列表（按指标注册表顺序），取消返回 None。
+        group 为真时是进程组（进程树 / 同名进程）任务的选择：对组不适用的指标置灰，
+        返回值末尾带进程总数。"""
         ...
 
     def ask_save_path(self, parent: QWidget, title: str, default_path: str,
@@ -74,8 +76,9 @@ class Dialogs(Protocol):
         ...
 
     def ask_close_action(self, parent: QWidget, running_count: int,
-                         can_tray: bool) -> str:
-        """仍有任务在监控时关闭主窗口的三选一：'quit' / 'tray' / 'cancel'。"""
+                         can_tray: bool, notice: str = "") -> str:
+        """仍有任务在监控时关闭主窗口的三选一：'quit' / 'tray' / 'cancel'。
+        notice 非空时作为醒目的一句提示附在对话框里（如退出后会丢失的数据）。"""
         ...
 
     def open_folder(self, path: str) -> None:
@@ -133,10 +136,10 @@ class QtDialogs:
                               process_name=process_name, pid=pid)
         return self._run_and_dispose(dialog, dialog.get_label, None)
 
-    def choose_metrics(self, parent: QWidget,
-                       selected: Sequence[str]) -> Optional[List[str]]:
+    def choose_metrics(self, parent: QWidget, selected: Sequence[str], *,
+                       group: bool = False) -> Optional[List[str]]:
         """指标选择框（MetricSelectorDialog）。"""
-        dialog = MetricSelectorDialog(list(selected), parent)
+        dialog = MetricSelectorDialog(list(selected), parent, group_mode=group)
         return self._run_and_dispose(dialog, dialog.get_selected, None)
 
     def ask_save_path(self, parent: QWidget, title: str, default_path: str,
@@ -159,9 +162,10 @@ class QtDialogs:
         return os.path.normpath(directory) if directory else None
 
     def ask_close_action(self, parent: QWidget, running_count: int,
-                         can_tray: bool) -> str:
+                         can_tray: bool, notice: str = "") -> str:
         """关窗三选一（CloseActionDialog）。"""
-        dialog = CloseActionDialog(running_count, can_tray=can_tray, parent=parent)
+        dialog = CloseActionDialog(running_count, can_tray=can_tray, parent=parent,
+                                   notice=notice)
         return self._run_and_dispose(dialog, lambda: dialog.choice, CLOSE_ACTION_CANCEL)
 
     def open_folder(self, path: str) -> None:

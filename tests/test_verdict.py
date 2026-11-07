@@ -100,7 +100,8 @@ def test_stop_reason_helpers():
     assert v.stop_reason_value(StopReason.PID_REUSED) == 'pid_reused'
     assert v.stop_reason_value('user') == 'user' and v.stop_reason_value(None) is None
     assert {r for r in StopReason if v.is_target_exit(r)} == {
-        StopReason.PROCESS_EXITED, StopReason.PROCESS_NOT_FOUND, StopReason.PID_REUSED}
+        StopReason.PROCESS_EXITED, StopReason.CRASHED, StopReason.PROCESS_NOT_FOUND,
+        StopReason.PID_REUSED}
 
 
 def test_compute_verdict_uses_shared_rules():

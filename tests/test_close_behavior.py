@@ -488,6 +488,35 @@ def test_close_with_running_task_cancel_keeps_everything(window, monkeypatch):
     assert window.isHidden() is False
 
 
+def test_close_confirmation_warns_about_data_held_for_a_full_disk(window, monkeypatch):
+    """磁盘已满、数据只留在内存里时，退出确认明确告诉用户"退出后将丢失"和条数"""
+    _start_running_task(window)
+    monkeypatch.setattr(window.monitor_manager, 'held_point_count', lambda: 1234)
+    _patch_ask(window, 'cancel')
+    window.closeEvent(_fake_event())
+    asked = window.services.dialogs.calls_of('ask_close_action')
+    assert asked[0]["notice"] == "有 1234 条因磁盘已满未写入的数据，退出后将丢失"
+
+
+def test_close_confirmation_has_no_notice_without_held_data(window, monkeypatch):
+    _start_running_task(window)
+    _patch_ask(window, 'cancel')
+    window.closeEvent(_fake_event())
+    assert "notice" not in window.services.dialogs.calls_of('ask_close_action')[0]
+
+
+def test_close_action_dialog_shows_the_notice_label(qapp):
+    from PyQt5.QtWidgets import QWidget
+    host = QWidget()
+    host.resize(800, 600)
+    text = "有 3 条因磁盘已满未写入的数据，退出后将丢失"
+    with_notice = CloseActionDialog(1, can_tray=True, parent=host, notice=text)
+    without = CloseActionDialog(1, can_tray=True, parent=host)
+    assert with_notice.notice_label.text() == text
+    assert not hasattr(without, 'notice_label')
+    host.deleteLater()
+
+
 def test_close_with_running_task_quit_stops_and_quits(window, monkeypatch):
     """选"停止监控并退出"：走完整清理 -> quit 路径，任务被停止"""
     _start_running_task(window)
@@ -914,3 +943,115 @@ def test_hide_to_tray_keeps_watchdog_running(window, monkeypatch):
     window.closeEvent(_fake_event())
 
     assert order == []
+
+
+# ---------- 磁盘已满时留在内存的数据：托盘退出与更新安装前的确认 ----------
+
+HELD_NOTICE = "有 1234 条因磁盘已满未写入的数据，退出后将丢失"
+
+
+def _hold_data(window, monkeypatch, count=1234):
+    monkeypatch.setattr(window.monitor_manager, 'held_point_count', lambda: count)
+
+
+def test_tray_quit_with_held_data_asks_and_cancel_keeps_running(window, monkeypatch):
+    _hold_data(window, monkeypatch)
+    window.services.dialogs.always('confirm', False)
+    quit_mock = MagicMock()
+    monkeypatch.setattr(QApplication, 'quit', quit_mock)
+
+    window.tray.quit_requested.emit()
+
+    asked = window.services.dialogs.calls_of('confirm')
+    assert len(asked) == 1
+    assert HELD_NOTICE in asked[0]["content"]
+    assert asked[0]["confirm_text"] == "仍然退出"
+    assert window._really_quit is False
+    quit_mock.assert_not_called()
+    assert window._shutdown_started is False
+
+
+def test_tray_quit_with_held_data_confirmed_quits(window, monkeypatch):
+    _hold_data(window, monkeypatch)
+    window.services.dialogs.always('confirm', True)
+    quit_mock = MagicMock()
+    monkeypatch.setattr(QApplication, 'quit', quit_mock)
+
+    window.tray.quit_requested.emit()
+
+    assert window._really_quit is True
+    quit_mock.assert_called_once()
+
+
+def test_tray_quit_without_held_data_does_not_ask(window, monkeypatch):
+    quit_mock = MagicMock()
+    monkeypatch.setattr(QApplication, 'quit', quit_mock)
+    window.tray.quit_requested.emit()          # confirm 未预设：被问到会直接断言失败
+    assert window.services.dialogs.calls_of('confirm') == []
+    quit_mock.assert_called_once()
+
+
+def test_quit_for_install_called_directly_asks_too(window, monkeypatch):
+    _hold_data(window, monkeypatch)
+    window.services.dialogs.always('confirm', False)
+    quit_mock = MagicMock()
+    monkeypatch.setattr(QApplication, 'quit', quit_mock)
+
+    window.quit_for_install()
+
+    assert len(window.services.dialogs.calls_of('confirm')) == 1
+    assert window._really_quit is False
+    quit_mock.assert_not_called()
+
+
+def test_install_flow_asks_before_launching_the_installer(window, monkeypatch):
+    """"安装更新并退出"：确认发生在启动安装程序之前，用户取消则安装程序根本不启动；
+    确认过的不会在 quit_for_install 里重复问"""
+    import ui.pages.about_update as about_module
+    _hold_data(window, monkeypatch)
+    monkeypatch.setattr(about_module.InstallConfirmDialog, 'exec', lambda self: True)
+    quit_mock = MagicMock()
+    monkeypatch.setattr(QApplication, 'quit', quit_mock)
+    group = window.about_group
+    group._pending_info = {'version': '9.9.9'}
+    dialogs = window.services.dialogs
+
+    dialogs.push('confirm', False)
+    group._on_download_finished(r"C:\temp\setup.exe")
+    assert dialogs.methods_called() == ['confirm']          # 没有 open_file
+    assert "已取消安装" in group.status_label.text()
+    quit_mock.assert_not_called()
+
+    dialogs.push('confirm', True)
+    group._on_download_finished(r"C:\temp\setup.exe")
+    assert dialogs.methods_called() == ['confirm', 'confirm', 'open_file']
+    assert window._really_quit is True                      # install_requested → quit_for_install
+    assert len(dialogs.calls_of('confirm')) == 2            # 退出路径里没有第三次确认
+    quit_mock.assert_called_once()
+
+
+def test_session_end_with_held_data_only_logs_a_warning(window, monkeypatch, caplog):
+    import logging
+    _hold_data(window, monkeypatch)
+    quit_mock = MagicMock()
+    monkeypatch.setattr(QApplication, 'quit', quit_mock)
+    with caplog.at_level(logging.WARNING, logger='ui.main_window'):
+        window._on_commit_data_request()
+    assert window.services.dialogs.calls_of('confirm') == []          # 不弹窗
+    assert any(r.levelno == logging.WARNING and HELD_NOTICE in r.getMessage()
+               for r in caplog.records)
+    assert window._really_quit is True
+    quit_mock.assert_called_once()
+
+
+def test_ipc_quit_with_held_data_logs_and_does_not_ask(window, monkeypatch, caplog):
+    """命令行 quit 没有人可以确认：不弹窗，只记 WARNING"""
+    import logging
+    _hold_data(window, monkeypatch)
+    quit_mock = MagicMock()
+    monkeypatch.setattr(QApplication, 'quit', quit_mock)
+    with caplog.at_level(logging.WARNING, logger='ui.main_window'):
+        window.request_quit()
+    assert window.services.dialogs.calls_of('confirm') == []
+    assert any(HELD_NOTICE in r.getMessage() for r in caplog.records)
+    quit_mock.assert_called_once()

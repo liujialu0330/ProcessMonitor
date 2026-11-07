@@ -25,6 +25,7 @@ from typing import (TYPE_CHECKING, Dict, Iterable, Iterator, List, Mapping, Opti
                     Sequence, Tuple)
 
 from core.analysis.intervals import IntervalStats
+from core.exit_forensics import CRASH_MARKER_PREFIX, format_exit_code, is_abnormal_exit
 from core.export import MARKER_COLUMN_NAME, _format_value, pivot_timed_rows
 from core.target_info import target_info_from_json_or_none
 from data.models import DataPoint, Marker, MonitorTask, QualityStats
@@ -154,6 +155,24 @@ def quality_text(quality: Optional[QualityStats]) -> str:
     return f"采集完成率 {percent:.1f}%（{details}）"
 
 
+LABEL_EXIT = '退出'
+TEXT_EXIT_UNKNOWN = "被测进程已退出，退出码未知"
+
+
+def exit_lines(task: MonitorTask) -> List[str]:
+    """被测进程退出信息行（"退出: 异常退出 0xC0000005（访问冲突）"）。任务记录里没有退出码、
+    停止原因也不是"被测进程已退出"（用户停止、仍在运行、旧任务）时为空列表。"""
+    code = getattr(task, 'exit_code', None)
+    reason = getattr(task, 'stop_reason', None)
+    if reason == 'crashed' or is_abnormal_exit(code):
+        return [f"{LABEL_EXIT}: {CRASH_MARKER_PREFIX} {format_exit_code(code)}"]
+    if code is not None:
+        return [f"{LABEL_EXIT}: 退出码 {format_exit_code(code)}"]
+    if reason == 'process_exited':
+        return [f"{LABEL_EXIT}: {TEXT_EXIT_UNKNOWN}"]
+    return []
+
+
 def target_lines(task: MonitorTask) -> List[str]:
     """被测目标元数据的摘要行（被测程序 / 命令行 / 环境，见 TargetInfo.summary_lines）；
     任务没有 meta_json（旧任务、探测前）或解析失败时为空列表。"""
@@ -244,6 +263,7 @@ def metadata_lines(task: MonitorTask, *, exported_at: datetime, range_text: str,
     if quality:
         lines.append(f"数据质量: {quality}")
     lines.extend(extra)
+    lines.extend(exit_lines(task))
     lines.extend(target_lines(task))
     lines.append(f"导出时间: {exported_at.strftime(TIME_FORMAT)}")
     lines.append(f"说明: {GAP_NOTE}")

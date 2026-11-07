@@ -43,6 +43,14 @@ pmctl run --tree --launch D:pp\App.exe --stop-after 3600 --out D:\out
 协议里对应 `start` 的 `target_kind` 参数（`pid` 缺省 / `tree` / `name`）；`status` 的每个任务带
 `target_kind`，`verdict` 在进程组任务里多一个 `members` 数组。
 
+被测进程重启后自动续接过的任务（`start` 的方案里开了续接）按启动段逐段判定，整体取最差的一段
+（持续上涨 > 数据不足 > 平稳）；`verdict` 多出 `segments`（每段的 `number` / `start` / `end` /
+`verdict` / `rising_metrics` / `rising_names` / `samples`）与 `conclusion`（纯文本，如“各段判定：
+第 1 段 持续上涨（私有字节）；第 2 段 本段数据不足”）。中途异常退出过（崩溃后被续接）整体为
+`target_exited`（退出码 30），另有 `mid_run_crashes`，`conclusion` 写“中途异常退出 N 次（最近一次
+0xC0000017（内存不足））”与各段判定；指标行的数值是最后一段的，基线在更早的启动段时 `baseline`
+为空、`baseline_note` 写“基线在第 N 段，不可比”。
+
 多个目标（多个 `--pid` / `--name` / `--group-name`）时取最严重的判定：被测进程退出 > 持续上涨 > 数据不足 > 平稳。
 
 ### 退出码
@@ -52,7 +60,7 @@ pmctl run --tree --launch D:pp\App.exe --stop-after 3600 --out D:\out
 | 0 | 平稳（或普通命令成功） |
 | 10 | 持续上涨（疑似泄漏） |
 | 20 | 数据不足（样本或轮数不够，无法判定） |
-| 30 | 被测进程在监控期间退出 |
+| 30 | 被测进程在监控期间退出（含中途崩溃后被续接过） |
 | 2 | 参数错误（含 `bad_request` / `unknown_command` / `invalid_args`） |
 | 3 | 连接失败（找不到程序、拉起超时、连接断开、身份校验失败、命令行控制已关闭） |
 | 1 | 其他错误（任务不存在、状态不允许、权限不足、内部错误；`wait` 未满足） |

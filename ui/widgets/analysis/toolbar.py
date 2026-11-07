@@ -1,7 +1,8 @@
 """
 分析页工具条（卡片）
 
-第 0 行：任务选择槽位 · [对比任务] · [导出报告 ▾ 报告/证据包/CSV/图片/复制图片] · [刷新] · [更多 ▾]
+第 0 行：任务选择槽位 · [成员（进程组任务才显示；窄宽度时换到第 3 行）] · [对比任务] ·
+        [导出报告 ▾ 报告/证据包/CSV/图片/复制图片] · [刷新] · [更多 ▾]
 第 1 行：范围分段（自基线 / 10分钟 / 1小时 / 6小时 / 24小时 / 全部 / 自定义）
         · 视图 [小倍数 | 叠加Δ%] · [绝对 | 相对时间]；窄宽度时视图切换换到第 2 行。
 
@@ -111,14 +112,22 @@ class AnalysisToolbar(CardWidget):
         self.more_menu.addAction(self.delete_action)
         self.more_button.setMenu(self.more_menu)
 
-        top = QHBoxLayout()
-        top.setSpacing(SPACING)
-        top.addWidget(BodyLabel("任务", self))
-        top.addWidget(self.task_slot, 1)
+        # 成员下拉的槽位：只有进程组任务才显示，位置由 update_layout 按宽度安排
+        self.member_box = QWidget(self)
+        self._member_layout = QHBoxLayout(self.member_box)
+        self._member_layout.setContentsMargins(0, 0, 0, 0)
+        self._member_layout.setSpacing(SPACING)
+        self._member_layout.addWidget(BodyLabel("成员", self.member_box))
+        self.member_box.setVisible(False)
+
+        self.top = QHBoxLayout()
+        self.top.setSpacing(SPACING)
+        self.top.addWidget(BodyLabel("任务", self))
+        self.top.addWidget(self.task_slot, 1)
         for widget in (self.compare_button, self.export_button, self.refresh_button,
                        self.more_button):
-            top.addWidget(widget)
-        self.grid.addLayout(top, 0, 0, 1, 3)
+            self.top.addWidget(widget)
+        self.grid.addLayout(self.top, 0, 0, 1, 3)
 
         self.range_label = BodyLabel("范围", self)
         self.range_segmented = self._segmented(RANGE_OPTIONS, DEFAULT_RANGE_KEY, self.range_changed)
@@ -160,6 +169,16 @@ class AnalysisToolbar(CardWidget):
     def set_task_selector(self, widget: QWidget) -> None:
         widget.setSizePolicy(QSizePolicy.Expanding, widget.sizePolicy().verticalPolicy())
         self._task_slot_layout.addWidget(widget)
+
+    def set_member_selector(self, widget: QWidget) -> None:
+        self._member_layout.addWidget(widget)
+
+    def set_members_visible(self, visible: bool) -> None:
+        """进程组任务才显示成员下拉。"""
+        self.member_box.setVisible(visible)
+
+    def members_visible(self) -> bool:
+        return not self.member_box.isHidden()
 
     # ---------- 范围 / 视图 ----------
 
@@ -230,8 +249,12 @@ class AnalysisToolbar(CardWidget):
         self.grid.removeWidget(self.views)
         if compact:
             self.grid.addWidget(self.views, 2, 1)
+            self.top.removeWidget(self.member_box)
+            self.grid.addWidget(self.member_box, 3, 0, 1, 3)
         else:
             self.grid.addWidget(self.views, 1, 2)
+            self.grid.removeWidget(self.member_box)
+            self.top.insertWidget(2, self.member_box)
         return True
 
     def resizeEvent(self, event):

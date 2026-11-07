@@ -77,6 +77,8 @@ HELP = {
     'stop_after': "运行多少秒后自动停止",
     'rounds': "打满多少轮后自动停止",
     'out': "导出目录（不给则不导出）",
+    'evidence_flag': "导出证据包 zip（报告图片、明细与摘要 CSV、task.json、README、日志摘录），此时 --kinds 无效",
+    'evidence_dir': "每个任务结束后另导出一个证据包 zip 到这个目录（不给则不导出证据包）",
     'junit': "把判定写成 JUnit XML（每个指标一个用例）",
     'idle_exit': (f"自动拉起的无窗口实例空闲多少秒后自动退出（默认 {DEFAULT_IDLE_EXIT_S:g}；"
                   "0 为不退出）"),
@@ -100,6 +102,10 @@ MSG_RUN_TIMEOUT = "{label}：等待超时（{seconds:g} 秒），已停止任务
 MSG_RUN_TIMEOUT_TAG = "超时停止"
 MSG_RUN_CLEANUP = "已停止本次开始的任务：{tasks}"
 MSG_TARGET_EXIT_AFTER = "  被测进程在停止条件达成后退出（{reason}），不影响判定"
+MSG_EXIT_CODE = "  被测进程退出码：{text}"
+MSG_CONCLUSION = "  {text}"
+MSG_SEGMENT_CASE = "第 {number} 段"
+MSG_WAITING_RESTART = "等待被测进程重启（已续接 {count}/{limit} 次）"
 MSG_WAITING = "{message}"
 MSG_LAUNCH_OPTION_ONLY = "--args、--cwd、--close-on-stop 只能与 --launch 一起使用"
 MSG_LAUNCH_NO_WAIT = "--launch 由本次启动程序，不能与 --wait 一起使用"
@@ -158,6 +164,7 @@ def build_parser() -> argparse.ArgumentParser:
     export.add_argument('--task', required=True, help=HELP['task'])
     export.add_argument('--dir', required=True, help=HELP['dir'])
     export.add_argument('--kinds', default=EXPORT_KINDS_DEFAULT, help=HELP['kinds'])
+    export.add_argument('--evidence', action='store_true', help=HELP['evidence_flag'])
 
     verdict = sub.add_parser('verdict', help=CMD_HELP['verdict'])
     verdict.add_argument('--task', required=True, help=HELP['task'])
@@ -181,6 +188,7 @@ def build_parser() -> argparse.ArgumentParser:
     stop.add_argument('--rounds', type=int, help=HELP['rounds'])
     run.add_argument('--out', help=HELP['out'])
     run.add_argument('--kinds', default=EXPORT_KINDS_DEFAULT, help=HELP['kinds'])
+    run.add_argument('--evidence', metavar='DIR', help=HELP['evidence_dir'])
     run.add_argument('--junit', help=HELP['junit'])
     return parser
 
@@ -347,6 +355,17 @@ def build_junit(results: Sequence[Dict[str, Any]], elapsed_s: float = 0.0, *,
         # 进程组任务：每个成员的每个指标也是一个用例（成员持续上涨同样算失败）
         metrics = list(metrics) + [metric for group in item.get('members') or []
                                    for metric in group.get('metrics') or []]
+        # 重启续接过的任务：持续上涨可能只出在更早的启动段（最后一段的各指标都不涨），
+        # 每个上涨的段单独记一个用例，CI 才不会在退出码为 20 时看到全部通过
+        for segment in item.get('segments') or []:
+            if segment.get('verdict') == ipc.VERDICT_RISING:
+                metrics.append({
+                    'key': f"segment_{segment.get('number')}",
+                    'name': MSG_SEGMENT_CASE.format(number=segment.get('number')),
+                    'verdict': ipc.VERDICT_RISING,
+                    'reason': 'rising',
+                    'rising': "、".join(segment.get('rising_names') or [])})
+        message_target_exited = item.get('conclusion') or MSG_VERDICT_TEXT['target_exited']
         for metric in metrics:
             counts['tests'] += 1
             case = ET.SubElement(suite, 'testcase', classname=str(target),
@@ -359,7 +378,7 @@ def build_junit(results: Sequence[Dict[str, Any]], elapsed_s: float = 0.0, *,
             if overall == ipc.VERDICT_TARGET_EXITED:
                 counts['errors'] += 1
                 node = ET.SubElement(case, 'error', type='target_exited',
-                                     message=MSG_VERDICT_TEXT['target_exited'])
+                                     message=message_target_exited)
                 node.text = detail
             elif verdict == ipc.VERDICT_RISING:
                 counts['failures'] += 1
@@ -386,7 +405,7 @@ def build_junit(results: Sequence[Dict[str, Any]], elapsed_s: float = 0.0, *,
 def _metric_detail(metric: Dict[str, Any]) -> str:
     parts = [f"{key}={metric.get(key)}" for key in
              ('key', 'verdict', 'reason', 'samples', 'first', 'last', 'baseline',
-              'rate_per_hour', 'rate_per_round', 'rounds') if key in metric]
+              'rate_per_hour', 'rate_per_round', 'rounds', 'rising') if key in metric]
     return "; ".join(parts)
 
 
@@ -463,6 +482,9 @@ class Cli:
                 self.emit("没有任务")
             for task in tasks:
                 state = "已暂停" if task.get('paused') else task.get('status')
+                if task.get('waiting_restart'):
+                    state = MSG_WAITING_RESTART.format(count=task.get('restart_count') or 0,
+                                                       limit=task.get('restart_limit') or 0)
                 group = GROUP_TEXTS.get(task.get('target_kind'))
                 target = (f"{task.get('name')}（{group}）" if task.get('target_kind') == 'name'
                           else f"{task.get('name')}（{group + '，' if group else ''}"
@@ -525,9 +547,11 @@ class Cli:
         return EXIT_OK if result.get('reached') else EXIT_ERROR
 
     def cmd_export(self) -> int:
-        result = self.call('export', {'task_id': self.args.task,
-                                      'dir': os.path.abspath(self.args.dir),
-                                      'kinds': _split(self.args.kinds) or []}, timeout=None)
+        payload = {'task_id': self.args.task, 'dir': os.path.abspath(self.args.dir),
+                   'kinds': _split(self.args.kinds) or []}
+        if self.args.evidence:
+            payload['evidence'] = True
+        result = self.call('export', payload, timeout=None)
         if not self.args.json:
             for path in result.get('paths') or []:
                 self.emit(path)
@@ -550,9 +574,17 @@ class Cli:
         if result.get('timeout_stopped'):
             text = f"{text}（{MSG_RUN_TIMEOUT_TAG}）"
         self.emit(f"{target}：{text}")
+        if result.get('conclusion'):
+            # 重启续接 / 中途异常退出：次数、最近一次退出码与各段判定
+            self.emit(MSG_CONCLUSION.format(text=result['conclusion']))
         exit_info = result.get('target_exit') or {}
         if exit_info and not exit_info.get('before_stop_condition', True):
             self.emit(MSG_TARGET_EXIT_AFTER.format(reason=exit_info.get('reason')))
+        if exit_info.get('exit_text'):
+            self.emit(MSG_EXIT_CODE.format(text=exit_info['exit_text']))
+        segment = result.get('segment') or {}
+        if segment.get('note'):
+            self.emit(f"  {segment['note']}")
         for metric in result.get('metrics') or []:
             self.emit(self._metric_line(metric))
         for group in result.get('members') or []:
@@ -562,8 +594,12 @@ class Cli:
 
     @staticmethod
     def _metric_line(metric: Dict[str, Any]) -> str:
-        return (f"  {metric.get('name')}：{metric.get('verdict')}"
+        line = (f"  {metric.get('name')}：{metric.get('verdict')}"
                 f"（每小时 {metric.get('rate_per_hour')}，每轮 {metric.get('rate_per_round')}）")
+        if metric.get('baseline_note'):
+            # 基线在别的启动段：不写"较基线"，只写它不可比
+            line += f"，{metric['baseline_note']}"
+        return line
 
     def cmd_run(self) -> int:
         """开始 → 等停止条件 → （超时则停止）→ 导出 → 判定。
@@ -622,6 +658,13 @@ class Cli:
                     if not args.json:
                         for path in exported.get('paths') or []:
                             self.emit(f"已导出：{path}")
+                if args.evidence:
+                    packed = self.call('export', {'task_id': task_id,
+                                                  'dir': os.path.abspath(args.evidence),
+                                                  'evidence': True}, timeout=None)
+                    if not args.json:
+                        for path in packed.get('paths') or []:
+                            self.emit(f"已导出证据包：{path}")
                 verdict = self.call('verdict', {'task_id': task_id}, timeout=None)
                 verdict['target'] = label
                 if timed_out:

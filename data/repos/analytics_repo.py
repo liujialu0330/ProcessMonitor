@@ -428,6 +428,50 @@ class AnalyticsRepo:
             rows = _gap_rows(conn, pts_cte, [*params, lo, hi], threshold)
         return [(from_ms(r['prev']), from_ms(r['ts'])) for r in rows]
 
+    def break_pairs(self, task_id: str, instants: Sequence[datetime],
+                    since: Optional[datetime] = None, until: Optional[datetime] = None,
+                    metric: Optional[str] = None) -> List[Tuple[datetime, datetime]]:
+        """
+        强制断点：每个时刻 T 取"T 之前最后一个样本、T 起第一个样本"，两端都存在且都在
+        [since, until] 内才算（与 gaps 同形：(断点前最后一点, 断点后第一点)）。
+        用于重启 / 续采这类数据来源变了的时刻：哪怕前后两点间隔不超过空洞阈值，也不该连线、
+        不该算速率。metric 为 None 时按任务全部指标的不同时间戳取（同 gaps）。
+        只从样本表现算、不写任何表——series_gaps 与汇总表仍与"按样本重算"逐项相同。
+        """
+        if not instants:
+            return []
+        lo, hi = ms_range(since, until)
+        with self._connect('读取强制断点') as conn:
+            series = task_series(conn, task_id, metric)
+            pairs = self._forced_pairs(conn, [sid for sid, _m in series], instants, lo, hi)
+        return [(from_ms(a), from_ms(b)) for a, b in pairs]
+
+    @staticmethod
+    def _forced_pairs(conn: sqlite3.Connection, sids: Sequence[int],
+                      instants: Sequence[datetime], lo: int, hi: int) -> List[Tuple[int, int]]:
+        """强制断点的毫秒形式（升序、去重）：每个时刻取这些序列合起来"之前最后一个样本、起第一个
+        样本"，两端都存在且都在 [lo, hi] 内才算。"""
+        pairs = set()
+        for instant in instants:
+            check_time(instant, 'instants')
+            at = to_ms(instant)
+            before: Optional[int] = None
+            after: Optional[int] = None
+            for sid in sids:
+                row = conn.execute(
+                    'SELECT MAX(ts_ms) FROM samples WHERE series_id = ? AND ts_ms < ?',
+                    (sid, at)).fetchone()
+                if row and row[0] is not None and (before is None or row[0] > before):
+                    before = row[0]
+                row = conn.execute(
+                    'SELECT MIN(ts_ms) FROM samples WHERE series_id = ? AND ts_ms >= ?',
+                    (sid, at)).fetchone()
+                if row and row[0] is not None and (after is None or row[0] < after):
+                    after = row[0]
+            if before is not None and after is not None and lo <= before and after <= hi:
+                pairs.add((before, after))
+        return sorted(pairs)
+
     @staticmethod
     def _series_gaps(conn: sqlite3.Connection, sid: int, lo: int, hi: int
                      ) -> List[Tuple[int, int]]:
@@ -468,9 +512,15 @@ class AnalyticsRepo:
     def buckets(self, task_id: str, metric: str, max_buckets: int,
                 since: Optional[datetime] = None, until: Optional[datetime] = None,
                 interval_seconds: Optional[float] = None,
-                gap_factor: float = DEFAULT_GAP_FACTOR) -> List[Bucket]:
+                gap_factor: float = DEFAULT_GAP_FACTOR,
+                break_instants: Sequence[datetime] = ()) -> List[Bucket]:
         """
         按时间等宽分桶（GROUP BY 时间桶），且任何桶都不跨空洞（空洞判定同 gaps）。
+
+        break_instants 是强制断点的时刻（重启 / 续采打点）：每个时刻 T 处"T 之前最后一个样本"与
+        "T 起第一个样本"之间同空洞一样切开（口径同 break_pairs），间隔再短也不让一个桶跨过去——
+        否则 min/max 带与中心线会把两次启动连成一段。断点只在查询里并入，series_gaps 与汇总表
+        不受影响（它们恒等于从样本按空洞规则重算的结果）。
 
         做法：先找出空洞（LAG），把序列切成若干连续段；所有段共用一个桶宽 w，
         每段从自己的首点起按 w 切桶（桶号 = floor((t - 段首) / w)），
@@ -505,17 +555,19 @@ class AnalyticsRepo:
                 return []
             rows = None
             gap_pairs = None
+            forced = (self._forced_pairs(conn, [sid], break_instants, lo, hi)
+                      if break_instants else [])
             if self._gap_rule_matches(conn, task_id, interval_seconds, gap_factor):
-                gap_pairs = self._series_gaps(conn, sid, lo, hi)
+                gap_pairs = sorted(set(self._series_gaps(conn, sid, lo, hi)) | set(forced))
             if gap_pairs is not None and self._use_rollup(conn, [sid], lo, hi):
                 starts = [0.0] + [b - t0 for _a, b in gap_pairs]
                 ends = [a - t0 for a, _b in gap_pairs] + [t1 - t0]
                 width_ms = _bucket_width([e - s for s, e in zip(starts, ends)], max_buckets)
                 if width_ms >= MINUTE_MS:
-                    rows = self._rollup_buckets(conn, sid, lo, hi, t0, width_ms)
+                    rows = self._rollup_buckets(conn, sid, lo, hi, t0, width_ms, forced)
             if rows is None:
                 rows = self._raw_buckets(conn, sid, lo, hi, t0, t1, threshold,
-                                         gap_factor, max_buckets, gap_pairs)
+                                         gap_factor, max_buckets, gap_pairs, forced)
 
         # 各桶时间上互不重叠、段按时间先后排列，按 start_ts 排序即 (段, 桶号) 的顺序
         return [
@@ -527,8 +579,10 @@ class AnalyticsRepo:
     @staticmethod
     def _raw_buckets(conn: sqlite3.Connection, sid: int, lo: int, hi: int, t0: int, t1: int,
                      threshold: Optional[float], gap_factor: float, max_buckets: int,
-                     gap_pairs: Optional[List[Tuple[int, int]]] = None) -> list:
-        """按样本分桶；gap_pairs 给定（读自 series_gaps）时不再扫样本找空洞"""
+                     gap_pairs: Optional[List[Tuple[int, int]]] = None,
+                     forced: Sequence[Tuple[int, int]] = ()) -> list:
+        """按样本分桶；gap_pairs 给定（读自 series_gaps，已并入强制断点）时不再扫样本找空洞；
+        否则扫出空洞后再并入 forced（强制断点的毫秒对）"""
         rng = (sid, lo, hi)
         anchor = t0
         last_ms = t1 - anchor
@@ -565,6 +619,12 @@ class AnalyticsRepo:
         else:
             gap_rows = (_gap_rows(conn, pts_cte, pts_params, threshold)
                         if need_scan else [])
+            if forced:
+                known = {r['ts'] for r in gap_rows}
+                gap_rows = sorted(
+                    [*gap_rows, *({'prev': a, 'pms': a - anchor, 'ts': b, 'ms': b - anchor}
+                                  for a, b in forced if b not in known)],
+                    key=lambda r: r['ts'])
 
         starts = [0.0] + [r['ms'] for r in gap_rows]
         ends = [r['pms'] for r in gap_rows] + [last_ms]
@@ -599,20 +659,40 @@ class AnalyticsRepo:
 
     @staticmethod
     def _rollup_buckets(conn: sqlite3.Connection, sid: int, lo: int, hi: int, t0: int,
-                        width_ms: float) -> list:
+                        width_ms: float, forced: Sequence[Tuple[int, int]] = ()) -> list:
         """
         汇总路径的 min/max 带：每个汇总行的段首（相对 t0）= 最后一个起点早于其首样本的空洞的
         end_ms，不早于 t0；桶号与原始路径同一算式（整数毫秒差除以 w 后截断）。整体落在一个桶里
         且在范围内的汇总行直接参与合并，其余行（跨桶边界或范围边界）展开为原始样本。
+
+        forced 是强制断点的毫秒对（汇总行只在写时空洞处切开，不知道它们）：段首也要看断点；
+        断点落在汇总行内部（两个样本同处一个自然分钟）的行同样展开为原始样本，且每个样本按
+        自己所在的段取段首。
         """
         # r 物化：段首是逐行的标量子查询，不物化会在 c、u 里每次引用都重算一遍
-        return fetch_packed(conn, '''
+        if forced:
+            forced_json = json.dumps([[a, b] for a, b in forced])
+            row_s0 = ''', COALESCE((SELECT MAX(json_extract(j.value, '$[1]'))
+                                      FROM json_each(?6) j
+                                      WHERE json_extract(j.value, '$[0]') < r.first_ms), ?3)'''
+            row_brk = ''', EXISTS (SELECT 1 FROM json_each(?6) j
+                                    WHERE json_extract(j.value, '$[0]') >= r.first_ms
+                                      AND json_extract(j.value, '$[1]') <= r.last_ms) AS brk'''
+            sample_s0 = '''MAX(c.s0, COALESCE((SELECT MAX(json_extract(j.value, '$[1]'))
+                                               FROM json_each(?6) j
+                                               WHERE json_extract(j.value, '$[1]') <= s.ts_ms),
+                                              ?3) - ?3)'''
+        else:
+            forced_json = '[]'
+            row_s0, row_brk, sample_s0 = '', ', 0 AS brk', 'c.s0'
+        return fetch_packed(conn, f'''
             WITH r AS MATERIALIZED (
                 SELECT r.count AS cnt, r.first_ms, r.last_ms, r.min_value, r.max_value, r.sum_y,
                        MAX(?3, COALESCE(
                            (SELECT g.end_ms FROM series_gaps g
                             WHERE g.series_id = ?1 AND g.start_ms < r.first_ms
-                            ORDER BY g.start_ms DESC LIMIT 1), ?3)) - ?3 AS s0
+                            ORDER BY g.start_ms DESC LIMIT 1), ?3){row_s0}) - ?3 AS s0
+                       {row_brk}
                 FROM rollup_1m r
                 WHERE r.series_id = ?1 AND r.bucket_ms > ?4 - 60000 AND r.bucket_ms <= ?5
             ),
@@ -625,13 +705,14 @@ class AnalyticsRepo:
             u AS (
                 SELECT s0, b1 AS b, cnt, first_ms AS f, last_ms AS l,
                        min_value AS mn, max_value AS mx, sum_y AS sy
-                FROM c WHERE inside AND b1 = b2
+                FROM c WHERE inside AND b1 = b2 AND NOT brk
                 UNION ALL
-                SELECT c.s0, CAST(((s.ts_ms - ?3) - c.s0) / ?2 AS INTEGER), 1,
-                       s.ts_ms, s.ts_ms, s.value, s.value, s.value
-                FROM c CROSS JOIN samples s
-                WHERE NOT (c.inside AND c.b1 = c.b2) AND s.series_id = ?1
-                  AND s.ts_ms BETWEEN MAX(c.first_ms, ?4) AND MIN(c.last_ms, ?5)
+                SELECT x.s0, CAST(((x.ts - ?3) - x.s0) / ?2 AS INTEGER), 1,
+                       x.ts, x.ts, x.v, x.v, x.v
+                FROM (SELECT s.ts_ms AS ts, s.value AS v, {sample_s0} AS s0
+                      FROM c CROSS JOIN samples s
+                      WHERE NOT (c.inside AND c.b1 = c.b2 AND NOT c.brk) AND s.series_id = ?1
+                        AND s.ts_ms BETWEEN MAX(c.first_ms, ?4) AND MIN(c.last_ms, ?5)) x
             ),
             agg AS (
                 SELECT s0, b, MIN(f) AS start_ts, MAX(l) AS end_ts, MIN(mn) AS min_v,
@@ -643,7 +724,7 @@ class AnalyticsRepo:
                    (SELECT value FROM samples
                     WHERE series_id = ?1 AND ts_ms = agg.end_ts) AS c6
             FROM agg
-        ''', (sid, width_ms, t0, lo, hi), 'iifffif')
+        ''', (sid, width_ms, t0, lo, hi, *([forced_json] if forced else [])), 'iifffif')
 
     # ========== 基线取值 ==========
 

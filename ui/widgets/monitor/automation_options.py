@@ -18,7 +18,8 @@ from qfluentwidgets import (
     PushButton, SpinBox, TransparentToolButton,
 )
 
-from core.automation.plan import (DEFAULT_LOG_ENCODING, SNAPSHOT_HOURS_MAX, SNAPSHOT_HOURS_MIN,
+from core.automation.plan import (DEFAULT_LOG_ENCODING, DEFAULT_RESTART_LIMIT, RESTART_LIMIT_MAX,
+                                  RESTART_LIMIT_MIN, SNAPSHOT_HOURS_MAX, SNAPSHOT_HOURS_MIN,
                                   AutomationPlan)
 from ui.formatting import plan_summary
 from ui.widgets.monitor.process_picker import ERROR_DARK, ERROR_LIGHT
@@ -52,6 +53,13 @@ SNAPSHOT_DIR_PLACEHOLDER = "快照目录"
 SNAPSHOT_TOOLTIP = ("运行中每隔这么久把报告图片与摘要 CSV 写到所选目录（不含明细 CSV），"
                     "不必停止任务也能看到阶段进展。\n"
                     "暂停期间不计时；写失败只提示一次，不影响采集。")
+
+RESTART_CHECK_TEXT = "被测进程退出后等待它重新启动并继续记录，最多"
+RESTART_UNIT_TEXT = "次"
+RESTART_TOOLTIP = ("适用于按 PID 或进程树监控的任务：被测进程退出（崩溃或自己重启）后，任务不结束，"
+                   "按进程名与程序路径等它再起来，起来后接着记录；等待期间不写数据点。\n"
+                   "超过次数或手动停止时，任务按最后一次退出的原因结束。\n"
+                   "判定与区间表只统计最后一次启动之后的数据。")
 
 # 编码选项 (显示文本, 编码名)
 ENCODING_CHOICES = (("UTF-8", DEFAULT_LOG_ENCODING), ("GBK", 'gbk'))
@@ -187,6 +195,21 @@ class AutomationOptions(QWidget):
         grid.addWidget(self.snapshot_check, 6, 0)
         grid.addLayout(snapshot_row, 6, 1)
         grid.addWidget(self.snapshot_browse_button, 6, 2)
+
+        # 被测进程重启后续接：同一任务、新进程，最多 N 次
+        self.restart_check = CheckBox(RESTART_CHECK_TEXT, self.body)
+        self.restart_check.setToolTip(RESTART_TOOLTIP)
+        self.restart_spin = SpinBox(self.body)
+        self.restart_spin.setRange(RESTART_LIMIT_MIN, RESTART_LIMIT_MAX)
+        self.restart_spin.setValue(DEFAULT_RESTART_LIMIT)
+        self.restart_spin.setToolTip(RESTART_TOOLTIP)
+        restart_row = QHBoxLayout()
+        restart_row.setSpacing(8)
+        restart_row.addWidget(self.restart_check)
+        restart_row.addWidget(self.restart_spin)
+        restart_row.addWidget(CaptionLabel(RESTART_UNIT_TEXT, self.body))
+        restart_row.addStretch(1)
+        grid.addLayout(restart_row, 7, 0, 1, 4)
         grid.setColumnStretch(1, 1)
 
         # 校验错误：就近显示在本区下方（与进程选择的字段错误同一配色）
@@ -194,13 +217,13 @@ class AutomationOptions(QWidget):
         self.error_label.setTextColor(ERROR_LIGHT, ERROR_DARK)
         self.error_label.setWordWrap(True)
         self.error_label.hide()
-        grid.addWidget(self.error_label, 7, 0, 1, 4)
+        grid.addWidget(self.error_label, 8, 0, 1, 4)
         layout.addWidget(self.body)
 
         for check in self._checks():
             check.toggled.connect(self._on_input_changed)
         for spin in (self.timed_spin, self.stop_minutes_spin, self.stop_rounds_spin,
-                     self.snapshot_hours_spin):
+                     self.snapshot_hours_spin, self.restart_spin):
             spin.valueChanged.connect(self._on_input_changed)
         for edit in (self.log_path_edit, self.log_pattern_edit, self.export_dir_edit,
                      self.snapshot_dir_edit):
@@ -221,7 +244,8 @@ class AutomationOptions(QWidget):
 
     def _checks(self) -> List[CheckBox]:
         return [self.timed_check, self.log_check, self.stop_time_check,
-                self.stop_rounds_check, self.export_check, self.snapshot_check]
+                self.stop_rounds_check, self.export_check, self.snapshot_check,
+                self.restart_check]
 
     def focus_chain(self) -> List[QWidget]:
         """本区可获得焦点的控件，按视觉顺序（表单据此声明 Tab 顺序）。"""
@@ -232,7 +256,7 @@ class AutomationOptions(QWidget):
                 self.stop_rounds_check, self.stop_rounds_spin,
                 self.export_check, self.export_dir_edit, self.export_browse_button,
                 self.snapshot_check, self.snapshot_hours_spin, self.snapshot_dir_edit,
-                self.snapshot_browse_button]
+                self.snapshot_browse_button, self.restart_check, self.restart_spin]
 
     # ========== 折叠 ==========
 
@@ -271,6 +295,9 @@ class AutomationOptions(QWidget):
                                   if snapshot_on else None),
             stage_snapshot_dir=((self.snapshot_dir_edit.text().strip() or None)
                                 if snapshot_on else None),
+            resume_on_restart=self.restart_check.isChecked(),
+            restart_limit=(int(self.restart_spin.value()) if self.restart_check.isChecked()
+                           else DEFAULT_RESTART_LIMIT),
         )
 
     def set_plan(self, plan: Optional[AutomationPlan]) -> None:
@@ -297,6 +324,9 @@ class AutomationOptions(QWidget):
         if plan.stage_snapshot_hours is not None:
             self.snapshot_hours_spin.setValue(plan.stage_snapshot_hours)
         self.snapshot_dir_edit.setText(plan.stage_snapshot_dir or '')
+        self.restart_check.setChecked(plan.resume_on_restart)
+        self.restart_spin.setValue(min(max(plan.restart_limit, RESTART_LIMIT_MIN),
+                                       RESTART_LIMIT_MAX))
         self.clear_error()
 
     def set_log_path(self, path: str) -> None:
@@ -376,6 +406,7 @@ class AutomationOptions(QWidget):
         for widget in (self.snapshot_hours_spin, self.snapshot_dir_edit,
                        self.snapshot_browse_button):
             widget.setEnabled(snapshot_on)
+        self.restart_spin.setEnabled(self.restart_check.isChecked())
 
     def _refresh_summary(self) -> None:
         text = plan_summary(self.plan()) or SECTION_OFF_TEXT
