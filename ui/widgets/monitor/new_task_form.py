@@ -78,6 +78,8 @@ class NewTaskForm(CardWidget):
                  parent=None):
         super().__init__(parent)
         self._metrics: List[str] = []
+        # 不能开始监控的原因（如数据库只读）；None 表示可以开始
+        self._start_blocked: Optional[str] = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
@@ -190,8 +192,28 @@ class NewTaskForm(CardWidget):
         # 等待中的进程本来就不在列表里，不提示"未找到"
         self.picker.set_no_match_hint_enabled(not checked)
         self.start_button.setText(WAIT_START_TEXT if checked else START_TEXT)
-        self.start_button.setToolTip(
-            "进程出现后自动开始记录" if checked else "")
+        self._sync_start_tooltip()
+
+    def _sync_start_tooltip(self) -> None:
+        if self._start_blocked:
+            self.start_button.setToolTip(self._start_blocked)
+        else:
+            self.start_button.setToolTip(
+                "进程出现后自动开始记录" if self.wait_enabled() else "")
+
+    # ========== 禁止开始 ==========
+
+    def set_start_blocked(self, reason: Optional[str]) -> None:
+        """禁止或恢复"开始监控"：reason 非空时禁用开始按钮并把原因放进 tooltip。
+
+        备注框回车仍会发出请求，由 MonitorPresenter 就近提示原因（表单不弹提示）。
+        """
+        self._start_blocked = reason or None
+        self.start_button.setEnabled(self._start_blocked is None)
+        self._sync_start_tooltip()
+
+    def start_blocked_reason(self) -> Optional[str]:
+        return self._start_blocked
 
     # ========== 提交 ==========
 

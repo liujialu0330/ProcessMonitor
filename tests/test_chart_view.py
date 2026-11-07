@@ -174,7 +174,9 @@ def test_hover_text_matches_safety_net_dataset(chart, db):
     task = _seed_query_dataset(db)
     chart.set_snapshot(_snapshot(db, task.task_id, MEM))
     chart.show_hover_at(chart.x_values[-1])
-    assert chart.hover_label.text() == "07-16 09:59:00 · 209.5 MB · 打点「② 第2轮」后 4分钟"
+    # 图表点集按时间等分（2.0）：最后一个 7 分钟桶含 119、120 分钟两点，最小值点是 120 分钟
+    # 的 160 MB（1.x 按行号等分时最后一点是 119 分钟的尖峰 209.5 MB）
+    assert chart.hover_label.text() == "07-16 10:00:00 · 160 MB · 打点「② 第2轮」后 5分钟"
 
 
 # ---------- 打点种类、空洞与速率曲线 ----------

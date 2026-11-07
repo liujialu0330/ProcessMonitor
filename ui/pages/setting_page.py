@@ -3,7 +3,7 @@
 
 三个分组：
 - 常规：应用主题 · 默认采集间隔 · 关闭行为 · 打点快捷键
-- 数据：历史数据保留 · 压缩数据库（按保留策略决定是否同时清理过期任务）· 数据目录
+- 数据：历史数据保留 · 压缩数据库（按保留策略决定是否同时清理过期任务）· 重建分钟汇总 · 数据目录
 - 关于与更新：版本与项目主页 · 检查更新（原"关于"页并入，见 ui/pages/about_update）
 """
 import logging
@@ -24,6 +24,7 @@ from core.maintenance_service import (
     BUSY_EXPORT_RUNNING, BUSY_MAINTENANCE_RUNNING, BUSY_TASKS_RUNNING,
     MaintenanceBusy, MaintenanceService,
 )
+from core.workers.base import BackgroundTask, CancelToken
 from core.workers.cleanup_worker import CleanupWorker
 from data.database import Database
 from ui.components.spinbox_setting_card import SpinBoxSettingCard
@@ -44,7 +45,15 @@ logger = logging.getLogger(__name__)
 # 数据库维护按钮：永久保留时只压缩、不删数据，按钮直说"压缩数据库"
 COMPACT_TEXT = "压缩数据库"
 CLEANUP_TEXT = "清理并压缩"
+REBUILD_TEXT = "重建汇总"
 HOTKEY_PLACEHOLDER = "点击后按下组合键"
+# "数据目录"卡片末尾显示的数据目录来源
+DATA_DIR_SOURCE_TEXTS = {
+    config.DATA_DIR_SOURCE_CLI: "命令行指定",
+    config.DATA_DIR_SOURCE_ENV: "环境变量",
+    config.DATA_DIR_SOURCE_PORTABLE: "便携模式",
+    config.DATA_DIR_SOURCE_DEFAULT: "默认",
+}
 
 
 def _retention_text(days: int) -> str:
@@ -75,6 +84,31 @@ _BUSY_REASON_TEXTS = {
     BUSY_MAINTENANCE_RUNNING: "数据库正在清理中，请稍候",
 }
 _BUSY_FALLBACK_TEXT = "数据库正忙，请稍后再清理"
+# 重建汇总被拒绝的原因 → 提示文案
+_REBUILD_BUSY_TEXTS = {
+    BUSY_TASKS_RUNNING: "有监控任务正在运行，请先停止全部任务再重建汇总",
+    BUSY_EXPORT_RUNNING: "正在导出数据，请等导出完成后再重建汇总",
+    BUSY_MAINTENANCE_RUNNING: "数据库正在维护中，请稍候",
+}
+_REBUILD_BUSY_FALLBACK_TEXT = "数据库正忙，请稍后再重建汇总"
+
+
+class RebuildRollupsWorker(BackgroundTask):
+    """
+    "重建汇总"后台线程：按样本整体重算分钟汇总与空洞（大库需要数秒，不放界面线程）。
+    两段式维护锁：界面线程已 MaintenanceService.begin() 占锁，本线程以 already_locked=True
+    调用、不占也不放锁，线程结束（QThread.finished，无论成败）后由界面线程 end()。
+    结果经 result(RebuildRollupsResult) / failed(str) 二选一发出；整个重算是一个事务，
+    中途失败整体回滚，因此不提供取消。
+    """
+
+    def __init__(self, maintenance_service: MaintenanceService, parent=None):
+        super().__init__(parent)
+        self.maintenance_service = maintenance_service
+
+    def execute(self, token: CancelToken):
+        return self.maintenance_service.rebuild_rollups(already_locked=True)
+
 
 # 修饰键（单独按下时不算完成输入）
 _MODIFIER_KEYS = {Qt.Key_Control, Qt.Key_Alt, Qt.Key_Shift, Qt.Key_Meta,
@@ -167,6 +201,8 @@ class SettingPage(ScrollArea):
             maintenance = MaintenanceService(db, manager)
         self.maintenance = maintenance
         self._cleanup_worker: Optional[CleanupWorker] = None
+        self._rebuild_worker: Optional[RebuildRollupsWorker] = None
+        self._rebuild_tooltip: Optional[StateToolTip] = None
         self._state_tooltip: StateToolTip = None
 
         # 承载各设置分组的滚动内容容器
@@ -225,7 +261,7 @@ class SettingPage(ScrollArea):
         self.general_group.addSettingCard(self.hotkey_card)
 
     def _init_data_group(self):
-        """数据：历史数据保留 · 压缩数据库 · 数据目录"""
+        """数据：历史数据保留 · 压缩数据库 · 重建汇总 · 数据目录"""
         self.data_group = SettingCardGroup("数据", self.scroll_widget)
         # 选项文案与 ConfigItem 校验器的可选值逐一对应：可选值只在应用配置里定义一份
         retention_texts = [_retention_text(days)
@@ -243,11 +279,22 @@ class SettingPage(ScrollArea):
             parent=self.data_group)
         self.data_group.addSettingCard(self.cleanup_card)
 
+        # 分析页大范围查询读分钟汇总；汇总与原始数据由写入同一事务维护，这里是兜底：
+        # 按原始数据整体重算（与清理共用维护锁，运行中有任务时禁用）
+        self.rebuild_card = PushSettingCard(
+            REBUILD_TEXT, FIF.SYNC, "分析汇总",
+            "分析结果与原始数据对不上时，按原始数据重新生成分钟汇总",
+            parent=self.data_group)
+        self.data_group.addSettingCard(self.rebuild_card)
+
         # 长路径收敛为末两级，完整值放在 tooltip，避免卡片文字挤压按钮。
         normalized_path = os.path.normpath(config.DATA_DIR)
         parent_name = os.path.basename(os.path.dirname(normalized_path))
         dir_name = os.path.basename(normalized_path)
         compact_path = os.path.join("…", parent_name, dir_name)
+        source_text = DATA_DIR_SOURCE_TEXTS.get(config.DATA_DIR_SOURCE, "")
+        if source_text:
+            compact_path = f"{compact_path}（{source_text}）"
         self.open_dir_card = PushSettingCard(
             "打开", FIF.FOLDER, "数据目录", compact_path, parent=self.data_group)
         self.open_dir_card.contentLabel.setToolTip(normalized_path)
@@ -298,6 +345,7 @@ class SettingPage(ScrollArea):
         """
         qconfig.themeChanged.connect(self._on_theme_changed_apply)
         self.cleanup_card.clicked.connect(self._on_cleanup_clicked)
+        self.rebuild_card.clicked.connect(self._on_rebuild_clicked)
         self.open_dir_card.clicked.connect(self._on_open_data_dir_clicked)
         # 保留策略一改，维护按钮文案（压缩 / 清理并压缩）随之变化
         cfg.retention_days.valueChanged.connect(self._on_retention_changed)
@@ -371,6 +419,10 @@ class SettingPage(ScrollArea):
         """清理线程是否仍在运行"""
         return self._cleanup_worker is not None and self._cleanup_worker.isRunning()
 
+    def _is_rebuild_running(self) -> bool:
+        """重建汇总线程是否仍在运行（引用在线程真正结束后才清空）"""
+        return self._rebuild_worker is not None
+
     def _refresh_data_management_state(self) -> None:
         """刷新数据库维护卡片的按钮文案、占用说明与可用状态"""
         days = self.services.preferences.retention_days()
@@ -382,10 +434,12 @@ class SettingPage(ScrollArea):
         suffix = " · 有任务在监控，停止后可清理" if has_running else ""
         self.cleanup_card.contentLabel.setText(f"当前占用 {size_text}{suffix}")
 
-        # 清理进行中保持禁用，不因任务状态信号被误启用
-        self.cleanup_card.button.setEnabled(
-            not has_running and not self._is_cleanup_running())
+        # 维护（清理或重建汇总）进行中保持禁用，不因任务状态信号被误启用
+        idle = not self._is_cleanup_running() and not self._is_rebuild_running()
+        self.cleanup_card.button.setEnabled(not has_running and idle)
         self.cleanup_card.button.setToolTip("请先停止全部监控任务" if has_running else "")
+        self.rebuild_card.button.setEnabled(not has_running and idle)
+        self.rebuild_card.button.setToolTip("请先停止全部监控任务" if has_running else "")
 
     def _on_open_data_dir_clicked(self) -> None:
         """"数据目录"卡片点击：用系统资源管理器打开数据目录（失败给出提示）"""
@@ -506,4 +560,70 @@ class SettingPage(ScrollArea):
         self.maintenance.end()
         if self._cleanup_worker is worker:
             self._cleanup_worker = None
+        self._refresh_data_management_state()
+
+    # ========== 重建汇总 ==========
+
+    def _warn_rebuild_busy(self, reason: str) -> None:
+        self.services.notifier.warning(
+            self.window(), "无法重建汇总",
+            _REBUILD_BUSY_TEXTS.get(reason, _REBUILD_BUSY_FALLBACK_TEXT), duration=4000)
+        self._refresh_data_management_state()
+
+    def _on_rebuild_clicked(self) -> None:
+        """"重建汇总"点击：与清理同样的两段式——只读预检（有运行中任务或导出时直接提示）→
+        界面线程 maintenance.begin() 占锁（被拒按原因提示、不启动线程）→ 后台线程重算 →
+        线程 finished（无论成败）后在界面线程 end()。重算不删除任何原始数据，不弹确认框。"""
+        if self._is_rebuild_running() or self._is_cleanup_running():
+            return
+        reason = self._busy_reason()
+        if reason is not None:
+            self._warn_rebuild_busy(reason)
+            return
+        try:
+            self.maintenance.begin()
+        except MaintenanceBusy as busy:
+            logger.info("重建汇总被拒绝: %s", busy.reason)
+            self._warn_rebuild_busy(busy.reason)
+            return
+
+        try:
+            worker = RebuildRollupsWorker(self.maintenance)
+            worker.result.connect(self._on_rebuild_finished)
+            worker.failed.connect(self._on_rebuild_failed)
+            worker.finished.connect(lambda w=worker: self._on_rebuild_thread_finished(w))
+            # 重算是一个事务，中途打断只会回滚；退出时给较长的等待超时
+            self.services.threads.register(worker, name="重建汇总", timeout_ms=5000)
+            self._rebuild_worker = worker
+            worker.start()
+        except Exception:
+            self._rebuild_worker = None
+            self.maintenance.end()
+            raise
+
+        self._refresh_data_management_state()
+        self._rebuild_tooltip = StateToolTip(
+            "正在重建汇总", "正在按原始数据重新生成分钟汇总，请稍候…", self.window())
+        self._rebuild_tooltip.move(self._rebuild_tooltip.getSuitablePos())
+        self._rebuild_tooltip.show()
+
+    def _on_rebuild_finished(self, result) -> None:
+        if self._rebuild_tooltip is not None:
+            self._rebuild_tooltip.setContent(f"汇总重建完成（{result.series} 条序列）")
+            self._rebuild_tooltip.setState(True)
+            self._rebuild_tooltip = None
+
+    def _on_rebuild_failed(self, reason: str) -> None:
+        if self._rebuild_tooltip is not None:
+            self._rebuild_tooltip.close()
+            self._rebuild_tooltip.deleteLater()
+            self._rebuild_tooltip = None
+        self.services.notifier.error(
+            self.window(), "重建汇总失败", f"重建分钟汇总失败（原汇总保持不变）：{reason}")
+
+    def _on_rebuild_thread_finished(self, worker) -> None:
+        """重建线程真正结束（无论成败）：释放维护锁与引用，刷新按钮可用状态。"""
+        self.maintenance.end()
+        if self._rebuild_worker is worker:
+            self._rebuild_worker = None
         self._refresh_data_management_state()

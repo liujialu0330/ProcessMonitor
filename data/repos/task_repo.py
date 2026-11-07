@@ -3,6 +3,7 @@
 
 sample_count / last_sample_at 不归这里写：它们只由 PointRepo.append（写入时累加）与
 PointRepo.recount（重算）维护，save() 刻意不覆盖，避免重复保存任务时把累计值清零。
+v5 为后续版本预留的列（target_kind、plan_json 等）模型尚未携带，save() 同样不碰它们。
 """
 import logging
 import sqlite3
@@ -11,7 +12,9 @@ from typing import Any, List, Optional
 
 from data.mappers import dump_metric_types, row_to_task, to_iso, to_iso_or_none
 from data.models import MonitorTask
+from data.repos import series_cache
 from data.repos._guard import storage_errors
+from data.repos._samples import delete_series_rows
 
 logger = logging.getLogger(__name__)
 
@@ -23,16 +26,24 @@ def status_value(status: Any) -> str:
 
 def delete_task_rows(cursor: sqlite3.Cursor, task_id: str) -> int:
     """
-    在调用方管理的事务内删除任务的 data_points / task_markers / tasks 三表行。
-    外键约束未启用，级联只能手工完成；TaskRepo.delete 与 Maintenance.cleanup_older_than 共用。
+    在调用方管理的事务内删除任务在所有表里的行：series 及其 samples / rollup_1m /
+    series_gaps，task_members、handle_snapshots、task_markers、data_points（1.4.1 降级期间
+    写入、尚未导回的样本）与 tasks。外键约束未启用，级联只能手工完成；
+    TaskRepo.delete 与 Maintenance.cleanup_older_than 共用。
 
     Returns:
-        int: 被删除的数据点行数
+        int: 被删除的样本行数（samples 与 data_points 合计）
     """
-    cursor.execute('DELETE FROM data_points WHERE task_id = ?', (task_id,))
-    point_count = cursor.rowcount
-    cursor.execute('DELETE FROM task_markers WHERE task_id = ?', (task_id,))
-    cursor.execute('DELETE FROM tasks WHERE task_id = ?', (task_id,))
+    conn = cursor.connection
+    series = [row[0] for row in conn.execute(
+        'SELECT series_id FROM series WHERE task_id = ?', (task_id,))]
+    # 删除的 series_id 可能被之后新建的序列复用：先让写入端的映射缓存失效
+    series_cache.invalidate()
+    point_count = delete_series_rows(conn, series)
+    point_count += conn.execute(
+        'DELETE FROM data_points WHERE task_id = ?', (task_id,)).rowcount
+    for table in ('task_members', 'handle_snapshots', 'task_markers', 'tasks'):
+        conn.execute(f'DELETE FROM {table} WHERE task_id = ?', (task_id,))
     return point_count
 
 
@@ -102,8 +113,8 @@ class TaskRepo:
         """
         至少采样过一次的任务（sample_count > 0），按开始时间倒序，单条 SQL。
 
-        库仍停留在旧版本（迁移失败、tasks 缺 sample_count 列）时回退为按 data_points
-        是否存在判断，而不是让分析页整体变空。
+        库仍停留在旧版本（迁移失败、tasks 缺 sample_count 列）时回退为按是否存在样本判断
+        （有 samples 表按样本，否则按旧 data_points），而不是让分析页整体变空。
         """
         with storage_errors("读取有数据的任务"):
             with self._factory.connect() as conn:
@@ -112,12 +123,18 @@ class TaskRepo:
                         'SELECT * FROM tasks WHERE sample_count > 0 '
                         'ORDER BY start_time DESC').fetchall()
                 except sqlite3.OperationalError:
-                    logger.warning("tasks 缺少 sample_count 列，回退到按数据点判断有数据的任务")
-                    rows = conn.execute('''
-                        SELECT * FROM tasks t
-                        WHERE EXISTS (SELECT 1 FROM data_points d WHERE d.task_id = t.task_id)
-                        ORDER BY start_time DESC
-                    ''').fetchall()
+                    logger.warning("tasks 缺少 sample_count 列，回退到按样本判断有数据的任务")
+                    has_samples = conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'samples'"
+                    ).fetchone() is not None
+                    exists = ('''EXISTS (SELECT 1 FROM series se JOIN samples s
+                                         ON s.series_id = se.series_id
+                                         WHERE se.task_id = t.task_id)'''
+                              if has_samples else
+                              'EXISTS (SELECT 1 FROM data_points d WHERE d.task_id = t.task_id)')
+                    rows = conn.execute(
+                        f'SELECT * FROM tasks t WHERE {exists} ORDER BY start_time DESC'
+                    ).fetchall()
                 return [row_to_task(row) for row in rows]
 
     def update_status(self, task_id: str, status: str,
@@ -141,10 +158,10 @@ class TaskRepo:
 
     def delete(self, task_id: str) -> bool:
         """
-        在一个事务内删除任务及其全部数据点与打点。
+        在一个事务内删除任务及其全部样本、打点与其他附属行（见 delete_task_rows）。
 
         Returns:
-            bool: 任务行是否存在并已删除（不存在时也会顺手清掉同 ID 的孤儿数据点/打点）
+            bool: 任务行是否存在并已删除（不存在时也会顺手清掉同 ID 的孤儿样本/打点）
         """
         with storage_errors(f"删除任务 {task_id} "):
             with self._factory.transaction() as cursor:

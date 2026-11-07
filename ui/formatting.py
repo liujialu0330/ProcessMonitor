@@ -5,6 +5,7 @@
 """
 import bisect
 import math
+import os
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, List, Optional, Sequence
@@ -13,6 +14,7 @@ from core.analysis.intervals import mean_round_delta
 from core.analysis.trend import (
     MIN_POINTS, Judgement, RateText, Verdict, min_span_for)
 from core.contracts import StopReason, UnavailableReason
+from data.db.migrations.runner import disk_shortage_message
 from data.models import MonitorTask
 from utils.metrics import (
     KB_UNIT_DIVISORS, VALUE_CLASS_PEAK, VALUE_CLASS_RATE, display_unit_for,
@@ -461,3 +463,42 @@ def format_relative(seconds: float) -> str:
     if hours:
         return f"T{sign}{hours}:{minutes:02d}:{secs:02d}"
     return f"T{sign}{minutes:02d}:{secs:02d}"
+
+
+# ========== 数据库升级与只读模式 ==========
+
+READ_ONLY_TITLE = "只读模式"
+# 只读横幅：{version} 为写入本库的更高版本号
+READ_ONLY_BANNER_TEMPLATE = (
+    "数据库由更高版本（{version}）创建，本版本以只读方式打开：可以查看与导出，不能开始监控")
+READ_ONLY_UNKNOWN_VERSION = "更新的版本"
+# 开始监控按钮的 tooltip 与被拒时的就近提示
+READ_ONLY_START_BLOCKED = "数据库为只读（由更高版本创建），不能开始监控；请升级到最新版本"
+READ_ONLY_MARKER_BLOCKED = "数据库为只读，不能打点"
+
+MIGRATED_TIP_TITLE = "数据库已升级"
+# 升级成功提示：{version} 为新结构版本，{name} 为旧文件备份的文件名
+MIGRATED_TIP_TEMPLATE = "数据库已升级到 v{version}，旧文件已保留为 {name}（可用于回退到 1.4.1）"
+MIGRATED_TIP_DURATION_MS = 6000
+
+BACKUP_ABORTED_TEXT = "未能升级数据库，历史数据完好保存在磁盘，请释放磁盘空间后重启。"
+# 磁盘预检不足：{detail} 为"需要约 N MB 可用空间（当前 M MB），数据库未改动"
+BACKUP_ABORTED_DISK_TEMPLATE = "磁盘空间不足，未能升级数据库：{detail}。请释放磁盘空间后重启。"
+
+
+def read_only_banner_text(version: Optional[str]) -> str:
+    """只读横幅文案；不知道写入版本时用"更新的版本"代替"""
+    return READ_ONLY_BANNER_TEMPLATE.format(version=version or READ_ONLY_UNKNOWN_VERSION)
+
+
+def migrated_tip_text(version: int, backup_path: str) -> str:
+    """升级成功提示：只显示备份的文件名（与库同目录）"""
+    return MIGRATED_TIP_TEMPLATE.format(version=version, name=os.path.basename(backup_path))
+
+
+def backup_aborted_text(required_bytes: Optional[int], free_bytes: Optional[int]) -> str:
+    """迁移中止提示：磁盘预检不足时写明所需与当前可用空间"""
+    if required_bytes is None or free_bytes is None:
+        return BACKUP_ABORTED_TEXT
+    return BACKUP_ABORTED_DISK_TEMPLATE.format(
+        detail=disk_shortage_message(required_bytes, free_bytes))

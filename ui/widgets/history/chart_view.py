@@ -717,7 +717,15 @@ class ChartView(CardWidget):
         self._redraw()
 
     def _on_theme_changed(self, _theme) -> None:
-        self.apply_theme()
+        # 无父对象的 ChartView（测试里常见）可能已被 Python 端回收了 pyqtgraph 的场景，
+        # 而控件本身还在：此时重新取色会碰到已删除的 C++ 对象。遇到就退订，不再跟随主题
+        try:
+            self.apply_theme()
+        except RuntimeError:
+            try:
+                qconfig.themeChanged.disconnect(self._on_theme_changed)
+            except TypeError:
+                pass
 
     # ---------- 导出 ----------
 

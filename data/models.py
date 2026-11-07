@@ -55,8 +55,10 @@ class Marker:
     kind: str = 'user'          # 打点类型，取值见 MARKER_KINDS
 
 
-# 打点类型：用户手动打点 / 基线 / 暂停 / 恢复（task_markers.kind 列的合法取值）
-MARKER_KINDS = ('user', 'baseline', 'pause', 'resume')
+# 打点类型（task_markers.kind 列的合法取值）：用户手动打点 / 基线 / 暂停 / 恢复，
+# 以及被测进程崩溃 / 重启 / 采集中断 / 采集恢复（由续采与退出取证写入）
+MARKER_KINDS = ('user', 'baseline', 'pause', 'resume',
+                'crash', 'restart', 'interrupt', 'recover')
 
 # 阶段性改名：MonitorTask 与 core 层的同名线程类易混，新代码请用 TaskRecord
 TaskRecord = MonitorTask

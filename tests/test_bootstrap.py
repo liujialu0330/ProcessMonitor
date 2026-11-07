@@ -205,8 +205,12 @@ def run_env(monkeypatch, app_paths):
                         lambda log_dir=None: events.append(('logging', log_dir)) or log_dir)
     monkeypatch.setattr(crash_handler, 'install_excepthook',
                         lambda log_dir: events.append('excepthook'))
-    monkeypatch.setattr(bootstrap, '_create_application',
-                        lambda argv: events.append('qapplication') or _FakeApp(events))
+    def create_application(argv):
+        state['qt_argv'] = list(argv)
+        events.append('qapplication')
+        return _FakeApp(events)
+
+    monkeypatch.setattr(bootstrap, '_create_application', create_application)
 
     class Guard(_FakeGuard):
         def notify_existing_instance(self):
@@ -221,8 +225,18 @@ def run_env(monkeypatch, app_paths):
     monkeypatch.setattr(bootstrap, '_apply_preferences',
                         lambda app, paths: events.append('preferences'))
 
-    def fake_build_context(paths):
+    def fake_migrate(paths):
+        events.append('migrate')
+        if state.get('real_migrate'):
+            return original_migrate_database(paths)
+        return state.get('report') or MigrationReport(MigrationOutcome.UP_TO_DATE, 5, 5)
+
+    original_migrate_database = bootstrap._migrate_database
+    monkeypatch.setattr(bootstrap, '_migrate_database', fake_migrate)
+
+    def fake_build_context(paths, *, report=None):
         events.append('build_context')
+        state['build_report'] = report
         return AppContext(paths=paths, db=_FakeDb(events), manager='manager',
                           services='services', registry=None, maintenance=None,
                           reconcile=ReconcileResult(0, 0, 0))
@@ -240,6 +254,9 @@ def run_env(monkeypatch, app_paths):
         def show(self):
             events.append('window.show')
 
+        def show_sync_dir_warning(self, text):
+            events.append(('sync_dir_warning', text))
+
     monkeypatch.setattr(main_window_module, 'MainWindow', FakeWindow)
     exits = []
     return events, state, exits, app_paths
@@ -252,7 +269,7 @@ def test_run_fixed_order(run_env):
     assert code == 3
     assert events == [
         ('logging', paths.log_dir), 'excepthook', 'qapplication', 'single_instance', 'listen',
-        'preferences', 'build_context', 'hotkey', ('window', 'manager', 'services'),
+        'preferences', 'migrate', 'build_context', 'hotkey', ('window', 'manager', 'services'),
         'window.show',
         'activation_connected', 'exec', ('exit', 3),
     ]
@@ -277,3 +294,275 @@ def test_run_returns_zero_when_instance_exists(run_env):
     assert events[-1] == 'single_instance'
     assert 'build_context' not in events and 'preferences' not in events
     assert exits == []
+
+
+# ========== run()：数据目录 ==========
+
+def test_run_uses_cli_data_dir(run_env, tmp_path):
+    """--data-dir 优先于环境变量：日志、单实例与建目录都跟随它，QApplication 拿不到该参数"""
+    events, state, exits, paths = run_env
+    target = tmp_path / "cli_data"
+    code = bootstrap.run(['prog', '--data-dir', str(target), '-style', 'fusion'],
+                         exit_process=exits.append)
+    assert code == 3
+    assert events[0] == ('logging', str(target / "logs"))
+    assert state['guard_args'] == ((), {'data_dir': str(target)})
+    assert state['qt_argv'] == ['prog', '-style', 'fusion']
+    assert target.is_dir() and (target / "logs").is_dir()
+    # 环境变量所指的目录没有被当作日志目录
+    assert ('logging', paths.log_dir) not in events
+
+
+def test_run_accepts_equals_form(run_env, tmp_path):
+    events, state, exits, paths = run_env
+    target = tmp_path / "eq"
+    bootstrap.run(['prog', f'--data-dir={target}'], exit_process=exits.append)
+    assert state['guard_args'] == ((), {'data_dir': str(target)})
+    assert state['qt_argv'] == ['prog']
+
+
+def test_resolve_matches_what_run_uses(tmp_path):
+    """run() 与 resolve() 用同一份 argv 解析（只测解析，不走启动流程）"""
+    from app.paths import AppPaths
+    import config
+    target = str(tmp_path / "x")
+    resolved = AppPaths.resolve(argv=['prog', '--data-dir', target])
+    assert resolved.data_dir == target
+    assert resolved.source == config.DATA_DIR_SOURCE_CLI
+
+
+@pytest.mark.parametrize("make_argv", [
+    lambda tmp: ['prog', '--data-dir'],
+    lambda tmp: ['prog', '--data-dir='],
+    # 同名文件挡路，makedirs 失败
+    lambda tmp: ['prog', '--data-dir', str(tmp / "blocker" / "sub")],
+])
+def test_run_fails_instead_of_falling_back(run_env, tmp_path, make_argv):
+    """数据目录不可用：只在默认日志目录记录原因并返回非 0，不建 QApplication、不回退到别的目录"""
+    from app.paths import AppPaths
+    events, state, exits, paths = run_env
+    (tmp_path / "blocker").write_text("x", encoding="utf-8")
+
+    code = bootstrap.run(make_argv(tmp_path), exit_process=exits.append)
+
+    assert code == bootstrap.EXIT_DATA_DIR_UNAVAILABLE != 0
+    assert events == [('logging', AppPaths.default().log_dir)]
+    assert 'guard_args' not in state and exits == []
+    # 环境变量所指的数据目录也没有被悄悄启用
+    assert not os.path.exists(paths.log_dir)
+
+
+def test_run_logs_failure_reason(run_env, tmp_path, caplog):
+    import logging
+    events, state, exits, paths = run_env
+    with caplog.at_level(logging.ERROR, logger="app.bootstrap"):
+        bootstrap.run(['prog', '--data-dir'], exit_process=exits.append)
+    assert any("数据目录不可用" in r.getMessage() and "--data-dir" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_run_hands_sync_dir_hint_to_window(run_env, monkeypatch):
+    events, state, exits, paths = run_env
+    seen = []
+    monkeypatch.setattr(bootstrap, 'sync_dir_hint',
+                        lambda data_dir: seen.append(data_dir) or "同步盘提示")
+    bootstrap.run(['prog'], exit_process=exits.append)
+    assert seen == [paths.data_dir]
+    show = events.index('window.show')
+    assert events[show + 1:show + 3] == ['activation_connected',
+                                         ('sync_dir_warning', "同步盘提示")]
+    assert events.index('exec') > events.index(('sync_dir_warning', "同步盘提示"))
+
+
+def test_run_without_sync_dir_hint_shows_nothing(run_env, monkeypatch):
+    events, state, exits, paths = run_env
+    monkeypatch.setattr(bootstrap, 'sync_dir_hint', lambda data_dir: None)
+    bootstrap.run(['prog'], exit_process=exits.append)
+    assert not any(isinstance(e, tuple) and e[0] == 'sync_dir_warning' for e in events)
+
+
+# ========== run()：迁移失败与启动失败的原生错误框 ==========
+
+def _boxes(state):
+    """注入 run() 的原生错误框替身：记录 (标题, 正文)"""
+    shown = state.setdefault('boxes', [])
+    return lambda title, text: shown.append((title, text))
+
+
+def test_run_passes_migration_report_to_build_context(run_env):
+    """迁移只跑一次：run() 跑出的报告原样交给 build_context"""
+    events, state, exits, paths = run_env
+    state['report'] = MigrationReport(MigrationOutcome.MIGRATED, 1, 5,
+                                      backup_path=paths.db_path + '.bak_v1')
+    bootstrap.run(['prog'], exit_process=exits.append)
+    assert state['build_report'] is state['report']
+
+
+def test_run_exits_with_native_box_when_old_db_not_restored(run_env):
+    """FAILED_KEPT：弹原生错误框写明原文件位置，返回 EXIT_MIGRATION_FAILED，不组装、不建窗口"""
+    events, state, exits, paths = run_env
+    kept = paths.db_path + '.bak_v1'
+    state['report'] = MigrationReport(MigrationOutcome.FAILED_KEPT, 1, 1,
+                                      backup_path=kept, broken_path=kept)
+
+    code = bootstrap.run(['prog'], exit_process=exits.append, message_box=_boxes(state))
+
+    assert code == bootstrap.EXIT_MIGRATION_FAILED == 3
+    assert events[-1] == 'migrate'
+    assert 'build_context' not in events and exits == []
+    [(title, text)] = state['boxes']
+    assert title == "进程监控助手"
+    assert "数据库升级失败" in text and kept in text and "程序将退出" in text
+
+
+@pytest.mark.parametrize("outcome", [
+    MigrationOutcome.FAILED_RESTORED, MigrationOutcome.BACKUP_ABORTED, MigrationOutcome.RESET,
+])
+def test_run_continues_on_other_migration_failures(run_env, outcome):
+    """其余失败照常启动（主窗口按三态标志提示），不弹原生错误框"""
+    events, state, exits, paths = run_env
+    state['report'] = MigrationReport(outcome, 1, 1)
+    code = bootstrap.run(['prog'], exit_process=exits.append, message_box=_boxes(state))
+    assert code == 3 and 'build_context' in events   # 3 是 _FakeApp 事件循环的退出码
+    assert state.get('boxes', []) == []
+
+
+def test_run_failed_swap_end_to_end_never_creates_empty_db(run_env, monkeypatch):
+    """
+    真实迁移：新库换不进来（os.replace 第一次失败）、旧库也改不回原名（os.rename 第二次
+    失败）→ 原路径没有库：组合根必须退出，不能让后续步骤在原路径建出空库
+    """
+    from tests.test_migration import _create_v0_db
+    from tests.test_rebuild_migration import _failing, _patch_os
+    events, state, exits, paths = run_env
+    state['real_migrate'] = True
+    _create_v0_db(paths.db_path)
+    _patch_os(monkeypatch, rename=_failing(os.rename, {2}), replace=_failing(os.replace, {1}))
+
+    code = bootstrap.run(['prog'], exit_process=exits.append, message_box=_boxes(state))
+
+    assert code == bootstrap.EXIT_MIGRATION_FAILED
+    assert 'build_context' not in events
+    assert not os.path.exists(paths.db_path)
+    backup = paths.db_path + '.bak_v0'
+    assert os.path.exists(backup)
+    [(_title, text)] = state['boxes']
+    assert backup in text
+
+
+def test_run_shows_native_box_for_data_dir_failure_when_frozen(run_env, monkeypatch):
+    """打包的窗口程序没有控制台：数据目录不可用时弹原生错误框（含路径与原因）"""
+    import sys
+    events, state, exits, paths = run_env
+    monkeypatch.setattr(sys, 'frozen', True, raising=False)
+    code = bootstrap.run(['prog', '--data-dir'], exit_process=exits.append,
+                         message_box=_boxes(state))
+    assert code == bootstrap.EXIT_DATA_DIR_UNAVAILABLE
+    [(title, text)] = state['boxes']
+    assert title == "进程监控助手"
+    assert "数据目录不可用" in text and "--data-dir" in text
+    assert bootstrap.DATA_DIR_UNKNOWN_PATH in text
+
+
+def test_data_dir_failure_box_names_the_path(run_env, monkeypatch, tmp_path):
+    import sys
+    events, state, exits, paths = run_env
+    monkeypatch.setattr(sys, 'frozen', True, raising=False)
+    (tmp_path / "blocker").write_text("x", encoding="utf-8")
+    target = str(tmp_path / "blocker" / "sub")
+    bootstrap.run(['prog', '--data-dir', target], exit_process=exits.append,
+                  message_box=_boxes(state))
+    [(_title, text)] = state['boxes']
+    assert "blocker" in text
+
+
+def test_run_has_no_native_box_for_data_dir_failure_in_dev(run_env):
+    """开发环境有控制台（stderr 已输出原因），不弹框打断"""
+    events, state, exits, paths = run_env
+    code = bootstrap.run(['prog', '--data-dir'], exit_process=exits.append,
+                         message_box=_boxes(state))
+    assert code == bootstrap.EXIT_DATA_DIR_UNAVAILABLE
+    assert state.get('boxes', []) == []
+
+
+# ========== 第 6 步：探测 → 同步 / 进度窗口 ==========
+
+def _probe(**kwargs):
+    from data.db.migrations.runner import ProbeResult
+    values = dict(has_tasks=True, version=1, target_version=5, file_bytes=0, estimated_rows=0)
+    values.update(kwargs)
+    return ProbeResult(**values)
+
+
+@pytest.mark.parametrize("probe, expected", [
+    (dict(estimated_rows=500_000), False),
+    (dict(estimated_rows=500_001), True),
+    (dict(file_bytes=100 * 1024 * 1024), False),
+    (dict(file_bytes=100 * 1024 * 1024 + 1), True),
+    # 不需要迁移的库再大也不显示
+    (dict(estimated_rows=10 ** 7, version=5), False),
+    (dict(estimated_rows=10 ** 7, has_tasks=False, version=0), False),
+])
+def test_needs_progress_window_thresholds(probe, expected):
+    assert bootstrap.needs_progress_window(_probe(**probe)) is expected
+
+
+def _v1_db(paths, rows=10):
+    from tests.test_migration_v2 import _create_v1_db
+    from tests.test_rebuild_migration import _v1_rows
+    _create_v1_db(paths.db_path, {'t1': ['memory_rss', 'memory_private']}, _v1_rows(rows))
+
+
+def test_migrate_database_small_db_runs_synchronously(paths, monkeypatch):
+    from ui.windows import migration_window
+    _v1_db(paths)
+
+    def no_window(*args, **kwargs):
+        pytest.fail("小库不应显示进度窗口")
+
+    monkeypatch.setattr(migration_window, 'run_with_progress_window', no_window)
+    report = bootstrap._migrate_database(paths)
+    assert report.outcome is MigrationOutcome.MIGRATED
+
+
+def test_migrate_database_large_db_uses_progress_window(paths, monkeypatch):
+    """超过阈值：经进度窗口执行同一个迁移，备份路径提前算好交给窗口"""
+    from ui.windows import migration_window
+    _v1_db(paths, rows=20)
+    monkeypatch.setattr(bootstrap, 'MIGRATION_PROGRESS_THRESHOLD_ROWS', 5)
+    seen = {'progress': []}
+
+    def fake_window(migrate, *, backup_path, estimated_rows):
+        seen.update(backup_path=backup_path, estimated_rows=estimated_rows)
+        return migrate(lambda stage, done, total: seen['progress'].append((done, total)))
+
+    monkeypatch.setattr(migration_window, 'run_with_progress_window', fake_window)
+    report = bootstrap._migrate_database(paths)
+
+    assert report.outcome is MigrationOutcome.MIGRATED
+    assert seen['backup_path'] == report.backup_path == paths.db_path + '.bak_v1'
+    assert seen['estimated_rows'] == 20
+    assert seen['progress'] and seen['progress'][-1] == (20, 20)
+
+
+def test_build_context_with_report_does_not_migrate_again(qapp, paths, monkeypatch):
+    first = bootstrap.new_migration_runner(paths).migrate()
+
+    def no_migrate(self):
+        pytest.fail("已传入报告时不应再迁移")
+
+    monkeypatch.setattr(MigrationRunner, 'migrate', no_migrate)
+    ctx = build_context(paths, retention_days=0, report=first)
+    _close(ctx)
+    assert ctx.db.migration_report is first
+
+
+def test_build_context_logs_backup_path_after_upgrade(qapp, paths, caplog):
+    import logging
+    _v1_db(paths)
+    with caplog.at_level(logging.INFO, logger="app.bootstrap"):
+        ctx = build_context(paths, retention_days=0)
+    _close(ctx)
+    assert ctx.db.backup_path == paths.db_path + '.bak_v1'
+    assert any("monitor.db.bak_v1" in r.getMessage() and "1.4.1" in r.getMessage()
+               for r in caplog.records)

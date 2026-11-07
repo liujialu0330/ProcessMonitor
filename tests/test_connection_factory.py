@@ -282,8 +282,8 @@ def test_checkpoint_returns_false_when_busy(db_path, monkeypatch):
     """
     real_apply = connection_module._apply_pragmas
 
-    def _short_timeout(conn):
-        real_apply(conn)
+    def _short_timeout(conn, *args, **kwargs):
+        real_apply(conn, *args, **kwargs)
         conn.execute('PRAGMA busy_timeout=50')
 
     monkeypatch.setattr(connection_module, '_apply_pragmas', _short_timeout)

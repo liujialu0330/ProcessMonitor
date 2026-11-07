@@ -6,12 +6,13 @@
 当前版本建库写数 → 1.4.1 打开后能列任务、读点、新增任务写点、删除任务，且不改
 user_version、不动表结构、不生成 .bak → 当前版本再打开，降级期间写入的数据仍在。
 
-阶段 1 把库升到 v5（样本改存 samples 紧凑表、data_points 保留为空表）后，本文件的预期改为：
-- 1.4.1 打开 v5 库时看不到 2.0 写入的历史（它只读 data_points，而 data_points 为空）；
-- 1.4.1 降级期间新写入的点落在空的 data_points 里；
-- 再升回 2.0 时启动流程把 data_points 中的点导回 samples 并清空 data_points，
-  降级期间写入的任务与点在 2.0 中可见。
-届时需要相应改写 test_v141_* 用例里"读到当前版本写入的点"的断言，并新增"导回"断言。
+v5 起样本改存 series / samples 紧凑表，data_points 保留 v4 定义但为空表，因此：
+- 1.4.1 打开 v5 库能列任务（tasks 新增列都有默认值），但看不到 2.0 写入的历史
+  （它只读 data_points）；
+- 1.4.1 降级期间新写入的点落在 data_points 里；
+- 再升回 2.0 时启动校正把 data_points 中的点导回 samples（旧内存键名合并、重算计数）并清空
+  data_points，降级期间写入的任务与点在 2.0 中可见；
+- 1.4.1 删除任务只删 tasks 与 data_points，留下的孤儿 series / samples（以及打点）由启动校正清掉。
 """
 import os
 import sqlite3
@@ -80,14 +81,14 @@ def test_v141_uses_current_db_without_migrating(tmp_path):
         (False, False, False)
     assert not any('.bak' in name for name in _files(tmp_path))
 
-    # 列任务、读点
+    # 列任务；2.0 写入的样本在 samples 里，1.4.1 只读 data_points，看不到历史
     assert {t.task_id for t in legacy.get_all_tasks()} == {'cur-keep', 'cur-drop'}
     keep = legacy.get_task('cur-keep')
     assert keep.process_name == '当前版本_保留.exe'
     assert keep.metric_types == ['memory_private', 'num_handles']
-    assert len(legacy.get_task_data_points('cur-keep', 'memory_private')) == 30
-    assert legacy.get_sample_count('cur-keep') == 30
-    assert legacy.get_metric_stats('cur-keep', 'num_handles')['count'] == 30
+    assert legacy.get_task_data_points('cur-keep', 'memory_private') == []
+    assert legacy.get_sample_count('cur-keep') == 0
+    assert legacy.get_metric_stats('cur-keep', 'num_handles') is None
 
     # 新增任务并写点（1.4.1 的采集流程：save_task → 每周期 save_data_points → 停止时更新状态）
     start = BASE + timedelta(hours=1)
@@ -101,6 +102,16 @@ def test_v141_uses_current_db_without_migrating(tmp_path):
             LegacyDataPoint('legacy-new', ts, 2000.0 + i, 'memory_private'),
             LegacyDataPoint('legacy-new', ts, 80.0 + i, 'num_handles'),
         ])
+    # 旧版键名：1.4.1 自己不会再写 memory_vms，这里直接插几行，锁住"导回时合并旧键名"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO data_points (task_id, timestamp, value, metric_type) "
+            "VALUES ('legacy-new', ?, 1.0, 'memory_vms')",
+            ((start + timedelta(seconds=30)).isoformat(),))
+        conn.commit()
+    finally:
+        conn.close()
     assert legacy.update_task_status('legacy-new', 'stopped', start + timedelta(seconds=20))
     assert len(legacy.get_task_data_points('legacy-new', 'num_handles')) == 20
 
@@ -113,24 +124,44 @@ def test_v141_uses_current_db_without_migrating(tmp_path):
     assert _schema(db_path) == schema_before
     assert not any('.bak' in name for name in _files(tmp_path))
 
-    # 当前版本再打开：不迁移，降级期间的增删都可见
+    # 当前版本再打开：不迁移；启动校正前降级期间写的点还在 data_points 里，2.0 看不到
     db = Database(db_path)
     try:
         assert db.migration_report.outcome is MigrationOutcome.UP_TO_DATE
         assert not db.migration_report.created
-
-        # 1.4.1 只写数据点不维护 sample_count：新任务计数为 0，启动校正按数据点重算
         assert db.get_task('legacy-new').sample_count == 0
+        assert db.get_task_data_points('legacy-new') == []
+
         result = MaintenanceService(db, manager=None).startup_reconcile(0)
-        assert result.recounted == 1
+        # 41 行 = 20 周期 × 2 指标 + 1 行旧键名；导回时已重算计数，recount 无事可做
+        assert result.imported == 41
+        assert result.recounted == 0
+        # cur-drop 的两条序列
+        assert result.purged == 2
+
+        conn = sqlite3.connect(db_path)
+        try:
+            assert conn.execute('SELECT COUNT(*) FROM data_points').fetchone()[0] == 0
+            assert conn.execute(
+                "SELECT COUNT(*) FROM series WHERE task_id = 'cur-drop'").fetchone()[0] == 0
+            assert conn.execute(
+                'SELECT COUNT(*) FROM samples WHERE series_id NOT IN '
+                '(SELECT series_id FROM series)').fetchone()[0] == 0
+        finally:
+            conn.close()
 
         new = db.get_task('legacy-new')
         assert new.status == 'stopped'
-        assert new.sample_count == 20
-        assert new.last_sample_at == start + timedelta(seconds=19)
+        assert new.sample_count == 21
+        assert new.last_sample_at == start + timedelta(seconds=30)
         assert new.note == '' and new.create_time is None
         assert {t.task_id for t in db.get_tasks_with_data()} == {'cur-keep', 'legacy-new'}
-        assert len(db.get_task_data_points('legacy-new', 'memory_private')) == 20
+        assert len(db.get_task_data_points('legacy-new', 'memory_private')) == 21
+        assert len(db.get_task_data_points('legacy-new', 'num_handles')) == 20
+        assert db.get_task_data_points('legacy-new', 'memory_vms') == []
+        # 分析页可见：统计与分桶都能算出
+        stats = db.get_metric_stats('legacy-new', 'num_handles')
+        assert stats['count'] == 20 and stats['first'] == 80.0 and stats['last'] == 99.0
 
         # 回退期间没碰过的任务：备注、计数、进程创建时间、打点都在
         keep = db.get_task('cur-keep')
@@ -139,11 +170,11 @@ def test_v141_uses_current_db_without_migrating(tmp_path):
         assert keep.create_time == 1700000000.5
         assert [m.label for m in db.markers.list('cur-keep')] == ['第1轮']
 
-        # 1.4.1 删除任务只删 data_points 与 tasks，不知道 task_markers：被删任务的打点
-        # 成为孤儿行留在库里（界面上随任务一起消失，不可见，只占空间）
+        # 1.4.1 删除任务只删 data_points 与 tasks，不知道 series / samples / task_markers；
+        # 启动校正把这些孤儿行一并清掉（v4 时打点会作为孤儿行一直留在库里）
         assert db.get_task('cur-drop') is None
         assert db.get_task_data_points('cur-drop') == []
-        assert len(db.markers.list('cur-drop')) == 1
+        assert db.markers.list('cur-drop') == []
     finally:
         db.close()
 

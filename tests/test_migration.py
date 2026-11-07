@@ -84,17 +84,30 @@ def patched_migrations(version: int, fn):
             for m in MIGRATIONS]
 
 
-def patch_database_migration(monkeypatch, version: int, fn):
-    """让 Database() 内部使用的 MigrationRunner 把第 version 步替换为 fn"""
-    patched = patched_migrations(version, fn)
+# 冻结的就地迁移链的终点。备份、单事务回滚、从备份还原、重置为空库这些失败分支只存在于
+# 就地迁移路径（MigrationRunner(target_version=4)，测试与样本生成器仍在用）；
+# 生产用的重建式迁移（目标 v5）的失败分支见 tests/test_rebuild_migration.py
+INPLACE_TARGET = 4
+
+
+def patch_database_migration(monkeypatch, version: int = None, fn=None):
+    """让 Database() 内部改用就地迁移链（version/fn 给出时把第 version 步替换为 fn）"""
+    patched = patched_migrations(version, fn) if version is not None else MIGRATIONS
     monkeypatch.setattr(
         database_module, 'MigrationRunner',
-        lambda factory: MigrationRunner(factory, migrations=patched))
+        lambda factory: MigrationRunner(factory, migrations=patched,
+                                        target_version=INPLACE_TARGET))
 
 
 def run_migration(db_path: str, migrations=MIGRATIONS):
-    """不经 Database 直接运行迁移，返回 MigrationReport"""
+    """不经 Database 直接运行迁移（目标为当前版本），返回 MigrationReport"""
     return MigrationRunner(ConnectionFactory(db_path), migrations=migrations).migrate()
+
+
+def run_inplace(db_path: str, migrations=MIGRATIONS):
+    """不经 Database 直接运行冻结的就地迁移链（目标 v4），返回 MigrationReport"""
+    return MigrationRunner(ConnectionFactory(db_path), migrations=migrations,
+                           target_version=INPLACE_TARGET).migrate()
 
 
 def _raise(exc):
@@ -217,7 +230,7 @@ def test_migration_failed_restores_backup(db_path):
     """迁移两次尝试均失败但还原备份成功：FAILED_RESTORED，旧数据（未迁移）保留"""
     _create_v0_db(db_path)
 
-    report = run_migration(db_path, patched_migrations(1, _boom))
+    report = run_inplace(db_path, patched_migrations(1, _boom))
 
     assert report.outcome is MigrationOutcome.FAILED_RESTORED
     assert (report.from_version, report.to_version) == (0, 0)
@@ -247,11 +260,11 @@ def test_migration_retries_once_after_restore(db_path):
             raise RuntimeError("瞬时故障")
         original(cursor)
 
-    report = run_migration(db_path, patched_migrations(1, _flaky))
+    report = run_inplace(db_path, patched_migrations(1, _flaky))
 
     assert calls['n'] == 2
     assert report.outcome is MigrationOutcome.MIGRATED
-    assert _get_user_version(db_path) == SCHEMA_VERSION
+    assert _get_user_version(db_path) == INPLACE_TARGET
 
 
 def test_backup_failure_aborts_migration_and_leaves_db_untouched(db_path, monkeypatch):
@@ -259,7 +272,7 @@ def test_backup_failure_aborts_migration_and_leaves_db_untouched(db_path, monkey
     _create_v0_db(db_path)
     monkeypatch.setattr(runner_module.shutil, 'copy2', _raise(OSError("模拟磁盘已满")))
 
-    report = run_migration(db_path)
+    report = run_inplace(db_path)
 
     assert report.outcome is MigrationOutcome.BACKUP_ABORTED
     assert (report.from_version, report.to_version) == (0, 0)
@@ -290,6 +303,7 @@ def test_migration_guard_prevents_repeated_backup_after_abort(db_path, monkeypat
         raise OSError("模拟磁盘已满")
 
     monkeypatch.setattr(runner_module.shutil, 'copy2', _boom_copy2)
+    patch_database_migration(monkeypatch)
 
     db1 = Database(db_path)
     assert db1.backup_aborted is True
@@ -318,10 +332,10 @@ def test_migration_guard_is_per_path(tmp_path, monkeypatch):
 
     monkeypatch.setattr(runner_module.shutil, 'copy2', _copy2)
 
-    assert run_migration(first).outcome is MigrationOutcome.BACKUP_ABORTED
-    assert run_migration(second).outcome is MigrationOutcome.MIGRATED
+    assert run_inplace(first).outcome is MigrationOutcome.BACKUP_ABORTED
+    assert run_inplace(second).outcome is MigrationOutcome.MIGRATED
     assert _get_user_version(first) == 0
-    assert _get_user_version(second) == SCHEMA_VERSION
+    assert _get_user_version(second) == INPLACE_TARGET
 
 
 def test_reset_guard_for_tests_allows_retry(db_path, monkeypatch):
@@ -329,11 +343,11 @@ def test_reset_guard_for_tests_allows_retry(db_path, monkeypatch):
     _create_v0_db(db_path)
     with monkeypatch.context() as m:
         m.setattr(runner_module.shutil, 'copy2', _raise(OSError("模拟磁盘已满")))
-        assert run_migration(db_path).outcome is MigrationOutcome.BACKUP_ABORTED
+        assert run_inplace(db_path).outcome is MigrationOutcome.BACKUP_ABORTED
 
-    assert run_migration(db_path).outcome is MigrationOutcome.BACKUP_ABORTED  # 仍复用
+    assert run_inplace(db_path).outcome is MigrationOutcome.BACKUP_ABORTED  # 仍复用
     runner_module.reset_guard_for_tests()
-    assert run_migration(db_path).outcome is MigrationOutcome.MIGRATED
+    assert run_inplace(db_path).outcome is MigrationOutcome.MIGRATED
 
 
 @pytest.mark.parametrize('corrupt_with', [_GARBAGE, b''], ids=['garbage', 'truncated'])
@@ -345,13 +359,13 @@ def test_restore_from_backup_also_fails_resets_to_empty_db(db_path, monkeypatch,
     _create_v0_db(db_path)
     _copy2_backup_only(monkeypatch, corrupt_db=db_path, corrupt_with=corrupt_with)
 
-    report = run_migration(db_path, patched_migrations(1, _boom))
+    report = run_inplace(db_path, patched_migrations(1, _boom))
 
     assert report.outcome is MigrationOutcome.RESET
-    assert (report.from_version, report.to_version) == (0, SCHEMA_VERSION)
+    assert (report.from_version, report.to_version) == (0, INPLACE_TARGET)
 
     # db_path 处最终应是全新的空库
-    assert _get_user_version(db_path) == SCHEMA_VERSION
+    assert _get_user_version(db_path) == INPLACE_TARGET
     assert Database(db_path).get_all_tasks() == []
 
     # 原始数据的权威留存位置是迁移前只写一次、之后只读不写的 .bak_v0 备份文件
@@ -384,7 +398,7 @@ def test_restore_and_rename_both_fail_never_touches_broken_db(db_path, monkeypat
     monkeypatch.setattr(runner_module.os, 'replace',
                         _raise(PermissionError("模拟文件被占用，无法改名")))
 
-    report = run_migration(db_path, patched_migrations(1, _boom))
+    report = run_inplace(db_path, patched_migrations(1, _boom))
 
     assert report.outcome is MigrationOutcome.FAILED_KEPT
     assert (report.from_version, report.to_version) == (0, 0)
@@ -401,7 +415,7 @@ def test_restore_fails_but_old_db_intact_is_kept(db_path, monkeypatch):
     _create_v0_db(db_path)
     _copy2_backup_only(monkeypatch)
 
-    report = run_migration(db_path, patched_migrations(1, _boom))
+    report = run_inplace(db_path, patched_migrations(1, _boom))
 
     assert report.outcome is MigrationOutcome.FAILED_KEPT
     assert (report.from_version, report.to_version) == (0, 0)
@@ -435,11 +449,12 @@ def test_reset_works_while_caller_holds_keep_alive(db_path, monkeypatch):
     assert factory.keep_alive_open is True
     _copy2_backup_only(monkeypatch, corrupt_db=db_path)
 
-    report = MigrationRunner(factory, migrations=patched_migrations(1, _boom)).migrate()
+    report = MigrationRunner(factory, migrations=patched_migrations(1, _boom),
+                             target_version=INPLACE_TARGET).migrate()
 
     assert report.outcome is MigrationOutcome.RESET
     assert factory.keep_alive_open is False
-    assert _get_user_version(db_path) == SCHEMA_VERSION
+    assert _get_user_version(db_path) == INPLACE_TARGET
 
 
 @pytest.mark.parametrize('scenario, expected', [
@@ -454,6 +469,7 @@ def test_database_maps_report_to_flags(db_path, monkeypatch, scenario, expected)
     _create_v0_db(db_path)
     if scenario == 'backup':
         monkeypatch.setattr(runner_module.shutil, 'copy2', _raise(OSError("模拟磁盘已满")))
+        patch_database_migration(monkeypatch)
     elif scenario != 'ok':
         patch_database_migration(monkeypatch, 1, _boom)
         if scenario == 'reset':
@@ -470,7 +486,8 @@ def test_database_maps_report_to_flags(db_path, monkeypatch, scenario, expected)
 def test_runner_rejects_incomplete_chain(db_path):
     """迁移链必须从 v1 连续到目标版本"""
     with pytest.raises(ValueError):
-        MigrationRunner(ConnectionFactory(db_path), migrations=MIGRATIONS[1:])
+        MigrationRunner(ConnectionFactory(db_path), migrations=MIGRATIONS[1:],
+                        target_version=INPLACE_TARGET)
 
 
 def test_new_db_report_is_up_to_date_and_created(db_path):
@@ -581,7 +598,7 @@ def test_existing_backup_is_not_overwritten(db_path, monkeypatch):
     with open(db_path + '.bak_v0_20260101_000000', 'wb') as f:
         f.write(b'same second backup')
 
-    report = run_migration(db_path)
+    report = run_inplace(db_path)
 
     assert report.outcome is MigrationOutcome.MIGRATED
     assert report.backup_path == db_path + '.bak_v0_20260101_000000_2'
@@ -597,7 +614,7 @@ def test_restore_uses_backup_made_by_this_run(db_path):
     with open(db_path + '.bak_v0', 'wb') as f:
         f.write(b'not a database')
 
-    report = run_migration(db_path, patched_migrations(1, _boom))
+    report = run_inplace(db_path, patched_migrations(1, _boom))
 
     assert report.outcome is MigrationOutcome.FAILED_RESTORED
     assert report.backup_path.startswith(db_path + '.bak_v0_')
@@ -611,7 +628,7 @@ def test_partial_backup_is_removed_and_aborts(db_path, monkeypatch):
     _create_v0_db(db_path)
     monkeypatch.setattr(runner_module.shutil, 'copy2', _copy2_half_then_fail)
 
-    report = run_migration(db_path)
+    report = run_inplace(db_path)
 
     assert report.outcome is MigrationOutcome.BACKUP_ABORTED
     assert glob.glob(db_path + '.bak_*') == []
@@ -620,17 +637,18 @@ def test_partial_backup_is_removed_and_aborts(db_path, monkeypatch):
 
 def test_checkpoint_busy_aborts_backup(db_path, monkeypatch):
     """
-    备份前 checkpoint 被其他连接挡住（PRAGMA 返回 busy=1，不抛错）：-wal 里可能还有未合并的
-    提交，只拷主文件会漏数据，必须按 BACKUP_ABORTED 处理，不备份、不迁移
+    迁移前 checkpoint 被其他连接挡住（PRAGMA 返回 busy=1，不抛错）：-wal 里可能还有未合并的
+    提交，旧文件不自包含，不能作为备份，必须按 BACKUP_ABORTED 处理，不备份、不迁移
     """
     _create_v0_db(db_path)
     real_apply = connection_module._apply_pragmas
 
-    def _short_timeout(conn):
-        real_apply(conn)
+    def _short_timeout(conn, *args):
+        real_apply(conn, *args)
         conn.execute('PRAGMA busy_timeout=50')   # 避免用例等满 5 秒
 
     monkeypatch.setattr(connection_module, '_apply_pragmas', _short_timeout)
+    monkeypatch.setattr(runner_module, 'PROBE_TIMEOUT', 0.05)
 
     writer = sqlite3.connect(db_path, isolation_level=None)
     reader = sqlite3.connect(db_path, isolation_level=None)
@@ -701,7 +719,7 @@ def test_failed_restore_keeps_intact_db_byte_for_byte(db_path, monkeypatch):
     with monkeypatch.context() as m:
         m.setattr(runner_module.shutil, 'copy2', _copy2)
 
-        report = run_migration(db_path, patched_migrations(1, _boom))
+        report = run_inplace(db_path, patched_migrations(1, _boom))
 
         assert report.outcome is MigrationOutcome.FAILED_KEPT
         assert report.broken_path is None
@@ -711,7 +729,7 @@ def test_failed_restore_keeps_intact_db_byte_for_byte(db_path, monkeypatch):
         assert glob.glob(db_path + '.broken_*') == []
         assert not os.path.exists(db_path + '.restore_tmp')
         # 结果已记入 guard：同进程再次迁移直接复用
-        assert run_migration(db_path) is report
+        assert run_inplace(db_path) is report
 
     runner_module.reset_guard_for_tests()
     again = run_migration(db_path)
@@ -740,7 +758,7 @@ def test_second_attempt_restore_failure_keeps_intact_db(db_path, monkeypatch):
         attempts['n'] += 1
         raise RuntimeError("模拟迁移失败")
 
-    report = run_migration(db_path, patched_migrations(1, _always_fail))
+    report = run_inplace(db_path, patched_migrations(1, _always_fail))
 
     assert attempts['n'] == 2 and calls['n'] == 3
     assert report.outcome is MigrationOutcome.FAILED_KEPT
@@ -760,10 +778,10 @@ def test_reset_create_failure_puts_old_db_back(db_path, monkeypatch):
     """
     _create_v0_db(db_path)
     _copy2_backup_only(monkeypatch, corrupt_db=db_path)
-    monkeypatch.setattr(runner_module, 'create_current',
+    monkeypatch.setattr(runner_module, 'create_schema_v4',
                         _raise(sqlite3.OperationalError("database or disk is full")))
 
-    report = run_migration(db_path, patched_migrations(1, _boom))
+    report = run_inplace(db_path, patched_migrations(1, _boom))
 
     assert report.outcome is MigrationOutcome.FAILED_KEPT
     assert (report.from_version, report.to_version) == (0, 0)
@@ -776,7 +794,7 @@ def test_reset_create_failure_puts_old_db_back(db_path, monkeypatch):
     assert glob.glob(db_path + '.broken_*') == []
     assert not os.path.exists(db_path + '.restore_tmp')
     # 结果已记入 guard（库不可读，再次 migrate() 会在检测阶段抛出，故直接查记录）
-    key = runner_module._guard_key(db_path, SCHEMA_VERSION)
+    key = runner_module._guard_key(db_path, INPLACE_TARGET)
     assert runner_module._ATTEMPTS[key] is report
 
 
@@ -787,7 +805,7 @@ def test_reset_create_failure_and_move_back_failure(db_path, monkeypatch):
     """
     _create_v0_db(db_path)
     _copy2_backup_only(monkeypatch, corrupt_db=db_path)
-    monkeypatch.setattr(runner_module, 'create_current',
+    monkeypatch.setattr(runner_module, 'create_schema_v4',
                         _raise(sqlite3.OperationalError("database or disk is full")))
     real_replace = os.replace
 
@@ -798,7 +816,7 @@ def test_reset_create_failure_and_move_back_failure(db_path, monkeypatch):
 
     monkeypatch.setattr(runner_module.os, 'replace', _replace)
 
-    report = run_migration(db_path, patched_migrations(1, _boom))
+    report = run_inplace(db_path, patched_migrations(1, _boom))
 
     assert report.outcome is MigrationOutcome.FAILED_KEPT
     assert report.broken_path is not None

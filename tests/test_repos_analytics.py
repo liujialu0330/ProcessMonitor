@@ -1,6 +1,8 @@
 """
 AnalyticsRepo 用例：聚合、按时间分桶（不跨空洞）、空洞、基线取值、计数，
-以及 legacy_* 与拆分前 Database 实现（本文件内冻结的旧 SQL）逐字段一致。
+legacy_stats 与拆分前 Database 实现（本文件内冻结的旧 SQL）逐字段一致，以及 legacy_buckets
+的 2.0 定义（按时间等分，与 tests/test_analytics_rollup_path 的参照实现比较）。
+v5 起样本在 samples 表里，旧 SQL 改在一份 v4 结构的对照库（_v4_reference）上执行。
 
 用现有 Database 建库造数据，再用本文件内的 _Factory 桩（与 Database 两个连接
 上下文管理器同实现）驱动仓储。
@@ -15,10 +17,14 @@ from datetime import datetime, timedelta
 
 import pytest
 
+from data.db.migrations._frozen import create_schema_v4
 from data.errors import StorageError
+from data.mappers import normalize_ms
 from data.models import DataPoint, MonitorTask
 from data.repos.analytics_repo import (
     DEFAULT_GAP_FACTOR, AnalyticsRepo, Bucket, MetricAggregates)
+from data.repos.point_repo import PointQuery
+from tests.test_analytics_rollup_path import reference_legacy_buckets
 
 T0 = datetime(2026, 3, 1, 10, 0, 0)
 MEM = 'memory_rss'
@@ -429,9 +435,9 @@ def test_sample_count_legacy_schema_fallback(tmp_path):
 
 # ========== legacy_* 与旧 Database 实现一致 ==========
 #
-# Database 门面现在直接委托 legacy_*，拿门面比对已是同义反复；下面两个函数是
-# 阶段 3 拆分前 Database.get_metric_stats / get_task_data_points_bucketed 的 SQL 原样冻结，
-# 作为等价性的参照实现（不随生产代码修改）。
+# Database 门面现在直接委托 legacy_*，拿门面比对已是同义反复；下面的 _old_metric_stats 是
+# 阶段 3 拆分前 Database.get_metric_stats 的 SQL 原样冻结，作为等价性的参照实现（不随生产代码
+# 修改）。get_task_data_points_bucketed 的旧 SQL（按行号等分）在 2.0 改为按时间等分后已删除。
 
 def _old_where(task_id, metric, since_iso):
     where = 'task_id = ?'
@@ -443,6 +449,25 @@ def _old_where(task_id, metric, since_iso):
         where += ' AND timestamp >= ?'
         params.append(since_iso)
     return where, params
+
+
+def _v4_reference(db_path, series, task_id='t1'):
+    """
+    建一份 v4 结构的对照库：与 _seed 相同的写入顺序（决定 id），时间取 v5 实际存储的毫秒值
+    （normalize_ms）——比较的是"同一份数据"在旧 SQL 与新仓储下的查询结果。
+    """
+    ref = db_path + '.v4ref'
+    conn = sqlite3.connect(ref)
+    try:
+        create_schema_v4(conn.cursor())
+        conn.executemany(
+            'INSERT INTO data_points (task_id, timestamp, value, metric_type) VALUES (?, ?, ?, ?)',
+            [(task_id, normalize_ms(ts).isoformat(), v, m)
+             for m, pts in series.items() for ts, v in pts])
+        conn.commit()
+    finally:
+        conn.close()
+    return ref
 
 
 def _old_metric_stats(db_path, task_id, metric, since_iso=None):
@@ -480,45 +505,6 @@ def _old_metric_stats(db_path, task_id, metric, since_iso=None):
     return {'count': count, 'min': agg['min_v'], 'max': agg['max_v'], 'avg': agg['avg_v'],
             'first': first_row['value'], 'first_ts': first_ts,
             'last': last_row['value'], 'last_ts': last_ts, 'slope_per_hour': slope}
-
-
-def _old_bucketed(db_path, task_id, metric, max_buckets, since_iso=None):
-    where, params = _old_where(task_id, metric, since_iso)
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    try:
-        rows = conn.execute(f'''
-            WITH numbered AS (
-                SELECT id, timestamp, value,
-                       ROW_NUMBER() OVER (ORDER BY timestamp ASC, id ASC) - 1 AS rn,
-                       COUNT(*) OVER () AS total
-                FROM data_points WHERE {where}
-            ),
-            bucketed AS (
-                SELECT id, timestamp, value,
-                       CASE WHEN total <= ? THEN rn
-                            ELSE MIN((rn * ?) / total, ? - 1) END AS bucket
-                FROM numbered
-            ),
-            mins AS (
-                SELECT bucket, timestamp, value, ROW_NUMBER() OVER (
-                    PARTITION BY bucket ORDER BY value ASC, timestamp ASC) AS rk
-                FROM bucketed
-            ),
-            maxs AS (
-                SELECT bucket, timestamp, value, ROW_NUMBER() OVER (
-                    PARTITION BY bucket ORDER BY value DESC, timestamp ASC) AS rk
-                FROM bucketed
-            )
-            SELECT timestamp, value FROM mins WHERE rk = 1
-            UNION
-            SELECT timestamp, value FROM maxs WHERE rk = 1
-            ORDER BY timestamp ASC
-        ''', (*params, max_buckets, max_buckets, max_buckets)).fetchall()
-    finally:
-        conn.close()
-    return [DataPoint(task_id=task_id, timestamp=datetime.fromisoformat(r['timestamp']),
-                      value=r['value'], metric_type=metric or '') for r in rows]
 
 
 def _dataset(name):
@@ -562,9 +548,10 @@ def _since_options(series):
 def test_legacy_stats_equals_old_database(db, repo, name):
     series = _dataset(name)
     tid = _seed(db, series)
+    ref = _v4_reference(db.db_path, series, tid)
     for metric in (MEM, CPU, 'absent'):
         for since in _since_options(series):
-            old = _old_metric_stats(db.db_path, tid, metric,
+            old = _old_metric_stats(ref, tid, metric,
                                     since.isoformat() if since else None)
             new = repo.legacy_stats(tid, metric, since=since)
             # 门面委托后与仓储逐字段相同
@@ -591,16 +578,24 @@ def test_legacy_stats_equals_old_database(db, repo, name):
 
 @pytest.mark.parametrize('name', DATASETS)
 @pytest.mark.parametrize('max_buckets', [1, 2, 7, 64, 2000])
-def test_legacy_buckets_equals_old_database(db, repo, name, max_buckets):
+def test_legacy_buckets_time_equal_definition(db, repo, name, max_buckets):
+    """
+    图表降采样按 2.0 定义（旧定义：按行号等分为 max_buckets 桶、每桶取最小/最大值行；
+    新定义：按时间等分、每桶取最小/最大值点，见 AnalyticsRepo.legacy_buckets），与参照实现
+    逐点相同；门面 get_task_data_points_bucketed 委托同一实现。
+    """
     series = _dataset(name)
     tid = _seed(db, series)
+    points = db.points.fetch(PointQuery(tid, None))
     for metric in (MEM, CPU, None):
         for since in _since_options(series):
-            old = _old_bucketed(db.db_path, tid, metric, max_buckets,
-                                since.isoformat() if since else None)
+            expected = reference_legacy_buckets(points, tid, metric, max_buckets, since)
             new = repo.legacy_buckets(tid, metric, max_buckets, since=since)
-            assert new == old, (metric, since)
+            assert new == expected, (metric, since)
             assert len(new) <= 2 * max_buckets
+            assert db.get_task_data_points_bucketed(
+                tid, metric_type=metric, max_buckets=max_buckets,
+                since_iso=since.isoformat() if since else None) == new
 
 
 # ========== 参数类型与错误包装 ==========

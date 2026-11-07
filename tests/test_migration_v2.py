@@ -11,8 +11,9 @@ import sqlite3
 from data.database import Database
 from data.db.migrations.runner import MigrationOutcome
 from data.db.schema import SCHEMA_VERSION
+from data.mappers import from_ms
 from tests.test_migration import (
-    _create_v0_db, _get_user_version, patched_migrations, run_migration,
+    _create_v0_db, _get_user_version, patched_migrations, run_inplace,
 )
 
 
@@ -59,13 +60,16 @@ def _create_v1_db(path: str, tasks: dict, rows: list):
 
 
 def _raw_points(path: str, task_id: str):
+    """库里该任务的全部样本 [(ISO 时间, 指标, 值)]，按时间、指标排序（v5 存 series/samples）"""
     conn = sqlite3.connect(path)
     try:
-        return conn.execute(
-            'SELECT timestamp, metric_type, value FROM data_points '
-            'WHERE task_id = ? ORDER BY timestamp, metric_type', (task_id,)).fetchall()
+        rows = conn.execute(
+            'SELECT s.ts_ms, se.metric, s.value FROM samples s '
+            'JOIN series se ON se.series_id = s.series_id '
+            'WHERE se.task_id = ? ORDER BY s.ts_ms, se.metric', (task_id,)).fetchall()
     finally:
         conn.close()
+    return [(from_ms(ms).isoformat(), metric, value) for ms, metric, value in rows]
 
 
 def test_v1_to_v2_merges_duplicate_memory_metrics(db_path):
@@ -144,7 +148,7 @@ def test_new_db_is_created_at_current_version(db_path):
 
 
 def test_v1_to_v2_failure_rolls_back_and_restores(db_path):
-    """v2 步骤抛异常：整条链回滚并从备份还原，库仍是 v1 且数据未变"""
+    """（冻结的就地迁移链）v2 步骤抛异常：整条链回滚并从备份还原，库仍是 v1 且数据未变"""
     rows = [('t1', '2026-01-01T00:00:01', 1.0, 'memory_vms')]
     _create_v1_db(db_path, {'t1': ['memory_vms']}, rows)
 
@@ -152,7 +156,7 @@ def test_v1_to_v2_failure_rolls_back_and_restores(db_path):
         cursor.execute("UPDATE tasks SET metric_type = 'x'")  # 先写点东西再失败
         raise RuntimeError("模拟迁移失败")
 
-    report = run_migration(db_path, patched_migrations(2, _boom))
+    report = run_inplace(db_path, patched_migrations(2, _boom))
 
     assert report.outcome is MigrationOutcome.FAILED_RESTORED
     assert (report.from_version, report.to_version) == (1, 1)

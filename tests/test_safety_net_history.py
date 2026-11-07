@@ -178,9 +178,11 @@ THREADS_1H_ROW = (['线程数', '24 个', '24 个', '±0', '--', '数据不足�
                    '数据不足', ''], True)
 # (焦点指标, 范围, 期望 since 相对 BASE 的分钟数（None=不过滤）, 焦点明细行数,
 #  焦点统计 count, 焦点分桶点数, 摘要表各行, 依据行)
-# 分桶：61 点以上抽稀为 20 桶 × (MIN, MAX) = 40 点；打点恒为 2（快照带任务全部打点）。
+# 分桶（2.0 起按时间等分，见 tests/history_dataset.QUERY_CASES）：121 点 → 7 分钟桶 × 18 =
+# 36 点；61 点 → 4 分钟桶 × 16、末桶单点 = 31 点（1.x 按行号等分时都是 20 × 2 = 40 点）。
+# 打点恒为 2（快照带任务全部打点）。
 QUERY_CASES = [
-    (MEM, 'all', None, 50, 121, 40, [MEM_ALL_ROW, THREADS_ALL_ROW], "2小时0分 · 121 点"),
+    (MEM, 'all', None, 50, 121, 36, [MEM_ALL_ROW, THREADS_ALL_ROW], "2小时0分 · 121 点"),
     # 10 分钟：锚点 120 分钟 → since 110 分钟（含端点）共 11 点，点数少于桶数不抽稀；
     # 线程数在该范围内无数据，整行置灰
     (MEM, '10m', 110, 11, 11, 11,
@@ -188,8 +190,8 @@ QUERY_CASES = [
         '↑ +2.5 MB', '数据不足', ''], True),
       (['线程数', '--', '--', '--', '--', '--', '--', '--', ''], True)],
      "10分钟 · 11 点"),
-    (MEM, '1h', 60, 50, 61, 40, [MEM_1H_ROW, THREADS_1H_ROW], "1小时0分 · 61 点"),
-    (THREADS, 'all', None, 50, 61, 40, [MEM_ALL_ROW, THREADS_ALL_ROW], "2小时0分 · 121 点"),
+    (MEM, '1h', 60, 50, 61, 31, [MEM_1H_ROW, THREADS_1H_ROW], "1小时0分 · 61 点"),
+    (THREADS, 'all', None, 50, 61, 31, [MEM_ALL_ROW, THREADS_ALL_ROW], "2小时0分 · 121 点"),
     (THREADS, '1h', 60, 1, 1, 1, [MEM_1H_ROW, THREADS_1H_ROW], "1小时0分 · 61 点"),
 ]
 

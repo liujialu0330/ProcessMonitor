@@ -32,7 +32,12 @@ def _seed(factory, task_id, *, status, start, end=None, points=3):
 
 
 def _count(factory, table, task_id):
+    """表中该任务的行数；'samples' 按任务的序列统计（v5 样本表不带 task_id）"""
     with factory.connect() as conn:
+        if table == 'samples':
+            return conn.execute(
+                'SELECT COUNT(*) FROM samples WHERE series_id IN '
+                '(SELECT series_id FROM series WHERE task_id = ?)', (task_id,)).fetchone()[0]
         return conn.execute(f'SELECT COUNT(*) FROM {table} WHERE task_id = ?',
                             (task_id,)).fetchone()[0]
 
@@ -57,11 +62,12 @@ def test_cleanup_deletes_only_expired_stopped_tasks(factory):
     tasks = TaskRepo(factory)
     for gone in ('expired', 'expired_no_end'):
         assert tasks.get(gone) is None
-        assert _count(factory, 'data_points', gone) == 0
+        assert _count(factory, 'samples', gone) == 0
+        assert _count(factory, 'series', gone) == 0
         assert _count(factory, 'task_markers', gone) == 0
     for kept in ('old_but_running', 'recent'):
         assert tasks.get(kept) is not None
-        assert _count(factory, 'data_points', kept) == 3
+        assert _count(factory, 'samples', kept) == 3
         assert _count(factory, 'task_markers', kept) == 1
     assert Maintenance(factory).cleanup_older_than(30) == 0
 

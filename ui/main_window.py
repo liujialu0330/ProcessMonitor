@@ -6,6 +6,8 @@ FluentWindow 外壳：侧栏 监控 / 分析 / 设置（底部），窗口宽度
 - 监控卡片"分析"→ 切到分析页并选中该任务；
 - 托盘菜单"打点"、全局快捷键 → 监控页的快速打点，结果用托盘气泡确认；
 - 静默检查到新版本 → 非模态提示，"查看"跳到设置页"关于与更新"。
+启动提示也在这里：数据库迁移结果（三态失败提示、升级成功时旧文件的备份位置）、只读库的
+常驻横幅（同时让监控页禁止开始监控与打点）、数据目录位于同步盘的警告。
 """
 import logging
 import os
@@ -28,6 +30,11 @@ from ui.services import CLOSE_ACTION_CANCEL, CLOSE_ACTION_TRAY, UiServices
 from ui.tray import TrayController
 from core.monitor_manager import MonitorManager
 from data.database import Database
+from data.db.schema import SCHEMA_VERSION
+from ui.formatting import (
+    MIGRATED_TIP_DURATION_MS, MIGRATED_TIP_TITLE, READ_ONLY_START_BLOCKED, READ_ONLY_TITLE,
+    backup_aborted_text, migrated_tip_text, read_only_banner_text,
+)
 from app_config import cfg
 import config
 
@@ -36,6 +43,11 @@ logger = logging.getLogger(__name__)
 # 窗口宽度达到该值时侧栏展开显示文字，窄于它时收成图标栏
 NAV_EXPAND_MIN_WIDTH = 1200
 NAV_EXPAND_WIDTH = 150
+
+# 启动提示延迟到窗口显示之后再弹出
+STARTUP_TIP_DELAY_MS = 500
+# 数据目录位于同步盘的提示标题（内容由组合根给出）
+SYNC_DIR_TIP_TITLE = "存储位置风险"
 
 
 class MainWindow(FluentWindow):
@@ -81,6 +93,8 @@ class MainWindow(FluentWindow):
         self._tray_tip_shown = False
         # 真退出收尾期间报告过的进度文案（按顺序；供日志与测试核对）
         self.shutdown_progress: List[str] = []
+        # 只读库的常驻横幅（窗口显示后创建；可写库为 None）
+        self.read_only_banner = None
 
         # 初始化界面
         self._init_window()
@@ -106,14 +120,32 @@ class MainWindow(FluentWindow):
         # 启动3秒后静默检查更新（对齐参考实现，避免阻塞启动）
         QTimer.singleShot(3000, lambda: self.about_group.check_update(silent=True))
 
-        # 数据库迁移三态提示（延迟到窗口显示后弹出，三态互斥，按严重程度顺序判断）
+        # 数据库迁移三态提示（延迟到窗口显示后弹出，三态互斥，按严重程度顺序判断）；
+        # 都不是而本次刚升级成功时，提示旧文件的备份位置
         db = self.db
         if db.backup_aborted:
-            QTimer.singleShot(500, self._show_backup_aborted_tip)
+            QTimer.singleShot(STARTUP_TIP_DELAY_MS, self._show_backup_aborted_tip)
         elif db.data_reset:
-            QTimer.singleShot(500, self._show_data_reset_tip)
+            QTimer.singleShot(STARTUP_TIP_DELAY_MS, self._show_data_reset_tip)
         elif db.migration_failed:
-            QTimer.singleShot(500, self._show_migration_failed_tip)
+            QTimer.singleShot(STARTUP_TIP_DELAY_MS, self._show_migration_failed_tip)
+        elif getattr(db, 'backup_path', None) and getattr(db, 'migrated_from', None) is not None:
+            QTimer.singleShot(STARTUP_TIP_DELAY_MS, self._show_migrated_tip)
+
+        # 只读库（由更高版本创建）：立即禁止开始监控与打点，窗口显示后挂常驻横幅
+        if getattr(db, 'read_only', False):
+            self.monitor_page.presenter.set_read_only(READ_ONLY_START_BLOCKED)
+            QTimer.singleShot(STARTUP_TIP_DELAY_MS, self._show_read_only_banner)
+
+    def show_sync_dir_warning(self, text: str, delay_ms: int = STARTUP_TIP_DELAY_MS) -> None:
+        """数据目录位于同步盘：窗口显示后给一条警告提示（每次启动都提示，但不弹对话框）。
+
+        由组合根在建窗后按 app.paths.sync_dir_hint 的结果调用；本窗口不判断路径。
+        """
+        QTimer.singleShot(delay_ms, lambda: self._show_sync_dir_tip(text))
+
+    def _show_sync_dir_tip(self, text: str) -> None:
+        self.services.notifier.warning(self, SYNC_DIR_TIP_TITLE, text, duration=-1)
 
     def _show_migration_failed_tip(self):
         """迁移失败且旧数据仍在原库（已从备份还原，或还原与改名都失败而原样保留）：
@@ -131,10 +163,26 @@ class MainWindow(FluentWindow):
             duration=-1)
 
     def _show_backup_aborted_tip(self):
-        """迁移前备份失败：中止迁移，旧库原样保留未做任何改动"""
+        """迁移前备份失败或磁盘预检不足：中止迁移，旧库原样保留未做任何改动"""
+        report = getattr(self.db, 'migration_report', None)
         self.services.notifier.warning(
             self, "数据库升级已中止",
-            "未能升级数据库，历史数据完好保存在磁盘，请释放磁盘空间后重启。",
+            backup_aborted_text(getattr(report, 'required_bytes', None),
+                                getattr(report, 'free_bytes', None)),
+            duration=-1)
+
+    def _show_migrated_tip(self):
+        """本次启动成功升级了库：告诉用户旧文件保留在哪里（回退到 1.4.1 时要用）"""
+        report = self.db.migration_report
+        version = report.to_version if report is not None else SCHEMA_VERSION
+        self.services.notifier.success(
+            self, MIGRATED_TIP_TITLE, migrated_tip_text(version, self.db.backup_path),
+            duration=MIGRATED_TIP_DURATION_MS)
+
+    def _show_read_only_banner(self):
+        """只读库：顶部常驻警告（不自动消失）"""
+        self.read_only_banner = self.services.notifier.warning(
+            self, READ_ONLY_TITLE, read_only_banner_text(getattr(self.db, 'newer_version', None)),
             duration=-1)
 
     def _init_window(self):

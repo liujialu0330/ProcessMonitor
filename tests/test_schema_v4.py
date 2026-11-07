@@ -15,7 +15,7 @@ from data.db.migrations._frozen import parse_metric_types
 from data.db.migrations.runner import MigrationOutcome
 from data.db.schema import SCHEMA_VERSION
 from tests.test_migration import (
-    _create_v0_db, _get_user_version, patched_migrations, run_migration,
+    _create_v0_db, _get_user_version, patched_migrations, run_inplace, run_migration,
 )
 from tests.test_migration_v2 import _create_v1_db
 from tests.test_schema_v3 import _create_v2_db, _schema_signature
@@ -48,14 +48,16 @@ def _columns(path: str, table: str):
         conn.close()
 
 
-def test_schema_version_is_4():
-    assert SCHEMA_VERSION == 4
+def test_schema_version_is_5():
+    """v5 起改为重建式迁移；冻结的就地迁移链仍止于 v4"""
+    assert SCHEMA_VERSION == 5
     assert [m.version for m in MIGRATIONS] == [1, 2, 3, 4]
 
 
-def test_new_db_is_v4_with_new_columns(db_path):
+def test_new_db_has_v4_columns(db_path):
+    """v4 增加的两列在新建（v5）库里仍存在且定义不变"""
     Database(db_path)
-    assert _get_user_version(db_path) == 4
+    assert _get_user_version(db_path) == SCHEMA_VERSION
     assert _columns(db_path, 'tasks')['create_time'] == ('REAL', 0, None)
     assert _columns(db_path, 'task_markers')['kind'] == ('TEXT', 1, "'user'")
 
@@ -69,9 +71,9 @@ def test_v3_to_v4_adds_columns_with_defaults(db_path):
 
     report = db.migration_report
     assert report.outcome is MigrationOutcome.MIGRATED
-    assert (report.from_version, report.to_version) == (3, 4)
+    assert (report.from_version, report.to_version) == (3, SCHEMA_VERSION)
     assert os.path.exists(db_path + '.bak_v3')
-    assert _get_user_version(db_path) == 4
+    assert _get_user_version(db_path) == SCHEMA_VERSION
 
     conn = sqlite3.connect(db_path)
     try:
@@ -131,14 +133,14 @@ def test_v4_apply_is_idempotent(db_path):
 
 
 def test_v4_failure_rolls_back_and_restores(db_path):
-    """v4 步骤失败：整条链回滚并从备份还原，库仍为 v3 且没有新列"""
+    """（冻结的就地迁移链）v4 步骤失败：整条链回滚并从备份还原，库仍为 v3 且没有新列"""
     _create_v3_db(db_path)
 
     def _boom(cursor):
         cursor.execute('ALTER TABLE tasks ADD COLUMN create_time REAL')
         raise RuntimeError("模拟迁移失败")
 
-    report = run_migration(db_path, patched_migrations(4, _boom))
+    report = run_inplace(db_path, patched_migrations(4, _boom))
 
     assert report.outcome is MigrationOutcome.FAILED_RESTORED
     assert _get_user_version(db_path) == 3
@@ -156,11 +158,14 @@ def test_v2_task_with_empty_metric_list_migrates(db_path):
 
     conn = sqlite3.connect(db_path)
     try:
-        rows = dict(conn.execute('SELECT task_id, metric_type FROM data_points'))
+        # v5 里样本按 (任务, 指标) 归入 series；无指标可回填的行归入空名序列 ''
+        rows = dict(conn.execute(
+            'SELECT se.task_id, se.metric FROM samples s '
+            'JOIN series se ON se.series_id = s.series_id'))
         tasks = dict(conn.execute('SELECT task_id, metric_type FROM tasks'))
     finally:
         conn.close()
-    assert rows == {'t1': None, 't2': 'cpu_percent'}
+    assert rows == {'t1': '', 't2': 'cpu_percent'}
     assert json.loads(tasks['t1']) == []
 
 

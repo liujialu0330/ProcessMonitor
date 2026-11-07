@@ -1,10 +1,17 @@
 """
 行 ↔ 对象映射与时间/指标列的编解码
 
-仓储层只通过这里把 sqlite3.Row 转成模型对象、把 datetime 转成库里的 ISO 文本。
-时间参数只接受 datetime：data_points.timestamp 等列是 TEXT，SQLite 会把 epoch float
-转成文本参与字典序比较，结果恒小于任何 ISO 串，过滤会静默失效；因此在编码入口直接
-拒绝非 datetime，而不是靠注释提醒调用方。
+仓储层只通过这里把 sqlite3.Row 转成模型对象、把 datetime 转成库里的时间值：
+- tasks / task_markers 的时间列是 ISO 文本（to_iso / from_iso）；
+- samples.ts_ms 是 UTC 毫秒整数（to_ms / from_ms，以及查询边界用的 ceil_ms / floor_ms）。
+时间参数只接受 datetime：SQLite 会把 epoch float 与文本列做跨类型比较，过滤会静默失效；
+整数毫秒列收到秒级 epoch 也不会报错，只是差了 1000 倍。因此在编码入口直接拒绝非 datetime，
+而不是靠注释提醒调用方。
+
+毫秒换算一律用整数运算：整秒部分由 datetime.timestamp() 得到（本地 naive 时间按本机时区
+解释，含夏令时规则），微秒部分按"四舍五入到毫秒、0.5 毫秒进位"取整。不用
+round(dt.timestamp() * 1000)：浮点乘法在恰好 0.5 毫秒处的进位方向不确定，
+与迁移时 SQL 侧的整数换算（data.db.migrations.rebuild）就可能差 1 毫秒。
 """
 import json
 import sqlite3
@@ -24,6 +31,51 @@ def to_iso(dt: datetime) -> str:
 def to_iso_or_none(dt: Optional[datetime]) -> Optional[str]:
     """可空版本的 to_iso：None 原样返回，其余同 to_iso。"""
     return None if dt is None else to_iso(dt)
+
+
+def _check_dt(dt: datetime) -> datetime:
+    if not isinstance(dt, datetime):
+        raise TypeError(f"时间参数必须是 datetime，收到 {type(dt).__name__}: {dt!r}")
+    return dt
+
+
+def _whole_seconds(dt: datetime) -> int:
+    """dt 所在整秒的 epoch 秒数（本地 naive 时间按本机时区解释）；结果是精确整数"""
+    return int(dt.replace(microsecond=0).timestamp())
+
+
+def to_ms(dt: datetime) -> int:
+    """datetime（本地 naive）→ UTC 毫秒整数，微秒按四舍五入（0.5 毫秒进位）取整。
+
+    与 from_ms 往返无损（毫秒精度的 datetime 原样返回）。
+    """
+    _check_dt(dt)
+    return _whole_seconds(dt) * 1000 + (dt.microsecond + 500) // 1000
+
+
+def ceil_ms(dt: datetime) -> int:
+    """查询下界：不早于 dt 的最小整数毫秒。样本 m 满足 m >= dt 当且仅当 m >= ceil_ms(dt)"""
+    _check_dt(dt)
+    return _whole_seconds(dt) * 1000 + (dt.microsecond + 999) // 1000
+
+
+def floor_ms(dt: datetime) -> int:
+    """查询上界：不晚于 dt 的最大整数毫秒。样本 m 满足 m <= dt 当且仅当 m <= floor_ms(dt)"""
+    _check_dt(dt)
+    return _whole_seconds(dt) * 1000 + dt.microsecond // 1000
+
+
+def from_ms(ms: int) -> datetime:
+    """UTC 毫秒整数 → 本地 naive datetime（毫秒精度）。
+
+    ms / 1000 的双精度误差远小于 0.5 微秒，fromtimestamp 舍入到微秒后恰好是整毫秒。
+    """
+    return datetime.fromtimestamp(ms / 1000)
+
+
+def normalize_ms(dt: datetime) -> datetime:
+    """dt 按 to_ms 取整到毫秒后的 datetime（即写入 samples 后再读回的样子）"""
+    return from_ms(to_ms(dt))
 
 
 def from_iso(text: Optional[str]) -> Optional[datetime]:
@@ -91,7 +143,10 @@ def row_to_task(row: sqlite3.Row) -> MonitorTask:
 
 
 def row_to_point(row: sqlite3.Row) -> DataPoint:
-    """data_points 表的一行（至少含 task_id/timestamp/value/metric_type）→ DataPoint。"""
+    """旧结构 data_points 表的一行（至少含 task_id/timestamp/value/metric_type）→ DataPoint。
+
+    v5 起样本存 samples 表，仓储直接用 from_ms 构造 DataPoint；本函数只服务旧结构的读取。
+    """
     return DataPoint(
         task_id=row['task_id'],
         timestamp=from_iso(row['timestamp']),

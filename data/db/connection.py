@@ -19,6 +19,10 @@
 （约 4 MB）内循环复用；但单个大事务（批量删除、VACUUM 等）会把 -wal 撑到与事务同量级，
 PASSIVE checkpoint 后仍停在高位，下次写入重置日志时才截到 journal_size_limit（之后就停在
 该上限）。需要立即收回空间时（如清理/VACUUM 之后）调用 checkpoint(truncate=True)，把 -wal 截到 0。
+
+只读模式（read_only=True）：库由更高版本写入、当前版本不能安全修改时使用（见 data.db.meta）。
+transaction() 直接抛 StorageError；connect() 的连接设 query_only，任何写语句都会失败并被
+仓储包成 StorageError。只读连接不切换日志模式（切换本身就是一次写）。
 """
 import logging
 import sqlite3
@@ -26,15 +30,20 @@ import threading
 from contextlib import contextmanager
 from typing import Iterator, Optional
 
+from data.errors import StorageError
+
 logger = logging.getLogger(__name__)
 
 # -wal 重置复用时保留的最大字节数
 JOURNAL_SIZE_LIMIT = 8 * 1024 * 1024
 
 
-def _apply_pragmas(conn: sqlite3.Connection) -> None:
+def _apply_pragmas(conn: sqlite3.Connection, read_only: bool = False) -> None:
     """新连接在其他语句之前设置的 PRAGMA（必须在事务外执行：journal_mode 不能在事务内切换）"""
-    conn.execute('PRAGMA journal_mode=WAL')
+    if read_only:
+        conn.execute('PRAGMA query_only=1')
+    else:
+        conn.execute('PRAGMA journal_mode=WAL')
     conn.execute('PRAGMA busy_timeout=5000')
     conn.execute('PRAGMA synchronous=NORMAL')
     conn.execute(f'PRAGMA journal_size_limit = {JOURNAL_SIZE_LIMIT}')
@@ -43,16 +52,18 @@ def _apply_pragmas(conn: sqlite3.Connection) -> None:
 class ConnectionFactory:
     """按库路径创建连接；可选持有一个常驻占位连接（见模块说明）"""
 
-    def __init__(self, db_path: str, keep_alive: bool = True):
+    def __init__(self, db_path: str, keep_alive: bool = True, read_only: bool = False):
         """
         Args:
             db_path: 数据库文件路径
             keep_alive: 是否在首次使用时打开常驻占位连接。迁移、备份、还原、改名库文件
                 这类需要库文件没有任何打开句柄的场景必须用 False（Windows 上被打开的
                 文件无法改名）。
+            read_only: 只读模式（见模块说明）
         """
         self.db_path = db_path
         self.keep_alive = keep_alive
+        self.read_only = read_only
         self._holder: Optional[sqlite3.Connection] = None
         self._holder_lock = threading.Lock()
 
@@ -67,7 +78,7 @@ class ConnectionFactory:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row  # 使结果可以按列名访问
         try:
-            _apply_pragmas(conn)
+            _apply_pragmas(conn, self.read_only)
             self._ensure_keep_alive()
             yield conn
             conn.commit()
@@ -84,7 +95,12 @@ class ConnectionFactory:
         用 BEGIN IMMEDIATE ... COMMIT 包住整段逻辑（失败 ROLLBACK）。
         与默认模式不同，这样 DDL（CREATE/ALTER/DROP）与 PRAGMA user_version
         也真正处于同一个事务内，迁移链任一步失败都能整体回滚。
+
+        Raises:
+            StorageError: 只读模式（不打开连接）
         """
+        if self.read_only:
+            raise StorageError(f"数据库为只读，不能写入: {self.db_path}")
         conn = sqlite3.connect(self.db_path, isolation_level=None)
         conn.row_factory = sqlite3.Row
         try:

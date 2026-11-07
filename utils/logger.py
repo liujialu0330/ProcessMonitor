@@ -20,12 +20,19 @@ _configured = False
 def get_log_dir() -> str:
     """
     获取日志目录（经 config.LOG_DIR 委托 app.paths.AppPaths.resolve，规则只在那里定义
-    一份；工具层不直接依赖 app 组装层）
+    一份；工具层不直接依赖 app 组装层）。数据目录按 AppPaths.resolve 的优先级取第一个
+    命中的来源，日志目录随之确定。
+
+    组合根 app.bootstrap.run() 直接把 AppPaths.log_dir 传给 setup_logging、不经本函数；
+    这里只给未传目录的调用方兜底，与组合根解析同一份命令行参数（sys.argv）。
 
     Returns:
         str: 日志目录路径
-            - 设置了环境变量 PROCESS_MONITOR_DATA_DIR：<该目录>\\logs，日志随数据一起
-              隔离在指定目录内（测试/便携运行不会写到默认位置）
+            - 命令行 --data-dir <目录>（或 --data-dir=<目录>）：<该目录>\\logs
+            - 环境变量 PROCESS_MONITOR_DATA_DIR：<该目录>\\logs，日志随数据一起
+              隔离在指定目录内（测试运行不会写到默认位置）
+            - 便携模式（基础目录下有 portable.flag；打包为 exe 所在目录，开发为项目根）：
+              <基础目录>\\logs，与 <基础目录>\\data 并列
             - 默认：与数据目录同级的 logs\\（打包为 %LOCALAPPDATA%\\<APP_NAME>\\logs，
               开发环境为项目根目录下的 logs\\，已加入 .gitignore）
     """
