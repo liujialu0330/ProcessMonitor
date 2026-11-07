@@ -17,7 +17,7 @@ from core.contracts import StopReason, UnavailableReason
 from core.monitor_manager import MonitorManager
 from tests.doubles import DEFAULT_FAKE_NOW, FakePreferences, FakeProcessQuery
 from tests.factories import make_monitor_page, make_services
-from tests.helpers import stop_and_join
+from tests.helpers import process_events_until, stop_and_join
 from ui.components.metric_selector import MetricSelectorDialog
 from ui.services import InfoBarNotifier
 from utils.metrics import (
@@ -54,8 +54,16 @@ def page(qapp, db, manager, services, started):
     widget = make_monitor_page(db, manager, services)
     widget.resize(900, 700)
     widget.show()
+    # 进程列表在后台线程读取：等首屏那次读取到达
+    _wait_process_list(widget)
     yield widget
     widget.close()
+
+
+def _wait_process_list(page):
+    """等后台读取进程列表结束且结果已填入（含合并的补读）"""
+    assert process_events_until(lambda: not page.form.picker.is_loading()
+                                and not page.services.threads.entries())
 
 
 def _add_card(manager, metrics=None, note="", pid=None, name="demo.exe"):
@@ -407,6 +415,7 @@ def test_exited_process_is_cleared_from_form(page, manager, services):
 
     services.process_query.kill(1002)
     manager.task_stopped.emit(task_id, StopReason.PROCESS_EXITED)
+    _wait_process_list(page)
 
     assert page.form.picker.text() == ""
     assert all(t.pid != 1002 for t in page.form.picker.targets())
@@ -457,6 +466,7 @@ def test_header_title_subtitle_summary_and_refresh(page, services):
     query = services.process_query
     before = sum(1 for name, _ in query.calls if name == 'list_processes')
     page.refresh_button.click()
+    _wait_process_list(page)
     assert sum(1 for name, _ in query.calls if name == 'list_processes') == before + 1
 
 
@@ -476,6 +486,7 @@ def test_shortcuts_only_while_visible(page, services):
     query = services.process_query
     before = sum(1 for name, _ in query.calls if name == 'list_processes')
     page._shortcuts[0].activated.emit()
+    _wait_process_list(page)
     assert sum(1 for name, _ in query.calls if name == 'list_processes') == before + 1
 
 

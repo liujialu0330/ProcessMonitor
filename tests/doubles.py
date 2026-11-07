@@ -5,11 +5,12 @@
 - 断言弹出了哪些提示（RecordingNotifier），
 - 预设"用户在对话框里的选择"（ScriptedDialogs），
 - 控制"现在几点"（FakeClock），
-- 给出固定的进程表（FakeProcessQuery），
+- 给出固定的进程表（FakeProcessQuery；读取列表可阻塞到测试放行的 BlockingProcessQuery），
 - 指定哪些任务仍在运行（FakeTaskStatus），
 - 给出固定的用户偏好（FakePreferences）。
 替身都不弹出任何窗口、不触达本机进程与配置文件。
 """
+import threading
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -352,6 +353,38 @@ class FakeProcessQuery:
         self.processes = [entry for entry in self.processes if entry[0] != pid]
         if self.alive is not None:
             self.alive.discard(pid)
+
+
+class BlockingProcessQuery(FakeProcessQuery):
+    """读取进程列表会阻塞的进程表替身（模拟 psutil 冷启动遍历要 2 秒上下）。
+
+    list_processes 先记下调用所在线程（list_threads，threading.get_ident()）并置位
+    entered，再等 release 放行（最长 block_timeout 秒）后返回固定进程表；release 放行
+    后不再复位，之后的读取都不阻塞，需要再次阻塞时测试自行 release.clear()。
+    fail_with 不为 None 时放行后抛出该异常（模拟读取失败）。其余查询与 FakeProcessQuery
+    相同、不阻塞（直接输入 PID 不依赖列表）。
+    """
+
+    def __init__(self, processes: Optional[Iterable[ProcessEntry]] = None,
+                 block_timeout: float = 5.0, **kwargs: Any):
+        super().__init__(processes, **kwargs)
+        self.release = threading.Event()
+        self.entered = threading.Event()
+        self.block_timeout = block_timeout
+        self.list_threads: List[int] = []
+        self.fail_with: Optional[BaseException] = None
+
+    def list_processes(self) -> List[ProcessEntry]:
+        self.list_threads.append(threading.get_ident())
+        self.entered.set()
+        self.release.wait(self.block_timeout)
+        if self.fail_with is not None:
+            raise self.fail_with
+        return super().list_processes()
+
+    def list_calls(self) -> int:
+        """list_processes 被调用的次数。"""
+        return len(self.list_threads)
 
 
 # ---------------------------------------------------------------- 任务状态

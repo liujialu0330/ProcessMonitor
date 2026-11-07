@@ -57,3 +57,5 @@ logs/
 
 # 测试
 test_*.db
+tests/perf/.cache/
+tests/visual/.out/

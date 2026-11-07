@@ -1,0 +1,70 @@
+{
+  "说明": "性能预算（tests/perf/README.md）：budget = 基线机器实测 × slack；运行时按 本机校准值 / calibration_ms 换算",
+  "calibration_ms": 140.4,
+  "slack": 1.5,
+  "updated": "2026-11-07T03:38:33",
+  "platform": "Windows-10-10.0.26200-SP0",
+  "python": "3.11.9",
+  "budgets": {
+    "analysis_1h_3d": {
+      "budget": 455.0,
+      "measured": 303.0,
+      "unit": "ms",
+      "desc": "自动刷新“最近 1 小时”整批 5 指标并行（1282200 行库）"
+    },
+    "analysis_all_3d": {
+      "budget": 5820.0,
+      "measured": 3880.0,
+      "unit": "ms",
+      "desc": "分析页“全部”整批 5 指标并行（1282200 行）"
+    },
+    "analysis_all_7d": {
+      "budget": 14300.0,
+      "measured": 9530.0,
+      "unit": "ms",
+      "desc": "分析页“全部”整批 5 指标并行（2991000 行）"
+    },
+    "collect_leak_preset_us": {
+      "budget": 16100.0,
+      "measured": 10700.0,
+      "unit": "us",
+      "desc": "collect_metrics 泄漏预设 5 项（本进程，200 次中位数）"
+    },
+    "import_main_window_cold": {
+      "budget": 901.0,
+      "measured": 601.0,
+      "unit": "ms",
+      "desc": "新进程 import ui.main_window"
+    },
+    "list_processes_cold": {
+      "budget": 3380.0,
+      "measured": 2260.0,
+      "unit": "ms",
+      "desc": "process_catalog.list_processes 冷（新进程首次，487 个进程）"
+    },
+    "list_processes_hot": {
+      "budget": 4.43,
+      "measured": 2.95,
+      "unit": "ms",
+      "desc": "process_catalog.list_processes 热（同进程第二次，487 个进程）"
+    },
+    "migration_v1_1m": {
+      "budget": 7040.0,
+      "measured": 4690.0,
+      "unit": "ms",
+      "desc": "v1 → v4 迁移（1000000 行，含备份）"
+    },
+    "write_cycle_p50": {
+      "budget": 0.898,
+      "measured": 0.599,
+      "unit": "ms",
+      "desc": "单周期写入 5 指标 p50（100000 行库，200 次）"
+    },
+    "write_cycle_p95": {
+      "budget": 1.79,
+      "measured": 1.19,
+      "unit": "ms",
+      "desc": "单周期写入 5 指标 p95（100000 行库，200 次）"
+    }
+  }
+}

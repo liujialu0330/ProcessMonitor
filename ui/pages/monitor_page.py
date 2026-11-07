@@ -7,6 +7,7 @@
 
 键盘：F5 刷新进程列表、Ctrl+F 聚焦进程搜索框（只在本页可见时生效，不与其他页的
 同名快捷键冲突）。进程列表在页面显示、窗口重新激活时自动刷新（两秒节流）。
+构造函数不读取进程列表：首屏只发起一次后台读取（线程登记到 services.threads）。
 """
 from typing import List
 
@@ -80,14 +81,21 @@ class MonitorPage(PageScaffold):
         self._add_shortcut("F5", self.refresh_processes)
         self._add_shortcut("Ctrl+F", self.form.picker.focus_search)
 
-        # 启动时加载一次进程列表（不默认选中任何进程）
+        # 进程列表一律在后台线程读取（psutil 冷启动遍历约 2 秒，不能推迟首屏）；
+        # 读取期间刷新按钮置灰，结束后恢复
+        self.form.picker.set_thread_registry(services.threads)
+        self.form.picker.loading_changed.connect(self._on_process_list_loading)
+        # 启动时发起一次读取（不默认选中任何进程）；直接输入 PID 不必等列表
         self.form.picker.refresh()
 
     # ========== 进程列表 ==========
 
     def refresh_processes(self) -> None:
-        """立即重新读取进程列表（页头按钮 / F5）。"""
+        """重新读取进程列表（页头按钮 / F5）：后台读取，进行中再按只合并为一次补读。"""
         self.form.picker.refresh()
+
+    def _on_process_list_loading(self, loading: bool) -> None:
+        self.refresh_button.setEnabled(not loading)
 
     def showEvent(self, event):
         super().showEvent(event)

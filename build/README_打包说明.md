@@ -209,6 +209,7 @@ build\
 | `Compression` | `lzma2/max` | 最大压缩率 |
 | `SolidCompression` | `yes` | 固实压缩 |
 | `[Files]` | `Source: "..\dist\进程监控助手\*"` + `ignoreversion recursesubdirs createallsubdirs` | 整体复制onedir目录；`ignoreversion` 防止Qt DLL被版本比较跳过覆盖 |
+| `AppMutex` | `ProcessMonitor.Running,Global\ProcessMonitor.Running` | 程序运行中时安装/卸载会提示先关闭；名称须与 `app/single_instance.py` 的 `INSTALLER_MUTEX_NAME` 一致 |
 
 #### 安装包功能
 

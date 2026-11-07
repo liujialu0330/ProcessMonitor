@@ -1,0 +1,46 @@
+name: Perf
+
+# 性能基准（tests/perf/，说明见 tests/perf/README.md）：每周一次 + 手动触发。
+# 预算按本机校准值换算，CI 机器与基线机器的差异由系数吸收；结果以 artifact 留档。
+on:
+  schedule:
+    - cron: '0 18 * * 0'   # 每周一 02:00（北京时间）
+  workflow_dispatch:
+
+jobs:
+  perf:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      QT_QPA_PLATFORM: offscreen
+      # 与 ci.yml 一致：防御性设置，避免 offscreen 下字体缺失导致刷屏/报错
+      QT_QPA_FONTDIR: C:\Windows\Fonts
+      # 本套件在终端汇总里输出中文（实测 / 预算 / 系数），管道输出默认 cp1252 编码会报错
+      PYTHONIOENCODING: utf-8
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements-lock.txt
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements-lock.txt
+          pip install pytest
+
+      - name: Run perf suite
+        run: pytest tests/perf -m perf -v
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-last-run
+          path: tests/perf/.cache/last_run.json
+          if-no-files-found: warn

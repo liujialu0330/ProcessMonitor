@@ -213,7 +213,11 @@ def run_env(monkeypatch, app_paths):
             self.events.append('single_instance')
             return state['existing']
 
-    monkeypatch.setattr(single_instance, 'SingleInstanceGuard', lambda: Guard(events))
+    def make_guard(*args, **kwargs):
+        state['guard_args'] = (args, kwargs)
+        return Guard(events)
+
+    monkeypatch.setattr(single_instance, 'SingleInstanceGuard', make_guard)
     monkeypatch.setattr(bootstrap, '_apply_preferences',
                         lambda app, paths: events.append('preferences'))
 
@@ -256,6 +260,13 @@ def test_run_fixed_order(run_env):
     assert 'db.close' not in events
     # 路径解析后先建目录（日志初始化要写文件）
     assert os.path.isdir(paths.data_dir) and os.path.isdir(paths.log_dir)
+
+
+def test_run_keys_single_instance_by_data_dir(run_env):
+    """单实例按数据目录区分：组合根必须把 AppPaths.data_dir 交给守卫"""
+    events, state, exits, paths = run_env
+    bootstrap.run(['prog'], exit_process=exits.append)
+    assert state['guard_args'] == ((), {'data_dir': paths.data_dir})
 
 
 def test_run_returns_zero_when_instance_exists(run_env):
