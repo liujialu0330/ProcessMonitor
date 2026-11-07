@@ -5,7 +5,7 @@
 
 重建式（目标 v5，生产路径；见 data.db.migrations.rebuild）：
 1. 用不设任何 PRAGMA 的裸连接探测：库里没有 tasks 表（全新库）→ 直接建当前结构
-   （UP_TO_DATE，created=True）；user_version >= 目标 → UP_TO_DATE（更新的库原样使用，只记警告）
+   （UP_TO_DATE，created=True；原路径没有库但留有换库中断的痕迹时例外，见第 6 步）；user_version >= 目标 → UP_TO_DATE（更新的库原样使用，只记警告）
 2. 磁盘预检：库所在磁盘的可用空间须 ≥ 旧库大小（含 -wal）× DISK_HEADROOM_RATIO +
    DISK_HEADROOM_BYTES，不足 → BACKUP_ABORTED（报告带 required_bytes / free_bytes），旧库原样保留；
    查询可用空间本身失败只记警告、照常迁移
@@ -13,15 +13,32 @@
    任何写入）；checkpoint 被其他连接挡住 → BACKUP_ABORTED，旧库原样保留
 4. 在 <库>.migrating 建 v5 结构，以只读 immutable 方式 ATTACH 旧库，SELECT 搬入全部数据；
    失败时删掉新文件再试一次，仍失败 → FAILED_RESTORED
-5. 旧文件改名为 <库>.bak_v{起始版本}（即备份，逐字节就是迁移前的旧库），新文件改名为 <库>
-   → MIGRATED。不变式：任何失败之后旧库都回到原路径——旧文件改名失败 → 删掉新文件，
-   FAILED_RESTORED；新文件改名失败 → 删掉新文件、把旧文件改回原名，FAILED_RESTORED；
-   只有连改回也失败才是 FAILED_KEPT（原路径暂无数据库，数据在 backup_path，报告的
-   backup_path 与 broken_path 都指向它）。组合根遇到 FAILED_KEPT 不得继续启动：
-   否则连接工厂会在原路径建出空库，用户的数据看上去"没了"
+5. 换库：先用 os.link 给旧文件建硬链接 <库>.bak_v{起始版本}（即备份，与旧库是同一份文件，
+   逐字节就是迁移前的旧库），再 os.replace 把新文件换到原路径 → MIGRATED。原路径任何时刻都有
+   完整的库：换入失败只需删掉多出来的硬链接，FAILED_RESTORED。
+   文件系统不支持硬链接时退回"改名"：先写 <库>.swap_pending 标记（旧库名、新库名、备份名、
+   时间），旧文件改名为备份、新文件改名为库，换完删除标记。改名式下任何失败之后旧库都回到
+   原路径——旧文件改名失败 → 删掉新文件，FAILED_RESTORED；新文件改名失败 → 把旧文件改回原名、
+   删掉新文件，FAILED_RESTORED；只有连改回也失败才是 FAILED_KEPT（原路径暂无数据库，数据在
+   backup_path，报告的 backup_path 与 broken_path 都指向它；标记与完整的新文件留着，供下次
+   启动恢复）。组合根遇到 FAILED_KEPT 不得继续启动：否则连接工厂会在原路径建出空库，用户的
+   数据看上去"没了"
+   换库成功后，与本次备份是同一份文件（os.path.samefile）的其他 .bak_v* 一并删除：它们是
+   上次硬链接换库中断（建了链接、没换成）留下的多余硬链接，不是另一份数据。
    重建式迁移从不改动旧库，所以这里的 FAILED_RESTORED 含义是"迁移没有完成，原路径仍是未被
    改动的旧库"——与就地迁移"已从备份还原"对用户的效果相同：本次运行新数据无法保存，下次
    启动重试。不会出现 RESET。磁盘峰值约为旧库 + 新库。
+   只对 sqlite3.OperationalError（锁、IO、磁盘满）与 OSError 重试一次；数据转换等程序性异常
+   重试也必然再失败，直接 FAILED_RESTORED。失败报告的 reason 带原因文案（主窗口提示用）。
+6. 换库中断的恢复（探测阶段）：原路径没有库（文件不存在或为 0 字节），且存在 <库>.swap_pending
+   标记或完整的 <库>.migrating 时才恢复、不建空库——.migrating 完整（能打开、user_version
+   为 5、quick_check 通过；重建时 user_version 在全部数据落盘后才写）→ 换到原路径，按 MIGRATED
+   报告；否则（有标记）把标记里记的备份（找不到时取修改时间最新的 .bak_v*）改回原路径、重新
+   迁移；都不行 → FAILED_KEPT。
+   只有裸的 .bak_v*（没有标记、没有完整的 .migrating）不算换库中断：硬链接式换库从不让原路径
+   变空，改名式先写标记再改名，这种现场只会来自用户或外部程序删掉了库。此时按全新库启动、
+   不自动放回备份，只记一条 WARNING 列出发现的备份文件及手动找回的办法；不完整的 .migrating
+   不含可恢复的数据，一并删掉。
 
 就地式（目标 v1–v4，只供测试与 golden 样本生成器截断迁移链，生产路径不再调用）：
 1. 同上探测；全新库建 v4 冻结结构
@@ -44,12 +61,14 @@
 同一库路径每进程只尝试一次迁移：失败时版本号始终不变，若不记住结果，
 每个新的 Database() 实例都会重新触发一次迁移。
 """
+import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -74,6 +93,18 @@ DISK_HEADROOM_RATIO = 0.3
 DISK_HEADROOM_BYTES = 200 * 1024 * 1024
 
 _MB = 1024 * 1024
+
+# 重建式迁移的临时新库与改名式换库的标记文件（后缀接在库路径后面）
+MIGRATING_SUFFIX = '.migrating'
+SWAP_PENDING_SUFFIX = '.swap_pending'
+
+# 失败原因文案（MigrationReport.reason；主窗口提示与只读横幅用）
+REASON_SOURCE_BUSY = "旧数据库正被其他程序占用"
+REASON_SWAP_FAILED = "新数据库无法换到原位置（{error}）"
+REASON_IO_ERROR = "读写数据库文件出错（{error}）"
+REASON_DATA_ERROR = "旧数据转换出错（{error}）"
+REASON_MARKER_FAILED = "无法写入换库标记（{error}）"
+REASON_RECOVERY_FAILED = "上次升级中断，未能自动恢复"
 
 
 def required_free_bytes(db_bytes: int) -> int:
@@ -114,6 +145,10 @@ class MigrationReport:
     # 磁盘预检不足而中止（BACKUP_ABORTED）时：所需与当前可用的字节数；其余情况为 None
     required_bytes: Optional[int] = None
     free_bytes: Optional[int] = None
+    # 重建时因时间戳为 NULL 或无法解析而跳过的数据点行数（MIGRATED 时有意义）
+    skipped_rows: int = 0
+    # 失败原因文案（失败结果时给出，主窗口提示用）；其余情况为 None
+    reason: Optional[str] = None
 
     @property
     def disk_shortage(self) -> bool:
@@ -177,6 +212,17 @@ def _remove_with_sidecars(path: str) -> bool:
     """删除 path 及其 -journal/-wal/-shm（不存在视为成功）"""
     ok = all([_remove_quietly(path + s) for s in ('-journal',) + _SIDECARS])
     return _remove_quietly(path) and ok
+
+
+def _retryable(exc: BaseException) -> bool:
+    """重建失败是否值得重试：锁、IO、磁盘满这类瞬时故障才重试，程序性异常重试必然再失败"""
+    return isinstance(exc, (sqlite3.OperationalError, OSError))
+
+
+def failure_reason(exc: BaseException) -> str:
+    """重建失败的原因文案"""
+    template = REASON_IO_ERROR if _retryable(exc) else REASON_DATA_ERROR
+    return template.format(error=exc)
 
 
 # 进度回调：(阶段名, 已完成行数, 总行数)
@@ -250,10 +296,25 @@ class MigrationRunner:
             sqlite3.Error: 库被锁或文件损坏（与 migrate() 第 1 步相同，交由上层处理）
         """
         has_tasks, version = self._probe()
-        file_bytes = self._source_bytes() if has_tasks else 0
+        source = self.db_path
+        if (not has_tasks and self._rebuild and self._db_absent()
+                and self._read_swap_marker() is not None):
+            # 改名式换库中断：迁移时会把备份放回原路径重新迁移，按备份估计（据此决定要不要
+            # 进度窗口）；没有标记的裸备份不恢复（见模块说明第 6 步）
+            bak = self._recovery_backup()
+            if bak is not None and not self._is_complete_v5(self.db_path + MIGRATING_SUFFIX):
+                conn = sqlite3.connect(rebuild.sqlite_uri(bak, mode='ro'), uri=True,
+                                       timeout=PROBE_TIMEOUT)
+                try:
+                    if table_exists(conn, 'tasks'):
+                        has_tasks, version, source = True, read_version(conn), bak
+                finally:
+                    conn.close()
+        file_bytes = self._source_bytes(source) if has_tasks else 0
         rows = 0
         if has_tasks and version < self._target:
-            conn = sqlite3.connect(self.db_path, timeout=PROBE_TIMEOUT)
+            conn = sqlite3.connect(rebuild.sqlite_uri(source, mode='ro'), uri=True,
+                                   timeout=PROBE_TIMEOUT)
             try:
                 if table_exists(conn, 'data_points'):
                     # 最大 rowid 走 B 树最右端，几百万行也是瞬间；删过数据时偏大，只用于估计
@@ -269,10 +330,11 @@ class MigrationRunner:
         """从 version 迁移时备份将使用的文件名（进度窗口提前告诉用户；规则见 _new_backup_path）"""
         return self._new_backup_path(version)
 
-    def _source_bytes(self) -> int:
+    def _source_bytes(self, source: Optional[str] = None) -> int:
         """旧库占用的字节数：主文件 + 未合并的 -wal（checkpoint 后会并入主文件）"""
+        source = source or self.db_path
         total = 0
-        for path in (self.db_path, self.db_path + '-wal'):
+        for path in (source, source + '-wal'):
             try:
                 total += os.path.getsize(path)
             except OSError:
@@ -293,6 +355,11 @@ class MigrationRunner:
     def migrate(self) -> MigrationReport:
         try:
             has_tasks, version = self._probe()
+            if not has_tasks and self._rebuild and self._db_absent():
+                recovered = self._recover_interrupted_swap()
+                if recovered is not None:
+                    return recovered
+                has_tasks, version = self._probe()
             if not has_tasks:
                 self._create_fresh()
                 logger.info("已新建数据库: %s (v%d)", self.db_path, self._target)
@@ -322,6 +389,170 @@ class MigrationRunner:
         _ATTEMPTS[key] = report
         return report
 
+    # ========== 换库中断的恢复 ==========
+
+    def _db_absent(self) -> bool:
+        """原路径没有库：文件不存在或为 0 字节（没有任何表的空文件）"""
+        try:
+            return os.path.getsize(self.db_path) == 0
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+
+    def _backup_candidates(self) -> List[str]:
+        """<库>.bak_v0 ~ .bak_v4（含带时间戳、序号的变体），按修改时间从新到旧"""
+        directory = os.path.dirname(os.path.abspath(self.db_path))
+        pattern = re.compile(re.escape(os.path.basename(self.db_path))
+                             + r'\.bak_v[0-4](?:_\d{8}_\d{6})?(?:_\d+)?$')
+        try:
+            names = [n for n in os.listdir(directory) if pattern.match(n)]
+        except OSError:
+            logger.error("列出数据目录失败: %s", directory, exc_info=True)
+            return []
+        paths = [os.path.join(directory, n) for n in names]
+
+        def _key(path: str) -> Tuple[float, str]:
+            try:
+                return os.path.getmtime(path), path
+            except OSError:
+                return 0.0, path
+        return sorted(paths, key=_key, reverse=True)
+
+    def _read_swap_marker(self) -> Optional[Dict[str, Any]]:
+        """读改名式换库留下的标记；不存在或读不出时为 None（读不出也按"有中断"处理）"""
+        path = self.db_path + SWAP_PENDING_SUFFIX
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, encoding='utf-8') as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            logger.error("换库标记读取失败: %s", path, exc_info=True)
+            return {}
+
+    def _recovery_backup(self) -> Optional[str]:
+        """恢复时放回原路径的备份：标记里记的那个，否则修改时间最新的 .bak_v*"""
+        marker = self._read_swap_marker() or {}
+        named = marker.get('backup')
+        if isinstance(named, str) and os.path.isfile(named):
+            return named
+        candidates = self._backup_candidates()
+        return candidates[0] if candidates else None
+
+    @staticmethod
+    def _is_complete_v5(path: str) -> bool:
+        """path 是否是一份完整的 v5 库：能打开、user_version 为 5、有 tasks 表、quick_check 通过"""
+        if not os.path.isfile(path):
+            return False
+        try:
+            conn = sqlite3.connect(rebuild.sqlite_uri(path, mode='ro', immutable='1'), uri=True)
+            try:
+                if read_version(conn) != rebuild.VERSION or not table_exists(conn, 'tasks'):
+                    return False
+                row = conn.execute('PRAGMA quick_check').fetchone()
+                return row is not None and row[0] == 'ok'
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            logger.warning("迁移临时文件不完整: %s", path, exc_info=True)
+            return False
+
+    def _note_orphan_traces(self, incomplete_migrating: Optional[str]) -> None:
+        """
+        原路径没有库、也没有换库中断标记：按全新库处理（不自动放回备份，见模块说明第 6 步）。
+        不完整的临时文件不含可恢复的数据，删掉；发现的备份只记 WARNING 提示用户手动找回。
+        """
+        if incomplete_migrating is not None:
+            logger.warning("删除不完整的迁移临时文件，按全新库处理: %s", incomplete_migrating)
+            _remove_with_sidecars(incomplete_migrating)
+        backups = self._backup_candidates()
+        if backups:
+            logger.warning(
+                "原路径没有数据库，也没有换库中断标记，按全新库启动，不自动放回备份。发现旧数据库"
+                "备份: %s；如需找回，请退出程序，删除新建的 %s，把其中一个备份改名为 %s 后再启动",
+                ', '.join(os.path.basename(p) for p in backups),
+                os.path.basename(self.db_path), os.path.basename(self.db_path))
+
+    def _drop_duplicate_backups(self, keep: str) -> None:
+        """
+        换库成功后删掉与 keep 是同一份文件的其他备份：上次硬链接换库在建链接之后、换入之前
+        中断时留下的多余硬链接（与这次的备份同一 inode，不是另一份数据）
+        """
+        for path in self._backup_candidates():
+            if os.path.normcase(os.path.abspath(path)) == os.path.normcase(os.path.abspath(keep)):
+                continue
+            try:
+                same = os.path.samefile(path, keep)
+            except OSError:
+                continue
+            if same and _remove_quietly(path):
+                logger.info("已删除与本次备份相同的多余硬链接: %s", path)
+
+    @staticmethod
+    def _version_from_backup_name(path: Optional[str]) -> Optional[int]:
+        match = re.search(r'\.bak_v(\d)', os.path.basename(path or ''))
+        return int(match.group(1)) if match else None
+
+    def _recover_interrupted_swap(self) -> Optional[MigrationReport]:
+        """
+        原路径没有库时检查上次换库是否中断（规则见模块说明第 6 步）。
+
+        Returns:
+            已换入新库（MIGRATED）或无法恢复（FAILED_KEPT）时返回报告；没有中断痕迹、
+            或已把备份放回原路径（调用方重新探测后照常迁移）时返回 None
+        """
+        marker_path = self.db_path + SWAP_PENDING_SUFFIX
+        migrating = self.db_path + MIGRATING_SUFFIX
+        marker = self._read_swap_marker()
+        has_migrating = os.path.exists(migrating)
+        complete = has_migrating and self._is_complete_v5(migrating)
+        if marker is None and not complete:
+            self._note_orphan_traces(migrating if has_migrating else None)
+            return None
+        bak = self._recovery_backup()
+        logger.warning("原路径没有数据库，但留有上次升级的痕迹（标记=%s，临时文件=%s，备份=%s），"
+                       "尝试恢复: %s", marker is not None, has_migrating, bak, self.db_path)
+        from_version = (marker or {}).get('from_version')
+        if not isinstance(from_version, int):
+            from_version = self._version_from_backup_name(bak)
+        if from_version is None:
+            from_version = 0
+
+        if complete:
+            try:
+                os.replace(migrating, self.db_path)
+            except OSError as exc:
+                logger.error("完整的新数据库未能换到原路径: %s", migrating, exc_info=True)
+                kept = bak or migrating
+                return MigrationReport(MigrationOutcome.FAILED_KEPT, from_version, from_version,
+                                       backup_path=kept, broken_path=kept,
+                                       reason=REASON_SWAP_FAILED.format(error=exc))
+            _remove_quietly(marker_path)
+            logger.warning("已把上次升级完成的新数据库换到原路径（旧文件保留为 %s）", bak)
+            return MigrationReport(MigrationOutcome.MIGRATED, from_version, self._target,
+                                   backup_path=bak)
+
+        if bak is None:
+            logger.error("上次升级中断且找不到旧数据库的备份，原路径保持为空: %s", self.db_path)
+            kept = migrating if has_migrating else None
+            return MigrationReport(MigrationOutcome.FAILED_KEPT, from_version, from_version,
+                                   backup_path=kept, broken_path=kept,
+                                   reason=REASON_RECOVERY_FAILED)
+        try:
+            os.rename(bak, self.db_path)
+        except OSError:
+            logger.error("旧数据库备份未能放回原路径，数据保存在: %s", bak, exc_info=True)
+            return MigrationReport(MigrationOutcome.FAILED_KEPT, from_version, from_version,
+                                   backup_path=bak, broken_path=bak,
+                                   reason=REASON_RECOVERY_FAILED)
+        _remove_quietly(marker_path)
+        if has_migrating:
+            _remove_with_sidecars(migrating)
+        logger.warning("已把旧数据库备份放回原路径，重新升级: %s -> %s", bak, self.db_path)
+        return None
+
     # ========== 迁移主流程 ==========
 
     def _run(self, version: int) -> MigrationReport:
@@ -340,32 +571,41 @@ class MigrationRunner:
         if not self._checkpoint_source():
             logger.error("迁移前无法让旧数据库自包含（WAL checkpoint 未完成），已中止迁移，"
                          "旧数据库保持不变: %s", self.db_path)
-            return MigrationReport(MigrationOutcome.BACKUP_ABORTED, version, version)
+            return MigrationReport(MigrationOutcome.BACKUP_ABORTED, version, version,
+                                   reason=REASON_SOURCE_BUSY)
 
-        new_path = self.db_path + '.migrating'
-        built = False
+        new_path = self.db_path + MIGRATING_SUFFIX
+        stats: Optional[rebuild.RebuildStats] = None
+        reason = None
         for attempt in (1, 2):
             if not _remove_with_sidecars(new_path):
                 logger.error("无法删除残留的迁移临时文件: %s", new_path)
+                reason = REASON_IO_ERROR.format(error=f"无法删除 {new_path}")
                 break
             try:
                 started = time.perf_counter()
                 stats = rebuild.rebuild_into(new_path, self.db_path, version,
                                              on_progress=self._on_progress)
                 logger.info("重建式迁移完成: v%d -> v%d，任务 %d、读入 %d 行、样本 %d、"
-                            "打点 %d，用时 %.2f 秒", version, self._target, stats.tasks,
-                            stats.rows_read, stats.samples, stats.markers,
-                            time.perf_counter() - started)
-                built = True
+                            "打点 %d、跳过时间戳无效的行 %d，用时 %.2f 秒", version, self._target,
+                            stats.tasks, stats.rows_read, stats.samples, stats.markers,
+                            stats.skipped_rows, time.perf_counter() - started)
                 break
-            except Exception:
+            except Exception as exc:
                 logger.error("重建式迁移失败（第%d次）", attempt, exc_info=True)
                 _remove_with_sidecars(new_path)
-        if not built:
+                reason = failure_reason(exc)
+                if not _retryable(exc):
+                    break
+        if stats is None:
             logger.error("数据库迁移失败，旧数据库未被改动，本次运行新数据无法保存，"
-                         "下次启动重试")
-            return MigrationReport(MigrationOutcome.FAILED_RESTORED, version, version)
-        return self._swap_in(new_path, version)
+                         "下次启动重试：%s", reason)
+            return MigrationReport(MigrationOutcome.FAILED_RESTORED, version, version,
+                                   reason=reason)
+        report = self._swap_in(new_path, version)
+        if stats.skipped_rows and report.outcome is MigrationOutcome.MIGRATED:
+            report = replace(report, skipped_rows=stats.skipped_rows)
+        return report
 
     def _check_disk_space(self, version: int) -> Optional[MigrationReport]:
         """
@@ -382,10 +622,11 @@ class MigrationRunner:
             return None
         if free >= required:
             return None
-        logger.error("磁盘空间不足，已中止数据库升级：%s（%s）",
-                     disk_shortage_message(required, free), self.db_path)
+        message = disk_shortage_message(required, free)
+        logger.error("磁盘空间不足，已中止数据库升级：%s（%s）", message, self.db_path)
         return MigrationReport(MigrationOutcome.BACKUP_ABORTED, version, version,
-                               required_bytes=required, free_bytes=free)
+                               required_bytes=required, free_bytes=free,
+                               reason=f"磁盘空间不足，{message}")
 
     def _checkpoint_source(self) -> bool:
         """
@@ -431,40 +672,96 @@ class MigrationRunner:
 
     def _swap_in(self, new_path: str, version: int) -> MigrationReport:
         """
-        旧文件改名为备份、新文件改名为库。
+        把新文件换到原路径，旧文件留作备份（见模块说明第 5 步）。
 
-        不变式：任何失败之后旧库都回到原路径（见模块说明第 5 步）。新文件换不进来时
-        先把旧库改回原名、再清理新文件：清理失败不影响旧库归位，而旧库归位失败时
-        报告必须带上它的去向（FAILED_KEPT 的 backup_path / broken_path）。
+        首选"硬链接备份 + os.replace"：两步之间任何时刻原路径都是完整的库（先是旧库，
+        替换后是新库），中途崩溃不会让原路径变空。不支持硬链接时退回改名式。
         """
         if not self._clear_source_sidecars():
             _remove_with_sidecars(new_path)
-            return MigrationReport(MigrationOutcome.FAILED_RESTORED, version, version)
+            return MigrationReport(MigrationOutcome.FAILED_RESTORED, version, version,
+                                   reason=REASON_SOURCE_BUSY)
         backup_path = self._new_backup_path(version)
         try:
-            os.rename(self.db_path, backup_path)
-        except OSError:
-            logger.error("旧数据库改名为备份失败，已放弃迁移，旧数据库保持不变: %s",
-                         self.db_path, exc_info=True)
-            _remove_with_sidecars(new_path)
-            return MigrationReport(MigrationOutcome.FAILED_RESTORED, version, version)
+            os.link(self.db_path, backup_path)
+        except (OSError, AttributeError, NotImplementedError):
+            logger.warning("无法为旧数据库建立硬链接备份，改用改名方式换库: %s", backup_path,
+                           exc_info=True)
+            return self._swap_by_rename(new_path, backup_path, version)
         try:
             os.replace(new_path, self.db_path)
-        except OSError:
+        except OSError as exc:
+            logger.error("新数据库换到原路径失败，旧数据库保持不变: %s", new_path, exc_info=True)
+            # 原路径仍是旧库；多出来的硬链接与它是同一份文件，删不掉也无害
+            _remove_quietly(backup_path)
+            _remove_with_sidecars(new_path)
+            return MigrationReport(MigrationOutcome.FAILED_RESTORED, version, version,
+                                   reason=REASON_SWAP_FAILED.format(error=exc))
+        logger.info("数据库迁移完成: v%s -> v%s，旧库已保留为 %s", version, self._target,
+                    backup_path)
+        self._drop_duplicate_backups(backup_path)
+        return MigrationReport(MigrationOutcome.MIGRATED, version, self._target,
+                               backup_path=backup_path)
+
+    def _write_swap_marker(self, new_path: str, backup_path: str, version: int) -> None:
+        """改名式换库前写标记（落盘后才改名）：中途崩溃时下次启动据此恢复"""
+        path = self.db_path + SWAP_PENDING_SUFFIX
+        data = {'old': self.db_path, 'new': new_path, 'backup': backup_path,
+                'from_version': version, 'time': datetime.now().isoformat()}
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+
+    def _swap_by_rename(self, new_path: str, backup_path: str, version: int) -> MigrationReport:
+        """
+        改名式换库：标记 → 旧文件改名为备份 → 新文件改名为库 → 删标记。
+
+        不变式：任何失败之后旧库都回到原路径。新文件换不进来时先把旧库改回原名、再清理
+        新文件：清理失败不影响旧库归位；旧库归位失败时报告带上它的去向（FAILED_KEPT 的
+        backup_path / broken_path），标记与完整的新文件留给下次启动恢复。
+        """
+        marker = self.db_path + SWAP_PENDING_SUFFIX
+        try:
+            self._write_swap_marker(new_path, backup_path, version)
+        except OSError as exc:
+            logger.error("写入换库标记失败，已放弃迁移，旧数据库保持不变: %s", marker,
+                         exc_info=True)
+            _remove_quietly(marker)
+            _remove_with_sidecars(new_path)
+            return MigrationReport(MigrationOutcome.FAILED_RESTORED, version, version,
+                                   reason=REASON_MARKER_FAILED.format(error=exc))
+        try:
+            os.rename(self.db_path, backup_path)
+        except OSError as exc:
+            logger.error("旧数据库改名为备份失败，已放弃迁移，旧数据库保持不变: %s",
+                         self.db_path, exc_info=True)
+            _remove_quietly(marker)
+            _remove_with_sidecars(new_path)
+            return MigrationReport(MigrationOutcome.FAILED_RESTORED, version, version,
+                                   reason=REASON_SWAP_FAILED.format(error=exc))
+        try:
+            os.replace(new_path, self.db_path)
+        except OSError as exc:
             logger.error("新数据库改名失败: %s", new_path, exc_info=True)
+            reason = REASON_SWAP_FAILED.format(error=exc)
             try:
                 os.rename(backup_path, self.db_path)
             except OSError:
-                logger.error("旧数据库未能改回原名，原路径暂无数据库，数据保存在: %s",
-                             backup_path, exc_info=True)
-                _remove_with_sidecars(new_path)
+                logger.error("旧数据库未能改回原名，原路径暂无数据库，数据保存在: %s"
+                             "（下次启动会按换库标记恢复）", backup_path, exc_info=True)
                 return MigrationReport(MigrationOutcome.FAILED_KEPT, version, version,
-                                       backup_path=backup_path, broken_path=backup_path)
+                                       backup_path=backup_path, broken_path=backup_path,
+                                       reason=reason)
+            _remove_quietly(marker)
             _remove_with_sidecars(new_path)
             logger.error("已把旧数据库改回原名，本次运行新数据无法保存，下次启动重试迁移")
-            return MigrationReport(MigrationOutcome.FAILED_RESTORED, version, version)
+            return MigrationReport(MigrationOutcome.FAILED_RESTORED, version, version,
+                                   reason=reason)
+        _remove_quietly(marker)
         logger.info("数据库迁移完成: v%s -> v%s，旧库已保留为 %s", version, self._target,
                     backup_path)
+        self._drop_duplicate_backups(backup_path)
         return MigrationReport(MigrationOutcome.MIGRATED, version, self._target,
                                backup_path=backup_path)
 

@@ -14,6 +14,7 @@ from PyQt5.QtCore import QObject, pyqtSignal
 
 from core.contracts import StopReason, TaskInfo, TaskStatus
 from core.monitor_task import ACTIVE_STATES, LIVE_STATES, MonitorWorker, WorkerState
+from core.snapshot_hub import SnapshotHub, default_hub
 from data.database import Database
 from data.errors import StorageError
 from data.models import MARKER_KINDS, Marker, TaskRecord
@@ -93,13 +94,19 @@ class MonitorManager(QObject):
     # 卡片与分析页据此重新读取打点，不必各自轮询
     markers_changed = pyqtSignal(str)
 
-    def __init__(self, db: Database, parent: Optional[QObject] = None):
+    def __init__(self, db: Database, parent: Optional[QObject] = None, *,
+                 snapshot_hub: Optional[SnapshotHub] = None):
         """
         Args:
             db: 数据库实例（与各页面共用同一实例，由组合根注入）
             parent: Qt 父对象（可选）
+            snapshot_hub: 全系统快照中心（可选）。None 用进程内共享实例
+                core.snapshot_hub.default_hub()（与进程列表共用同一份快照）；
+                全部任务线程共用它，按相位对齐采样
         """
         super().__init__(parent)
+
+        self._snapshot_hub = snapshot_hub if snapshot_hub is not None else default_hub()
 
         # 任务字典 {task_id: MonitorWorker}
         self._tasks: Dict[str, MonitorWorker] = {}
@@ -153,6 +160,7 @@ class MonitorManager(QObject):
             db=self.db,
             note=note,
             create_time=create_time,
+            hub=self._snapshot_hub,
         )
 
         # 连接任务信号（工作线程发出，经队列在本对象所在的 GUI 线程执行）
@@ -268,6 +276,11 @@ class MonitorManager(QObject):
             return False
         self.markers_changed.emit(task_id)
         return True
+
+    @property
+    def snapshot_hub(self) -> SnapshotHub:
+        """全部任务线程共用的全系统快照中心"""
+        return self._snapshot_hub
 
     # ========== 只读快照（界面只用这一组，不接触任务线程对象） ==========
 

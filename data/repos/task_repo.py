@@ -3,7 +3,8 @@
 
 sample_count / last_sample_at 不归这里写：它们只由 PointRepo.append（写入时累加）与
 PointRepo.recount（重算）维护，save() 刻意不覆盖，避免重复保存任务时把累计值清零。
-v5 为后续版本预留的列（target_kind、plan_json 等）模型尚未携带，save() 同样不碰它们。
+v5 为后续版本预留的列（target_kind 等）模型尚未携带，save() 同样不碰它们；plan_json
+（自动化方案）模型会读出，但只经 save_plan 写入，save() 也不碰它。
 """
 import logging
 import sqlite3
@@ -12,7 +13,7 @@ from typing import Any, List, Optional
 
 from data.mappers import dump_metric_types, row_to_task, to_iso, to_iso_or_none
 from data.models import MonitorTask
-from data.repos import series_cache
+from data.repos import rollup, series_cache
 from data.repos._guard import storage_errors
 from data.repos._samples import delete_series_rows
 
@@ -55,7 +56,8 @@ class TaskRepo:
 
     def save(self, task: MonitorTask) -> None:
         """
-        UPSERT：不存在则插入，存在则只更新模型携带的列。
+        UPSERT：不存在则插入，存在则只更新模型携带的列（一个事务）。
+        采集周期（interval）变化且任务已有样本时，在同一事务内按新周期重算其汇总与空洞。
 
         不能用 INSERT OR REPLACE：那是"删旧行再插新行"，会把 sample_count /
         last_sample_at 重置为默认值。create_time 用 COALESCE 保留已有值，
@@ -75,7 +77,10 @@ class TaskRepo:
             task.create_time,
         )
         with storage_errors(f"保存任务 {task.task_id} "):
-            with self._factory.connect() as conn:
+            with self._factory.transaction() as cursor:
+                conn = cursor.connection
+                old = conn.execute('SELECT interval FROM tasks WHERE task_id = ?',
+                                   (task.task_id,)).fetchone()
                 conn.execute('''
                     INSERT INTO tasks
                     (task_id, pid, process_name, metric_type, interval, start_time,
@@ -92,6 +97,44 @@ class TaskRepo:
                         note = excluded.note,
                         create_time = COALESCE(excluded.create_time, tasks.create_time)
                 ''', params)
+                if old is not None and float(old[0]) != float(task.interval):
+                    self._rebuild_rollups(conn, task.task_id)
+
+    @staticmethod
+    def _rebuild_rollups(conn, task_id: str) -> None:
+        """
+        采集周期改了：空洞阈值与汇总的段起点都随之变化，已有样本的序列按新周期整体重算
+        汇总与空洞（在 save 的同一事务内，汇总与 tasks.interval 始终一致）。
+        """
+        ids = [row[0] for row in conn.execute('''
+            SELECT series_id FROM series se WHERE task_id = ?
+              AND EXISTS (SELECT 1 FROM samples s WHERE s.series_id = se.series_id)
+        ''', (task_id,))]
+        if ids:
+            rollup.rebuild_rollups(conn, series_ids=ids)
+            logger.info("任务采集周期变化，已重算 %d 条序列的分钟汇总与空洞: task_id=%s",
+                        len(ids), task_id)
+
+    def save_plan(self, task_id: str, plan_json: Optional[str]) -> bool:
+        """
+        写入（或以 None 清除）任务的自动化方案 tasks.plan_json。只更新已有任务行：
+        任务行由采集线程启动时写入，调用方在它之前调用时返回 False，应稍后重试。
+
+        Returns:
+            bool: 是否命中了任务行
+        """
+        with storage_errors(f"保存任务方案 {task_id} "):
+            with self._factory.connect() as conn:
+                return conn.execute('UPDATE tasks SET plan_json = ? WHERE task_id = ?',
+                                    (plan_json or None, task_id)).rowcount > 0
+
+    def load_plan(self, task_id: str) -> Optional[str]:
+        """任务的自动化方案 JSON 文本；任务不存在或没有方案返回 None。"""
+        with storage_errors(f"读取任务方案 {task_id} "):
+            with self._factory.connect() as conn:
+                row = conn.execute('SELECT plan_json FROM tasks WHERE task_id = ?',
+                                   (task_id,)).fetchone()
+                return (row[0] or None) if row else None
 
     def get(self, task_id: str) -> Optional[MonitorTask]:
         """按 ID 取任务；不存在返回 None。"""

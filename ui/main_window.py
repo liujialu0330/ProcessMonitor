@@ -33,6 +33,7 @@ from data.database import Database
 from data.db.schema import SCHEMA_VERSION
 from ui.formatting import (
     MIGRATED_TIP_DURATION_MS, MIGRATED_TIP_TITLE, READ_ONLY_START_BLOCKED, READ_ONLY_TITLE,
+    SCHEMA_STALE_START_BLOCKED, migration_failed_text, schema_stale_banner_text,
     backup_aborted_text, migrated_tip_text, read_only_banner_text,
 )
 from app_config import cfg
@@ -121,20 +122,26 @@ class MainWindow(FluentWindow):
         QTimer.singleShot(3000, lambda: self.about_group.check_update(silent=True))
 
         # 数据库迁移三态提示（延迟到窗口显示后弹出，三态互斥，按严重程度顺序判断）；
-        # 都不是而本次刚升级成功时，提示旧文件的备份位置
+        # 都不是而本次刚升级成功时，提示旧文件的备份位置。升级失败、库仍是旧结构时
+        # 只挂下面的只读横幅（它已写明失败原因与处理办法），不再重复弹失败提示
         db = self.db
-        if db.backup_aborted:
-            QTimer.singleShot(STARTUP_TIP_DELAY_MS, self._show_backup_aborted_tip)
-        elif db.data_reset:
-            QTimer.singleShot(STARTUP_TIP_DELAY_MS, self._show_data_reset_tip)
-        elif db.migration_failed:
-            QTimer.singleShot(STARTUP_TIP_DELAY_MS, self._show_migration_failed_tip)
-        elif getattr(db, 'backup_path', None) and getattr(db, 'migrated_from', None) is not None:
-            QTimer.singleShot(STARTUP_TIP_DELAY_MS, self._show_migrated_tip)
+        schema_mismatch = getattr(db, 'schema_mismatch', False)
+        if not schema_mismatch:
+            if db.backup_aborted:
+                QTimer.singleShot(STARTUP_TIP_DELAY_MS, self._show_backup_aborted_tip)
+            elif db.data_reset:
+                QTimer.singleShot(STARTUP_TIP_DELAY_MS, self._show_data_reset_tip)
+            elif db.migration_failed:
+                QTimer.singleShot(STARTUP_TIP_DELAY_MS, self._show_migration_failed_tip)
+            elif (getattr(db, 'backup_path', None)
+                  and getattr(db, 'migrated_from', None) is not None):
+                QTimer.singleShot(STARTUP_TIP_DELAY_MS, self._show_migrated_tip)
 
-        # 只读库（由更高版本创建）：立即禁止开始监控与打点，窗口显示后挂常驻横幅
+        # 只读库（由更高版本创建，或升级失败仍是旧结构）：立即禁止开始监控与打点，
+        # 窗口显示后挂常驻横幅
         if getattr(db, 'read_only', False):
-            self.monitor_page.presenter.set_read_only(READ_ONLY_START_BLOCKED)
+            self.monitor_page.presenter.set_read_only(
+                SCHEMA_STALE_START_BLOCKED if schema_mismatch else READ_ONLY_START_BLOCKED)
             QTimer.singleShot(STARTUP_TIP_DELAY_MS, self._show_read_only_banner)
 
     def show_sync_dir_warning(self, text: str, delay_ms: int = STARTUP_TIP_DELAY_MS) -> None:
@@ -150,9 +157,9 @@ class MainWindow(FluentWindow):
     def _show_migration_failed_tip(self):
         """迁移失败且旧数据仍在原库（已从备份还原，或还原与改名都失败而原样保留）：
         本次运行新数据无法保存，下次启动会重新迁移"""
+        report = getattr(self.db, 'migration_report', None)
         self.services.notifier.warning(
-            self, "数据库升级失败",
-            "数据库升级失败，本次运行新数据无法保存；旧数据已保留，请重启重试。",
+            self, "数据库升级失败", migration_failed_text(getattr(report, 'reason', None)),
             duration=-1)
 
     def _show_data_reset_tip(self):
@@ -179,11 +186,18 @@ class MainWindow(FluentWindow):
             self, MIGRATED_TIP_TITLE, migrated_tip_text(version, self.db.backup_path),
             duration=MIGRATED_TIP_DURATION_MS)
 
+    def read_only_banner_content(self) -> str:
+        """只读横幅的文案：升级失败（旧结构）时写明失败原因，否则说明库由更高版本创建"""
+        if getattr(self.db, 'schema_mismatch', False):
+            report = getattr(self.db, 'migration_report', None)
+            return schema_stale_banner_text(
+                getattr(report, 'reason', None), bool(getattr(report, 'disk_shortage', False)))
+        return read_only_banner_text(getattr(self.db, 'newer_version', None))
+
     def _show_read_only_banner(self):
         """只读库：顶部常驻警告（不自动消失）"""
         self.read_only_banner = self.services.notifier.warning(
-            self, READ_ONLY_TITLE, read_only_banner_text(getattr(self.db, 'newer_version', None)),
-            duration=-1)
+            self, READ_ONLY_TITLE, self.read_only_banner_content(), duration=-1)
 
     def _init_window(self):
         """初始化窗口属性"""

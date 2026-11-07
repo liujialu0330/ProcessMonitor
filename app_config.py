@@ -166,6 +166,10 @@ class AppConfig(QConfig):
     # 关闭窗口时是否最小化到系统托盘：设置页开关控制，默认关闭（直接退出）
     close_to_tray = ConfigItem("Behavior", "CloseToTray", False, BoolValidator())
 
+    # 有运行中任务时阻止系统因空闲进入睡眠（core.power_guard）：设置页开关控制，默认开启
+    keep_awake_while_monitoring = ConfigItem(
+        "Monitor", "KeepAwakeWhileMonitoring", True, BoolValidator())
+
     # 监控页上次选择的指标：新建任务时沿用，默认"泄漏排查"预设
     last_metrics = ConfigItem(
         "Monitor", "LastMetrics", list(LEAK_CHECK_PRESET), MetricListValidator())

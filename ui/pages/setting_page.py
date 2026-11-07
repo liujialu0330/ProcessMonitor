@@ -2,7 +2,7 @@
 设置页面
 
 三个分组：
-- 常规：应用主题 · 默认采集间隔 · 关闭行为 · 打点快捷键
+- 常规：应用主题 · 默认采集间隔 · 关闭行为 · 监控期间阻止睡眠 · 打点快捷键
 - 数据：历史数据保留 · 压缩数据库（按保留策略决定是否同时清理过期任务）· 重建分钟汇总 · 数据目录
 - 关于与更新：版本与项目主页 · 检查更新（原"关于"页并入，见 ui/pages/about_update）
 """
@@ -47,6 +47,8 @@ COMPACT_TEXT = "压缩数据库"
 CLEANUP_TEXT = "清理并压缩"
 REBUILD_TEXT = "重建汇总"
 HOTKEY_PLACEHOLDER = "点击后按下组合键"
+KEEP_AWAKE_TITLE = "监控期间阻止电脑睡眠"
+KEEP_AWAKE_CONTENT = "有运行中任务时阻止系统因空闲进入睡眠；挡不住合上盖子、手动睡眠与电源按钮"
 # "数据目录"卡片末尾显示的数据目录来源
 DATA_DIR_SOURCE_TEXTS = {
     config.DATA_DIR_SOURCE_CLI: "命令行指定",
@@ -223,7 +225,7 @@ class SettingPage(ScrollArea):
     # ========== 分组 ==========
 
     def _init_general_group(self):
-        """常规：主题 · 默认采集间隔 · 关闭行为 · 打点快捷键"""
+        """常规：主题 · 默认采集间隔 · 关闭行为 · 监控期间阻止睡眠 · 打点快捷键"""
         self.general_group = SettingCardGroup("常规", self.scroll_widget)
         # 旧分组名都指向"常规"：外部读取与冒烟测试仍用这些属性
         self.appearance_group = self.general_group
@@ -246,6 +248,12 @@ class SettingPage(ScrollArea):
             "开启后关闭窗口仍继续采集，从托盘菜单“退出”才真正结束",
             configItem=cfg.close_to_tray, parent=self.general_group)
         self.general_group.addSettingCard(self.close_to_tray_card)
+
+        # 卡片只写配置；PowerGuard 跟随该配置项的 valueChanged，切换即生效
+        self.keep_awake_card = CnSwitchSettingCard(
+            FIF.POWER_BUTTON, KEEP_AWAKE_TITLE, KEEP_AWAKE_CONTENT,
+            configItem=cfg.keep_awake_while_monitoring, parent=self.general_group)
+        self.general_group.addSettingCard(self.keep_awake_card)
 
         # 打点快捷键：录入框 + 恢复默认；说明行显示当前状态（可用 / 不可用的原因）
         self.hotkey_card = SettingCard(

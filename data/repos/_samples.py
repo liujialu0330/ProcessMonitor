@@ -6,6 +6,7 @@
 """
 import math
 import random
+import sqlite3
 from datetime import datetime
 from typing import Iterable, List, Optional, Tuple
 
@@ -106,13 +107,17 @@ def fetch_packed(conn, sql: str, params, kinds: str) -> List[tuple]:
 
     sql 的结果列须依次命名为 c0..c{n-1}，kinds 逐列给类型：'i' 整数、'f' 浮点（存成整数的
     浮点也算）。任一行出现与 kinds 不符的值（NULL、文本、'i' 列里的浮点）、浮点超出安全量级、
+    拼出的字符串超过 SQLite 的长度上限（SQLITE_MAX_LENGTH，默认 1e9 字节，抛 DataError）、
     或本进程的 SQLite 自检不通过时，整体退回逐行读取——结果总与逐行读取逐位相同。
+    唯一的规范化：'f' 列的 -0.0 一律成为 0.0（两条路径都如此）。SQLite 的 printf 不输出负零的
+    符号，整包读取无法区分；样本表存 REAL 时 SQLite 本来就把 -0.0 存成 0.0，只有表达式算出的
+    负零会出现，数值上与 0.0 相等。
     """
     global _pack_supported
     if _pack_supported is None:
         _pack_supported = _probe_pack(conn)
     if not _pack_supported:
-        return [tuple(row) for row in conn.execute(sql, params)]
+        return _fetch_rows(conn, sql, params, kinds)
     parts, unsafe = [], []
     for i, kind in enumerate(kinds):
         col = f'c{i}'
@@ -125,18 +130,38 @@ def fetch_packed(conn, sql: str, params, kinds: str) -> List[tuple]:
             parts.append(col)
             unsafe.append(f"typeof({col}) != 'integer'")
     row_text = " || ',' || ".join(parts)
-    text, bad, count = conn.execute(
-        f"SELECT group_concat({row_text}, ','), "
-        f"MAX({' OR '.join(unsafe)}), COUNT(*) FROM ({sql})", params).fetchone()
+    try:
+        text, bad, count = conn.execute(
+            f"SELECT group_concat({row_text}, ','), "
+            f"MAX({' OR '.join(unsafe)}), COUNT(*) FROM ({sql})", params).fetchone()
+    except sqlite3.DataError:
+        # 结果太多，拼成的字符串超过 SQLite 的长度上限
+        return _fetch_rows(conn, sql, params, kinds)
     if not count:
         return []
     flat = text.split(',') if text is not None else []
     width = len(kinds)
     if bad or len(flat) != count * width:
-        return [tuple(row) for row in conn.execute(sql, params)]
+        return _fetch_rows(conn, sql, params, kinds)
     columns = [list(map(int if kind == 'i' else float, flat[i::width]))
                for i, kind in enumerate(kinds)]
     return list(zip(*columns))
+
+
+def _fetch_rows(conn, sql: str, params, kinds: str) -> List[tuple]:
+    """逐行读取（fetch_packed 的退路）：'f' 列的 -0.0 规范为 0.0，与整包读取一致"""
+    rows = [tuple(row) for row in conn.execute(sql, params)]
+    floats = [i for i, kind in enumerate(kinds) if kind == 'f']
+    if not floats:
+        return rows
+    fixed = []
+    for row in rows:
+        if any(isinstance(row[i], float) and row[i] == 0.0 and math.copysign(1.0, row[i]) < 0
+               for i in floats):
+            row = tuple(0.0 if (i in floats and isinstance(v, float) and v == 0.0) else v
+                        for i, v in enumerate(row))
+        fixed.append(row)
+    return fixed
 
 
 def delete_series_rows(conn, ids: List[int]) -> int:

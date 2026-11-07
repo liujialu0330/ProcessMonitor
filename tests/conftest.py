@@ -107,6 +107,8 @@ def _reset_app_config():
         item_cfg.retention_days.value = item_cfg.retention_days.defaultValue
         item_cfg.close_to_tray.value = item_cfg.close_to_tray.defaultValue
         item_cfg.skipped_version.value = item_cfg.skipped_version.defaultValue
+        item_cfg.keep_awake_while_monitoring.value = (
+            item_cfg.keep_awake_while_monitoring.defaultValue)
         # 主题复位为本应用语义上的默认值 AUTO（跟随系统），而非 qfluentwidgets
         # 库自带的类默认值 Theme.LIGHT——与 load_app_config() 首启行为保持一致
         item_cfg.themeMode.value = Theme.AUTO

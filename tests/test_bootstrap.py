@@ -65,9 +65,9 @@ def test_build_context_order_and_explicit_migration(qapp, paths, monkeypatch):
 
     original_reconcile = MaintenanceService.startup_reconcile
 
-    def reconcile(self, days):
+    def reconcile(self, days, **kwargs):
         events.append(('reconcile', days))
-        return original_reconcile(self, days)
+        return original_reconcile(self, days, **kwargs)
 
     import ui.services as services_module
     original_services = services_module.production_services
@@ -132,7 +132,7 @@ def test_build_context_reads_retention_from_config(qapp, paths, monkeypatch):
     cfg.retention_days.value = 30
     seen = []
     monkeypatch.setattr(MaintenanceService, 'startup_reconcile',
-                        lambda self, days: seen.append(days) or ReconcileResult(0, 0, 0))
+                        lambda self, days, **kw: seen.append(days) or ReconcileResult(0, 0, 0))
     _close(build_context(paths))
     assert seen == [30]
 
@@ -234,9 +234,10 @@ def run_env(monkeypatch, app_paths):
     original_migrate_database = bootstrap._migrate_database
     monkeypatch.setattr(bootstrap, '_migrate_database', fake_migrate)
 
-    def fake_build_context(paths, *, report=None):
+    def fake_build_context(paths, *, report=None, legacy_importer=None):
         events.append('build_context')
         state['build_report'] = report
+        state['legacy_importer'] = legacy_importer
         return AppContext(paths=paths, db=_FakeDb(events), manager='manager',
                           services='services', registry=None, maintenance=None,
                           reconcile=ReconcileResult(0, 0, 0))
@@ -389,6 +390,13 @@ def _boxes(state):
     return lambda title, text: shown.append((title, text))
 
 
+def test_run_passes_progress_importer_to_build_context(run_env):
+    """启动校正的导回一步经组合根给出的进度窗口方式执行（行数多时不在界面线程同步跑）"""
+    events, state, exits, paths = run_env
+    bootstrap.run(['prog'], exit_process=exits.append)
+    assert state['legacy_importer'] is bootstrap.import_legacy_with_progress
+
+
 def test_run_passes_migration_report_to_build_context(run_env):
     """迁移只跑一次：run() 跑出的报告原样交给 build_context"""
     events, state, exits, paths = run_env
@@ -429,15 +437,16 @@ def test_run_continues_on_other_migration_failures(run_env, outcome):
 
 def test_run_failed_swap_end_to_end_never_creates_empty_db(run_env, monkeypatch):
     """
-    真实迁移：新库换不进来（os.replace 第一次失败）、旧库也改不回原名（os.rename 第二次
-    失败）→ 原路径没有库：组合根必须退出，不能让后续步骤在原路径建出空库
+    真实迁移（不支持硬链接、退回改名式）：新库换不进来（os.replace 第一次失败）、旧库也改不回
+    原名（os.rename 第二次失败）→ 原路径没有库：组合根必须退出，不能让后续步骤在原路径建出空库
     """
     from tests.test_migration import _create_v0_db
-    from tests.test_rebuild_migration import _failing, _patch_os
+    from tests.test_rebuild_migration import _failing, _no_link, _patch_os
     events, state, exits, paths = run_env
     state['real_migrate'] = True
     _create_v0_db(paths.db_path)
-    _patch_os(monkeypatch, rename=_failing(os.rename, {2}), replace=_failing(os.replace, {1}))
+    _patch_os(monkeypatch, link=_no_link, rename=_failing(os.rename, {2}),
+              replace=_failing(os.replace, {1}))
 
     code = bootstrap.run(['prog'], exit_process=exits.append, message_box=_boxes(state))
 
@@ -534,7 +543,8 @@ def test_migrate_database_large_db_uses_progress_window(paths, monkeypatch):
 
     def fake_window(migrate, *, backup_path, estimated_rows):
         seen.update(backup_path=backup_path, estimated_rows=estimated_rows)
-        return migrate(lambda stage, done, total: seen['progress'].append((done, total)))
+        return migrate(lambda stage, done, total: stage == 'samples'
+                       and seen['progress'].append((done, total)))
 
     monkeypatch.setattr(migration_window, 'run_with_progress_window', fake_window)
     report = bootstrap._migrate_database(paths)

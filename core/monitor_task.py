@@ -13,6 +13,7 @@ from PyQt5.QtCore import QThread, pyqtSignal
 
 from core.contracts import StopReason, TaskStatus, UnavailableReason
 from core.process_collector import ProcessCollector
+from core.snapshot_hub import SnapshotHub
 from data.models import TaskRecord, DataPoint
 from utils.metrics import MetricType
 import config
@@ -102,7 +103,8 @@ class MonitorWorker(QThread):
     def __init__(self, pid: int, process_name: str, metric_types: List[str],
                  interval: float = None, task_id: str = None, db: "Database" = None,
                  note: str = '', create_time: Optional[float] = None,
-                 *, clock: Optional[SystemClock] = None):
+                 *, clock: Optional[SystemClock] = None,
+                 hub: Optional[SnapshotHub] = None):
         """
         初始化监控任务
 
@@ -120,6 +122,10 @@ class MonitorWorker(QThread):
                 PID）时跳过比对
             clock: 时钟对象（接口见 SystemClock），None 用系统时钟；测试注入假时钟
                 以免真实睡眠
+            hub: 快照中心（可选，由 MonitorManager 注入共享实例）。注入后采集器从全系统
+                快照取值，且截止时间对齐到 hub 的相位网格（见 _first_deadline），同周期
+                任务在同一时刻采样、共用一份快照；None 时行为与旧版相同。hub 的相位原点
+                与本线程的截止时间应来自同一单调时钟（生产环境均为 time.monotonic）
         """
         if db is None:
             raise TypeError("MonitorWorker 需要注入 db（不再自建数据库连接）")
@@ -144,7 +150,12 @@ class MonitorWorker(QThread):
         self._wake = threading.Event()
 
         # 数据采集器
-        self.collector = ProcessCollector(pid)
+        self._hub = hub
+        if hub is not None:
+            self.collector = ProcessCollector(
+                pid, hub=hub, max_age_s=SnapshotHub.max_age_for(self.interval))
+        else:
+            self.collector = ProcessCollector(pid)
 
         # 数据缓存（批量保存；SAVE_BATCH_SIZE 固化为1时语义为每周期一批）
         self._data_buffer: List[DataPoint] = []
@@ -275,12 +286,11 @@ class MonitorWorker(QThread):
 
         stop_reason = StopReason.USER
 
-        # 调度：用单调时钟的截止时间驱动，每周期 deadline += interval，避免
-        # "采集耗时 + 睡眠"造成的累积漂移；等待统一走时钟的 wait（默认即 Event.wait），stop/pause/resume
-        # 置位事件即可立即唤醒，无需轮询。不含 CPU 指标时启动即采一次。
-        next_deadline = clock.monotonic()
-        if cpu_primed:
-            next_deadline += self.interval
+        # 调度：用单调时钟的截止时间驱动，每周期 deadline += interval（有 hub 时为相位
+        # 网格上的下一点，见 _next_deadline），避免"采集耗时 + 睡眠"造成的累积漂移；
+        # 等待统一走时钟的 wait（默认即 Event.wait），stop/pause/resume 置位事件即可立即
+        # 唤醒，无需轮询。不含 CPU 指标时启动即采一次（有 hub 时为下一个整秒网格点）。
+        next_deadline = self._first_deadline(clock.monotonic(), cpu_primed)
         while True:
             state = self.state
             if state not in ACTIVE_STATES:
@@ -344,9 +354,33 @@ class MonitorWorker(QThread):
                 logger.error(error_msg, exc_info=True)
                 self.error_occurred.emit(self.task_id, error_msg)
 
-            next_deadline += self.interval
+            next_deadline = self._next_deadline(next_deadline)
 
         return stop_reason
+
+    def _first_deadline(self, now: float, cpu_primed: bool) -> float:
+        """
+        首个截止时间。
+
+        无 hub：不含 CPU 指标为 now（启动即采），含 CPU 指标为 now + interval（预热后
+        隔满一个周期）。
+        有 hub：对齐到 hub 的相位网格（原点 = hub 创建时刻），首采用"周期与 1 秒中
+        较小者"为网格，比无 hub 时最多晚 1 秒（不会因长周期白等一整个周期）；含 CPU
+        指标时从 now + interval 起对齐，差分窗口仍不短于一个周期。之后每次由
+        _next_deadline 落到周期网格上，同周期任务从此同时采样。
+        """
+        hub = self._hub
+        start = now + self.interval if cpu_primed else now
+        if hub is None:
+            return start
+        return hub.align(start, min(self.interval, 1.0))
+
+    def _next_deadline(self, deadline: float) -> float:
+        """本次截止时间之后的下一个截止时间：无 hub 为 deadline + interval；有 hub 为
+        周期网格上的下一点（恢复或落后重置后的那次采样不在网格上，借此回到网格）。"""
+        if self._hub is None:
+            return deadline + self.interval
+        return self._hub.next_slot(deadline, self.interval)
 
     def _notify_unavailable(self):
         """把本周期新出现且尚未通知过的不可用指标一次性 emit 出去。"""

@@ -32,6 +32,7 @@ from core.analysis.trend import (
     Judgement, RateText, fit_input_from_aggregates, judge, linear_fit,
     rate_display, rate_unit_for_span)
 from data.errors import StorageError
+from data.mappers import normalize_ms
 from data.models import DataPoint, Marker
 from data.repos.analytics_repo import Bucket
 from data.repos.point_repo import PointQuery
@@ -280,10 +281,10 @@ def _baseline_info(db, task_id: str, metric: str, marker: Marker,
         task_id, metric, marker.timestamp, BASELINE_SAMPLES, after_only=True)
     if value is None:
         return BaselineInfo(marker, None, 0)
-    if stats_since == marker.timestamp or stats_count >= BASELINE_SAMPLES:
+    if stats_since == _bound(marker.timestamp) or stats_count >= BASELINE_SAMPLES:
         after = stats_count
     else:
-        after = db.analytics.point_count(task_id, metric, since=marker.timestamp)
+        after = db.analytics.point_count(task_id, metric, since=_bound(marker.timestamp))
     return BaselineInfo(marker, value, max(1, min(BASELINE_SAMPLES, after)))
 
 
@@ -293,6 +294,7 @@ def _rounds(db, task_id: str, metric: str, markers: List[Marker],
     """统计范围内（基线 + 用户打点）相邻两两成一轮；用户打点不足 MIN_ROUND_MARKERS 个时不算。
     每个打点处的值与基线同口径：其后 BASELINE_SAMPLES 个样本的中位数。"""
     def in_range(ts: datetime) -> bool:
+        ts = _bound(ts)
         return (stats_since is None or ts >= stats_since) and ts <= last_ts
 
     users = [m for m in markers if m.kind == MARKER_KIND_USER and in_range(m.timestamp)]
@@ -310,6 +312,14 @@ def _rounds(db, task_id: str, metric: str, markers: List[Marker],
         return db.analytics.value_near(task_id, metric, ts, BASELINE_SAMPLES, after_only=True)
 
     return round_deltas(boundaries, value_at)
+
+
+def _bound(ts: datetime) -> datetime:
+    """
+    打点/基线时刻作为样本查询边界：按样本同一规则（data.mappers.to_ms，四舍五入）取整到毫秒，
+    与该时刻同时采集的样本因此总落在打点之后（规则见 data.mappers 模块说明）
+    """
+    return normalize_ms(ts)
 
 
 def _to_points(task_id: str, metric: str, pairs) -> List[DataPoint]:
@@ -347,7 +357,7 @@ def run_history_query(db, request: HistoryRequest) -> HistorySnapshot:
         if request.range_key == BASELINE_RANGE_KEY:
             request = replace(request, since=compute_since(
                 request.range_key, anchor,
-                baseline_marker.timestamp if baseline_marker else None))
+                _bound(baseline_marker.timestamp) if baseline_marker else None))
         return _query_data(db, request, task_info, anchor, markers, baseline_marker)
     except StorageError as exc:
         logger.error("历史数据读取失败: task_id=%s", request.task_id, exc_info=True)
@@ -380,8 +390,8 @@ def _query_data(db, request: HistoryRequest, task_info, anchor: Optional[datetim
 
     stats_since = since
     if request.baseline_only and baseline_marker is not None:
-        stats_since = (baseline_marker.timestamp if since is None
-                       else max(since, baseline_marker.timestamp))
+        stats_since = (_bound(baseline_marker.timestamp) if since is None
+                       else max(since, _bound(baseline_marker.timestamp)))
         # 基线落在自定义范围之后：这段数据没有"基线之后"，统计退回整个显示范围
         if until is not None and stats_since > until:
             stats_since = since
@@ -472,10 +482,10 @@ def _intervals(db, task_id: str, metric: str, markers: List[Marker],
     """
     edges = [Boundary(m.timestamp, m.label, m.kind) for m in markers
              if m.kind in (MARKER_KIND_USER, MARKER_KIND_BASELINE)
-             and first_ts <= m.timestamp <= last_ts]
-    if not edges or edges[0].timestamp > first_ts:
+             and first_ts <= _bound(m.timestamp) <= last_ts]
+    if not edges or _bound(edges[0].timestamp) > first_ts:
         edges.insert(0, Boundary(first_ts, INTERVAL_FIRST_LABEL, 'start'))
-    if edges[-1].timestamp < last_ts:
+    if _bound(edges[-1].timestamp) < last_ts:
         edges.append(Boundary(last_ts, INTERVAL_LAST_LABEL, 'end'))
     if len(edges) < 2:
         return []
@@ -485,10 +495,12 @@ def _intervals(db, task_id: str, metric: str, markers: List[Marker],
     last_index = len(edges) - 2
     for i in range(len(edges) - 1):
         left, right = edges[i], edges[i + 1]
-        # 右开：终点退 1 微秒（ISO 串的字典序与时间序一致，无小数位的时刻排在带小数的之前）
-        end = right.timestamp if i == last_index else right.timestamp - timedelta(microseconds=1)
-        agg = (db.analytics.aggregates(task_id, metric, since=left.timestamp, until=end)
-               if end >= left.timestamp else None)
+        # 打点时刻按样本同一规则取整后作查询边界（见 _bound）；右开：终点退 1 毫秒
+        start = _bound(left.timestamp)
+        end = (_bound(right.timestamp) if i == last_index
+               else _bound(right.timestamp) - timedelta(milliseconds=1))
+        agg = (db.analytics.aggregates(task_id, metric, since=start, until=end)
+               if end >= start else None)
         duration = (right.timestamp - left.timestamp).total_seconds()
         if agg is not None and agg.count:
             start_value, end_value = agg.first_value, agg.last_value

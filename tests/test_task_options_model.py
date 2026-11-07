@@ -6,6 +6,7 @@ TaskOptionsModel（纯单元，不建任何控件）：
 """
 from datetime import datetime, timedelta
 
+from core.automation.plan import AutomationPlan
 from data.models import MonitorTask
 from ui.formatting import format_task_option_text, format_task_tooltip
 from ui.models.task_options import TaskOption, TaskOptionsModel
@@ -129,3 +130,39 @@ def test_rebuild_with_no_tasks():
     assert model.rebuild([], (), NOW) == []
     assert len(model) == 0 and model.tracked_running_ids() == []
     assert model.refresh_running(NOW, set(), {}) == []
+
+
+# ---------- 自动化方案 ----------
+
+
+def test_plan_round_trips_through_option():
+    plan = AutomationPlan(timed_marker_seconds=600, stop_after_rounds=10)
+    planned = _task("planned", BASE)
+    planned.plan_json = plan.to_json()
+    model = TaskOptionsModel()
+    options = model.rebuild([planned, _task("plain", BASE)], set(), NOW)
+
+    assert options[0].plan == plan and model.plan("planned") == plan
+    assert options[1].plan is None and model.plan("plain") is None
+    assert model.plan("missing") is None
+    assert "自动化：自动打点 每 10 分钟 · 满 10 轮停止" in options[0].tooltip
+    assert "自动化" not in options[1].tooltip
+    # 与 ui.formatting 逐字一致的约定不因方案而变
+    assert options[0].tooltip == format_task_tooltip(planned, False, NOW)
+
+
+def test_broken_plan_json_is_ignored():
+    broken = _task("broken", BASE)
+    broken.plan_json = '{"schema_version": 99}'
+    [option] = TaskOptionsModel().rebuild([broken], set(), NOW)
+    assert option.plan is None and "自动化" not in option.tooltip
+
+
+def test_refresh_keeps_plan():
+    plan = AutomationPlan(timed_marker_seconds=60)
+    task = _task("run", BASE)
+    task.plan_json = plan.to_json()
+    model = TaskOptionsModel()
+    model.rebuild([task], {"run"}, NOW)
+    model.refresh_running(NOW + timedelta(minutes=5), {"run"}, {})
+    assert model.plan("run") == plan

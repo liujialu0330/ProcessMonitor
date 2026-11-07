@@ -17,7 +17,7 @@
 """
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable, Optional
 
 import config
 
@@ -26,6 +26,10 @@ if TYPE_CHECKING:
     from data.database import Database
 
 logger = logging.getLogger(__name__)
+
+# 导回降级数据的执行方式（由组合根给出）：(待导回行数, 执行导回的函数) -> 导回行数。
+# 执行导回的函数接收进度回调 (阶段名, 已完成, 总数) 或 None；组合根据行数决定是否经进度窗口
+LegacyImporter = Callable[[int, Callable[[Optional[Callable[[str, int, int], None]]], int]], int]
 
 # MaintenanceBusy.reason 的取值
 BUSY_TASKS_RUNNING = 'tasks_running'
@@ -73,7 +77,8 @@ class MaintenanceService:
         self._db = db
         self._manager = manager
 
-    def startup_reconcile(self, retention_days: int) -> ReconcileResult:
+    def startup_reconcile(self, retention_days: int, *,
+                          legacy_importer: Optional[LegacyImporter] = None) -> ReconcileResult:
         """
         启动校正：必须在任何监控任务启动前、每进程只调用一次。
 
@@ -87,16 +92,22 @@ class MaintenanceService:
         5. 按样本重算 sample_count=0 的任务（如 1.4.1 对已有任务 INSERT OR REPLACE 清零了计数）；
         6. 最后才按保留天数清理——否则"刚崩溃、其实还新鲜"的任务可能被当作过期任务误删。
         各步失败只记日志（由 Database 门面降级为 0 / False），不阻止启动。
-        库以只读方式打开时（由更高版本写入）整个校正跳过：每一步都要写库。
+        库以只读方式打开时（由更高版本写入，或升级失败仍是旧结构）整个校正跳过：每一步都要
+        写库，旧结构上更不能按 v5 的表写。
 
         Args:
             retention_days: 历史数据保留天数，<= 0 表示不自动清理
+            legacy_importer: 导回一步的执行方式（组合根用它在行数多时显示进度窗口）；
+                None 时在调用线程里同步导回
         """
+        if getattr(self._db, 'schema_mismatch', False):
+            logger.warning("数据库仍是旧结构（升级失败），跳过启动校正")
+            return ReconcileResult(orphans=0, recounted=0, cleaned=0)
         if getattr(self._db, 'read_only', False):
             logger.info("数据库为只读打开，跳过启动校正")
             return ReconcileResult(orphans=0, recounted=0, cleaned=0)
         self._db.touch_writer(config.APP_VERSION)
-        imported = self._db.import_legacy_points()
+        imported = self._import_legacy(legacy_importer)
         purged = self._db.purge_orphan_series()
         orphans = self._db.reconcile_orphan_tasks()
         recounted = self._db.reconcile_sample_counts()
@@ -106,6 +117,15 @@ class MaintenanceService:
         logger.info("启动校正完成: 导回=%d 行, 孤儿序列=%d, 孤儿任务=%d, 重算计数=%d, "
                     "过期清理=%d", imported, purged, orphans, recounted, cleaned)
         return result
+
+    def _import_legacy(self, importer: Optional[LegacyImporter]) -> int:
+        if importer is None:
+            return self._db.import_legacy_points()
+        pending = self._db.legacy_points_pending()
+        if pending <= 0:
+            return 0
+        return importer(
+            pending, lambda on_progress: self._db.import_legacy_points(on_progress=on_progress))
 
     def begin(self) -> None:
         """

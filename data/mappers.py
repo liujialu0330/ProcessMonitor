@@ -12,6 +12,15 @@
 解释，含夏令时规则），微秒部分按"四舍五入到毫秒、0.5 毫秒进位"取整。不用
 round(dt.timestamp() * 1000)：浮点乘法在恰好 0.5 毫秒处的进位方向不确定，
 与迁移时 SQL 侧的整数换算（data.db.migrations.rebuild）就可能差 1 毫秒。
+
+边界取整规则：
+- 时刻类边界（打点、基线这类"事件发生的时刻"）与样本同一取整规则，一律 to_ms（四舍五入）：
+  比较的是"打点若也存成样本会落在哪一毫秒"。取整单调，因此不早于打点采集的样本一定算打点
+  及之后（与打点同一时刻采集的样本不会因打点被向上取整而落到打点之前）；早于打点 1 毫秒以上
+  的一定算之前；相差不足 1 毫秒时按取整后是否落在同一毫秒判定（同一毫秒算之后）。
+  调用方用 normalize_ms 把打点时刻换成取整后的时刻再作查询边界；
+- 范围类边界（查询的 since / until，闭区间）比较的是已存的毫秒值本身：since 向上取整、
+  until 向下取整（ceil_ms / floor_ms），"m >= since 当且仅当 m >= ceil_ms(since)"。
 """
 import json
 import sqlite3
@@ -74,7 +83,8 @@ def from_ms(ms: int) -> datetime:
 
 
 def normalize_ms(dt: datetime) -> datetime:
-    """dt 按 to_ms 取整到毫秒后的 datetime（即写入 samples 后再读回的样子）"""
+    """dt 按 to_ms 取整到毫秒后的 datetime（即写入 samples 后再读回的样子）；
+    打点时刻作为样本查询边界前先经过它（见模块说明"边界取整规则"）"""
     return from_ms(to_ms(dt))
 
 
@@ -123,8 +133,8 @@ def _has(row: sqlite3.Row, column: str) -> bool:
 def row_to_task(row: sqlite3.Row) -> MonitorTask:
     """tasks 表的一行 → MonitorTask。
 
-    后加的列（v3 的 note/sample_count/last_sample_at、v4 的 create_time）缺失时取默认值，
-    兼容迁移失败后仍停留在旧版本的库。
+    后加的列（v3 的 note/sample_count/last_sample_at、v4 的 create_time、v5 的 plan_json）
+    缺失时取默认值，兼容迁移失败后仍停留在旧版本的库。
     """
     return MonitorTask(
         task_id=row['task_id'],
@@ -139,6 +149,7 @@ def row_to_task(row: sqlite3.Row) -> MonitorTask:
         sample_count=(row['sample_count'] or 0) if _has(row, 'sample_count') else 0,
         last_sample_at=from_iso(row['last_sample_at']) if _has(row, 'last_sample_at') else None,
         create_time=row['create_time'] if _has(row, 'create_time') else None,
+        plan_json=(row['plan_json'] or None) if _has(row, 'plan_json') else None,
     )
 
 

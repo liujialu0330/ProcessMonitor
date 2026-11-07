@@ -4,8 +4,10 @@
 默认标签序列"基线 / 第 N 轮"、类型推断、失败提示）、卡片基线（5 个样本中位数、换基线、
 删基线）、任务结束（卡片转已结束、表单清掉已退出进程、异常结束提示）、
 指标不可用（管理员提示）、错误去重、上限提示、同配置再测三种情况、关闭卡片与表单折叠、
+自动化方案（落库与补存、挂接自动打点、按方案停止的提示、再测沿用、停止后自动导出）、
 免弹窗打点（托盘 / 全局快捷键）与"清除全部"已结束卡片。
 """
+from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
@@ -13,16 +15,20 @@ import pytest
 from PyQt5.QtCore import QObject, pyqtSignal
 from PyQt5.QtWidgets import QWidget
 
+from core.automation.plan import AutomationPlan
 from core.contracts import StopReason, TaskInfo, TaskStatus, UnavailableReason
 from core.monitor_manager import BASELINE_LABEL, BaselineSamples, round_label
-from data.models import Marker
+from core.report_worker import ReportResult, ReportWorker
+from data.errors import StorageError
+from data.models import Marker, MonitorTask
 from tests.doubles import DEFAULT_FAKE_NOW, FakePreferences, FakeProcessQuery
 from tests.factories import make_services
 from ui.presenters.monitor_presenter import (
     ABNORMAL_STOP_INFOBAR_MS, QUICK_MARKER_FAILED, QUICK_MARKER_NONE, QUICK_MARKER_OK,
     MonitorPresenter, resolve_error_text,
 )
-from ui.widgets.monitor.new_task_form import TaskRequest
+from ui.formatting import plan_summary
+from ui.widgets.monitor.new_task_form import TaskRequest, WaitRequest
 from ui.widgets.monitor.process_picker import (
     ERROR_EMPTY, ERROR_NO_MATCH, ERROR_NOT_A_NUMBER, ERROR_NOT_FOUND, ResolveError,
 )
@@ -64,6 +70,9 @@ class FakeManager(QObject):
         self.pause_result = True
         self.resume_result = True
         self.marker_ok = True
+        self.paused_ids = set()
+        self.maintenance = False
+        self.exports = 0
 
     def create_task(self, pid, name, metrics, interval=None, note='', create_time=None):
         self.created.append((pid, name, list(metrics), interval, note, create_time))
@@ -101,6 +110,21 @@ class FakeManager(QObject):
     def resume_task(self, task_id):
         self.commands.append(("resume", task_id))
         return self.resume_result
+
+    def is_task_paused(self, task_id):
+        return task_id in self.paused_ids
+
+    def is_maintenance_running(self):
+        return self.maintenance
+
+    def begin_export(self):
+        if self.maintenance:
+            return False
+        self.exports += 1
+        return True
+
+    def end_export(self):
+        self.exports -= 1
 
     def remove_task(self, task_id):
         self.commands.append(("remove", task_id))
@@ -159,6 +183,7 @@ class FakeCard:
         self.markers: List[Marker] = []
         self.baseline: Optional[tuple] = None      # (时间, {指标: 值})
         self.baseline_events: List[tuple] = []
+        self.tooltip = ''
 
     def __getattr__(self, name):
         if name in self._RECORDED:
@@ -167,6 +192,9 @@ class FakeCard:
 
     def tick(self, now):
         self.ticks.append(now)
+
+    def setToolTip(self, text):
+        self.tooltip = text
 
     def set_started_at(self, when):
         self.started_at = when
@@ -234,6 +262,8 @@ class FakeForm(QObject):
     wait_requested = pyqtSignal(object)
     target_invalid = pyqtSignal(object)
     choose_metrics_requested = pyqtSignal()
+    browse_log_requested = pyqtSignal()
+    browse_export_dir_requested = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -243,6 +273,9 @@ class FakeForm(QObject):
         self.filled: List[str] = []
         self.forgotten: List[int] = []
         self.interval_value = 4.0
+        self.automation_plans: List[object] = []
+        self.log_path_value = ''
+        self.export_dir_value = ''
 
     def set_metrics_summary(self, metrics):
         self._metrics = list(metrics)
@@ -265,6 +298,21 @@ class FakeForm(QObject):
 
     def set_collapsed(self, collapsed):
         self.collapsed.append(collapsed)
+
+    def set_automation_plan(self, plan):
+        self.automation_plans.append(plan)
+
+    def log_path(self):
+        return self.log_path_value
+
+    def set_log_path(self, path):
+        self.log_path_value = path
+
+    def export_dir(self):
+        return self.export_dir_value
+
+    def set_export_dir(self, path):
+        self.export_dir_value = path
 
 
 # ---------------------------------------------------------------- fixtures
@@ -999,3 +1047,322 @@ def test_clear_finished_removes_only_finished(presenter, manager, board, form):
 
     assert list(board.cards) == [alive]
     assert presenter.task_ids() == [alive]
+
+
+# ---------------------------------------------------------------- 自动化方案
+
+
+TIMED_PLAN = AutomationPlan(timed_marker_seconds=10)
+
+
+class FakePlanStore:
+    """TaskRepo 的 plan_json 部分：任务行出现（rows）前 save_plan 返回 False。"""
+
+    def __init__(self):
+        self.rows = set()
+        self.saved: Dict[str, str] = {}
+        self.calls = 0
+        self.error = False
+
+    def save_plan(self, task_id, plan_json):
+        self.calls += 1
+        if self.error:
+            raise StorageError("磁盘已满")
+        if task_id not in self.rows:
+            return False
+        self.saved[task_id] = plan_json
+        return True
+
+
+class FakeDb:
+    def __init__(self):
+        self.tasks = FakePlanStore()
+        self.records: Dict[str, MonitorTask] = {}
+
+    def get_task(self, task_id):
+        return self.records.get(task_id)
+
+
+@pytest.fixture
+def plan_db():
+    return FakeDb()
+
+
+@pytest.fixture
+def auto_presenter(manager, services, form, board, host, plan_db):
+    return MonitorPresenter(manager, services, form, board, host, db=plan_db)
+
+
+def test_start_with_plan_saves_plan_attaches_and_shows_summary(
+        auto_presenter, manager, board, plan_db):
+    task_id = auto_presenter.on_start_requested(replace(_request(), plan=TIMED_PLAN))
+
+    assert manager.commands[-1] == ("start", task_id)
+    assert auto_presenter.plan_of(task_id) == TIMED_PLAN
+    assert auto_presenter.auto_marker.plan_of(task_id) == TIMED_PLAN
+    assert board.cards[task_id].tooltip == plan_summary(TIMED_PLAN) == "自动打点 每 10 秒"
+    # 任务行要等采集线程启动才写入：第一次写不进去，下一个采集周期补存，之后不再写
+    assert plan_db.tasks.saved == {}
+    plan_db.tasks.rows.add(task_id)
+    manager.data_updated.emit(task_id, {METRICS[0]: 1.0})
+    assert AutomationPlan.from_json(plan_db.tasks.saved[task_id]) == TIMED_PLAN
+    calls = plan_db.tasks.calls
+    manager.data_updated.emit(task_id, {METRICS[0]: 2.0})
+    assert plan_db.tasks.calls == calls
+
+
+def test_plan_saved_on_stop_when_no_cycle_ran(auto_presenter, manager, plan_db):
+    task_id = auto_presenter.on_start_requested(replace(_request(), plan=TIMED_PLAN))
+    plan_db.tasks.rows.add(task_id)
+    manager.task_stopped.emit(task_id, StopReason.PROCESS_NOT_FOUND)
+    assert task_id in plan_db.tasks.saved
+
+
+def test_plan_storage_error_is_retried(auto_presenter, manager, plan_db):
+    plan_db.tasks.error = True
+    task_id = auto_presenter.on_start_requested(replace(_request(), plan=TIMED_PLAN))
+    plan_db.tasks.error = False
+    plan_db.tasks.rows.add(task_id)
+    manager.data_updated.emit(task_id, {METRICS[0]: 1.0})
+    assert task_id in plan_db.tasks.saved
+
+
+def test_start_without_plan_writes_nothing(auto_presenter, manager, plan_db, board):
+    task_id = auto_presenter.on_start_requested(_request())
+    plan_db.tasks.rows.add(task_id)
+    manager.data_updated.emit(task_id, {METRICS[0]: 1.0})
+    assert plan_db.tasks.calls == 0
+    assert not auto_presenter.auto_marker.is_attached(task_id)
+    assert board.cards[task_id].tooltip == ''
+
+
+def test_empty_plan_is_treated_as_no_plan(auto_presenter, plan_db):
+    task_id = auto_presenter.on_start_requested(replace(_request(), plan=AutomationPlan()))
+    assert auto_presenter.plan_of(task_id) is None and plan_db.tasks.calls == 0
+
+
+def test_invalid_plan_is_rejected_before_creating(auto_presenter, manager, services):
+    bad = AutomationPlan(timed_marker_seconds=1)
+    assert auto_presenter.on_start_requested(replace(_request(interval=5.0), plan=bad)) is None
+    assert manager.created == []
+    notice = services.notifier.last("warning")
+    assert notice.title == "自动化设置有误" and "不能小于采集间隔" in notice.content
+
+
+def test_presenter_tick_drives_timed_markers(auto_presenter, manager, services):
+    task_id = auto_presenter.on_start_requested(replace(_request(), plan=TIMED_PLAN))
+    services.clock.advance(10)
+    auto_presenter.tick()
+    assert [m.label for m in manager.list_markers(task_id)] == [BASELINE_LABEL]
+    assert _marker_commands(manager)[-1][2] == services.clock.now()
+
+
+def test_resume_restarts_timer_from_resume_moment(auto_presenter, manager, board, services):
+    task_id = auto_presenter.on_start_requested(replace(_request(), plan=TIMED_PLAN))
+    services.clock.advance(4)
+    manager.paused_ids.add(task_id)
+    board.pause_requested.emit(task_id)
+    assert auto_presenter.auto_marker.next_due(task_id) is None
+    services.clock.advance(60)
+    manager.paused_ids.discard(task_id)
+    board.resume_requested.emit(task_id)
+    assert auto_presenter.auto_marker.next_due(task_id) == (
+        services.clock.now() + timedelta(seconds=10))
+
+
+def test_auto_stop_marks_card_stopping_and_informs(auto_presenter, manager, board, services):
+    plan = AutomationPlan(stop_after_seconds=60)
+    task_id = auto_presenter.on_start_requested(replace(_request(), plan=plan))
+    services.clock.advance(60)
+    auto_presenter.tick()
+
+    assert ("stop", task_id) in manager.commands
+    assert ("set_stopping",) in board.cards[task_id].calls
+    notice = services.notifier.last("info")
+    assert notice.title == "已按方案自动停止"
+    assert notice.content == "alpha.exe（PID 1001）：已运行满 1 分钟"
+    # 不能再打点；随后的停止按"用户停止"处理，不弹异常结束提示
+    assert task_id not in auto_presenter.active_task_ids()
+    services.notifier.clear()
+    manager.task_stopped.emit(task_id, StopReason.USER)
+    assert services.notifier.messages("warning") == []
+
+
+def test_restart_reuses_plan(auto_presenter, manager, services):
+    task_id = auto_presenter.on_start_requested(replace(_request(), plan=TIMED_PLAN))
+    manager.task_stopped.emit(task_id, StopReason.PROCESS_EXITED)
+    services.process_query.processes[:] = [(4321, "alpha.exe", 9.0)]
+
+    new_id = auto_presenter.on_restart(task_id)
+
+    assert new_id is not None and new_id != task_id
+    assert auto_presenter.plan_of(new_id) == TIMED_PLAN
+    assert auto_presenter.auto_marker.is_attached(new_id)
+
+
+def test_restart_without_unique_match_fills_plan_into_form(auto_presenter, manager, services,
+                                                           form):
+    task_id = auto_presenter.on_start_requested(replace(_request(), plan=TIMED_PLAN))
+    manager.task_stopped.emit(task_id, StopReason.PROCESS_EXITED)
+    services.process_query.processes[:] = []
+    assert auto_presenter.on_restart(task_id) is None
+    assert form.filled == ["alpha.exe"] and form.automation_plans == [TIMED_PLAN]
+
+
+def test_restart_without_plan_leaves_form_plan_alone(auto_presenter, manager, services, form):
+    task_id = auto_presenter.on_start_requested(_request())
+    manager.task_stopped.emit(task_id, StopReason.PROCESS_EXITED)
+    services.process_query.processes[:] = []
+    auto_presenter.on_restart(task_id)
+    assert form.automation_plans == []
+
+
+def test_wait_request_plan_is_applied_when_process_appears(auto_presenter, manager, services):
+    auto_presenter.on_wait_requested(WaitRequest(
+        name="late.exe", metrics=METRICS, interval=1.0, plan=TIMED_PLAN))
+    services.process_query.processes.append((5555, "late.exe", 5.0))
+    auto_presenter.poll_waits()
+    assert len(manager.created) == 1
+    assert auto_presenter.plan_of("t1") == TIMED_PLAN
+
+
+def test_browse_log_and_export_dir_go_through_dialogs(auto_presenter, services, form):
+    services.dialogs.push('ask_open_file', "D:\\logs\\app.log", None)
+    services.dialogs.push('ask_directory', "D:\\out")
+    form.browse_log_requested.emit()
+    assert form.log_path_value == "D:\\logs\\app.log"
+    form.browse_log_requested.emit()            # 取消：不改
+    assert form.log_path_value == "D:\\logs\\app.log"
+    assert services.dialogs.last_call('ask_open_file')['start_dir'] == "D:\\logs"
+    form.browse_export_dir_requested.emit()
+    assert form.export_dir_value == "D:\\out"
+
+
+# ---------- 停止后自动导出 ----------
+
+
+class FakeExportWorker(QObject):
+    """ReportWorker 替身：start() 同步发出结果（或失败）与 finished。"""
+
+    result = pyqtSignal(object)
+    failed = pyqtSignal(str)
+    finished = pyqtSignal()
+    created: List["FakeExportWorker"] = []
+
+    def __init__(self, db, job, fail=None):
+        super().__init__()
+        self.db, self.job, self.fail = db, job, fail
+        FakeExportWorker.created.append(self)
+
+    def cancel(self):
+        pass
+
+    def isFinished(self):
+        return False
+
+    def start(self):
+        if self.fail:
+            self.failed.emit(self.fail)
+        else:
+            self.result.emit(ReportResult((self.job.csv_path,), 3, 3))
+        self.finished.emit()
+
+
+def _record(task_id, start=DEFAULT_FAKE_NOW):
+    return MonitorTask(task_id=task_id, pid=1001, process_name="alpha.exe",
+                       metric_types=list(METRICS), interval=1.0, start_time=start,
+                       end_time=start + timedelta(minutes=5), status='stopped',
+                       sample_count=3)
+
+
+def _export_presenter(manager, services, form, board, host, plan_db, fail=None):
+    FakeExportWorker.created = []
+    return MonitorPresenter(
+        manager, services, form, board, host, db=plan_db,
+        export_worker_factory=lambda db, job: FakeExportWorker(db, job, fail))
+
+
+def test_task_end_triggers_csv_export(manager, services, form, board, host, plan_db, tmp_path):
+    presenter = _export_presenter(manager, services, form, board, host, plan_db)
+    out = tmp_path / "导出"
+    plan = AutomationPlan(export_on_stop=True, export_dir=str(out))
+    task_id = presenter.on_start_requested(replace(_request(), plan=plan))
+    plan_db.records[task_id] = _record(task_id)
+
+    manager.task_stopped.emit(task_id, StopReason.PROCESS_EXITED)
+
+    [worker] = FakeExportWorker.created
+    job = worker.job
+    assert job.csv_path == str(out / "alpha_1001_20260101_120000.csv")
+    assert job.image_path is None and job.summary_path is None
+    assert any("任务结束后自动导出" in line for line in job.metadata)
+    assert out.is_dir()
+    assert manager.exports == 0                      # begin/end 成对
+    assert services.notifier.last("success").title == "已自动导出"
+
+
+def test_export_does_not_overwrite_existing_file(manager, services, form, board, host,
+                                                 plan_db, tmp_path):
+    presenter = _export_presenter(manager, services, form, board, host, plan_db)
+    (tmp_path / "alpha_1001_20260101_120000.csv").write_text("旧", encoding="utf-8")
+    plan_db.records["x"] = _record("x")
+    assert presenter.on_export_requested("x", str(tmp_path))
+    assert FakeExportWorker.created[0].job.csv_path == str(
+        tmp_path / "alpha_1001_20260101_120000_2.csv")
+
+
+def test_export_refused_during_maintenance(manager, services, form, board, host, plan_db,
+                                           tmp_path):
+    presenter = _export_presenter(manager, services, form, board, host, plan_db)
+    plan_db.records["x"] = _record("x")
+    manager.maintenance = True
+    assert presenter.on_export_requested("x", str(tmp_path)) is False
+    assert FakeExportWorker.created == []
+    assert "正在清理数据库" in services.notifier.last("error").content
+
+
+def test_export_failure_is_reported(manager, services, form, board, host, plan_db, tmp_path):
+    presenter = _export_presenter(manager, services, form, board, host, plan_db,
+                                  fail="导出失败：磁盘已满")
+    plan_db.records["x"] = _record("x")
+    presenter.on_export_requested("x", str(tmp_path))
+    notice = services.notifier.last("error")
+    assert notice.title == "自动导出失败" and "磁盘已满" in notice.content
+    assert manager.exports == 0
+
+
+def test_export_without_task_record_is_reported(manager, services, form, board, host, plan_db,
+                                                tmp_path):
+    presenter = _export_presenter(manager, services, form, board, host, plan_db)
+    assert presenter.on_export_requested("missing", str(tmp_path)) is False
+    assert services.notifier.last("error").title == "自动导出失败"
+
+
+class _InlineReportWorker(ReportWorker):
+    """真实 ReportWorker 的导出逻辑，但在调用线程里同步执行：本用例只验证"写出的文件"，
+    不依赖跨线程信号投递（e2e 冒烟真退出调用过 QApplication.quit() 之后，同一进程里
+    工作线程发往界面线程的排队信号不再送达，真线程版本会在全量运行时超时）。"""
+
+    def start(self):
+        self.run()
+        self.finished.emit()
+
+
+def test_export_writes_real_csv(db, manager, services, form, board, host, tmp_path):
+    """真实 ReportWorker 导出逻辑 + 真实库：文件确实写出，导出线程登记到 services.threads"""
+    from data.models import DataPoint
+    db.save_task(_record("real"))
+    db.save_data_points([DataPoint("real", DEFAULT_FAKE_NOW + timedelta(seconds=i), 1.0 + i,
+                                   METRICS[0]) for i in range(3)])
+    registered = []
+    services.threads.register = lambda worker, **kw: registered.append(kw['name'])
+    presenter = MonitorPresenter(manager, services, form, board, host, db=db,
+                                 export_worker_factory=_InlineReportWorker)
+
+    assert presenter.on_export_requested("real", str(tmp_path))
+    assert registered == ["自动导出"]
+    assert manager.exports == 0
+    assert [n.title for n in services.notifier.messages()] == ["已自动导出"], (
+        services.notifier.messages())
+    text = (tmp_path / "alpha_1001_20260101_120000.csv").read_text(encoding="utf-8-sig")
+    assert "进程: alpha.exe (PID 1001)" in text

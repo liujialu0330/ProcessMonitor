@@ -30,6 +30,9 @@ class MonitorTask:
     # 被监控进程的创建时间（psutil.Process.create_time() 的 epoch 秒）；
     # 用于识别 PID 复用，不是查询用的时间参数，因此保留 float
     create_time: Optional[float] = None
+    # 自动化方案（core.automation.AutomationPlan 的 JSON 文本）；没有方案为 None。
+    # 只经 TaskRepo.save_plan 写入，save() 不碰它（UPSERT 不会把它清掉）
+    plan_json: Optional[str] = None
 
     def is_running(self) -> bool:
         """判断任务是否正在运行"""

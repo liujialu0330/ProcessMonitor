@@ -220,10 +220,12 @@ def test_invalid_target_shows_error_under_field_and_clears_on_edit(
 
 
 def test_page_has_no_separate_pid_box(page):
-    """PID 直接在搜索框输入（P10）：表单里除搜索框外只剩备注一个单行输入框"""
+    """PID 直接在搜索框输入（P10）：表单里除搜索框外只剩备注一个单行输入框
+    （"自动化"折叠区里的日志路径、匹配规则与导出目录不算）"""
     from qfluentwidgets import EditableComboBox, LineEdit
     edits = [w for w in page.form.findChildren(LineEdit)
-             if not isinstance(w, EditableComboBox)]
+             if not isinstance(w, EditableComboBox)
+             and not page.form.automation.isAncestorOf(w)]
     assert edits == [page.form.note_input]
 
 

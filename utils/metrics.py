@@ -84,6 +84,16 @@ _CUMULATIVE_KINDS = frozenset({
 })
 
 
+# 采集开销/来源（MetricSpec.cost）。采集器据此决定每个指标从哪里取：
+# - snapshot：从全系统进程快照取（一次系统调用服务全部任务的全部此类指标）；
+# - cheap：快照里没有，逐进程调用开销小（GetGuiResources、优先级类）；
+# - expensive：逐进程调用开销大（USS 要遍历工作集）。
+COST_SNAPSHOT = 'snapshot'
+COST_CHEAP = 'cheap'
+COST_EXPENSIVE = 'expensive'
+METRIC_COSTS = (COST_SNAPSHOT, COST_CHEAP, COST_EXPENSIVE)
+
+
 @dataclass(frozen=True)
 class MetricSpec:
     """一个指标的全部元数据；新增指标只需在 _SPECS 里加一项（采集侧另加一个 sampler）。"""
@@ -104,6 +114,8 @@ class MetricSpec:
     leak_preset_rank: int = 0
     # 已废弃：不再可选，但显示名、单位、说明与格式化保留，供旧任务数据显示与导出
     deprecated: bool = False
+    # 采集来源与开销（METRIC_COSTS 之一），见上方 COST_* 说明
+    cost: str = COST_CHEAP
 
 
 # 注册表：顺序即界面顺序（分类按首次出现的先后，分类内按此处顺序）。
@@ -114,136 +126,163 @@ _SPECS = (
     MetricSpec(
         MetricType.MEMORY_RSS, "工作集内存", "KB", "内存", MetricKind.BYTES_KB,
         "工作集：当前驻留在物理内存中的页，会被系统换出而随内存压力波动，"
-        "适合看内存占用的实时水位，不宜单独用来判断泄漏"),
+        "适合看内存占用的实时水位，不宜单独用来判断泄漏",
+        cost=COST_SNAPSHOT),
     # 工作集占整机内存的比例
     MetricSpec(
         MetricType.MEMORY_PERCENT, "内存使用率", "%", "内存", MetricKind.PERCENT,
-        "工作集占整机物理内存的百分比，适合评估被测进程对整机内存的压力"),
+        "工作集占整机物理内存的百分比，适合评估被测进程对整机内存的压力",
+        cost=COST_SNAPSHOT),
     # 进程启动以来的最大工作集，只增不减
     MetricSpec(
         MetricType.MEMORY_PEAK_WSET, "工作集峰值", "KB", "内存", MetricKind.PEAK,
         "进程启动以来工作集的最大值，只增不减，适合查看内存使用的历史峰值",
-        requires='windows'),
+        requires='windows',
+        cost=COST_SNAPSHOT),
     # 已提交私有内存的当前水位，泄漏主指标
     MetricSpec(
         MetricType.MEMORY_PRIVATE, "私有字节", "KB", "内存", MetricKind.BYTES_KB,
         "进程独占的已提交内存（Private Bytes，即任务管理器“详细信息”里的“提交大小”），"
         "持续上涨是内存泄漏的主要信号",
-        requires='windows', in_leak_preset=True, leak_preset_rank=1),
+        requires='windows', in_leak_preset=True, leak_preset_rank=1,
+        cost=COST_SNAPSHOT),
     # 私有字节的历史最大值，只增不减
     MetricSpec(
         MetricType.MEMORY_PEAK_PAGEFILE, "私有字节峰值", "KB", "内存", MetricKind.PEAK,
         "私有字节的历史峰值，只增不减，适合查看某次操作期间的内存冲高",
-        requires='windows'),
+        requires='windows',
+        cost=COST_SNAPSHOT),
     # 内核分页缓冲池的当前占用，可升可降
     MetricSpec(
         MetricType.MEMORY_PAGED_POOL, "分页缓冲池", "KB", "内存", MetricKind.BYTES_KB,
         "进程占用的内核分页缓冲池（任务管理器同名列），持续上涨多见于驱动或系统对象（如文件、注册表句柄）泄漏",
-        requires='windows'),
+        requires='windows',
+        cost=COST_SNAPSHOT),
     # 分页缓冲池的历史最大值，只增不减
     MetricSpec(
         MetricType.MEMORY_PEAK_PAGED_POOL, "分页缓冲池峰值", "KB", "内存", MetricKind.PEAK,
         "分页缓冲池的历史峰值，只增不减，适合排查内核资源的瞬时冲高",
-        requires='windows'),
+        requires='windows',
+        cost=COST_SNAPSHOT),
     # 内核非分页缓冲池的当前占用，可升可降
     MetricSpec(
         MetricType.MEMORY_NONPAGED_POOL, "非分页缓冲池", "KB", "内存", MetricKind.BYTES_KB,
         "进程占用的内核非分页缓冲池（常驻物理内存，任务管理器同名列），持续上涨多见于驱动、设备或句柄泄漏",
-        requires='windows'),
+        requires='windows',
+        cost=COST_SNAPSHOT),
     # 非分页缓冲池的历史最大值，只增不减
     MetricSpec(
         MetricType.MEMORY_PEAK_NONPAGED_POOL, "非分页缓冲池峰值", "KB", "内存", MetricKind.PEAK,
         "非分页缓冲池的历史峰值，只增不减，适合排查内核资源的瞬时冲高",
-        requires='windows'),
+        requires='windows',
+        cost=COST_SNAPSHOT),
     # 进程启动以来的缺页总次数，只增不减
     MetricSpec(
         MetricType.MEMORY_NUM_PAGE_FAULTS, "页面错误", "次", "内存",
         MetricKind.CUMULATIVE_COUNT,
         "累计缺页次数，增长过快说明内存被频繁换入换出，适合发现内存紧张或访问模式异常",
-        requires='windows'),
+        requires='windows',
+        cost=COST_SNAPSHOT),
     # 独占物理内存的当前水位；memory_full_info 需要较高的进程访问权限
     MetricSpec(
         MetricType.MEMORY_USS, "独占物理内存（USS）", "KB", "内存", MetricKind.BYTES_KB,
         "进程独占的物理内存（Unique Set Size，不含共享页），比工作集更接近真实占用；"
         "读取开销较大，且对更高权限进程可能因权限不足而不可用",
-        requires='admin'),
+        requires='admin',
+        cost=COST_EXPENSIVE),
 
     # ---------- CPU ----------
     # 两次采集之间的占用率；psutil 首次调用恒为 0，需要预热
     MetricSpec(
         MetricType.CPU_PERCENT, "CPU使用率", "%", "CPU", MetricKind.PERCENT,
         "进程 CPU 占用率（可超过 100%，按核数累计），适合发现空闲时仍高占用的死循环或忙等",
-        needs_priming=True),
+        needs_priming=True,
+        cost=COST_SNAPSHOT),
     # 进程启动以来累计的用户态时间（秒），只增不减
     MetricSpec(
         MetricType.CPU_USER_TIME, "CPU用户时间", "秒", "CPU", MetricKind.SECONDS,
-        "累计在用户态运行的 CPU 时间，适合比较各轮操作消耗的计算量"),
+        "累计在用户态运行的 CPU 时间，适合比较各轮操作消耗的计算量",
+        cost=COST_SNAPSHOT),
     # 进程启动以来累计的内核态时间（秒），只增不减
     MetricSpec(
         MetricType.CPU_SYSTEM_TIME, "CPU系统时间", "秒", "CPU", MetricKind.SECONDS,
-        "累计在内核态运行的 CPU 时间，偏高多见于大量系统调用或 I/O"),
+        "累计在内核态运行的 CPU 时间，偏高多见于大量系统调用或 I/O",
+        cost=COST_SNAPSHOT),
     # 调度优先级是可被改回的整数状态值，不是累计量；无单位
     MetricSpec(
         MetricType.CPU_PRIORITY, "基本优先级", "", "CPU", MetricKind.COUNT,
-        "进程的基本调度优先级（任务管理器同名列），用于确认被测程序的优先级是否被改动"),
+        "进程的基本调度优先级（任务管理器同名列），用于确认被测程序的优先级是否被改动",
+        cost=COST_CHEAP),
 
     # ---------- 系统资源 ----------
     # 线程/句柄/GDI/USER 都是"当前持有数"，资源释放后会下降，是水位量
     MetricSpec(
         MetricType.NUM_THREADS, "线程数", "个", "系统资源", MetricKind.COUNT,
         "进程内的线程总数，持续上涨说明线程创建后没有退出（线程泄漏）",
-        in_leak_preset=True, leak_preset_rank=5),
+        in_leak_preset=True, leak_preset_rank=5,
+        cost=COST_SNAPSHOT),
     # 非 Windows 上回落为文件描述符数，因此不标 windows
     MetricSpec(
         MetricType.NUM_HANDLES, "句柄数", "个", "系统资源", MetricKind.COUNT,
         "进程打开的内核句柄数（文件、事件、互斥量等），持续上涨是句柄泄漏的信号，"
         "单进程上限约 1600 万",
-        in_leak_preset=True, leak_preset_rank=2),
+        in_leak_preset=True, leak_preset_rank=2,
+        cost=COST_SNAPSHOT),
     MetricSpec(
         MetricType.NUM_GDI_OBJECTS, "GDI对象数", "个", "系统资源", MetricKind.COUNT,
         "位图、画刷、字体等 GDI 资源数，单进程上限 10000，"
         "持续上涨会导致界面花屏或崩溃",
-        requires='windows', in_leak_preset=True, leak_preset_rank=3),
+        requires='windows', in_leak_preset=True, leak_preset_rank=3,
+        cost=COST_CHEAP),
     MetricSpec(
         MetricType.NUM_USER_OBJECTS, "USER对象数", "个", "系统资源", MetricKind.COUNT,
         "窗口、菜单、光标等 USER 对象数，单进程上限 10000，"
         "持续上涨说明窗口或菜单创建后没有销毁",
-        requires='windows', in_leak_preset=True, leak_preset_rank=4),
+        requires='windows', in_leak_preset=True, leak_preset_rank=4,
+        cost=COST_CHEAP),
     # 上下文切换是进程启动以来的累计次数，只增不减
     MetricSpec(
         MetricType.NUM_CTX_SWITCHES_VOL, "自愿上下文切换", "次", "系统资源",
         MetricKind.CUMULATIVE_COUNT,
-        "累计自愿上下文切换次数（线程主动等待让出 CPU），适合分析线程同步与阻塞"),
+        "累计自愿上下文切换次数（线程主动等待让出 CPU），适合分析线程同步与阻塞",
+        cost=COST_SNAPSHOT),
     # 同为累计次数；psutil 在 Windows 上只能取到自愿切换，此项恒为 0，已废弃
     MetricSpec(
         MetricType.NUM_CTX_SWITCHES_INVOL, "非自愿上下文切换", "次", "系统资源",
         MetricKind.CUMULATIVE_COUNT,
         "累计非自愿上下文切换次数（时间片用完被抢占）；已废弃：Windows 上无法采集，恒为 0",
-        deprecated=True),
+        deprecated=True,
+        cost=COST_SNAPSHOT),
 
     # ---------- I/O ----------
     # psutil.io_counters 的字节与次数都是进程启动以来的累计值，只增不减
     MetricSpec(
         MetricType.IO_READ_BYTES, "I/O 读取字节", "KB", "I/O", MetricKind.CUMULATIVE_BYTES,
-        "累计读取字节数，适合发现异常的磁盘或网络读取量"),
+        "累计读取字节数，适合发现异常的磁盘或网络读取量",
+        cost=COST_SNAPSHOT),
     MetricSpec(
         MetricType.IO_WRITE_BYTES, "I/O 写入字节", "KB", "I/O", MetricKind.CUMULATIVE_BYTES,
-        "累计写入字节数，适合发现日志刷屏或临时文件持续增长"),
+        "累计写入字节数，适合发现日志刷屏或临时文件持续增长",
+        cost=COST_SNAPSHOT),
     MetricSpec(
         MetricType.IO_READ_COUNT, "I/O 读取次数", "次", "I/O", MetricKind.CUMULATIVE_COUNT,
-        "累计读取操作次数，适合发现高频小块读取"),
+        "累计读取操作次数，适合发现高频小块读取",
+        cost=COST_SNAPSHOT),
     MetricSpec(
         MetricType.IO_WRITE_COUNT, "I/O 写入次数", "次", "I/O", MetricKind.CUMULATIVE_COUNT,
-        "累计写入操作次数，适合发现高频小块写入"),
+        "累计写入操作次数，适合发现高频小块写入",
+        cost=COST_SNAPSHOT),
     # "其他 I/O" 字段只有 Windows 版 psutil 提供
     MetricSpec(
         MetricType.IO_OTHER_BYTES, "I/O 其他字节", "KB", "I/O", MetricKind.CUMULATIVE_BYTES,
         "累计其他 I/O（非读写，如设备控制）传输的字节数",
-        requires='windows'),
+        requires='windows',
+        cost=COST_SNAPSHOT),
     MetricSpec(
         MetricType.IO_OTHER_COUNT, "I/O 其他次数", "次", "I/O", MetricKind.CUMULATIVE_COUNT,
         "累计其他 I/O（非读写，如设备控制）操作次数",
-        requires='windows'),
+        requires='windows',
+        cost=COST_SNAPSHOT),
 )
 
 REGISTRY: Dict[str, MetricSpec] = {s.key: s for s in _SPECS}

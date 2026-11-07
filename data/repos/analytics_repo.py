@@ -16,6 +16,10 @@ float/int 直接 TypeError，杜绝"把秒级 epoch 当毫秒比较、过滤静�
 （gap_factor 为默认值、interval_seconds 等于任务的采集周期）时才走汇总路径。
 构造参数 path 可强制某条路径（测试比对两条路径用；强制汇总时口径不符仍走原始）。
 
+每次查询在一个读事务里完成（_connect 显式 BEGIN）：汇总路径要先后读 rollup_1m、series_gaps
+与两端的原始样本，WAL 下各语句默认各自取快照，期间采集线程追加的样本会让前后几条语句看到
+不同的数据（如桶数按旧样本算、端点又读到新样本）；同一读事务内所有语句看到同一快照。
+
 所有 sqlite3 异常包成 StorageError 向上抛（原始异常挂在 __cause__），是否降级由调用方决定。
 """
 import bisect
@@ -28,7 +32,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
-from data.mappers import ceil_ms, from_ms
+from data.mappers import from_ms, to_ms
 from data.models import DataPoint
 from data.repos import rollup
 from data.repos._guard import storage_errors
@@ -245,9 +249,14 @@ class AnalyticsRepo:
 
     @contextmanager
     def _connect(self, what: str) -> Iterator[sqlite3.Connection]:
-        """连接上下文；块内 sqlite3.Error 经 storage_errors 统一改抛 StorageError"""
+        """
+        连接上下文：显式 BEGIN 开读事务（WAL 下首条读语句取快照，块内各语句共用），块结束时
+        由连接工厂 COMMIT（异常时 ROLLBACK）。只读连接（query_only）同样允许 BEGIN。
+        块内 sqlite3.Error 经 storage_errors 统一改抛 StorageError。
+        """
         with storage_errors(what):
             with self._factory.connect() as conn:
+                conn.execute('BEGIN')
                 yield conn
 
     # ========== 路径选择 ==========
@@ -651,8 +660,9 @@ class AnalyticsRepo:
         check_time(ts, 'ts')
         if not isinstance(n, int) or isinstance(n, bool) or n < 1:
             raise ValueError(f'n 必须是 >= 1 的整数，实际为 {n!r}')
-        # 样本 m >= ts 当且仅当 m >= ceil_ms(ts)；其余都在 ts 之前
-        pivot = ceil_ms(ts)
+        # ts 是时刻类边界，与样本同一取整规则（见 data.mappers 模块说明）：取整后不早于它的
+        # 样本算 ts 及之后，其余在 ts 之前
+        pivot = to_ms(ts)
         with self._connect('读取基线值') as conn:
             sid = series_id(conn, task_id, metric)
             if sid is None:

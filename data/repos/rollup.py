@@ -23,7 +23,7 @@
 - 导回降级数据、重建式迁移、设置页"重建汇总"：rebuild_rollups 整体重算。
 """
 import logging
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -276,7 +276,8 @@ def _rebuild_one(conn, sid: int, threshold: Optional[float]) -> None:
 
 
 def rebuild_rollups(conn, series_id: Optional[int] = None,
-                    series_ids: Optional[Iterable[int]] = None) -> int:
+                    series_ids: Optional[Iterable[int]] = None,
+                    on_progress: Optional[Callable[[int, int], None]] = None) -> int:
     """
     从 samples 整体重算 rollup_1m 与 series_gaps（调用方已开启事务）。空洞阈值取所属任务的
     interval；任务不存在（孤儿序列）或 interval 不是正数时不记空洞。
@@ -284,6 +285,7 @@ def rebuild_rollups(conn, series_id: Optional[int] = None,
     Args:
         series_id: 只重算这一条序列
         series_ids: 只重算这些序列（与 series_id 二选一；都不给时重算全部）
+        on_progress: 每重算完一条序列回调一次 (已完成序列数, 序列总数)；在调用线程里同步调用
 
     Returns:
         int: 重算的序列数
@@ -308,8 +310,10 @@ def rebuild_rollups(conn, series_id: Optional[int] = None,
             conn.execute('DELETE FROM rollup_1m WHERE series_id = ?', (sid,))
             conn.execute('DELETE FROM series_gaps WHERE series_id = ?', (sid,))
             targets.append((sid, _series_threshold(conn, sid)))
-    for sid, threshold in targets:
+    for done, (sid, threshold) in enumerate(targets, 1):
         _rebuild_one(conn, sid, threshold)
+        if on_progress is not None:
+            on_progress(done, len(targets))
     return len(targets)
 
 
