@@ -375,6 +375,57 @@ class Database:
         """checkpoint 后 VACUUM 压缩数据库；失败抛 StorageError（调用方据此提示失败）"""
         self.maintenance.vacuum()
 
+    # ========== 存储健康（后台作业的底层入口，调度见 core.storage_guard） ==========
+
+    def wal_size_bytes(self) -> int:
+        """-wal 文件的字节数（不存在为 0）；文件系统错误按 0 计并记日志"""
+        from data.db import maintenance as storage_health
+        try:
+            return storage_health.wal_size(self.db_path)
+        except OSError:
+            logger.warning("获取 -wal 文件大小失败: %s", self.db_path, exc_info=True)
+            return 0
+
+    def checkpoint_wal(self):
+        """-wal 兜底 checkpoint（先 TRUNCATE，被挡住退到 PASSIVE）；不抛 sqlite3 异常，
+        失败写进返回的 CheckpointOutcome.error。只读库没有写入、也没有 -wal 可收，不应调用"""
+        from data.db import maintenance as storage_health
+        return storage_health.checkpoint_wal(self._factory)
+
+    def new_quick_check(self):
+        """新建一次 PRAGMA quick_check（只读连接，run() 阻塞、interrupt() 可跨线程中止）"""
+        from data.db import maintenance as storage_health
+        return storage_health.QuickCheck(self.db_path)
+
+    # ========== 进程组成员（tree / name 任务） ==========
+
+    @property
+    def members(self):
+        """成员仓储（task_members 留痕与成员序列发现）；首次访问时按需创建。"""
+        repo = self.__dict__.get('_members_repo')
+        if repo is None:
+            from data.repos.member_repo import MemberRepo
+            repo = self.__dict__['_members_repo'] = MemberRepo(self._factory)
+        return repo
+
+    def save_member_changes(self, appeared=(), last_seen=()) -> bool:
+        """批量写进程组实例的出现与消失（见 MemberRepo.apply）；返回是否成功，
+        失败记日志（采集线程据此保留缓冲、下个周期重试）"""
+        try:
+            self.members.apply(appeared, last_seen)
+            return True
+        except StorageError:
+            logger.error("保存进程组成员留痕失败", exc_info=True)
+            return False
+
+    def list_members(self, task_id: str) -> list:
+        """任务的成员概况（见 MemberRepo.list_members）；失败返回 []"""
+        try:
+            return self.members.list_members(task_id)
+        except StorageError:
+            logger.error("读取进程组成员失败: task_id=%s", task_id, exc_info=True)
+            return []
+
 
 # 单元测试
 if __name__ == "__main__":

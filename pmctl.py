@@ -53,6 +53,9 @@ HELP = {
     'no_launch': "程序没在运行时不自动以无窗口模式拉起",
     'pid': "被测进程 PID",
     'name': "被测进程名（如 notepad.exe；唯一匹配时使用）",
+    'tree': "进程树：监控 --pid（或 --launch 启动的程序）及其全部子孙进程，根进程退出任务才结束",
+    'group_name': ("同名进程组：监控全部名为该名字的进程（如 chrome.exe，不要求唯一；当前没有也能开始，"
+                   "成员出现后自动纳入，归零不结束任务）"),
     'metrics': "指标键，逗号分隔（缺省沿用程序里上次选择的指标）",
     'interval': "采集间隔（秒）",
     'note': "任务备注",
@@ -87,7 +90,10 @@ CMD_HELP = {
 }
 MSG_ERROR = "错误：{message}"
 MSG_PLAN_READ = "无法读取方案文件 {path}：{detail}"
-MSG_RUN_NEEDS_TARGET = "run 需要至少一个 --pid、--name 或 --launch"
+MSG_RUN_NEEDS_TARGET = "run 需要至少一个 --pid、--name、--group-name 或 --launch"
+MSG_TREE_NEEDS_ROOT = "--tree 需要与 --pid 或 --launch 一起使用（它们是进程树的根）"
+MSG_TREE_NO_NAME = "--tree 不能与 --name / --group-name 一起使用"
+GROUP_TEXTS = {'tree': "进程树", 'name': "同名进程组"}
 MSG_RUN_NEEDS_STOP = ("run 需要停止条件：--stop-after、--rounds，或方案文件里的 stop_after_seconds / "
                       "stop_after_rounds（否则会一直等下去）")
 MSG_RUN_TIMEOUT = "{label}：等待超时（{seconds:g} 秒），已停止任务"
@@ -127,7 +133,9 @@ def build_parser() -> argparse.ArgumentParser:
     target = start.add_mutually_exclusive_group(required=True)
     target.add_argument('--pid', type=int, help=HELP['pid'])
     target.add_argument('--name', help=HELP['name'])
+    target.add_argument('--group-name', metavar='进程名', help=HELP['group_name'])
     target.add_argument('--launch', metavar='EXE', help=HELP['launch'])
+    start.add_argument('--tree', action='store_true', help=HELP['tree'])
     _add_task_options(start)
     _add_launch_options(start)
     start.add_argument('--wait', action='store_true', help=HELP['wait_start'])
@@ -159,7 +167,10 @@ def build_parser() -> argparse.ArgumentParser:
     run = sub.add_parser('run', help=CMD_HELP['run'])
     run.add_argument('--pid', type=int, action='append', default=[], help=HELP['pid'])
     run.add_argument('--name', action='append', default=[], help=HELP['name'])
+    run.add_argument('--group-name', action='append', default=[], metavar='进程名',
+                     help=HELP['group_name'])
     run.add_argument('--launch', metavar='EXE', help=HELP['launch'])
+    run.add_argument('--tree', action='store_true', help=HELP['tree'])
     _add_task_options(run)
     _add_launch_options(run)
     run.add_argument('--wait', action='store_true', help=HELP['wait_start'])
@@ -208,6 +219,16 @@ def launch_payload(args) -> Optional[Dict[str, Any]]:
     return payload
 
 
+def check_tree_options(args, *, has_root: bool, has_name: bool) -> None:
+    """--tree 的组合校验：必须有根（--pid / --launch），不能和按名的目标混用。"""
+    if not getattr(args, 'tree', False):
+        return
+    if has_name:
+        raise UsageError(MSG_TREE_NO_NAME)
+    if not has_root:
+        raise UsageError(MSG_TREE_NEEDS_ROOT)
+
+
 def _split(text: Optional[str]) -> Optional[List[str]]:
     if text is None:
         return None
@@ -229,8 +250,11 @@ def _read_plan(path: Optional[str]) -> Optional[Dict[str, Any]]:
 
 def _start_args(args, *, pid: Optional[int] = None, name: Optional[str] = None,
                 launch: Optional[Dict[str, Any]] = None,
-                plan: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                plan: Optional[Dict[str, Any]] = None,
+                target_kind: Optional[str] = None) -> Dict[str, Any]:
     payload: Dict[str, Any] = {}
+    if target_kind is not None:
+        payload['target_kind'] = target_kind
     if pid is not None:
         payload['pid'] = pid
     if name is not None:
@@ -320,6 +344,9 @@ def build_junit(results: Sequence[Dict[str, Any]], elapsed_s: float = 0.0, *,
         target = item.get('target') or item.get('task_id') or ''
         overall = item.get('verdict')
         metrics = item.get('metrics') or [{'key': 'verdict', 'name': '判定', 'verdict': overall}]
+        # 进程组任务：每个成员的每个指标也是一个用例（成员持续上涨同样算失败）
+        metrics = list(metrics) + [metric for group in item.get('members') or []
+                                   for metric in group.get('metrics') or []]
         for metric in metrics:
             counts['tests'] += 1
             case = ET.SubElement(suite, 'testcase', classname=str(target),
@@ -436,8 +463,11 @@ class Cli:
                 self.emit("没有任务")
             for task in tasks:
                 state = "已暂停" if task.get('paused') else task.get('status')
-                line = (f"{task.get('task_id')}  {task.get('name')}（PID {task.get('pid')}）"
-                        f"  {state}  第 {task.get('rounds')} 轮")
+                group = GROUP_TEXTS.get(task.get('target_kind'))
+                target = (f"{task.get('name')}（{group}）" if task.get('target_kind') == 'name'
+                          else f"{task.get('name')}（{group + '，' if group else ''}"
+                               f"PID {task.get('pid')}）")
+                line = f"{task.get('task_id')}  {target}  {state}  第 {task.get('rounds')} 轮"
                 quality = (task.get('quality') or {}).get('text')
                 if quality:
                     line += f"  {quality}"
@@ -448,8 +478,15 @@ class Cli:
         launch = launch_payload(self.args)
         if launch is not None and self.args.wait:
             raise UsageError(MSG_LAUNCH_NO_WAIT)
-        payload = _start_args(self.args, pid=self.args.pid, name=self.args.name,
-                              launch=launch, plan=_read_plan(self.args.plan))
+        group_name = self.args.group_name
+        check_tree_options(self.args, has_root=self.args.pid is not None or launch is not None,
+                           has_name=self.args.name is not None or group_name is not None)
+        if group_name is not None:
+            target_kind, name = 'name', group_name
+        else:
+            target_kind, name = ('tree' if self.args.tree else None), self.args.name
+        payload = _start_args(self.args, pid=self.args.pid, name=name, launch=launch,
+                              plan=_read_plan(self.args.plan), target_kind=target_kind)
         result = self.call('start', payload, timeout=None if self.args.wait else self.args.timeout)
         if not self.args.json:
             self.emit(result.get('task_id', ''))
@@ -517,8 +554,16 @@ class Cli:
         if exit_info and not exit_info.get('before_stop_condition', True):
             self.emit(MSG_TARGET_EXIT_AFTER.format(reason=exit_info.get('reason')))
         for metric in result.get('metrics') or []:
-            self.emit(f"  {metric.get('name')}：{metric.get('verdict')}"
-                      f"（每小时 {metric.get('rate_per_hour')}，每轮 {metric.get('rate_per_round')}）")
+            self.emit(self._metric_line(metric))
+        for group in result.get('members') or []:
+            self.emit(f"  成员 {group.get('key')}：{MSG_VERDICT_TEXT.get(group.get('verdict'), group.get('verdict'))}")
+            for metric in group.get('metrics') or []:
+                self.emit("  " + self._metric_line(metric))
+
+    @staticmethod
+    def _metric_line(metric: Dict[str, Any]) -> str:
+        return (f"  {metric.get('name')}：{metric.get('verdict')}"
+                f"（每小时 {metric.get('rate_per_hour')}，每轮 {metric.get('rate_per_round')}）")
 
     def cmd_run(self) -> int:
         """开始 → 等停止条件 → （超时则停止）→ 导出 → 判定。
@@ -529,12 +574,15 @@ class Cli:
         - 中途出错（如第二个目标 start 失败）或 Ctrl+C：停掉本次已开始、尚未结束的任务再退出。
         """
         args = self.args
-        targets = [('pid', pid) for pid in args.pid] + [('name', name) for name in args.name]
+        targets = ([('pid', pid) for pid in args.pid] + [('name', name) for name in args.name]
+                   + [('group_name', name) for name in args.group_name])
         launch = launch_payload(args)
         if launch is not None:
             targets.append(('launch', launch))
         if not targets:
             raise UsageError(MSG_RUN_NEEDS_TARGET)
+        check_tree_options(args, has_root=bool(args.pid) or launch is not None,
+                           has_name=bool(args.name) or bool(args.group_name))
         plan = dict(_read_plan(args.plan) or {})
         if args.rounds_every is not None:
             plan['timed_marker_seconds'] = args.rounds_every
@@ -549,7 +597,13 @@ class Cli:
         finished = set()
         try:
             for kind, value in targets:
-                payload = _start_args(args, plan=plan, **{kind: value})
+                if kind == 'group_name':
+                    target = {'name': value, 'target_kind': 'name'}
+                else:
+                    target = {kind: value}
+                    if args.tree:
+                        target['target_kind'] = 'tree'
+                payload = _start_args(args, plan=plan, **target)
                 result = self.call('start', payload, timeout=None if args.wait else args.timeout)
                 label = f"{result.get('name')}（PID {result.get('pid')}）"
                 started.append((label, result['task_id']))

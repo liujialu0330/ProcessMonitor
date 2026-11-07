@@ -655,11 +655,12 @@ def bg_env(run_env, monkeypatch):
 
     class FakeRuntime:
         def __init__(self, manager, registry, db, *, idle_exit_s=0.0, busy=None,
-                     stage_renderer=None):
+                     stage_renderer=None, quit_hooks=()):
             events.append(('runtime', manager, registry, idle_exit_s))
             self.auto_marker = 'auto_marker'
             self.busy = busy
             self.stage_renderer = stage_renderer
+            self.quit_hooks = list(quit_hooks)
             state['runtime'] = self
 
         def quit(self):
@@ -697,6 +698,33 @@ def test_run_background_order(bg_env):
     assert runtime.busy == state['guard'].dispatcher.has_pending
     # 无窗口模式也写阶段快照：报告图片的渲染函数由组合根注入
     assert runtime.stage_renderer is bootstrap.render_stage_snapshot_image
+
+
+def test_run_background_starts_storage_guard_and_stops_it_on_quit(bg_env, monkeypatch):
+    """无窗口模式：守卫启动（不连任何界面），退出收尾之前由运行期的钩子停掉"""
+    events, state, exits, paths = bg_env
+
+    class Guard:
+        started = False
+
+        def start(self):
+            self.started = True
+
+        def stop(self):
+            pass
+
+    guard = Guard()
+    fake_build = bootstrap.build_context
+
+    def build(paths, *, report=None, legacy_importer=None):
+        ctx = fake_build(paths, report=report, legacy_importer=legacy_importer)
+        ctx.storage_guard = guard
+        return ctx
+
+    monkeypatch.setattr(bootstrap, 'build_context', build)
+    bootstrap.run(['prog', '--background'], exit_process=exits.append)
+    assert guard.started
+    assert state['runtime'].quit_hooks == [guard.stop]
 
 
 def test_run_background_secondary_does_not_activate(bg_env):
@@ -808,6 +836,17 @@ def test_run_installs_watchdog_and_self_monitor_after_show(run_env):
     bootstrap.run(['prog'], exit_process=exits.append)
     # 两者都在窗口显示之后（看门狗不能在首屏渲染期间就计时）
     assert state['after_show'] == [('watchdog', True), ('self_monitor', True)]
+
+
+def test_run_starts_storage_guard_after_show_with_the_window(run_env, monkeypatch):
+    """存储守卫在窗口显示之后启动，并把主窗口交给它接信号（有窗口模式的提示都经窗口）"""
+    events, state, exits, paths = run_env
+    seen = []
+    monkeypatch.setattr(bootstrap, 'start_storage_guard',
+                        lambda ctx, window=None: seen.append(
+                            ('window.show' in events, window is not None)))
+    bootstrap.run(['prog'], exit_process=exits.append)
+    assert seen == [(True, True)]
 
 
 def test_run_gives_window_the_context_as_diagnostics_provider(run_env):

@@ -10,7 +10,7 @@ import math
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 
 class MetricType:
@@ -116,6 +116,9 @@ class MetricSpec:
     deprecated: bool = False
     # 采集来源与开销（METRIC_COSTS 之一），见上方 COST_* 说明
     cost: str = COST_CHEAP
+    # 对进程组（tree / name 任务）是否有意义：False 的指标（如基本优先级，各实例求和
+    # 没有含义）与峰值类一样，在组任务里不可选、被选中时记为不可用
+    group_applicable: bool = True
 
 
 # 注册表：顺序即界面顺序（分类按首次出现的先后，分类内按此处顺序）。
@@ -212,7 +215,7 @@ _SPECS = (
     MetricSpec(
         MetricType.CPU_PRIORITY, "基本优先级", "", "CPU", MetricKind.COUNT,
         "进程的基本调度优先级（任务管理器同名列），用于确认被测程序的优先级是否被改动",
-        cost=COST_CHEAP),
+        cost=COST_CHEAP, group_applicable=False),
 
     # ---------- 系统资源 ----------
     # 线程/句柄/GDI/USER 都是"当前持有数"，资源释放后会下降，是水位量
@@ -390,22 +393,35 @@ def canonical_metric_type(metric_type: str) -> str:
     return LEGACY_METRIC_ALIASES.get(metric_type, metric_type)
 
 
+def _find_spec(key: Optional[str]) -> Optional[MetricSpec]:
+    """按键找元数据：先剥掉成员后缀（"指标@成员"取指标部分），再查常规注册表与进程组
+    专属注册表；找不到返回 None。"""
+    if key is None:
+        return None
+    base = split_member_key(key)[0]
+    base = canonical_metric_type(base)
+    return REGISTRY.get(base) or GROUP_REGISTRY.get(base)
+
+
 def spec(key: str) -> MetricSpec:
-    """取指标元数据；旧键先归一。未知键抛 KeyError。"""
-    return REGISTRY[canonical_metric_type(key)]
+    """取指标元数据；旧键先归一，成员序列键（指标@成员）取其指标部分，进程组专属
+    指标（进程总数）同样可取。未知键抛 KeyError。"""
+    found = _find_spec(key)
+    if found is None:
+        raise KeyError(key)
+    return found
 
 
 def _kind_of(metric_type: Optional[str]) -> Optional[MetricKind]:
     """指标的 kind；None 或未知键返回 None（按"无特殊语义"处理）。"""
-    if metric_type is None:
-        return None
-    found = REGISTRY.get(canonical_metric_type(metric_type))
+    found = _find_spec(metric_type)
     return found.kind if found else None
 
 
 def get_metric_description(metric_type: str) -> str:
     """获取指标说明（含义 + 适合发现的问题）；未知指标返回空串。"""
-    return METRIC_DESCRIPTIONS.get(canonical_metric_type(metric_type), "")
+    found = _find_spec(metric_type)
+    return found.description if found else ""
 
 
 def all_metric_types() -> list:
@@ -414,15 +430,17 @@ def all_metric_types() -> list:
 
 
 def get_metric_display_name(metric_type: str) -> str:
-    """获取指标的显示名称"""
-    metric_type = canonical_metric_type(metric_type)
-    return METRIC_DISPLAY_NAMES.get(metric_type, metric_type)
+    """获取指标的显示名称；成员序列（指标@成员）显示为"指标名（成员名）"。"""
+    base, member = split_member_key(metric_type)
+    found = _find_spec(base)
+    name = found.name if found else canonical_metric_type(base)
+    return f"{name}（{member}）" if member is not None else name
 
 
 def get_metric_unit(metric_type: str) -> str:
     """获取指标的单位"""
-    metric_type = canonical_metric_type(metric_type)
-    return METRIC_UNITS.get(metric_type, "")
+    found = _find_spec(metric_type)
+    return found.unit if found else ""
 
 
 def is_integer_metric(metric_type: str) -> bool:
@@ -616,3 +634,96 @@ def object_count_limit(metric_type: Optional[str]) -> Optional[int]:
     if canonical_metric_type(metric_type) in _OBJECT_LIMITED_METRICS:
         return OBJECT_COUNT_LIMIT
     return None
+
+
+# ---------- 进程组（tree / name 任务）----------
+# 一个组任务由若干同名成员（同名进程的所有实例合并为一个成员）组成。库里的序列命名：
+# 合计序列直接用原指标键，现有分析、报告、导出看到的就是合计；成员序列用
+# "指标@成员键"（成员键 = 进程名小写）。"@" 的拼接与拆分全项目只走下面三个函数。
+
+# 成员序列键里指标与成员键之间的分隔符（指标键不含 "@"，按第一个 "@" 拆分）
+MEMBER_SEPARATOR = "@"
+# 进程组专属指标"进程总数"：只给 tree / name 任务用，不在可选集合（all_metric_types）里
+PROCESS_COUNT = "process_count"
+# 一个组任务最多为多少种成员名建成员序列；超出的进程只计入合计
+MAX_GROUP_MEMBERS = 20
+
+
+def normalize_member_key(name: str) -> str:
+    """进程名 → 成员键（去首尾空白并小写；Windows 进程名不区分大小写）。"""
+    return (name or "").strip().lower()
+
+
+def member_series_key(metric: str, member_key: str) -> str:
+    """成员序列的指标键："指标@成员键"。"""
+    return f"{metric}{MEMBER_SEPARATOR}{member_key}"
+
+
+def split_member_key(series_key: str) -> Tuple[str, Optional[str]]:
+    """序列键 → (指标键, 成员键)；合计序列（不含 "@"）的成员键为 None。"""
+    metric, sep, member = series_key.partition(MEMBER_SEPARATOR)
+    return (metric, member) if sep else (series_key, None)
+
+
+def is_member_series(series_key: str) -> bool:
+    """是否成员序列（键里带 "@"）。"""
+    return MEMBER_SEPARATOR in series_key
+
+
+class GroupAggregation(Enum):
+    """一个指标在进程组里的聚合方式（由 MetricKind 派生，见 group_aggregation）。"""
+
+    SUM = "sum"              # 各实例求和（水位类：字节、个数、百分比）
+    DELTA_SUM = "delta_sum"  # 虚拟累计：各实例自首次出现以来的正增量之和（累计类）
+    NONE = "none"            # 对组不适用（峰值类等）
+
+
+_GROUP_AGGREGATION_BY_KIND = {
+    MetricKind.BYTES_KB: GroupAggregation.SUM,
+    MetricKind.COUNT: GroupAggregation.SUM,
+    MetricKind.PERCENT: GroupAggregation.SUM,
+    MetricKind.SECONDS: GroupAggregation.DELTA_SUM,
+    MetricKind.CUMULATIVE_COUNT: GroupAggregation.DELTA_SUM,
+    MetricKind.CUMULATIVE_BYTES: GroupAggregation.DELTA_SUM,
+    MetricKind.PEAK: GroupAggregation.NONE,
+}
+
+# 进程组专属指标（不进 REGISTRY：它不是单个进程的指标，没有采样函数，pid 任务不可选）
+GROUP_SPECS = (
+    MetricSpec(
+        PROCESS_COUNT, "进程总数", "个", "进程组", MetricKind.COUNT,
+        "进程组里当前存活的进程实例数，持续上涨说明子进程创建后没有退出（进程泄漏）",
+        in_leak_preset=False, cost=COST_SNAPSHOT),
+)
+GROUP_REGISTRY: Dict[str, MetricSpec] = {s.key: s for s in GROUP_SPECS}
+
+
+def group_aggregation(metric_type: str) -> GroupAggregation:
+    """指标在进程组里的聚合方式：由 kind 派生，不逐指标手写；MetricSpec.group_applicable
+    为 False 的指标与未知键为 NONE（对组不适用）。成员序列键按其指标部分判断。"""
+    found = _find_spec(metric_type)
+    if found is None or not found.group_applicable:
+        return GroupAggregation.NONE
+    return _GROUP_AGGREGATION_BY_KIND.get(found.kind, GroupAggregation.NONE)
+
+
+def is_group_only_metric(metric_type: str) -> bool:
+    """是否进程组专属指标（进程总数）：pid 任务不可选。"""
+    return split_member_key(metric_type)[0] in GROUP_REGISTRY
+
+
+def group_selectable_metrics() -> List[str]:
+    """组任务（tree / name）可选的指标键：对组适用的常规指标，加上进程组专属指标。"""
+    selectable = [m for m in all_metric_types()
+                  if group_aggregation(m) is not GroupAggregation.NONE]
+    return selectable + list(GROUP_REGISTRY)
+
+
+def group_unsupported_metrics(metrics: Sequence[str]) -> List[str]:
+    """metrics 中对组不适用的指标（峰值类、基本优先级），保持原顺序。"""
+    return [m for m in metrics if group_aggregation(m) is GroupAggregation.NONE]
+
+
+def filter_group_metrics(metrics: Sequence[str]) -> List[str]:
+    """剔除对组不适用的指标，保持原顺序（组任务选择指标时用）。"""
+    return [m for m in metrics if group_aggregation(m) is not GroupAggregation.NONE]

@@ -8,15 +8,20 @@ import time
 import uuid
 from datetime import datetime
 from enum import Enum
-from typing import TYPE_CHECKING, Dict, Optional, List
+from typing import TYPE_CHECKING, Dict, Optional, List, Tuple
 from PyQt5.QtCore import QThread, pyqtSignal
 
 from core.contracts import StopReason, TaskStatus, UnavailableReason
 from core.cycle_stats import CycleStats
+from core.group_aggregator import MemberSnapshot
+from core.group_collector import GroupCollector
 from core.process_collector import ProcessCollector
+from core.process_tree import GroupSpec
 from core.snapshot_hub import SnapshotHub
-from data.models import DataPoint, QualityStats, TaskRecord
-from utils.metrics import MetricType
+from data.mappers import to_ms
+from data.models import (TARGET_PID, DataPoint, MemberRecord, QualityStats, TaskRecord)
+from data.errors import StorageError
+from utils.metrics import MetricType, is_member_series
 import config
 
 if TYPE_CHECKING:
@@ -30,6 +35,10 @@ MAX_BUFFER_SIZE = 1000
 CONSECUTIVE_FAILURE_NOTIFY_THRESHOLD = 3
 # flush 持续失败时的日志节流：首次必记，之后每隔该次数记一条（带累计次数）
 FLUSH_FAILURE_LOG_INTERVAL = 100
+
+# 进程组实例留痕（task_members）写库失败时缓冲上限：超出丢弃最旧的，防止库长时间不可写时
+# 内存无界增长（留痕只是附带信息，丢几条不影响采集数据）
+MAX_PENDING_MEMBER_CHANGES = 5000
 
 # 暂停/恢复时自动写入的系统打点 {kind: 标签}：分析时据此把暂停期间识别为空洞，
 # 而不是误判为"进程在这段时间没有变化"
@@ -107,12 +116,17 @@ class MonitorWorker(QThread):
     error_occurred = pyqtSignal(str, str)   # 错误信号 (task_id, error_message)
     # 指标不可用信号 (task_id, {指标类型: UnavailableReason})：每个指标每个任务只通知一次
     metrics_unavailable = pyqtSignal(str, dict)
+    # 进程组任务的成员集合变化 (task_id)：已建成员列表或"有实例的成员"集合与上个周期不同
+    # （首个周期也发一次）；pid 任务不发
+    members_changed = pyqtSignal(str)
 
     def __init__(self, pid: int, process_name: str, metric_types: List[str],
                  interval: float = None, task_id: str = None, db: "Database" = None,
                  note: str = '', create_time: Optional[float] = None,
                  *, clock: Optional[SystemClock] = None,
-                 hub: Optional[SnapshotHub] = None):
+                 hub: Optional[SnapshotHub] = None,
+                 group_spec: Optional[GroupSpec] = None,
+                 tree_source=None):
         """
         初始化监控任务
 
@@ -134,6 +148,11 @@ class MonitorWorker(QThread):
                 快照取值，且截止时间对齐到 hub 的相位网格（见 _first_deadline），同周期
                 任务在同一时刻采样、共用一份快照；None 时行为与旧版相同。hub 的相位原点
                 与本线程的截止时间应来自同一单调时钟（生产环境均为 time.monotonic）
+            group_spec: 进程组目标（tree / name，见 core.process_tree.GroupSpec）；None 为
+                单个进程（pid，行为与旧版完全相同）。给定时 pid / process_name 仍是任务行
+                的显示字段（tree 为根进程，name 的 pid 为 0）
+            tree_source: 进程组成员来源（ProcessTreeSource），None 用从快照解析的生产实现；
+                测试注入假实现
         """
         if db is None:
             raise TypeError("MonitorWorker 需要注入 db（不再自建数据库连接）")
@@ -164,7 +183,14 @@ class MonitorWorker(QThread):
 
         # 数据采集器
         self._hub = hub
-        if hub is not None:
+        self.group_spec = group_spec
+        self.target_kind = group_spec.kind if group_spec is not None else TARGET_PID
+        if group_spec is not None:
+            self.collector = GroupCollector(
+                group_spec, source=tree_source, hub=hub,
+                max_age_s=SnapshotHub.max_age_for(self.interval),
+                label=self.task_id[:8])
+        elif hub is not None:
             self.collector = ProcessCollector(
                 pid, hub=hub, max_age_s=SnapshotHub.max_age_for(self.interval))
         else:
@@ -183,6 +209,15 @@ class MonitorWorker(QThread):
         # 已通知过 UI 的不可用指标（每个指标每个任务只通知一次，避免每周期刷屏）
         self._unavailable_notified = set()
 
+        # 进程组任务：成员快照与实例留痕（task_members）的待写缓冲。留痕只在实例出现或消失时
+        # 才有变化，和样本一起在 _flush_buffer 里批量写，不为每个周期单独开事务
+        self._group_members: Tuple[MemberSnapshot, ...] = ()
+        self._members_truncated = False
+        self._group_last_ms: Optional[int] = None
+        self._pending_appeared: List[MemberRecord] = []
+        self._pending_last_seen: Dict[tuple, tuple] = {}
+        self._member_flush_failures = 0
+
         # 数据库（与 MonitorManager 持有同一实例）
         self.db = db
 
@@ -198,6 +233,8 @@ class MonitorWorker(QThread):
             status=TaskStatus.PENDING,
             note=self.note,
             create_time=create_time,   # 随任务行落库，供事后识别 PID 复用
+            target_kind=self.target_kind,
+            target_spec=group_spec.to_json() if group_spec is not None else None,
         )
 
     # ========== 状态 ==========
@@ -364,11 +401,14 @@ class MonitorWorker(QThread):
                             value=value,
                             metric_type=metric_type,
                         ))
+                    if self.group_spec is not None:
+                        self._after_group_cycle(timestamp)
 
                     # 发送更新信号（新建dict，避免emit后被修改）；全部指标本周期都不可用
-                    # 时 values 为空，没有数据落库，不 emit（否则卡片采集次数虚增）
+                    # 时 values 为空，没有数据落库，不 emit（否则卡片采集次数虚增）。进程组
+                    # 的成员序列不进信号（卡片只看合计，成员经 group_members() 取）
                     if values:
-                        self.data_updated.emit(self.task_id, dict(values))
+                        self.data_updated.emit(self.task_id, self._signal_values(values))
 
                     # 本周期新出现的不可用指标，一次性通知 UI（已通知过的不重复）
                     self._notify_unavailable()
@@ -393,6 +433,42 @@ class MonitorWorker(QThread):
 
         stats.end_segment(clock.monotonic())
         return stop_reason
+
+    def _signal_values(self, values: Dict[str, float]) -> Dict[str, float]:
+        """data_updated 的载荷：pid 任务原样；进程组只带合计序列（去掉 指标@成员 的序列）。"""
+        if self.group_spec is None:
+            return dict(values)
+        return {k: v for k, v in values.items() if not is_member_series(k)}
+
+    def _after_group_cycle(self, timestamp: datetime) -> None:
+        """进程组本周期的收尾：取走成员快照、把实例的出现与消失记进待写缓冲、成员集合变化
+        时通知。消失实例的 last_ms 取上个周期的时刻（它最后一次被看到）。"""
+        group = getattr(self.collector, 'last_group', None)
+        if group is None:
+            return
+        now_ms = to_ms(timestamp)
+        for info in group.appeared:
+            self._pending_appeared.append(MemberRecord(
+                self.task_id, info.pid, info.create_time, info.name, now_ms, now_ms))
+        for info in group.disappeared:
+            self._pending_last_seen[info.key] = (
+                self.task_id, info.pid, info.create_time,
+                self._group_last_ms if self._group_last_ms is not None else now_ms)
+        self._group_last_ms = now_ms
+        self._group_members = group.members
+        self._members_truncated = group.members_truncated
+        if group.members_changed:
+            self.members_changed.emit(self.task_id)
+
+    def group_members(self) -> Tuple[MemberSnapshot, ...]:
+        """进程组当前的成员快照（已建序列的全部成员，含本周期没有实例的）；pid 任务为空。
+        可在任意线程调用（引用整体替换，读到的总是某个周期完整的快照）。"""
+        return self._group_members
+
+    @property
+    def members_truncated(self) -> bool:
+        """进程组是否出现过因成员名超过上限而没建序列的进程。"""
+        return self._members_truncated
 
     def _first_deadline(self, now: float, cpu_primed: bool) -> float:
         """
@@ -508,6 +584,8 @@ class MonitorWorker(QThread):
         Args:
             reason: 停止原因
         """
+        # 仍存活的实例以最后一个周期为"最后一次见到"
+        self._close_members()
         # 收尾 flush 没有下一轮重试机会，失败也要继续走完收尾流程
         try:
             self._flush_buffer(is_teardown=True)
@@ -572,9 +650,14 @@ class MonitorWorker(QThread):
         Args:
             is_teardown: 是否为收尾阶段的最后一次 flush（无重试机会，失败需明确记日志）
         """
-        if not self._data_buffer:
-            return
+        points_ok = True
+        if self._data_buffer:
+            points_ok = self._flush_points(is_teardown)
+        if points_ok or is_teardown:
+            self._flush_members(is_teardown)
 
+    def _flush_points(self, is_teardown: bool) -> bool:
+        """把缓冲的数据点写库；成功返回 True（缓冲已清空），失败返回 False（缓冲保留）。"""
         success = self._ensure_task_row() and self.db.save_data_points(self._data_buffer)
 
         if success:
@@ -584,7 +667,7 @@ class MonitorWorker(QThread):
             self._data_buffer.clear()
             self._flush_fail_count = 0
             self._notified = False
-            return
+            return True
 
         # 失败：缓冲保留，等待下一轮重试
         self._flush_fail_count += 1
@@ -612,6 +695,46 @@ class MonitorWorker(QThread):
             # 收尾阶段失败没有下一轮重试机会，明确记录未落库条数
             logger.error("task_id=%s 任务收尾 flush 失败，%d 条数据未落库",
                          self.task_id, len(self._data_buffer))
+        return False
+
+    def _close_members(self) -> None:
+        """收尾：把仍存活的进程组实例的 last_ms 记为最后一个周期的时刻。"""
+        if self.group_spec is None or self._group_last_ms is None:
+            return
+        try:
+            for info in self.collector.alive_instances():
+                self._pending_last_seen[info.key] = (
+                    self.task_id, info.pid, info.create_time, self._group_last_ms)
+        except Exception:
+            logger.error("task_id=%s 收尾记录进程组实例失败", self.task_id, exc_info=True)
+
+    def _flush_members(self, is_teardown: bool = False) -> None:
+        """把待写的实例出现 / 消失一个事务写进 task_members。失败保留缓冲（下次 flush 重试），
+        日志节流同数据点；缓冲超限丢弃最旧的。留痕只是附带信息，失败不影响采集。"""
+        if not (self._pending_appeared or self._pending_last_seen):
+            return
+        store = getattr(self.db, 'members', None)
+        if store is None:
+            self._pending_appeared.clear()
+            self._pending_last_seen.clear()
+            return
+        try:
+            store.apply(list(self._pending_appeared), list(self._pending_last_seen.values()))
+        except StorageError:
+            self._member_flush_failures += 1
+            if (self._member_flush_failures == 1
+                    or self._member_flush_failures % FLUSH_FAILURE_LOG_INTERVAL == 0):
+                logger.error("task_id=%s 保存进程组成员留痕失败（连续第%d次），保留待重试",
+                             self.task_id, self._member_flush_failures, exc_info=True)
+            overflow = len(self._pending_appeared) - MAX_PENDING_MEMBER_CHANGES
+            if overflow > 0:
+                del self._pending_appeared[:overflow]
+            if is_teardown:
+                logger.error("task_id=%s 收尾时进程组成员留痕未落库", self.task_id)
+            return
+        self._member_flush_failures = 0
+        self._pending_appeared.clear()
+        self._pending_last_seen.clear()
 
 
 # 旧名兼容：保留一个版本，新代码请用 MonitorWorker

@@ -24,7 +24,7 @@ HistoryRequest、把结果定型为 HistorySnapshot，由 run_history_query 同�
 import logging
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from core.analysis.intervals import Boundary, IntervalStats, RoundDelta, round_deltas
 from core.analysis.series import count_rises, per_second_rates
@@ -37,7 +37,8 @@ from data.models import DataPoint, Marker
 from data.repos.analytics_repo import Bucket
 from data.repos.point_repo import PointQuery
 from utils.metrics import (
-    VALUE_CLASS_LEVEL, VALUE_CLASS_PEAK, VALUE_CLASS_RATE, spec, value_class)
+    VALUE_CLASS_LEVEL, VALUE_CLASS_PEAK, VALUE_CLASS_RATE, member_series_key, spec,
+    split_member_key, value_class)
 
 logger = logging.getLogger(__name__)
 
@@ -532,10 +533,30 @@ class TaskAnalysis:
     snapshots: Dict[str, HistorySnapshot]
     request_seq: int = 0
     auto_refresh: bool = False
+    # 进程组任务（tree / name）的成员序列快照 {"指标@成员键": 快照}，按成员、指标的建立顺序；
+    # pid 任务为空。判定把它们和合计一起看（见 core.verdict）。用 load_member_snapshots 取
+    member_snapshots: Dict[str, HistorySnapshot] = field(default_factory=dict)
 
     @property
     def metrics(self) -> List[str]:
         return list(self.snapshots)
+
+    @property
+    def member_keys(self) -> List[str]:
+        """有成员序列快照的成员键（去重，保持顺序）。"""
+        keys: List[str] = []
+        for series_key in self.member_snapshots:
+            member = split_member_key(series_key)[1]
+            if member is not None and member not in keys:
+                keys.append(member)
+        return keys
+
+    def member_snapshot(self, metric: Optional[str],
+                        member: Optional[str]) -> Optional[HistorySnapshot]:
+        """某成员某指标的快照；没有为 None。"""
+        if not metric or member is None:
+            return None
+        return self.member_snapshots.get(member_series_key(metric, member))
 
     def snapshot(self, metric: Optional[str]) -> Optional[HistorySnapshot]:
         return self.snapshots.get(metric) if metric else None
@@ -549,6 +570,34 @@ class TaskAnalysis:
     @property
     def has_data(self) -> bool:
         return any(s.points for s in self.snapshots.values())
+
+
+def member_series_keys(db, task_id: str, metrics: Sequence[str]) -> List[str]:
+    """进程组任务里已有样本的成员序列键 "指标@成员键"（只含 metrics 里的指标，按序列建立
+    顺序）。pid 任务与没有成员仓储的库返回空列表。"""
+    members = getattr(db, 'members', None)
+    if members is None:
+        return []
+    wanted = set(metrics)
+    return [member_series_key(base, member) for base, member in members.member_series(task_id)
+            if base in wanted]
+
+
+def load_member_snapshots(db, task_id: str, metrics: Sequence[str], range_key: str, *,
+                          analysis: bool = True,
+                          is_cancelled: Optional[Callable[[], bool]] = None
+                          ) -> Optional[Dict[str, HistorySnapshot]]:
+    """逐成员序列跑 run_history_query（与合计序列同一函数、同一范围，口径一致）。
+
+    返回 {序列键: 快照}；pid 任务为空字典。is_cancelled 为真时返回 None（调用方据此放弃）。
+    存储故障转成快照的 error，由调用方像对合计快照一样处理。"""
+    snapshots: Dict[str, HistorySnapshot] = {}
+    for key in member_series_keys(db, task_id, metrics):
+        if is_cancelled is not None and is_cancelled():
+            return None
+        snapshots[key] = run_history_query(
+            db, build_request(task_id, key, range_key, analysis=analysis))
+    return snapshots
 
 
 def _known(metric: str) -> bool:

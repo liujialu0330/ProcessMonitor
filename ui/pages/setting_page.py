@@ -24,8 +24,8 @@ from qfluentwidgets import (
 from app_config import cfg
 from core.diagnostics import collect_diagnostics, write_diagnostic_bundle
 from core.maintenance_service import (
-    BUSY_EXPORT_RUNNING, BUSY_MAINTENANCE_RUNNING, BUSY_TASKS_RUNNING,
-    MaintenanceBusy, MaintenanceService,
+    BUSY_EXPORT_RUNNING, BUSY_MAINTENANCE_RUNNING, BUSY_STORAGE_JOB_RUNNING,
+    BUSY_TASKS_RUNNING, MaintenanceBusy, MaintenanceService,
 )
 from core.workers.base import BackgroundTask, CancelToken
 from core.workers.cleanup_worker import CleanupWorker
@@ -36,6 +36,7 @@ from ui.hotkey import (
 )
 from ui.pages.about_update import AboutUpdateGroup
 from ui.services import UiServices
+from ui.storage_notices import INTEGRITY_TITLE, integrity_card_content
 from ui.typography import PageTitleLabel
 from ui.widgets.qfw_compat import CnSwitchSettingCard
 import config
@@ -109,6 +110,7 @@ _BUSY_REASON_TEXTS = {
     # 导出线程长时间读库，与压缩数据库互相抢锁
     BUSY_EXPORT_RUNNING: "正在导出数据，请等导出完成后再清理数据库",
     BUSY_MAINTENANCE_RUNNING: "数据库正在清理中，请稍候",
+    BUSY_STORAGE_JOB_RUNNING: "数据库正在做例行整理，请几秒后再试",
 }
 _BUSY_FALLBACK_TEXT = "数据库正忙，请稍后再清理"
 # 重建汇总被拒绝的原因 → 提示文案
@@ -116,6 +118,7 @@ _REBUILD_BUSY_TEXTS = {
     BUSY_TASKS_RUNNING: "有监控任务正在运行，请先停止全部任务再重建汇总",
     BUSY_EXPORT_RUNNING: "正在导出数据，请等导出完成后再重建汇总",
     BUSY_MAINTENANCE_RUNNING: "数据库正在维护中，请稍候",
+    BUSY_STORAGE_JOB_RUNNING: "数据库正在做例行整理，请几秒后再试",
 }
 _REBUILD_BUSY_FALLBACK_TEXT = "数据库正忙，请稍后再重建汇总"
 
@@ -252,6 +255,8 @@ class SettingPage(ScrollArea):
         self._diagnostics_provider = diagnostics_provider
         self._bundle_worker: Optional[DiagnosticBundleWorker] = None
         self.open_bundle_folder_button: Optional[PushButton] = None
+        # "数据"分组顶部的完整性警告卡片（quick_check 未通过时才显示，见 show_integrity_warning）
+        self.integrity_card: Optional[SettingCard] = None
 
         # 承载各设置分组的滚动内容容器
         self.scroll_widget = QWidget()
@@ -323,6 +328,7 @@ class SettingPage(ScrollArea):
     def _init_data_group(self):
         """数据：历史数据保留 · 压缩数据库 · 重建汇总 · 数据目录 · 报告配色 · 诊断信息"""
         self.data_group = SettingCardGroup("数据", self.scroll_widget)
+        self._init_integrity_card()
         # 选项文案与 ConfigItem 校验器的可选值逐一对应：可选值只在应用配置里定义一份
         retention_texts = [_retention_text(days)
                            for days in self.services.preferences.retention_options()]
@@ -379,6 +385,27 @@ class SettingPage(ScrollArea):
             self.export_diagnostics_button, 0, Qt.AlignRight)
         self.diagnostics_card.hBoxLayout.addSpacing(16)
         self.data_group.addSettingCard(self.diagnostics_card)
+
+    def _init_integrity_card(self) -> None:
+        """"数据"分组的第一张卡片：数据库完整性检查未通过时的警告，平时隐藏。
+        卡片先加入再隐藏：ExpandLayout 不处理中途插入，显示时只需让分组重新量高。"""
+        self.integrity_card = SettingCard(
+            FIF.INFO, INTEGRITY_TITLE, "", parent=self.data_group)
+        self.integrity_copy_button = PushButton(COPY_DIAGNOSTICS_TEXT, self.integrity_card)
+        self.integrity_copy_button.clicked.connect(self.copy_diagnostics)
+        self.integrity_card.hBoxLayout.addWidget(self.integrity_copy_button, 0, Qt.AlignRight)
+        self.integrity_card.hBoxLayout.addSpacing(16)
+        self.data_group.addSettingCard(self.integrity_card)
+        self.integrity_card.hide()
+
+    def show_integrity_warning(self, summary: str) -> None:
+        """quick_check 未通过：显示"数据"分组顶部的警告卡片（由主窗口在存储守卫发信号时调用）"""
+        card = self.integrity_card
+        if card is None:
+            return
+        card.setContent(integrity_card_content(summary))
+        card.show()
+        self.data_group.adjustSize()
 
     def _init_layout(self):
         """整体布局：ScrollArea + ExpandLayout 承载各分组

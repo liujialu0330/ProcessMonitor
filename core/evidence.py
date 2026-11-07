@@ -32,11 +32,11 @@ from core.analysis.intervals import mean_round_delta
 from core.history_query import HistorySnapshot, TaskAnalysis
 from core.report import process_stem, quality_text, safe_filename_part
 from core.target_info import TargetInfo, target_info_from_json_or_none
-from data.models import Marker, MonitorTask, QualityStats
+from data.models import TARGET_NAME, TARGET_PID, TARGET_TREE, Marker, MonitorTask, QualityStats
 from utils.logger import LOG_BACKUP_COUNT
 from utils.metrics import (VALUE_CLASS_PEAK, VALUE_CLASS_RATE, format_metric_delta,
                            format_metric_rate, format_metric_value,
-                           get_metric_display_name, get_metric_unit)
+                           get_metric_display_name, get_metric_unit, split_member_key)
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +94,10 @@ TEXT_VS_BASELINE = "较基线 {delta}（{start} → {last}）"
 TEXT_VS_FIRST = "较开始 {delta}（{start} → {last}）"
 TEXT_CURRENT = "当前 {value}"
 README_TASK = "任务：{process}（PID {pid}）"
+README_TASK_TREE = "任务：{process}（进程树，根进程 PID {pid}）"
+README_TASK_NAME = "任务：全部名为 {process} 的进程"
+README_MEMBER = "成员 {member}：{verdict}"
+README_MEMBER_INDENT = "  "
 README_NOTE = "备注：{note}"
 README_PERIOD = "时间：{start} ~ {end}"
 README_RUNNING = "进行中"
@@ -255,15 +259,32 @@ def target_exited_before_condition(task: MonitorTask, stop_reason: Any,
 def analysis_verdict(analysis: TaskAnalysis, *, stop_reason: Any = None,
                      stopped_before_condition: bool = False) -> Dict[str, Any]:
     """{overall, metrics: [...]}（给了 stop_reason 时另附 stop_reason）；任一快照查询失败
-    抛 EvidenceError。"""
+    抛 EvidenceError。进程组任务另附 members = [{key, verdict, metrics}]：每个成员各指标的
+    判定（条目同 metrics，key 为 "指标@成员键"，另有 metric / member）；整体判定把合计与
+    全部成员一起看。pid 任务没有 members 字段。"""
     metrics = []
     for metric, snapshot in analysis.snapshots.items():
         if snapshot.error is not None:
             raise EvidenceError(MSG_ANALYSIS_FAILED.format(detail=snapshot.error))
         metrics.append(metric_verdict(metric, snapshot))
+    members: List[Dict[str, Any]] = []
+    for key, snapshot in verdict_rules.member_snapshots_of(analysis).items():
+        if snapshot.error is not None:
+            raise EvidenceError(MSG_ANALYSIS_FAILED.format(detail=snapshot.error))
+        metric, member = split_member_key(key)
+        entry = {**metric_verdict(key, snapshot), 'metric': metric, 'member': member}
+        group = next((g for g in members if g['key'] == member), None)
+        if group is None:
+            group = {'key': member, 'verdict': None, 'metrics': []}
+            members.append(group)
+        group['metrics'].append(entry)
+    for group in members:
+        group['verdict'] = verdict_rules.combine_verdicts(m['verdict'] for m in group['metrics'])
     result = {'overall': verdict_rules.overall_verdict(
         analysis, stop_reason=stop_reason, stopped_before_condition=stopped_before_condition),
         'metrics': metrics}
+    if members:
+        result['members'] = members
     if stop_reason is not None:
         result['stop_reason'] = verdict_rules.stop_reason_value(stop_reason)
     return result
@@ -296,7 +317,7 @@ def _marker_dicts(markers: Iterable[Marker]) -> List[Dict[str, Any]]:
 def _task_dict(task: MonitorTask) -> Dict[str, Any]:
     create_time = (datetime.fromtimestamp(task.create_time)
                    if task.create_time and task.create_time > 0 else None)
-    return {
+    result = {
         'task_id': task.task_id,
         'process_name': task.process_name,
         'pid': task.pid,
@@ -311,6 +332,11 @@ def _task_dict(task: MonitorTask) -> Dict[str, Any]:
         'sample_count': task.sample_count,
         'process_create_time': _iso(create_time),
     }
+    if task.target_kind != TARGET_PID:
+        # 进程组任务：监控目标的类型与参数（pid 任务沿用旧结构，不加这两个字段）
+        result['target_kind'] = task.target_kind
+        result['target_spec'] = _plan_value(task.target_spec)[0]
+    return result
 
 
 def build_task_payload(task: MonitorTask, analysis: TaskAnalysis, *, target: Optional[TargetInfo],
@@ -391,6 +417,8 @@ def overall_line(verdict: Dict[str, Any]) -> str:
     overall = verdict['overall']
     if overall == VERDICT_RISING:
         names = [m['name'] for m in verdict['metrics'] if m['verdict'] == VERDICT_RISING]
+        names += [m['name'] for g in verdict.get('members') or [] for m in g['metrics']
+                  if m['verdict'] == VERDICT_RISING]
         return OVERALL_RISING.format(names=NAME_SEPARATOR.join(names))
     if overall == VERDICT_INSUFFICIENT:
         return OVERALL_INSUFFICIENT
@@ -409,8 +437,14 @@ def readme_text(task: MonitorTask, payload: Dict[str, Any], *, target: Optional[
     verdict = payload['verdict']
     lines = [overall_line(verdict)]
     lines += [metric_line(item) for item in verdict['metrics']]
+    for group in verdict.get('members') or []:
+        lines.append(README_MEMBER.format(
+            member=group['key'], verdict=VERDICT_TEXTS.get(group['verdict'], group['verdict'])))
+        lines += [README_MEMBER_INDENT + metric_line(item) for item in group['metrics']]
     lines.append('')
-    lines.append(README_TASK.format(process=task.process_name, pid=task.pid))
+    task_text = {TARGET_TREE: README_TASK_TREE, TARGET_NAME: README_TASK_NAME}.get(
+        task.target_kind, README_TASK)
+    lines.append(task_text.format(process=task.process_name, pid=task.pid))
     if (task.note or '').strip():
         lines.append(README_NOTE.format(note=' '.join(task.note.split())))
     lines.append(README_PERIOD.format(start=_time_text(task.start_time),

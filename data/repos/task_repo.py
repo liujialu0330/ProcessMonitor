@@ -3,7 +3,8 @@
 
 sample_count / last_sample_at 不归这里写：它们只由 PointRepo.append（写入时累加）与
 PointRepo.recount（重算）维护，save() 刻意不覆盖，避免重复保存任务时把累计值清零。
-v5 为后续版本预留的列（target_kind 等）模型尚未携带，save() 同样不碰它们；plan_json
+v5 为后续版本预留的列中，target_kind / target_spec 只在插入时写入（目标类型创建后不变），
+其余（group_id 等）模型尚未携带，save() 不碰；plan_json
 （自动化方案）模型会读出，但只经 save_plan 写入，save() 也不碰它；meta_json（被测目标
 元数据）同理，只经 save_meta 写入；数据质量列（planned_cycles 等）同理，只经 save_quality 写入。
 """
@@ -77,6 +78,8 @@ class TaskRepo:
             status_value(task.status),
             task.note or '',
             task.create_time,
+            task.target_kind or 'pid',
+            task.target_spec,
         )
         with storage_errors(f"保存任务 {task.task_id} "):
             with self._factory.transaction() as cursor:
@@ -86,8 +89,8 @@ class TaskRepo:
                 conn.execute('''
                     INSERT INTO tasks
                     (task_id, pid, process_name, metric_type, interval, start_time,
-                     end_time, status, note, create_time)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     end_time, status, note, create_time, target_kind, target_spec)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(task_id) DO UPDATE SET
                         pid = excluded.pid,
                         process_name = excluded.process_name,
