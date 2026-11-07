@@ -11,7 +11,8 @@
 抛 StorageError（导出必须知道读取是否完整）。
 
 只读模式（read_only=True）：库由更高版本写入、当前版本不能安全修改时使用（判定见
-data.db.meta.reader_blocked）。不跑迁移；所有仓储写入抛 StorageError，门面旧写方法
+data.db.meta.reader_blocked）；或升级失败、库仍是旧结构时（schema_mismatch=True，本版本的
+读写都按 v5 结构写成，不能在旧结构上写入）。不跑迁移；所有仓储写入抛 StorageError，门面旧写方法
 按原语义返回 False。
 """
 import logging
@@ -52,7 +53,8 @@ class Database:
 
     def __init__(self, db_path: str = None, migrate: bool = True,
                  migration_report: Optional[MigrationReport] = None,
-                 read_only: bool = False, newer_version: Optional[str] = None):
+                 read_only: bool = False, newer_version: Optional[str] = None,
+                 schema_mismatch: bool = False):
         """
         Args:
             db_path: 数据库文件路径，默认使用 config 中的配置
@@ -62,8 +64,12 @@ class Database:
             migration_report: migrate=False 时由调用方已跑出的迁移报告，用于映射提示标志
             read_only: 只读打开（见模块说明）；为 True 时不跑迁移
             newer_version: 只读打开时，写入本库的更高版本号（主窗口提示用；组合根由 meta 给出）
+            schema_mismatch: 库没能升级、仍是旧结构（组合根按迁移报告判定）；为 True 时
+                一律只读打开
         """
         self.db_path = db_path or config.DB_PATH
+        self.schema_mismatch = schema_mismatch
+        read_only = read_only or schema_mismatch
         self.read_only = read_only
         self.newer_version: Optional[str] = newer_version if read_only else None
         self._factory = ConnectionFactory(self.db_path, read_only=read_only)
@@ -131,13 +137,21 @@ class Database:
             logger.error("孤儿任务校正失败", exc_info=True)
             return 0
 
-    def import_legacy_points(self) -> int:
+    def import_legacy_points(self, on_progress=None) -> int:
         """导回回退 1.4.1 期间写入 data_points 的样本（见 Maintenance.import_legacy_points）；
         返回导回前的行数，失败返回 0"""
         try:
-            return self.maintenance.import_legacy_points()
+            return self.maintenance.import_legacy_points(on_progress=on_progress)
         except StorageError:
             logger.error("导回降级期间写入的数据点失败", exc_info=True)
+            return 0
+
+    def legacy_points_pending(self) -> int:
+        """待导回的 data_points 行数（见 Maintenance.legacy_points_pending）；失败返回 0"""
+        try:
+            return self.maintenance.legacy_points_pending()
+        except StorageError:
+            logger.error("检查降级期间写入的数据点失败", exc_info=True)
             return 0
 
     def purge_orphan_series(self) -> int:

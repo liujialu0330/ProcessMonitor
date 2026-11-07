@@ -96,6 +96,30 @@ def test_close_to_tray_switch_uses_chinese_text(setting, tmp_path):
     assert card.switchButton.text == "开"
 
 
+def test_keep_awake_switch_roundtrips_config(setting, tmp_path):
+    """"监控期间阻止电脑睡眠"开关：默认开，点击写配置并落盘，配置变化反映到开关"""
+    from ui.pages.setting_page import KEEP_AWAKE_CONTENT, KEEP_AWAKE_TITLE
+
+    config_path = tmp_path / "keep_awake_config.json"
+    qconfig.load(str(config_path), cfg)
+    item = cfg.keep_awake_while_monitoring
+    try:
+        card = setting.keep_awake_card
+        assert card.titleLabel.text() == KEEP_AWAKE_TITLE
+        assert card.contentLabel.text() == KEEP_AWAKE_CONTENT
+        assert card.isChecked() is True and card.switchButton.text == "开"
+
+        card.switchButton.toggleChecked()          # 用户点击
+        assert cfg.get(item) is False
+        assert card.switchButton.text == "关"
+        assert '"KeepAwakeWhileMonitoring": false' in config_path.read_text(encoding='utf-8')
+
+        qconfig.set(item, True, save=False)        # 配置变化回显到开关
+        assert card.isChecked() is True
+    finally:
+        item.value = item.defaultValue
+
+
 # ---------- 数据目录 ----------
 
 def test_open_data_dir_goes_through_dialogs(setting, dialogs, notifier):

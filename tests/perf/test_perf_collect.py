@@ -79,6 +79,82 @@ def test_list_processes_cold_and_hot(perf, subprocess_env):
                       desc=f'process_catalog.list_processes 热（同进程第二次，{count} 个进程）')
 
 
+# ---------------------------------------------------------------- 快照路径
+# 以下条目在 budgets.json 回填前只记录、不按预算比较（PerfSession.record），改为按
+# 2.0.0 规划的目标值断言：目标 × 机器系数。
+
+# 5 任务 1 秒周期的采集 CPU 目标（规划 §6）：单次快照 + 5 × 每任务从快照取值
+COLLECT_5_TASKS_TARGET_MS_PER_S = 15.0
+# 进程列表冷启动目标（规划 §3 A-5）
+LIST_COLD_TARGET_MS = 100.0
+SNAPSHOT_CALLS = 50
+TASKS = 5
+
+_CATALOG_SNAPSHOT_SCRIPT = '''
+import json, time
+from core import process_catalog
+from core.snapshot_hub import SnapshotHub
+t = time.perf_counter(); hub = SnapshotHub(); n = len(process_catalog.list_processes(hub))
+cold = (time.perf_counter() - t) * 1000
+print(json.dumps({"cold": cold, "count": n, "available": hub.available()}))
+'''
+
+
+def _record(perf, name, samples, unit, desc):
+    value = statistics.median(samples)
+    perf.session.record(name, value, unit, desc, samples)
+    print(f"\n[perf] {name}: 实测 {value:.1f} {unit}（{desc}；仅记录，未入预算）")
+    return value
+
+
+def test_collect_snapshot_path(perf):
+    """单次全系统快照耗时、每任务从快照取泄漏预设 5 项的耗时，换算 5 任务每秒采集开销"""
+    from core.snapshot_hub import SnapshotHub
+    from core.system_snapshot import NtProcessSnapshotter
+
+    snapper = NtProcessSnapshotter()
+    if not snapper.available():
+        pytest.skip(f"全系统快照不可用：{snapper.unavailable_reason}")
+    snapshot_ms = _record(
+        perf, 'snapshot_once_ms', perf.time_ms(snapper.snapshot, repeat=SNAPSHOT_CALLS), 'ms',
+        f'NtQuerySystemInformation 全系统快照（{SNAPSHOT_CALLS} 次中位数，'
+        f'{len(snapper.snapshot().processes)} 个进程）')
+
+    # 快照年龄上限放宽到 1 小时：只计"从已有快照取值 + GDI/USER 逐进程调用"
+    collector = ProcessCollector(os.getpid(), hub=SnapshotHub(snapper), max_age_s=3600)
+    assert collector.collect_metrics(METRICS)
+    assert collector.last_source == 'snapshot'
+    medians = []
+    for _ in range(perf.repeat):
+        calls = []
+        for _ in range(COLLECT_CALLS):
+            begin = time.perf_counter()
+            collector.collect_metrics(METRICS)
+            calls.append((time.perf_counter() - begin) * 1e6)
+        medians.append(statistics.median(calls))
+    per_task_us = _record(perf, 'collect_leak_preset_snapshot_us', medians, 'us',
+                          f'快照路径 collect_metrics 泄漏预设 5 项（不含取快照，'
+                          f'{COLLECT_CALLS} 次中位数）')
+
+    per_second = snapshot_ms + TASKS * per_task_us / 1000
+    perf.session.record('collect_5_tasks_ms_per_s', per_second, 'ms',
+                        '5 任务 1 秒周期采集开销 = 单次快照 + 5 × 每任务取值')
+    limit = COLLECT_5_TASKS_TARGET_MS_PER_S * perf.session.factor
+    print(f"\n[perf] collect_5_tasks_ms_per_s: {per_second:.2f} ms/s（目标 {limit:.1f}）")
+    assert per_second <= limit
+
+
+def test_list_processes_cold_snapshot(perf, subprocess_env):
+    """新进程里经快照首次列出进程（含快照器自检）"""
+    runs = [_run_script(_CATALOG_SNAPSHOT_SCRIPT, subprocess_env) for _ in range(perf.repeat)]
+    if not runs[-1]['available']:
+        pytest.skip("全系统快照不可用")
+    assert all(r['count'] > 0 for r in runs)
+    value = _record(perf, 'list_processes_cold_snapshot', [r['cold'] for r in runs], 'ms',
+                    f"快照路径 list_processes 冷（新进程首次，含自检，{runs[-1]['count']} 个进程）")
+    assert value <= LIST_COLD_TARGET_MS * perf.session.factor
+
+
 def test_import_main_window_cold(perf, subprocess_env):
     """新解释器里 import ui.main_window（含 PyQt5 / qfluentwidgets / pyqtgraph 等全部依赖）"""
     samples = [_run_script(_IMPORT_SCRIPT, subprocess_env)['ms'] for _ in range(perf.repeat)]

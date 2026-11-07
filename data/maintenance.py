@@ -58,15 +58,25 @@ class Maintenance:
             self._checkpoint_truncate()
         return len(task_ids)
 
-    def import_legacy_points(self) -> int:
+    def legacy_points_pending(self) -> int:
+        """data_points 里待导回的行数（1.4.1 降级期间写入；组合根据此决定是否显示进度窗口）"""
+        with storage_errors("检查降级期间写入的数据点"):
+            with self._factory.connect() as conn:
+                return conn.execute('SELECT COUNT(*) FROM data_points').fetchone()[0]
+
+    def import_legacy_points(self, on_progress=None) -> int:
         """
         启动校正：把 data_points 中的行（用户回退 1.4.1 期间由它写入）导回 samples，
         清空 data_points，并重算受影响任务的采样计数（一个事务）。
 
         口径同重建式迁移对 v1 源库的处理：旧内存指标键（memory_vms / memory_pagefile）并入
         memory_private、同一时刻的重复内存指标只留一行，NULL 指标回填为任务首指标，
-        任务已不存在的孤儿行丢弃；任务指标列表里的旧键同样改名。
+        任务已不存在的孤儿行丢弃，时间戳无效的行跳过；任务指标列表里的旧键同样改名。
         data_points 为空时只做一次只读检查，不开写事务。
+
+        Args:
+            on_progress: 进度回调 (阶段名, 已完成, 总数)，阶段同重建式迁移
+                （rebuild.STAGE_SAMPLES / STAGE_ROLLUPS）；在调用线程里同步调用
 
         Returns:
             int: 导回前 data_points 的行数（0 表示无事可做）
@@ -79,9 +89,10 @@ class Maintenance:
             return 0
         with storage_errors("导回降级期间写入的数据点"):
             with self._factory.transaction() as cursor:
-                total, tasks = rebuild.import_legacy_points(cursor.connection)
-        logger.warning("已导回回退旧版本期间写入的数据点: %d 行，涉及任务 %d 个",
-                       total, len(tasks))
+                total, tasks, skipped = rebuild.import_legacy_points(
+                    cursor.connection, on_progress=on_progress)
+        logger.warning("已导回回退旧版本期间写入的数据点: %d 行，涉及任务 %d 个，"
+                       "跳过时间戳无效的行 %d", total, len(tasks), skipped)
         return total
 
     def rebuild_rollups(self) -> int:

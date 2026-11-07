@@ -1,7 +1,7 @@
 """
 模态对话框与系统交互（Dialogs）
 
-确认框、打点标签输入、指标选择、保存路径、关窗三选一，以及打开文件夹/网址、
+确认框、打点标签输入、指标选择、保存路径、选择文件/文件夹、关窗三选一，以及打开文件夹/网址、
 复制图片到剪贴板，统一经由注入的 Dialogs：页面测试换成脚本化替身即可预设
 "用户的选择"，不会弹出阻塞的模态对话框，也不会真的拉起资源管理器或浏览器。
 
@@ -62,6 +62,15 @@ class Dialogs(Protocol):
     def ask_save_path(self, parent: QWidget, title: str, default_path: str,
                       name_filter: str) -> Optional[str]:
         """保存文件对话框：返回规范化后的路径（Windows 反斜杠），取消返回 None。"""
+        ...
+
+    def ask_open_file(self, parent: QWidget, title: str, start_dir: str,
+                      name_filter: str) -> Optional[str]:
+        """选择已有文件的对话框：返回规范化后的路径，取消返回 None。"""
+        ...
+
+    def ask_directory(self, parent: QWidget, title: str, start_dir: str) -> Optional[str]:
+        """选择文件夹的对话框：返回规范化后的路径，取消返回 None。"""
         ...
 
     def ask_close_action(self, parent: QWidget, running_count: int,
@@ -133,6 +142,17 @@ class QtDialogs:
             parent, title, default_path, name_filter)
         # Qt 返回正斜杠路径：规范化后再显示/写入，与资源管理器里看到的一致
         return os.path.normpath(file_path) if file_path else None
+
+    def ask_open_file(self, parent: QWidget, title: str, start_dir: str,
+                      name_filter: str) -> Optional[str]:
+        """选择已有文件（QFileDialog.getOpenFileName）。"""
+        file_path, _ = QFileDialog.getOpenFileName(parent, title, start_dir, name_filter)
+        return os.path.normpath(file_path) if file_path else None
+
+    def ask_directory(self, parent: QWidget, title: str, start_dir: str) -> Optional[str]:
+        """选择文件夹（QFileDialog.getExistingDirectory）。"""
+        directory = QFileDialog.getExistingDirectory(parent, title, start_dir)
+        return os.path.normpath(directory) if directory else None
 
     def ask_close_action(self, parent: QWidget, running_count: int,
                          can_tray: bool) -> str:

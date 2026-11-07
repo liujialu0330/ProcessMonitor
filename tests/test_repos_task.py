@@ -1,6 +1,6 @@
 """
 TaskRepo：UPSERT 语义（不清 note/sample_count/create_time）、查询、状态更新、
-三表级联删除、孤儿任务校正、datetime 强校验与 StorageError 包装
+三表级联删除、孤儿任务校正、datetime 强校验与 StorageError 包装；plan_json 读写且 UPSERT 不清掉它
 """
 import sqlite3
 import uuid
@@ -220,3 +220,51 @@ def test_read_failure_on_missing_table_is_storage_error(repo, factory):
         repo.list_all()
     with pytest.raises(StorageError):
         repo.get('x')
+
+
+# ---------- plan_json（自动化方案） ----------
+
+PLAN_JSON = '{"schema_version": 1, "timed_marker_seconds": 600, "log_path": "D:\\\\日志\\\\a.log"}'
+
+
+def test_save_and_load_plan(repo):
+    task = _task()
+    repo.save(task)
+    assert repo.load_plan(task.task_id) is None
+    assert repo.get(task.task_id).plan_json is None
+
+    assert repo.save_plan(task.task_id, PLAN_JSON) is True
+    assert repo.load_plan(task.task_id) == PLAN_JSON
+    assert repo.get(task.task_id).plan_json == PLAN_JSON
+    assert [t.plan_json for t in repo.list_all()] == [PLAN_JSON]
+
+    assert repo.save_plan(task.task_id, None) is True
+    assert repo.load_plan(task.task_id) is None
+
+
+def test_save_plan_before_task_row_exists_reports_miss(repo):
+    """任务行由采集线程启动时写入：之前调用 save_plan 不新建残缺行，只返回 False"""
+    assert repo.save_plan('not-yet', PLAN_JSON) is False
+    assert repo.get('not-yet') is None
+    assert repo.load_plan('not-yet') is None
+
+
+def test_upsert_does_not_clear_plan(repo):
+    task = _task()
+    repo.save(task)
+    repo.save_plan(task.task_id, PLAN_JSON)
+    # 采集线程收尾时再次保存（模型里 plan_json 为 None）不能把方案清掉
+    repo.save(replace(task, status='stopped', end_time=BASE + timedelta(hours=1)))
+    assert repo.load_plan(task.task_id) == PLAN_JSON
+    # 模型带着别的值也不会经 save 覆盖：方案只经 save_plan 写
+    repo.save(replace(task, plan_json='{"timed_marker_seconds": 1}'))
+    assert repo.load_plan(task.task_id) == PLAN_JSON
+
+
+def test_plan_methods_wrap_storage_errors(tmp_path):
+    for factory in make_broken_factories(str(tmp_path)):
+        repo = TaskRepo(factory)
+        with pytest.raises(StorageError):
+            repo.save_plan('x', PLAN_JSON)
+        with pytest.raises(StorageError):
+            repo.load_plan('x')

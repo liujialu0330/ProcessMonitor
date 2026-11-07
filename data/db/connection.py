@@ -2,7 +2,8 @@
 数据库连接工厂
 
 每次读写都新建连接、用完即关（各线程互不共享连接对象）。连接打开后统一设置以下 PRAGMA：
-- journal_mode=WAL：写日志模式，读写并发更稳定；设置持久化在库文件里，重复设置幂等
+- journal_mode=WAL：写日志模式，读写并发更稳定。它是持久属性（写在库文件头里），每个工厂只在
+  首次打开连接时设一次（每次都设约多花 0.3 ms）；只读工厂不设（切换本身就是一次写）
 - busy_timeout=5000：其他连接持有写锁时最多等待 5 秒再抛 OperationalError，而非立即失败
 - synchronous=NORMAL：WAL 模式下的推荐权衡——牺牲操作系统崩溃/掉电那一瞬间的极端持久性，
   换取相对 FULL 明显更好的写入性能；应用自身崩溃时 WAL 机制仍保证已提交事务不丢
@@ -38,11 +39,12 @@ logger = logging.getLogger(__name__)
 JOURNAL_SIZE_LIMIT = 8 * 1024 * 1024
 
 
-def _apply_pragmas(conn: sqlite3.Connection, read_only: bool = False) -> None:
+def _apply_pragmas(conn: sqlite3.Connection, read_only: bool = False,
+                   set_wal: bool = True) -> None:
     """新连接在其他语句之前设置的 PRAGMA（必须在事务外执行：journal_mode 不能在事务内切换）"""
     if read_only:
         conn.execute('PRAGMA query_only=1')
-    else:
+    elif set_wal:
         conn.execute('PRAGMA journal_mode=WAL')
     conn.execute('PRAGMA busy_timeout=5000')
     conn.execute('PRAGMA synchronous=NORMAL')
@@ -66,6 +68,15 @@ class ConnectionFactory:
         self.read_only = read_only
         self._holder: Optional[sqlite3.Connection] = None
         self._holder_lock = threading.Lock()
+        # 本工厂是否已把库切到 WAL（持久属性，设一次即可；并发首次打开时重复设置无害）
+        self._wal_ready = False
+
+    def _prepare(self, conn: sqlite3.Connection) -> None:
+        """新连接的 PRAGMA：WAL 只在本工厂首次打开可写连接时设置"""
+        set_wal = not self.read_only and not self._wal_ready
+        _apply_pragmas(conn, self.read_only, set_wal=set_wal)
+        if set_wal:
+            self._wal_ready = True
 
     # ========== 连接上下文 ==========
 
@@ -78,7 +89,7 @@ class ConnectionFactory:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row  # 使结果可以按列名访问
         try:
-            _apply_pragmas(conn, self.read_only)
+            self._prepare(conn)
             self._ensure_keep_alive()
             yield conn
             conn.commit()
@@ -104,7 +115,7 @@ class ConnectionFactory:
         conn = sqlite3.connect(self.db_path, isolation_level=None)
         conn.row_factory = sqlite3.Row
         try:
-            _apply_pragmas(conn)
+            self._prepare(conn)
             self._ensure_keep_alive()
             conn.execute('BEGIN IMMEDIATE')
             try:

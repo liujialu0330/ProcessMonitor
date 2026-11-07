@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING, List, Optional, Sequence
 from core.analysis.intervals import mean_round_delta
 from core.analysis.trend import (
     MIN_POINTS, Judgement, RateText, Verdict, min_span_for)
+from core.automation.plan import plan_from_json_or_none
+from core.automation.stop_conditions import AUTO_STOP_DURATION, AUTO_STOP_ROUNDS
 from core.contracts import StopReason, UnavailableReason
 from data.db.migrations.runner import disk_shortage_message
 from data.models import MonitorTask
@@ -136,7 +138,7 @@ def format_task_option_text(
 
 def format_task_tooltip(
         task: MonitorTask, running: bool, now: datetime) -> str:
-    """任务下拉项 tooltip：完整进程名、起止时间、时长与完整备注。"""
+    """任务下拉项 tooltip：完整进程名、起止时间、时长、完整备注与自动化方案简述。"""
     duration = format_duration(task_duration_seconds(task, running, now))
     lines = [
         f"{task.process_name}（PID {task.pid}）",
@@ -147,6 +149,9 @@ def format_task_tooltip(
     note = (task.note or '').strip()
     if note:
         lines.append(f"备注：{note}")
+    summary = plan_summary(plan_from_json_or_none(getattr(task, "plan_json", None)))
+    if summary:
+        lines.append(f"自动化：{summary}")
     return "\n".join(lines)
 
 
@@ -476,6 +481,15 @@ READ_ONLY_UNKNOWN_VERSION = "更新的版本"
 READ_ONLY_START_BLOCKED = "数据库为只读（由更高版本创建），不能开始监控；请升级到最新版本"
 READ_ONLY_MARKER_BLOCKED = "数据库为只读，不能打点"
 
+# 升级失败、库仍是旧结构时的只读横幅：{reason} 为失败原因，{advice} 为处理建议
+SCHEMA_STALE_BANNER_TEMPLATE = (
+    "数据库尚未升级（上次升级失败：{reason}），本次以只读方式打开：不能开始监控与打点，"
+    "历史数据要等升级完成后才能查看与分析。{advice}")
+SCHEMA_STALE_UNKNOWN_REASON = "原因见日志"
+SCHEMA_STALE_ADVICE_DISK = "请释放磁盘空间后重启。"
+SCHEMA_STALE_ADVICE = "请关闭可能占用数据库的程序后重启重试，详情见日志。"
+SCHEMA_STALE_START_BLOCKED = "数据库尚未升级，不能开始监控；请按窗口顶部的提示处理后重启"
+
 MIGRATED_TIP_TITLE = "数据库已升级"
 # 升级成功提示：{version} 为新结构版本，{name} 为旧文件备份的文件名
 MIGRATED_TIP_TEMPLATE = "数据库已升级到 v{version}，旧文件已保留为 {name}（可用于回退到 1.4.1）"
@@ -491,6 +505,26 @@ def read_only_banner_text(version: Optional[str]) -> str:
     return READ_ONLY_BANNER_TEMPLATE.format(version=version or READ_ONLY_UNKNOWN_VERSION)
 
 
+MIGRATION_FAILED_TEXT = "数据库升级失败，本次运行新数据无法保存；旧数据已保留，请重启重试。"
+# 带失败原因：{reason} 为 MigrationReport.reason
+MIGRATION_FAILED_REASON_TEMPLATE = (
+    "数据库升级失败（{reason}），本次运行新数据无法保存；旧数据已保留，请重启重试。")
+
+
+def migration_failed_text(reason: Optional[str]) -> str:
+    """迁移失败提示；报告带原因时写明原因"""
+    if not reason:
+        return MIGRATION_FAILED_TEXT
+    return MIGRATION_FAILED_REASON_TEMPLATE.format(reason=reason)
+
+
+def schema_stale_banner_text(reason: Optional[str], disk_shortage: bool = False) -> str:
+    """升级失败、以只读方式打开旧结构库时的横幅文案"""
+    return SCHEMA_STALE_BANNER_TEMPLATE.format(
+        reason=reason or SCHEMA_STALE_UNKNOWN_REASON,
+        advice=SCHEMA_STALE_ADVICE_DISK if disk_shortage else SCHEMA_STALE_ADVICE)
+
+
 def migrated_tip_text(version: int, backup_path: str) -> str:
     """升级成功提示：只显示备份的文件名（与库同目录）"""
     return MIGRATED_TIP_TEMPLATE.format(version=version, name=os.path.basename(backup_path))
@@ -502,3 +536,64 @@ def backup_aborted_text(required_bytes: Optional[int], free_bytes: Optional[int]
         return BACKUP_ABORTED_TEXT
     return BACKUP_ABORTED_DISK_TEMPLATE.format(
         detail=disk_shortage_message(required_bytes, free_bytes))
+
+
+# ---------- 自动化方案（自动打点与停止条件） ----------
+
+AUTO_STOP_TITLE = "已按方案自动停止"
+_AUTO_STOP_TEMPLATES = {
+    AUTO_STOP_DURATION: "已运行满 {span}",
+    AUTO_STOP_ROUNDS: "已完成 {rounds} 轮",
+}
+AUTO_EXPORT_DONE_TITLE = "已自动导出"
+AUTO_EXPORT_FAILED_TITLE = "自动导出失败"
+AUTO_EXPORT_BUSY = "正在清理数据库，本次未能自动导出；请稍后在分析页手动导出"
+AUTO_EXPORT_NO_TASK = "找不到该任务的数据，未能自动导出"
+AUTO_EXPORT_NO_DATABASE = "未连接数据库，未能自动导出"
+# 自动导出的 CSV 元数据"范围"一行
+AUTO_EXPORT_RANGE_TEXT = "全部（任务结束后自动导出）"
+PLAN_INVALID_TITLE = "自动化设置有误"
+
+
+def plan_span_text(seconds: int) -> str:
+    """方案里的时长：整小时写"N 小时"，整分钟写"N 分钟"，否则"N 秒"。"""
+    seconds = int(seconds)
+    if seconds >= 3600 and seconds % 3600 == 0:
+        return f"{seconds // 3600} 小时"
+    if seconds >= 60 and seconds % 60 == 0:
+        return f"{seconds // 60} 分钟"
+    return f"{seconds} 秒"
+
+
+def plan_summary(plan) -> str:
+    """自动化方案的一行简述（卡片悬停提示、任务下拉提示），如
+    "自动打点 每 10 分钟 · 日志触发（app.log） · 2 小时后停止 · 停止后自动导出"。
+    没有方案或方案为空时返回空串。"""
+    if plan is None:
+        return ""
+    parts: List[str] = []
+    if plan.timed_marker_seconds is not None:
+        parts.append(f"自动打点 每 {plan_span_text(plan.timed_marker_seconds)}")
+    if plan.log_path and plan.log_pattern:
+        parts.append(f"日志触发（{os.path.basename(plan.log_path) or plan.log_path}）")
+    if plan.stop_after_seconds is not None:
+        parts.append(f"{plan_span_text(plan.stop_after_seconds)}后停止")
+    if plan.stop_after_rounds is not None:
+        parts.append(f"满 {plan.stop_after_rounds} 轮停止")
+    if plan.export_on_stop:
+        parts.append("停止后自动导出")
+    return " · ".join(parts)
+
+
+def auto_stop_text(reason: str, plan=None) -> str:
+    """自动停止原因（core.automation.stop_conditions.AUTO_STOP_*）的说明。"""
+    template = _AUTO_STOP_TEMPLATES.get(reason)
+    if template is None:
+        raise ValueError(f"未知的自动停止原因：{reason!r}")
+    seconds = getattr(plan, 'stop_after_seconds', None)
+    rounds = getattr(plan, 'stop_after_rounds', None)
+    if reason == AUTO_STOP_DURATION and seconds is None:
+        return "已达到设定的运行时长"
+    if reason == AUTO_STOP_ROUNDS and rounds is None:
+        return "已达到设定的轮数"
+    return template.format(span=plan_span_text(seconds or 0), rounds=rounds)

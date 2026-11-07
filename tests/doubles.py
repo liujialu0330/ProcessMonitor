@@ -7,7 +7,9 @@
 - 控制"现在几点"（FakeClock），
 - 给出固定的进程表（FakeProcessQuery；读取列表可阻塞到测试放行的 BlockingProcessQuery），
 - 指定哪些任务仍在运行（FakeTaskStatus），
-- 给出固定的用户偏好（FakePreferences）。
+- 给出固定的用户偏好（FakePreferences），
+- 给出固定的全系统进程快照（FakeSnapshotSource、fake_process_sample、fake_system_snapshot，
+  快照不可用的 unavailable_snapshot_hub）。
 替身都不弹出任何窗口、不触达本机进程与配置文件。
 """
 import threading
@@ -147,14 +149,14 @@ class ScriptedDialogs:
     预设值（或回调的返回值）若是异常实例则抛出它（例如模拟 open_folder 失败）。
 
     需要返回值的方法（confirm / ask_marker_label / choose_metrics / ask_save_path /
-    ask_close_action）未预设即被调用时断言失败，避免测试在不知情时走了默认分支；
+    ask_open_file / ask_directory / ask_close_action）未预设即被调用时断言失败，避免测试在不知情时走了默认分支；
     无需返回值的系统交互（open_folder / open_file / copy_pixmap）与 open_url
     （默认返回 True）不预设也可调用，只做记录。
     """
 
     _REQUIRES_SCRIPT = (
         'confirm', 'ask_marker_label', 'choose_metrics', 'ask_save_path',
-        'ask_close_action',
+        'ask_open_file', 'ask_directory', 'ask_close_action',
     )
     _DEFAULTS = {
         'open_folder': None,
@@ -251,6 +253,14 @@ class ScriptedDialogs:
                       name_filter: str) -> Optional[str]:
         return self._answer('ask_save_path', parent=parent, title=title,
                             default_path=default_path, name_filter=name_filter)
+
+    def ask_open_file(self, parent, title: str, start_dir: str,
+                      name_filter: str) -> Optional[str]:
+        return self._answer('ask_open_file', parent=parent, title=title,
+                            start_dir=start_dir, name_filter=name_filter)
+
+    def ask_directory(self, parent, title: str, start_dir: str) -> Optional[str]:
+        return self._answer('ask_directory', parent=parent, title=title, start_dir=start_dir)
 
     def ask_close_action(self, parent, running_count: int, can_tray: bool) -> str:
         return self._answer('ask_close_action', parent=parent,
@@ -470,3 +480,114 @@ class FakePreferences:
             self.hotkeys_set = []
         self.hotkeys_set.append(text)
         self.hotkey = text
+
+
+# ---------------------------------------------------------------- 全系统快照
+
+
+def fake_process_sample(pid: int, **fields: Any):
+    """构造 core.system_snapshot.ProcessSample：未给出的字段取互不相同的缺省值。
+
+    字节类缺省为 KB 整数倍再加零头，便于发现漏换算；时间类为秒。
+    """
+    from core.system_snapshot import ProcessSample
+    defaults = dict(
+        pid=pid, parent_pid=1, name=f"proc{pid}.exe", create_time=1_700_000_000.0 + pid,
+        num_threads=17, handle_count=345, session_id=1, base_priority=8,
+        working_set=10240 * 1024, peak_working_set=20480 * 1024,
+        private_bytes=3072 * 1024 + 512, pagefile=3072 * 1024 + 512,
+        peak_pagefile=4096 * 1024, virtual_size=1 << 32, peak_virtual=(1 << 32) + 4096,
+        paged_pool=1536, peak_paged_pool=2560, nonpaged_pool=768, peak_nonpaged_pool=1280,
+        page_faults=12345, read_count=11, write_count=22, other_count=33,
+        read_bytes=5 * 1024 * 1024, write_bytes=3000, other_bytes=1024 * 7 + 256,
+        user_time=1.25, kernel_time=0.75, cycle_time=123456789,
+    )
+    unknown = set(fields) - set(defaults)
+    if unknown:
+        raise TypeError(f"ProcessSample 没有字段 {sorted(unknown)}")
+    defaults.update(fields)
+    return ProcessSample(**defaults)
+
+
+def fake_system_snapshot(samples: Iterable[Any] = (), monotonic: float = 0.0,
+                         wall: float = 1_800_000_000.0,
+                         context_switches: Optional[Dict[int, int]] = None):
+    """构造 SystemSnapshot。context_switches 给出时按 {pid: 次数} 伪造线程数组
+    （每个进程一个线程），使 snapshot.context_switches(pid) 可用。"""
+    import struct as _struct
+    from core.system_snapshot import SystemSnapshot, TakenAt
+    processes = {s.pid: s for s in samples}
+    if not context_switches:
+        return SystemSnapshot(taken_at=TakenAt(monotonic, wall), processes=processes)
+    raw = bytearray()
+    threads = {}
+    for pid, count in context_switches.items():
+        threads[pid] = (len(raw), 1)
+        raw += _struct.pack('<I', count)
+    return SystemSnapshot(taken_at=TakenAt(monotonic, wall), processes=processes,
+                          _threads=threads, _raw=memoryview(bytes(raw)),
+                          _thread_size=4, _ctx_offset=0)
+
+
+class FakeSnapshotSource:
+    """SnapshotHub 的快照来源替身（代替 NtProcessSnapshotter）。
+
+    - snapshots：snapshot() 依次返回的快照；用完后重复最后一个；元素可以是异常实例
+      （该次抛出）或无参可调用（每次调用现算）；
+    - available / reason：可用性，available=False 时 snapshot() 抛 SnapshotUnavailable；
+    - delay：每次 snapshot() 前真实睡眠的秒数（并发用例用来拉长取样窗口）。
+    calls 记录 snapshot() 被调用的次数（线程安全）。
+    """
+
+    def __init__(self, snapshots: Optional[Sequence[Any]] = None, available: bool = True,
+                 reason: Optional[str] = None, delay: float = 0.0):
+        self.snapshots: List[Any] = list(snapshots or [])
+        self._available = available
+        self.reason = reason if reason is not None else (None if available else "测试禁用")
+        self.delay = delay
+        self.calls = 0
+        self._lock = threading.Lock()
+
+    def available(self) -> bool:
+        return self._available
+
+    @property
+    def unavailable_reason(self) -> Optional[str]:
+        return None if self._available else self.reason
+
+    def snapshot(self):
+        from core.system_snapshot import SnapshotUnavailable
+        with self._lock:
+            self.calls += 1
+            index = self.calls - 1
+        if self.delay:
+            import time as _time
+            _time.sleep(self.delay)
+        if not self._available:
+            raise SnapshotUnavailable(self.reason)
+        if not self.snapshots:
+            return fake_system_snapshot()
+        item = self.snapshots[min(index, len(self.snapshots) - 1)]
+        if isinstance(item, BaseException):
+            raise item
+        return item() if callable(item) else item
+
+
+class ManualMonotonic:
+    """只提供 monotonic() 的手动时钟（SnapshotHub 的 clock 参数用）。"""
+
+    def __init__(self, start: float = 1000.0):
+        self.value = start
+
+    def monotonic(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> float:
+        self.value += seconds
+        return self.value
+
+
+def unavailable_snapshot_hub():
+    """快照不可用的 SnapshotHub：用于强制走 psutil 回退路径。"""
+    from core.snapshot_hub import SnapshotHub
+    return SnapshotHub(source=FakeSnapshotSource(available=False))

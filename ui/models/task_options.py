@@ -8,23 +8,28 @@
 模型只负责"选项长什么样"：任务列表从哪来（查库）、运行中集合怎么得到、
 刷新时取哪些任务的最新记录，都由调用方决定并传入；时间同样由调用方传入，
 同一批选项共用一个时刻。
+
+任务带自动化方案（tasks.plan_json）时，选项另带解析好的 plan（"同配置再测"、
+方案模板可直接取用），提示里多一行方案简述；方案损坏或版本过高时 plan 为 None。
 """
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Collection, Dict, List, Mapping, Optional, Sequence
 
+from core.automation.plan import AutomationPlan, plan_from_json_or_none
 from data.models import MonitorTask
 from ui.formatting import format_task_option_text, format_task_tooltip
 
 
 @dataclass(frozen=True)
 class TaskOption:
-    """一个下拉项：任务 ID、显示文本、悬停提示、载入/刷新时是否在运行。"""
+    """一个下拉项：任务 ID、显示文本、悬停提示、载入/刷新时是否在运行、自动化方案。"""
 
     task_id: str
     text: str
     tooltip: str
     running: bool
+    plan: Optional[AutomationPlan] = None
 
 
 @dataclass
@@ -53,6 +58,7 @@ class TaskOptionsModel:
             text=format_task_option_text(task, running=running, now=now),
             tooltip=format_task_tooltip(task, running, now),
             running=running,
+            plan=plan_from_json_or_none(task.plan_json),
         )
 
     def rebuild(self, tasks: Sequence[MonitorTask], running_ids: Collection[str],
@@ -114,6 +120,11 @@ class TaskOptionsModel:
         """任务对应的选项，不在列表中返回 None。"""
         index = self.index_of(task_id)
         return self._entries[index].option if index >= 0 else None
+
+    def plan(self, task_id: Optional[str]) -> Optional[AutomationPlan]:
+        """任务的自动化方案；不在列表中或没有方案返回 None。"""
+        option = self.option(task_id)
+        return option.plan if option is not None else None
 
     def task(self, task_id: Optional[str]) -> Optional[MonitorTask]:
         """生成该选项所用的任务记录（刷新后为最新记录），不在列表中返回 None。"""

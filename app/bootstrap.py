@@ -11,9 +11,12 @@ run() 的顺序是固定的，调整前先确认每一步的前置条件：
 → 6. 迁移数据库：探测（不写入）→ 待搬迁的行数或库文件超过阈值时先显示进度窗口、迁移在
    工作线程执行，否则在界面线程同步迁移 → 结果为 FAILED_KEPT（旧库没能回到原路径）时弹
    原生错误框说明原文件位置并返回 EXIT_MIGRATION_FAILED，绝不在原路径建空库继续运行
-→ 7. 读库的 meta：库由更高版本写入、本版本不能安全修改时只读打开；构造 Database（不再在
-   构造时迁移）→ 8. 启动校正（任何任务启动之前；只读库跳过）
-→ 9. 线程登记表、界面服务 → 10. 主窗口（托盘由主窗口创建并持有；迁移结果与只读状态由主窗口
+→ 7. 读库的 meta：库由更高版本写入、本版本不能安全修改时只读打开；迁移没有成功（库仍是
+   旧结构：BACKUP_ABORTED / FAILED_RESTORED / FAILED_KEPT）时同样只读打开并标记
+   schema_mismatch——本版本的读写都按 v5 结构写成，不能在旧结构上写；构造 Database（不再在
+   构造时迁移）→ 8. 启动校正（任何任务启动之前；只读库跳过）。其中导回回退 1.4.1 期间写入的
+   数据一步：待导回行数超过 MIGRATION_PROGRESS_THRESHOLD_ROWS 时经进度窗口在工作线程执行
+→ 9. 线程登记表、界面服务、阻止睡眠守卫 → 10. 主窗口（托盘由主窗口创建并持有；迁移结果与只读状态由主窗口
 按 Database 的标志提示；数据目录在同步盘上时交给主窗口显示一次提示）→ 11. 事件循环
 → 12. 结束进程
 
@@ -37,6 +40,7 @@ from app.paths import (
 if TYPE_CHECKING:
     from core.maintenance_service import MaintenanceService, ReconcileResult
     from core.monitor_manager import MonitorManager
+    from core.power_guard import PowerGuard
     from core.shutdown import ThreadRegistry
     from data.database import Database
     from data.db.migrations.runner import MigrationReport, MigrationRunner, ProbeResult
@@ -50,7 +54,8 @@ EXIT_DATA_DIR_UNAVAILABLE = 2
 # 数据库升级失败且旧库没能回到原路径（FAILED_KEPT）时 run() 的返回码
 EXIT_MIGRATION_FAILED = 3
 
-# 迁移前先显示进度窗口的阈值：待搬迁的数据点行数超过它，或库文件（含 -wal）超过字节阈值
+# 迁移前先显示进度窗口的阈值：待搬迁的数据点行数超过它，或库文件（含 -wal）超过字节阈值。
+# 启动校正导回降级数据时同样按行数阈值决定是否显示进度窗口
 MIGRATION_PROGRESS_THRESHOLD_ROWS = 500_000
 MIGRATION_PROGRESS_THRESHOLD_BYTES = 100 * 1024 * 1024
 
@@ -83,13 +88,16 @@ class AppContext:
     maintenance: "MaintenanceService"
     reconcile: "ReconcileResult"
     window: Optional["MainWindow"] = None
+    # 监控期间阻止系统空闲睡眠（跟随 cfg.keep_awake_while_monitoring）
+    power_guard: Optional["PowerGuard"] = None
 
 
 def build_context(paths: AppPaths, *, registry=None,
                   retention_days: Optional[int] = None,
-                  report: Optional["MigrationReport"] = None) -> AppContext:
+                  report: Optional["MigrationReport"] = None,
+                  legacy_importer=None) -> AppContext:
     """
-    组装 Database / MonitorManager / 维护服务 / 界面服务（不建 QApplication 与窗口）。
+    组装 Database / MonitorManager / 维护服务 / 界面服务 / 阻止睡眠守卫（不建 QApplication 与窗口）。
 
     Args:
         paths: 应用路径（调用方负责 ensure_dirs）
@@ -97,6 +105,9 @@ def build_context(paths: AppPaths, *, registry=None,
         retention_days: 启动清理用的保留天数；None 时取用户配置
         report: run() 已跑出的迁移报告（可能经过进度窗口），传入时不再迁移第二次；
             None 时在这里同步迁移
+        legacy_importer: 启动校正里导回降级数据的执行方式（见
+            MaintenanceService.startup_reconcile）；run() 传 import_legacy_with_progress，
+            None 时同步导回
     """
     from core.maintenance_service import MaintenanceService
     from core.monitor_manager import MonitorManager
@@ -112,9 +123,17 @@ def build_context(paths: AppPaths, *, registry=None,
         logger.info("数据库已升级到 v%d，旧文件已保留为 %s（可用于回退到 1.4.1）",
                     report.to_version, report.backup_path)
 
-    read_only, newer_version = _read_only_state(paths.db_path)
+    schema_mismatch = schema_not_upgraded(report)
+    if schema_mismatch:
+        # 旧结构上不能跑 v5 的写入与校正：只读打开，主窗口横幅说明原因
+        logger.warning("数据库尚未升级（%s：%s），本次以只读方式打开: %s",
+                       report.outcome.value, report.reason or "原因见上文", paths.db_path)
+        read_only, newer_version = True, None
+    else:
+        read_only, newer_version = _read_only_state(paths.db_path)
     db = Database(paths.db_path, migrate=False, migration_report=report,
-                  read_only=read_only, newer_version=newer_version)
+                  read_only=read_only, newer_version=newer_version,
+                  schema_mismatch=schema_mismatch)
 
     manager = MonitorManager(db=db)
     maintenance = MaintenanceService(db, manager)
@@ -122,14 +141,44 @@ def build_context(paths: AppPaths, *, registry=None,
         from app_config import cfg
         retention_days = cfg.get(cfg.retention_days)
     # 必须在任何监控任务启动之前；此时 manager 刚构造，还没有任务
-    reconcile = maintenance.startup_reconcile(retention_days)
+    reconcile = maintenance.startup_reconcile(retention_days, legacy_importer=legacy_importer)
 
     if registry is None:
         registry = ThreadRegistry()
     from ui.services import production_services
     services = production_services(manager, registry)
+    from app_config import cfg
+    from core.power_guard import PowerGuard
+    power_guard = PowerGuard.from_config_item(manager, cfg.keep_awake_while_monitoring)
     return AppContext(paths=paths, db=db, manager=manager, services=services,
-                      registry=registry, maintenance=maintenance, reconcile=reconcile)
+                      registry=registry, maintenance=maintenance, reconcile=reconcile,
+                      power_guard=power_guard)
+
+
+def schema_not_upgraded(report: "MigrationReport") -> bool:
+    """
+    迁移报告是否意味着原路径的库仍是旧结构：备份/预检中止、迁移失败已复原、或旧库原样保留。
+    UP_TO_DATE / MIGRATED 是当前结构；RESET 是新建的空库，可正常使用。
+    """
+    from data.db.migrations.runner import MigrationOutcome
+    return report.outcome in (MigrationOutcome.BACKUP_ABORTED, MigrationOutcome.FAILED_RESTORED,
+                              MigrationOutcome.FAILED_KEPT)
+
+
+def import_legacy_with_progress(pending: int, do_import) -> int:
+    """
+    启动校正的导回一步（MaintenanceService.startup_reconcile 的 legacy_importer）：
+    待导回行数超过阈值时显示进度窗口、在工作线程导回，否则在界面线程同步导回。
+    必须在主窗口创建之前调用（与迁移进度窗口相同）。
+    """
+    if pending <= MIGRATION_PROGRESS_THRESHOLD_ROWS:
+        return do_import(None)
+    from ui.windows import migration_window
+    logger.info("回退旧版本期间写入的数据约 %d 行，先显示进度窗口再导回", pending)
+    return migration_window.run_with_progress_window(
+        do_import, backup_path=None, estimated_rows=pending,
+        title=migration_window.LEGACY_IMPORT_WINDOW_TITLE,
+        hint=migration_window.LEGACY_IMPORT_HINT_TEXT)
 
 
 def new_migration_runner(paths: AppPaths, on_progress=None) -> "MigrationRunner":
@@ -358,7 +407,7 @@ def run(argv: List[str], *, exit_process: Callable[[int], None] = os._exit,
             path=kept, name=os.path.basename(paths.db_path)))
         return EXIT_MIGRATION_FAILED
 
-    ctx = build_context(paths, report=report)
+    ctx = build_context(paths, report=report, legacy_importer=import_legacy_with_progress)
 
     from ui.main_window import MainWindow
     hotkey = _create_marker_hotkey(app, ctx.services)
