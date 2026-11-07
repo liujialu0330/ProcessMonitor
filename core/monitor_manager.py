@@ -4,20 +4,24 @@
 """
 import logging
 import statistics
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence
 
 from PyQt5 import sip
 from PyQt5.QtCore import QObject, pyqtSignal
 
 from core.contracts import StopReason, TaskInfo, TaskStatus
-from core.monitor_task import ACTIVE_STATES, LIVE_STATES, MonitorWorker, WorkerState
+from core.monitor_task import (ACTIVE_STATES, LIVE_STATES, SYSTEM_CLOCK, MonitorWorker,
+                               WorkerState)
 from core.snapshot_hub import SnapshotHub, default_hub
+from core.target_info import TargetInfo
+from core.target_info import probe as default_target_probe
 from data.database import Database
 from data.errors import StorageError
-from data.models import MARKER_KINDS, Marker, TaskRecord
+from data.models import MARKER_KINDS, Marker, QualityStats, TaskRecord
 from data.repos.point_repo import PointQuery
 from utils.thread_utils import shutdown_thread
 import config
@@ -32,6 +36,9 @@ BASELINE_SAMPLE_COUNT = 5
 # 为一个很早的基线把整段历史读出来
 _BASELINE_WINDOW_FACTOR = 4
 _BASELINE_WINDOW_SLACK = timedelta(seconds=5)
+
+# 被测目标元数据探针线程名前缀（日志与排查用）
+TARGET_PROBE_THREAD_PREFIX = "目标元数据探针"
 
 
 def round_label(n: int) -> str:
@@ -73,6 +80,20 @@ _STATUS_BY_STATE = {
 }
 
 
+def _quality_of(task) -> Optional[QualityStats]:
+    """任务线程当前的数据质量快照；取不到（尚未调度、替身对象）时为 None。
+    快照是给界面与命令行看的附带信息，任何异常都不能让 get_task_info 失败。"""
+    snapshot = getattr(task, 'quality_snapshot', None)
+    if snapshot is None:
+        return None
+    try:
+        return snapshot()
+    except Exception:
+        logger.warning("读取任务数据质量失败: task_id=%s", getattr(task, 'task_id', '?'),
+                       exc_info=True)
+        return None
+
+
 class MonitorManager(QObject):
     """
     监控管理器
@@ -93,9 +114,21 @@ class MonitorManager(QObject):
     # 某任务的打点有变化（新增、改名、删除、换基线、暂停/恢复系统打点）(task_id)：
     # 卡片与分析页据此重新读取打点，不必各自轮询
     markers_changed = pyqtSignal(str)
+    # 暂停 / 恢复成功 (task_id)：无论命令来自监控页、托盘还是命令行（IPC），界面都据此
+    # 同步卡片状态
+    task_paused = pyqtSignal(str)
+    task_resumed = pyqtSignal(str)
+    # 被测目标元数据已探测 (task_id, TargetInfo)：任务卡片据此补上悬停提示里的被测程序行
+    target_info_ready = pyqtSignal(str, object)
+    # 内部：探针线程通知本对象所在线程来取结果 (task_id)；结果本身放在 _probe_results 里，
+    # 退出路径的 join_all 不经事件循环也能直接取走
+    _target_probed = pyqtSignal(str)
 
     def __init__(self, db: Database, parent: Optional[QObject] = None, *,
-                 snapshot_hub: Optional[SnapshotHub] = None):
+                 snapshot_hub: Optional[SnapshotHub] = None,
+                 target_probe: Optional[Callable[..., TargetInfo]] = None,
+                 clock=None,
+                 dpi_scale: Optional[Callable[[], Optional[float]]] = None):
         """
         Args:
             db: 数据库实例（与各页面共用同一实例，由组合根注入）
@@ -103,10 +136,29 @@ class MonitorManager(QObject):
             snapshot_hub: 全系统快照中心（可选）。None 用进程内共享实例
                 core.snapshot_hub.default_hub()（与进程列表共用同一份快照）；
                 全部任务线程共用它，按相位对齐采样
+            target_probe: 被测目标元数据探针，签名同 core.target_info.probe
+                (pid, *, clock, dpi_scale) -> TargetInfo；测试注入替身
+            clock: 探针 captured_at 取时的时钟（只用 now()），缺省为系统时钟
+            dpi_scale: 读显示缩放倍数的函数（界面层提供，见 set_dpi_scale_provider）；
+                无窗口模式为 None，元数据里缩放留空
         """
         super().__init__(parent)
 
         self._snapshot_hub = snapshot_hub if snapshot_hub is not None else default_hub()
+
+        # 被测目标元数据：任务启动后在后台线程探测（platform.win32_ver 一次就要约 20 ms，
+        # 整个探针 30–80 ms，不放在界面线程），结果经 _target_probed 回到本线程写库。
+        # 任务行由采集线程启动时写入，探测完还没落库时 save_meta 返回 False，挂在
+        # _pending_meta 里，在 data_updated / task_stopped 时补存
+        self._target_probe = target_probe if target_probe is not None else default_target_probe
+        self._clock = clock if clock is not None else SYSTEM_CLOCK
+        self._dpi_scale = dpi_scale
+        self._probe_threads: Dict[str, threading.Thread] = {}
+        self._probe_results: Dict[str, Optional[TargetInfo]] = {}
+        self._probe_lock = threading.Lock()
+        self._target_infos: Dict[str, TargetInfo] = {}
+        self._pending_meta: Dict[str, str] = {}
+        self._target_probed.connect(self._on_target_probed)
 
         # 任务字典 {task_id: MonitorWorker}
         self._tasks: Dict[str, MonitorWorker] = {}
@@ -199,6 +251,7 @@ class MonitorManager(QObject):
         task.start()
         logger.info("任务启动请求: task_id=%s pid=%s", task_id, task.pid)
         self.task_started.emit(task_id)
+        self._start_target_probe(task_id, task.pid)
         return True
 
     def stop_task(self, task_id: str) -> bool:
@@ -245,7 +298,8 @@ class MonitorManager(QObject):
 
     def pause_task(self, task_id: str, timestamp: Optional[datetime] = None) -> bool:
         """
-        暂停监控任务；成功时任务线程对象写入"暂停"系统打点，随后发 markers_changed
+        暂停监控任务；成功时任务线程对象写入"暂停"系统打点，随后发 task_paused 与
+        markers_changed
 
         Args:
             task_id: 任务ID
@@ -257,12 +311,14 @@ class MonitorManager(QObject):
         task = self._tasks.get(task_id)
         if task is None or not task.pause(timestamp):
             return False
+        self.task_paused.emit(task_id)
         self.markers_changed.emit(task_id)
         return True
 
     def resume_task(self, task_id: str, timestamp: Optional[datetime] = None) -> bool:
         """
-        恢复监控任务；成功时任务线程对象写入"恢复"系统打点，随后发 markers_changed
+        恢复监控任务；成功时任务线程对象写入"恢复"系统打点，随后发 task_resumed 与
+        markers_changed
 
         Args:
             task_id: 任务ID
@@ -274,6 +330,7 @@ class MonitorManager(QObject):
         task = self._tasks.get(task_id)
         if task is None or not task.resume(timestamp):
             return False
+        self.task_resumed.emit(task_id)
         self.markers_changed.emit(task_id)
         return True
 
@@ -281,6 +338,119 @@ class MonitorManager(QObject):
     def snapshot_hub(self) -> SnapshotHub:
         """全部任务线程共用的全系统快照中心"""
         return self._snapshot_hub
+
+    # ========== 被测目标元数据 ==========
+
+    def set_dpi_scale_provider(self, provider: Optional[Callable[[], Optional[float]]]) -> None:
+        """设置读显示缩放倍数的函数（主窗口构造时传入；它只能在界面线程调用，
+        探针启动前在本线程读一次再交给探针线程）。"""
+        self._dpi_scale = provider
+
+    def target_info(self, task_id: str) -> Optional[TargetInfo]:
+        """任务的被测目标元数据（探测完成后可用；任务移出管理器后为 None，请读库）。"""
+        return self._target_infos.get(task_id)
+
+    def _read_dpi_scale(self) -> Optional[float]:
+        provider = self._dpi_scale
+        if provider is None:
+            return None
+        try:
+            value = provider()
+            return float(value) if value else None
+        except Exception:
+            logger.debug("读取显示缩放失败，元数据里缩放留空", exc_info=True)
+            return None
+
+    def _start_target_probe(self, task_id: str, pid: int) -> None:
+        """在后台线程探测被测目标元数据。守护线程：探针卡住也不拖住退出（退出路径的
+        join_all 只等到总期限）。"""
+        dpi_scale = self._read_dpi_scale()
+        thread = threading.Thread(
+            target=self._run_target_probe, args=(task_id, pid, dpi_scale),
+            name=f"{TARGET_PROBE_THREAD_PREFIX}-{task_id[:8]}", daemon=True)
+        self._probe_threads[task_id] = thread
+        thread.start()
+
+    def _run_target_probe(self, task_id: str, pid: int, dpi_scale: Optional[float]) -> None:
+        """探针线程：探测失败只记日志（元数据是附带信息，不影响任务）。"""
+        try:
+            info = self._target_probe(pid, clock=self._clock, dpi_scale=dpi_scale)
+        except Exception:
+            logger.warning("被测目标元数据探测失败: task_id=%s pid=%s", task_id, pid,
+                           exc_info=True)
+            info = None
+        with self._probe_lock:
+            self._probe_results[task_id] = info
+        try:
+            self._target_probed.emit(task_id)
+        except RuntimeError:
+            # 管理器已被销毁（测试收尾或进程退出中），结果无处可交
+            logger.debug("管理器已销毁，丢弃元数据探测结果: task_id=%s", task_id)
+
+    def _on_target_probed(self, task_id: str) -> None:
+        """探测结果回到本线程：缓存、写库（任务行还没落库时挂起待补存）、通知界面。
+        结果已被 join_all 取走时什么也不做。"""
+        with self._probe_lock:
+            if task_id not in self._probe_results:
+                return
+            info = self._probe_results.pop(task_id)
+        self._probe_threads.pop(task_id, None)
+        if info is None:
+            return
+        if task_id in self._tasks:
+            self._target_infos[task_id] = info
+        try:
+            self._pending_meta[task_id] = info.to_json()
+        except Exception:
+            logger.warning("被测目标元数据序列化失败: task_id=%s", task_id, exc_info=True)
+        else:
+            if not self._save_pending_meta(task_id) and task_id not in self._tasks:
+                # 任务已结束并移出管理器：任务行若此时还不存在，就再也不会有了
+                self._drop_pending_meta(task_id)
+        self.target_info_ready.emit(task_id, info)
+
+    def _save_pending_meta(self, task_id: str) -> bool:
+        """把挂起的元数据写进 tasks.meta_json。命中任务行或写库失败都不再重试
+        （失败重试只会每个周期刷一条同样的错误日志）；任务行尚不存在返回 False、继续挂起。"""
+        meta_json = self._pending_meta.get(task_id)
+        if meta_json is None:
+            return True
+        store = getattr(self.db, 'tasks', None)
+        if store is None:
+            self._pending_meta.pop(task_id, None)
+            return False
+        try:
+            saved = bool(store.save_meta(task_id, meta_json))
+        except StorageError:
+            logger.error("保存被测目标元数据失败: task_id=%s", task_id, exc_info=True)
+            self._pending_meta.pop(task_id, None)
+            return False
+        if saved:
+            self._pending_meta.pop(task_id, None)
+            logger.info("被测目标元数据已保存: task_id=%s", task_id)
+        return saved
+
+    def _drop_pending_meta(self, task_id: str) -> None:
+        if self._pending_meta.pop(task_id, None) is not None:
+            logger.warning("任务行始终未落库，放弃保存被测目标元数据: task_id=%s", task_id)
+
+    def _join_target_probes(self, deadline: Optional[float], timeout_ms: int) -> bool:
+        """等探针线程结束，并把结果当场交付（退出路径随后就关库，不能等事件循环）。"""
+        all_finished = True
+        for task_id, thread in list(self._probe_threads.items()):
+            wait_s = timeout_ms / 1000.0
+            if deadline is not None:
+                wait_s = min(wait_s, deadline - time.monotonic())
+            if wait_s > 0:
+                thread.join(wait_s)
+            if thread.is_alive():
+                all_finished = False
+                logger.error("被测目标元数据探针未在期限内结束: task_id=%s", task_id)
+        with self._probe_lock:
+            finished = list(self._probe_results)
+        for task_id in finished:
+            self._on_target_probed(task_id)
+        return all_finished
 
     # ========== 只读快照（界面只用这一组，不接触任务线程对象） ==========
 
@@ -303,6 +473,7 @@ class MonitorManager(QObject):
             create_time=task.expected_create_time,
             is_paused=state is WorkerState.PAUSED,
             is_stopping=state is WorkerState.STOPPING,
+            quality=_quality_of(task),
         )
 
     def get_task_info(self, task_id: str) -> Optional[TaskInfo]:
@@ -417,6 +588,11 @@ class MonitorManager(QObject):
                 continue
             if not shutdown_thread(task, timeout_ms=wait_ms):
                 all_finished = False
+        # 任务线程收尾后任务行一定已落库：等探针结束并交付结果，挂起的元数据在这里补存
+        if not self._join_target_probes(deadline, timeout_ms):
+            all_finished = False
+        for task_id in list(self._pending_meta):
+            self._save_pending_meta(task_id)
         return all_finished
 
     # ========== 运行状态与维护 ==========
@@ -707,6 +883,9 @@ class MonitorManager(QObject):
         task = self._tasks.pop(task_id, None)
         if task is None:
             return
+        self._target_infos.pop(task_id, None)
+        if task_id in self._pending_meta and not self._save_pending_meta(task_id):
+            self._drop_pending_meta(task_id)
         sip.transferto(task, None)
         task.deleteLater()
         self.task_removed.emit(task_id)
@@ -720,11 +899,16 @@ class MonitorManager(QObject):
                 self._discard(task_id)
 
     def _on_task_data_updated(self, task_id: str, values: dict):
-        """任务数据更新处理"""
+        """任务数据更新处理：首个周期到达时任务行已落库，挂起的元数据在这里补存"""
+        if task_id in self._pending_meta:
+            self._save_pending_meta(task_id)
         self.data_updated.emit(task_id, values)
 
     def _on_task_stopped(self, task_id: str, reason: StopReason):
-        """任务停止处理"""
+        """任务停止处理：收尾已写过任务行（一个周期都没采到就结束时元数据在这里补存）；
+        仍写不进去说明任务行从未落库，放弃"""
+        if task_id in self._pending_meta and not self._save_pending_meta(task_id):
+            self._drop_pending_meta(task_id)
         self.task_stopped.emit(task_id, reason)
 
     def _on_task_error(self, task_id: str, error_msg: str):

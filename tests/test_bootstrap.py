@@ -248,9 +248,10 @@ def run_env(monkeypatch, app_paths):
                         lambda app, services: events.append('hotkey') or 'hotkey')
 
     class FakeWindow:
-        def __init__(self, db, manager, services, *, hotkey=None):
+        def __init__(self, db, manager, services, *, hotkey=None, diagnostics_provider=None):
             events.append(('window', manager, services))
             assert hotkey == 'hotkey'
+            state['diagnostics_provider'] = diagnostics_provider
 
         def show(self):
             events.append('window.show')
@@ -259,6 +260,13 @@ def run_env(monkeypatch, app_paths):
             events.append(('sync_dir_warning', text))
 
     monkeypatch.setattr(main_window_module, 'MainWindow', FakeWindow)
+    # 看门狗与自身监控另有用例覆盖；这里只记下调用时机，不进 events（固定顺序断言不变）
+    monkeypatch.setattr(bootstrap, 'install_watchdog',
+                        lambda app, ctx, window: state.setdefault('after_show', []).append(
+                            ('watchdog', 'window.show' in events)))
+    monkeypatch.setattr(bootstrap, 'start_self_monitor',
+                        lambda ctx: state.setdefault('after_show', []).append(
+                            ('self_monitor', 'window.show' in events)))
     exits = []
     return events, state, exits, app_paths
 
@@ -576,3 +584,366 @@ def test_build_context_logs_backup_path_after_upgrade(qapp, paths, caplog):
     assert ctx.db.backup_path == paths.db_path + '.bak_v1'
     assert any("monitor.db.bak_v1" in r.getMessage() and "1.4.1" in r.getMessage()
                for r in caplog.records)
+
+
+# ========== 无窗口模式（--background）与 IPC 接线 ==========
+
+class _FakeDispatcher:
+    def __init__(self, events):
+        self.events = events
+        self.context = None
+
+    def has_pending(self):
+        return False
+
+    def set_settings(self, settings):
+        self.events.append('dispatcher.settings')
+
+    def set_context(self, context):
+        self.events.append('dispatcher.context')
+        self.context = context
+
+
+@pytest.fixture
+def bg_env(run_env, monkeypatch):
+    """run_env 之上：守卫接受 activate 参数并带命令处理器，无窗口路径的各步换成替身"""
+    import app.single_instance as single_instance
+    import app_config
+    import core.headless as headless_module
+    from utils import crash_handler
+    events, state, exits, paths = run_env
+    # 无窗口模式会把异常处理切到"不弹框"：测试结束后还原，不影响后续用例
+    monkeypatch.setattr(crash_handler, '_headless', False)
+
+    class Guard(_FakeGuard):
+        def __init__(self, events):
+            super().__init__(events)
+            self.dispatcher = _FakeDispatcher(events)
+            self.activation_error = state.get('activation_error')
+
+        def notify_existing_instance(self, activate=True):
+            self.events.append(('single_instance', activate))
+            return state['existing']
+
+    def make_guard(*args, **kwargs):
+        state['guard_args'] = (args, kwargs)
+        guard = Guard(events)
+        state['guard'] = guard
+        return guard
+
+    monkeypatch.setattr(single_instance, 'SingleInstanceGuard', make_guard)
+    monkeypatch.setattr(app_config, 'load_app_config',
+                        lambda paths=None: events.append('load_config'))
+
+    class Runner:
+        def migrate(self):
+            events.append('headless_migrate')
+            return state.get('report') or MigrationReport(MigrationOutcome.UP_TO_DATE, 5, 5)
+
+    monkeypatch.setattr(bootstrap, 'new_migration_runner', lambda paths, on_progress=None: Runner())
+
+    class FakeServices:
+        clock = 'clock'
+
+    def fake_build_context(paths, *, report=None, legacy_importer=None):
+        events.append('build_context')
+        return AppContext(paths=paths, db=_FakeDb(events), manager='manager',
+                          services=FakeServices(), registry='registry', maintenance=None,
+                          reconcile=ReconcileResult(0, 0, 0))
+
+    monkeypatch.setattr(bootstrap, 'build_context', fake_build_context)
+
+    class FakeRuntime:
+        def __init__(self, manager, registry, db, *, idle_exit_s=0.0, busy=None,
+                     stage_renderer=None):
+            events.append(('runtime', manager, registry, idle_exit_s))
+            self.auto_marker = 'auto_marker'
+            self.busy = busy
+            self.stage_renderer = stage_renderer
+            state['runtime'] = self
+
+        def quit(self):
+            events.append('runtime.quit')
+
+        def start(self):
+            events.append('runtime.start')
+
+    monkeypatch.setattr(headless_module, 'HeadlessRuntime', FakeRuntime)
+    return events, state, exits, paths
+
+
+def test_run_background_order(bg_env):
+    events, state, exits, paths = bg_env
+    code = bootstrap.run(['prog', '--background', '--idle-exit-s', '7'],
+                         exit_process=lambda c: events.append(('exit', c)))
+    assert code == 3
+    assert events == [
+        ('logging', paths.log_dir), 'excepthook', 'qapplication', ('single_instance', False),
+        'listen', 'load_config', 'headless_migrate', 'build_context',
+        ('runtime', 'manager', 'registry', 7.0), 'dispatcher.settings', 'dispatcher.context',
+        'runtime.start', 'exec', ('exit', 3),
+    ]
+    # 不建主窗口、托盘、全局热键，也不走带进度窗口的迁移
+    assert not any(isinstance(e, tuple) and e[0] == 'window' for e in events)
+    assert 'hotkey' not in events and 'preferences' not in events and 'migrate' not in events
+    # 交给 QApplication 的参数里没有无窗口模式的私有参数
+    assert state['qt_argv'] == ['prog']
+    assert state['guard_args'] == ((), {'data_dir': paths.data_dir, 'background': True})
+    context = state['guard'].dispatcher.context
+    runtime = state['runtime']
+    assert context.auto_marker == 'auto_marker' and context.handle_auto_export is True
+    assert context.quit == runtime.quit and context.clock == 'clock'
+    assert context.report_renderer is bootstrap.render_report_image_for_ipc
+    assert runtime.busy == state['guard'].dispatcher.has_pending
+    # 无窗口模式也写阶段快照：报告图片的渲染函数由组合根注入
+    assert runtime.stage_renderer is bootstrap.render_stage_snapshot_image
+
+
+def test_run_background_secondary_does_not_activate(bg_env):
+    events, state, exits, paths = bg_env
+    state['existing'] = True
+    code = bootstrap.run(['prog', '--background'], exit_process=exits.append)
+    assert code == 0
+    assert events[-1] == ('single_instance', False)
+    assert 'listen' not in events and exits == []
+
+
+def test_run_background_migration_failure_exits(bg_env):
+    events, state, exits, paths = bg_env
+    state['report'] = MigrationReport(MigrationOutcome.FAILED_KEPT, 3, 5)
+    code = bootstrap.run(['prog', '--background'], exit_process=exits.append)
+    assert code == bootstrap.EXIT_MIGRATION_FAILED
+    assert 'build_context' not in events and 'exec' not in events
+
+
+def test_run_background_exits_when_ipc_cannot_listen(bg_env, monkeypatch):
+    """没有管道就收不到 quit：无窗口实例不能留成关不掉的后台进程"""
+    events, state, exits, paths = bg_env
+    monkeypatch.setattr(_FakeGuard, 'listen', lambda self: self.events.append('listen') or False)
+    code = bootstrap.run(['prog', '--background'], exit_process=exits.append)
+    assert code == bootstrap.EXIT_IPC_UNAVAILABLE
+    assert events[-1] == 'listen'
+    assert 'build_context' not in events and exits == []
+
+
+def test_run_gui_tells_user_when_background_instance_runs(bg_env):
+    events, state, exits, paths = bg_env
+    state['existing'] = True
+    state['activation_error'] = 'invalid_state'
+    boxes = []
+    code = bootstrap.run(['prog'], exit_process=exits.append,
+                         message_box=lambda title, text: boxes.append(text))
+    assert code == 0
+    assert events[-1] == ('single_instance', True)
+    assert boxes == [bootstrap.BACKGROUND_RUNNING_TEXT]
+
+
+def test_run_gui_attaches_ipc_after_window(bg_env, monkeypatch):
+    import ui.main_window as main_window_module
+    events, state, exits, paths = bg_env
+
+    class Presenter:
+        auto_marker = 'presenter_auto_marker'
+
+    class Page:
+        presenter = Presenter()
+
+    class Window:
+        monitor_page = Page()
+
+        def __init__(self, *args, **kwargs):
+            events.append('window')
+
+        def show(self):
+            events.append('window.show')
+
+        def request_quit(self):
+            pass
+
+    monkeypatch.setattr(main_window_module, 'MainWindow', Window)
+    monkeypatch.setattr(bootstrap, 'sync_dir_hint', lambda data_dir: None)
+    bootstrap.run(['prog'], exit_process=exits.append)
+    assert events.index('listen') < events.index('window') < events.index('dispatcher.context')
+    assert events.index('activation_connected') < events.index('dispatcher.context')
+    context = state['guard'].dispatcher.context
+    # 自动打点服务全程只有一份：用监控页 Presenter 的那一份
+    assert context.auto_marker == 'presenter_auto_marker'
+    assert context.handle_auto_export is False
+    assert context.quit.__func__ is Window.request_quit
+
+
+@pytest.mark.parametrize('argv, expected', [
+    (['p'], 0.0), (['p', '--idle-exit-s', '30'], 30.0), (['p', '--idle-exit-s=2.5'], 2.5),
+    (['p', '--idle-exit-s', 'abc'], 0.0), (['p', '--idle-exit-s', '-5'], 0.0),
+    (['p', '--idle-exit-s'], 0.0),
+])
+def test_parse_idle_exit(argv, expected):
+    assert bootstrap._parse_idle_exit(argv) == expected
+
+
+def test_strip_background_args():
+    argv = ['p', '--background', '--idle-exit-s', '5', '-x', '--idle-exit-s=3', 'y']
+    assert bootstrap.strip_background_args(argv) == ['p', '-x', 'y']
+    # argv[0] 恰好与参数同名时不剥
+    assert bootstrap.strip_background_args(['--background']) == ['--background']
+
+
+def test_command_settings_reads_config_live():
+    from app_config import cfg
+    settings = bootstrap.command_settings()
+    original = cfg.automation_enabled.value
+    try:
+        cfg.automation_enabled.value = False
+        assert settings.automation_enabled() is False
+        cfg.automation_enabled.value = True
+        assert settings.automation_enabled() is True
+    finally:
+        cfg.automation_enabled.value = original
+
+
+# ========== run()：自身监控、看门狗、启动计时 ==========
+
+def test_run_installs_watchdog_and_self_monitor_after_show(run_env):
+    events, state, exits, paths = run_env
+    bootstrap.run(['prog'], exit_process=exits.append)
+    # 两者都在窗口显示之后（看门狗不能在首屏渲染期间就计时）
+    assert state['after_show'] == [('watchdog', True), ('self_monitor', True)]
+
+
+def test_run_gives_window_the_context_as_diagnostics_provider(run_env):
+    events, state, exits, paths = run_env
+    bootstrap.run(['prog'], exit_process=exits.append)
+    ctx = state['diagnostics_provider']()
+    assert isinstance(ctx, AppContext) and ctx.paths == paths
+
+
+def test_startup_trace_flag_is_stripped_and_logs_stages(run_env, caplog):
+    events, state, exits, paths = run_env
+    with caplog.at_level('INFO', logger='app.bootstrap'):
+        bootstrap.run(['prog', '--startup-trace'], exit_process=exits.append)
+    assert '--startup-trace' not in state['qt_argv']
+    report = "\n".join(r.getMessage() for r in caplog.records if r.levelname == 'INFO')
+    for stage in ("QApplication", "迁移", "主窗口", "就绪"):
+        assert stage in report
+
+
+def test_no_startup_trace_without_flag(run_env, caplog):
+    events, state, exits, paths = run_env
+    with caplog.at_level('INFO', logger='app.bootstrap'):
+        bootstrap.run(['prog'], exit_process=exits.append)
+    assert not any("就绪" in r.getMessage() for r in caplog.records)
+
+
+def test_strip_startup_trace_arg_keeps_program_name():
+    assert bootstrap.strip_startup_trace_arg(['prog', '--startup-trace', '-x']) == ['prog', '-x']
+    assert bootstrap.strip_startup_trace_arg(['--startup-trace']) == ['--startup-trace']
+
+
+def test_start_self_monitor_ticks_now_and_every_interval(qapp):
+    from tests.helpers import process_events_until
+
+    class Monitor:
+        def __init__(self):
+            self.ticks = 0
+
+        def tick(self):
+            self.ticks += 1
+
+    ctx = AppContext(paths=None, db=None, manager=None, services=None, registry=None,
+                     maintenance=None, reconcile=None, self_monitor=Monitor())
+    timer = bootstrap.start_self_monitor(ctx, interval_ms=60_000)
+    try:
+        assert ctx.self_monitor_timer is timer and timer.interval() == 60_000
+        assert timer.isActive()
+        # 立即采一次：诊断信息里马上有值
+        assert process_events_until(lambda: ctx.self_monitor.ticks >= 1, timeout=2)
+    finally:
+        timer.stop()
+    assert bootstrap.SELF_MONITOR_INTERVAL_MS == 60_000
+
+
+def test_start_self_monitor_without_monitor_does_nothing(qapp):
+    ctx = AppContext(paths=None, db=None, manager=None, services=None, registry=None,
+                     maintenance=None, reconcile=None)
+    assert bootstrap.start_self_monitor(ctx) is None
+
+
+def test_build_context_creates_self_monitor(qapp, paths):
+    ctx = build_context(paths)
+    try:
+        assert ctx.self_monitor is not None
+        assert ctx.hub is ctx.manager.snapshot_hub
+    finally:
+        _close(ctx)
+
+
+def test_install_watchdog_hands_it_to_window(qapp, monkeypatch):
+    import utils.crash_handler as crash_handler
+    sentinel = object()
+    monkeypatch.setattr(crash_handler, 'install_ui_watchdog', lambda app: sentinel)
+    attached = []
+
+    class Window:
+        def attach_watchdog(self, wd):
+            attached.append(wd)
+
+    ctx = AppContext(paths=None, db=None, manager=None, services=None, registry=None,
+                     maintenance=None, reconcile=None)
+    bootstrap.install_watchdog(qapp, ctx, Window())
+    assert ctx.watchdog is sentinel and attached == [sentinel]
+
+    monkeypatch.setattr(crash_handler, 'install_ui_watchdog', lambda app: None)
+    attached.clear()
+    bootstrap.install_watchdog(qapp, ctx, Window())
+    assert ctx.watchdog is None and attached == []
+
+
+
+# ========== 评审修复：无窗口模式不弹异常框、关闭命令行控制时直接退出 ==========
+
+def test_run_background_suppresses_crash_message_box(bg_env):
+    from utils import crash_handler
+    events, state, exits, paths = bg_env
+    bootstrap.run(['prog', '--background'], exit_process=exits.append)
+    assert crash_handler.is_headless() is True
+
+
+def test_run_gui_keeps_crash_message_box(bg_env, monkeypatch):
+    from utils import crash_handler
+    events, state, exits, paths = bg_env
+    state['existing'] = True
+    bootstrap.run(['prog'], exit_process=exits.append,
+                  message_box=lambda title, text: None)
+    assert crash_handler.is_headless() is False
+
+
+def test_run_background_exits_zero_when_automation_disabled(bg_env, monkeypatch, caplog):
+    import logging
+    events, state, exits, paths = bg_env
+    monkeypatch.setattr(bootstrap, '_automation_enabled', lambda: False)
+    with caplog.at_level(logging.WARNING):
+        code = bootstrap.run(['prog', '--background'], exit_process=exits.append)
+    assert code == bootstrap.EXIT_AUTOMATION_DISABLED == 0
+    # 读完配置就退出：不升级数据库、不组装、不进事件循环
+    assert events[-1] == 'load_config'
+    assert 'headless_migrate' not in events and 'build_context' not in events
+    assert 'exec' not in events and exits == []
+    assert "允许命令行与脚本控制" in caplog.text
+
+
+def test_automation_enabled_reads_setting_and_fails_open(monkeypatch):
+    class Settings:
+        def __init__(self, value):
+            self.value = value
+
+        def automation_enabled(self):
+            if isinstance(self.value, Exception):
+                raise self.value
+            return self.value
+
+    monkeypatch.setattr(bootstrap, 'command_settings', lambda: Settings(False))
+    assert bootstrap._automation_enabled() is False
+    monkeypatch.setattr(bootstrap, 'command_settings', lambda: Settings(True))
+    assert bootstrap._automation_enabled() is True
+    monkeypatch.setattr(bootstrap, 'command_settings', lambda: Settings(RuntimeError("坏")))
+    assert bootstrap._automation_enabled() is True

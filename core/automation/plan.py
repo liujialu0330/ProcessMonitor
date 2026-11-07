@@ -2,7 +2,7 @@
 自动化方案（AutomationPlan）
 
 一次监控任务的自动打点与停止条件：定时打点、日志匹配打点、按时长 / 轮数停止、停止后
-自动导出。全部字段可选，缺省即"不做任何自动化"（与没有方案时的行为一致）。
+自动导出、运行中每 N 小时写阶段快照。全部字段可选，缺省即"不做任何自动化"（与没有方案时的行为一致）。
 
 方案随任务存进 tasks.plan_json（JSON 文本，带 schema_version）。后续的测试方案模板
 （plans\\*.json）会在此基础上扩展字段，因此字段名一经发布就不再改名：
@@ -45,11 +45,24 @@ ERR_LOG_PATH_NOT_ABSOLUTE = "日志文件路径必须是完整的绝对路径（
 ERR_LOG_PATTERN_INVALID = "日志匹配规则不是合法的正则表达式：{detail}"
 ERR_LOG_ENCODING_UNKNOWN = "不认识的日志文件编码：{encoding}"
 ERR_LOG_ENCODING_UNSUPPORTED = "暂不支持 UTF-16 / UTF-32 编码的日志文件，请改用 UTF-8 或 GBK"
+ERR_LOG_ENCODING_NOT_TEXT = "{encoding} 不是文本编码，请改用 UTF-8 或 GBK 等"
+ERR_TIMED_TOO_LARGE = "定时打点间隔不能超过 {limit} 秒（30 天）"
 ERR_STOP_SECONDS_TOO_SMALL = "停止时长至少为 1 秒"
+ERR_STOP_SECONDS_TOO_LARGE = "停止时长不能超过 {limit} 秒（30 天）"
 ERR_STOP_SECONDS_BELOW_INTERVAL = "停止时长（{value} 秒）不能小于采集间隔（{interval:g} 秒）"
 ERR_STOP_ROUNDS_TOO_SMALL = "停止轮数至少为 1 轮"
 ERR_EXPORT_DIR_MISSING = "已勾选停止后自动导出，请选择导出目录"
 ERR_EXPORT_DIR_NOT_ABSOLUTE = "导出目录必须是完整的绝对路径"
+ERR_SNAPSHOT_HOURS_RANGE = "阶段快照间隔须在 {low:g} 到 {high:g} 小时之间"
+ERR_SNAPSHOT_HOURS_MISSING = "已选择阶段快照目录，请同时设置快照间隔（小时）"
+ERR_SNAPSHOT_DIR_MISSING = "已勾选阶段快照，请选择快照目录"
+ERR_SNAPSHOT_DIR_NOT_ABSOLUTE = "阶段快照目录必须是完整的绝对路径"
+
+# 阶段快照间隔（小时）的允许范围：太密会让快照文件与后台读库喧宾夺主，超过一周没有意义
+SNAPSHOT_HOURS_MIN = 0.5
+SNAPSHOT_HOURS_MAX = 168.0
+# 定时打点间隔与停止时长（秒）的上限：30 天。再长没有意义，且过大的值会让 timedelta 溢出
+MAX_PLAN_SECONDS = 30 * 24 * 3600
 
 
 class PlanFormatError(ValueError):
@@ -65,10 +78,18 @@ class PlanVersionError(PlanFormatError):
         self.version = version
 
 
+def is_device_path(path: str) -> bool:
+    """是否为设备命名空间路径（\\\\.\\PhysicalDrive0、\\\\?\\C:\\x 之类，正反斜杠混写也算）。"""
+    head = path[:4].replace('/', '\\')
+    return head in ('\\\\.\\', '\\\\?\\')
+
+
 def is_absolute_path(path: str) -> bool:
     """是否为绝对路径。Windows 盘符路径与 UNC 路径在任何平台上都算（方案可能在别的
-    机器上编辑），另认本平台的绝对路径。"""
-    if not path:
+    机器上编辑），另认本平台的绝对路径；设备命名空间（\\\\.\\、\\\\?\\）一律不算。"""
+    if not path or not isinstance(path, str):
+        return False
+    if is_device_path(path):
         return False
     # 带盘符或 UNC 前缀且从根开始（"C:foo"、"\\foo" 这类相对当前盘/目录的写法不算）
     if ntpath.splitdrive(path)[0] and ntpath.isabs(path):
@@ -77,13 +98,23 @@ def is_absolute_path(path: str) -> bool:
 
 
 def encoding_problem(encoding: str) -> Optional[str]:
-    """日志编码的问题描述；可用返回 None。"""
+    """日志编码的问题描述；可用返回 None。
+
+    除了能查到，还要求是文本编码（base64、rot13、zlib 之类的 bytes→bytes 编解码器
+    能 lookup 成功，但 bytes.decode 用它会抛 LookupError），并实际解码一行试一次。"""
     try:
-        name = codecs.lookup(encoding).name.replace('-', '_')
-    except (LookupError, TypeError):
+        info = codecs.lookup(encoding)
+    except (LookupError, TypeError, ValueError):
         return ERR_LOG_ENCODING_UNKNOWN.format(encoding=encoding)
+    name = info.name.replace('-', '_')
     if name.startswith(_UNSUPPORTED_ENCODING_PREFIXES):
         return ERR_LOG_ENCODING_UNSUPPORTED
+    if not getattr(info, '_is_text_encoding', True):
+        return ERR_LOG_ENCODING_NOT_TEXT.format(encoding=encoding)
+    try:
+        b'probe 123\r\n'.decode(encoding, errors='replace')
+    except Exception:   # noqa: BLE001 —— 任何解码失败都说明这个编码不能用来读日志
+        return ERR_LOG_ENCODING_NOT_TEXT.format(encoding=encoding)
     return None
 
 
@@ -104,6 +135,9 @@ class AutomationPlan:
             为续采等后续能力预留）
         export_on_stop: 任务结束后自动导出
         export_dir: 自动导出的目录（绝对路径）
+        stage_snapshot_hours: 运行中每隔多少小时写一次阶段快照（报告图片 + 摘要 CSV），
+            从任务开始或恢复时刻起算、暂停期间不计时；None 表示不写
+        stage_snapshot_dir: 阶段快照的目录（绝对路径）；与 stage_snapshot_hours 成对给出
     """
     timed_marker_seconds: Optional[int] = None
     log_path: Optional[str] = None
@@ -114,6 +148,8 @@ class AutomationPlan:
     stop_when_target_exits: bool = True
     export_on_stop: bool = False
     export_dir: Optional[str] = None
+    stage_snapshot_hours: Optional[float] = None
+    stage_snapshot_dir: Optional[str] = None
 
     # ---------- 派生判断 ----------
 
@@ -129,14 +165,18 @@ class AutomationPlan:
     def has_stop_condition(self) -> bool:
         return self.stop_after_seconds is not None or self.stop_after_rounds is not None
 
+    @property
+    def has_stage_snapshot(self) -> bool:
+        return self.stage_snapshot_hours is not None and bool(self.stage_snapshot_dir)
+
     def is_empty(self) -> bool:
         """与缺省方案等价（没有任何自动化）。没有方案的任务不必存 plan_json。"""
         return self == AutomationPlan()
 
     def needs_service(self) -> bool:
-        """是否需要自动打点服务跟踪该任务（打点、停止条件或停止后导出任一开启）。"""
+        """是否需要自动打点服务跟踪该任务（打点、停止条件、停止后导出或阶段快照任一开启）。"""
         return (self.has_timed_marker or self.has_log_trigger or self.has_stop_condition
-                or self.export_on_stop)
+                or self.export_on_stop or self.has_stage_snapshot)
 
     def compiled_pattern(self) -> Optional["re.Pattern[str]"]:
         """编译后的日志匹配规则；未设置时为 None。规则不合法时抛 re.error。"""
@@ -156,6 +196,8 @@ class AutomationPlan:
         if self.timed_marker_seconds is not None:
             if self.timed_marker_seconds < 1:
                 errors.append(ERR_TIMED_TOO_SMALL)
+            elif self.timed_marker_seconds > MAX_PLAN_SECONDS:
+                errors.append(ERR_TIMED_TOO_LARGE.format(limit=MAX_PLAN_SECONDS))
             elif interval and self.timed_marker_seconds < interval:
                 errors.append(ERR_TIMED_BELOW_INTERVAL.format(
                     value=self.timed_marker_seconds, interval=interval))
@@ -179,6 +221,8 @@ class AutomationPlan:
         if self.stop_after_seconds is not None:
             if self.stop_after_seconds < 1:
                 errors.append(ERR_STOP_SECONDS_TOO_SMALL)
+            elif self.stop_after_seconds > MAX_PLAN_SECONDS:
+                errors.append(ERR_STOP_SECONDS_TOO_LARGE.format(limit=MAX_PLAN_SECONDS))
             elif interval and self.stop_after_seconds < interval:
                 errors.append(ERR_STOP_SECONDS_BELOW_INTERVAL.format(
                     value=self.stop_after_seconds, interval=interval))
@@ -192,6 +236,19 @@ class AutomationPlan:
                 errors.append(ERR_EXPORT_DIR_NOT_ABSOLUTE)
         elif self.export_dir and not is_absolute_path(self.export_dir):
             errors.append(ERR_EXPORT_DIR_NOT_ABSOLUTE)
+
+        hours = self.stage_snapshot_hours
+        if hours is not None:
+            # 写成 not (a <= x <= b)：NaN 也判为越界
+            if not SNAPSHOT_HOURS_MIN <= hours <= SNAPSHOT_HOURS_MAX:
+                errors.append(ERR_SNAPSHOT_HOURS_RANGE.format(
+                    low=SNAPSHOT_HOURS_MIN, high=SNAPSHOT_HOURS_MAX))
+            if not self.stage_snapshot_dir:
+                errors.append(ERR_SNAPSHOT_DIR_MISSING)
+        elif self.stage_snapshot_dir:
+            errors.append(ERR_SNAPSHOT_HOURS_MISSING)
+        if self.stage_snapshot_dir and not is_absolute_path(self.stage_snapshot_dir):
+            errors.append(ERR_SNAPSHOT_DIR_NOT_ABSOLUTE)
         return errors
 
     # ---------- JSON 往返 ----------
@@ -244,7 +301,8 @@ class AutomationPlan:
 
 # 字段 -> 允许的取值类型（None 另行允许的见 _NULLABLE）
 _INT_FIELDS = ('timed_marker_seconds', 'stop_after_seconds', 'stop_after_rounds')
-_STR_FIELDS = ('log_path', 'log_pattern', 'export_dir')
+_FLOAT_FIELDS = ('stage_snapshot_hours',)
+_STR_FIELDS = ('log_path', 'log_pattern', 'export_dir', 'stage_snapshot_dir')
 _BOOL_FIELDS = ('stop_when_target_exits', 'export_on_stop')
 
 
@@ -258,6 +316,12 @@ def _check_field(name: str, value: Any) -> Any:
         if isinstance(value, bool) or not isinstance(value, int):
             raise PlanFormatError(f"{name} 必须是整数或 null，收到 {value!r}")
         return value
+    if name in _FLOAT_FIELDS:
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise PlanFormatError(f"{name} 必须是数值或 null，收到 {value!r}")
+        return float(value)
     if name in _STR_FIELDS:
         if value is None or value == '':
             return None

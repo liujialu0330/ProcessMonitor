@@ -1,5 +1,5 @@
 """
-历史页趋势图控件 ChartView：曲线点数、打点竖线与编号徽标（基线"基"、暂停/恢复不编号的
+历史页趋势图控件 ChartView：曲线点数、打点竖线与编号徽标（基线"基线"、暂停/恢复不编号的
 短竖线）、空洞断开与阴影、累计量的速率曲线、纵轴标题与显示单位（与历史页安全网/
 流程测试逐字一致）、清空、十字线最近点吸附与读数、交互状态、最小纵向跨度、
 自适应范围、主题切换、导出图片与截图。
@@ -108,7 +108,7 @@ def test_markers_drawn_as_vertical_lines(chart):
     assert _marker_lines(chart) == []
     chart.set_markers([_marker(3, "基线", 'baseline')])
     chart.set_series(_flow_points(5), MEM)
-    assert [label for _value, label in _marker_lines(chart)] == ["基"]
+    assert [label for _value, label in _marker_lines(chart)] == ["基线"]
 
 
 def test_axis_title_without_metric_and_non_byte_units(chart):
@@ -185,16 +185,16 @@ def test_marker_badges_number_user_markers_only():
     markers = [_marker(0, "预热", 'user'), _marker(1, "基线", 'baseline'),
                _marker(2, "暂停", 'pause'), _marker(3, "恢复", 'resume'),
                _marker(4, "第1轮"), SimpleNamespace(timestamp=FLOW_BASE, label="旧")]
-    assert marker_badges(markers) == ["①", "基", None, None, "②", "③"]
+    assert marker_badges(markers) == ["①", "基线", None, None, "②", "③"]
 
 
 def test_baseline_and_gaps_dataset(chart, db):
-    """基线实线 + "基"；暂停/恢复为底部浅色短竖线、不编号；空洞处断开并画阴影。"""
+    """基线实线 + "基线"；暂停/恢复为底部浅色短竖线、不编号；空洞处断开并画阴影。"""
     task = _seed_baseline_dataset(db)
     chart.set_snapshot(_snapshot(db, task.task_id, MEM))
 
     kinds = [(kind, badge) for kind, badge, _line in chart.marker_items()]
-    assert kinds == [('baseline', "基"), ('user', "①"), ('pause', None),
+    assert kinds == [('baseline', "基线"), ('user', "①"), ('pause', None),
                      ('resume', None), ('user', "②")]
     lines = {kind: line for kind, _badge, line in chart.marker_items()}
     assert lines['baseline'].pen.style() == pg.QtCore.Qt.SolidLine
@@ -328,14 +328,21 @@ def test_constant_rate_series_gets_relative_y_span(chart, monkeypatch):
     assert compute_y_range([0.0, 0.0], MetricType.IO_READ_COUNT, rate=True) == (-0.5, 0.5)
 
 
+def _axis_text_color(chart) -> str:
+    return chart.chart_widget.getAxis('left').textPen().color().name()
+
+
 def test_theme_switch_recolors_and_keeps_data(chart):
+    # 背景透明、由卡片提供底色（不再写死 #ffffff / #2b2b2b）；主题切换只换前景色
     chart.set_series(_flow_points(), MEM, markers=[_marker(2, "第1轮")])
-    assert chart.chart_widget.backgroundBrush().color().name() == '#ffffff'
+    assert chart.is_background_transparent()
+    light_text = _axis_text_color(chart)
 
     qconfig._theme = Theme.DARK
     qconfig.themeChanged.emit(Theme.DARK)
 
-    assert chart.chart_widget.backgroundBrush().color().name() == '#2b2b2b'
+    assert chart.is_background_transparent()
+    assert _axis_text_color(chart) != light_text
     curve, = _curves(chart)
     assert curve.opts['pen'].color().name() == '#44d7d1'
     assert len(curve.getData()[0]) == 10
@@ -343,7 +350,32 @@ def test_theme_switch_recolors_and_keeps_data(chart):
 
     qconfig._theme = Theme.LIGHT
     qconfig.themeChanged.emit(Theme.LIGHT)
-    assert chart.chart_widget.backgroundBrush().color().name() == '#ffffff'
+    assert chart.is_background_transparent()
+    assert _axis_text_color(chart) == light_text
+
+
+def test_export_and_copy_use_opaque_card_background(chart, tmp_path):
+    """屏幕上透明，导出 PNG 与复制到剪贴板的图片垫当前主题的卡片底色（离开卡片后仍可读）"""
+    from PyQt5.QtGui import QColor, QImage
+    from ui.chart_theme import chart_palette
+
+    chart.set_series(_flow_points(), MEM)
+    chart.resize(600, 400)
+    original = qconfig._theme
+    try:
+        for theme, dark in ((Theme.LIGHT, False), (Theme.DARK, True)):
+            qconfig._theme = theme
+            qconfig.themeChanged.emit(theme)
+            expected = QColor(chart_palette(dark)['background'])
+            corner = chart.grab_pixmap().toImage().pixelColor(1, 1)
+            assert corner.alpha() == 255 and corner.name() == expected.name()
+            target = tmp_path / f"chart_{theme.value}.png"
+            chart.export_png(str(target), width=400)
+            exported = QImage(str(target)).pixelColor(1, 1)
+            assert exported.alpha() == 255 and exported.name() == expected.name()
+    finally:
+        qconfig._theme = original
+        qconfig.themeChanged.emit(original)
 
 
 def test_export_png_writes_file(chart, tmp_path):

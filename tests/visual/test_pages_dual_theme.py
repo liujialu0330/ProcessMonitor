@@ -138,3 +138,253 @@ def test_page_dual_theme(visual_snapshot, context, page_attr, name, settle):
     light, dark = visual_snapshot(_window_builder(ctx, services, hotkey, page_attr), name,
                                   SIZE, settle=settle)
     _assert_pair(light, dark)
+
+
+# ---------- 分析页：空洞 + 3 轮打点 + 对比任务（深色主题收口） ----------
+
+RICH_SIZE = (1280, 2300)       # 结论条、摘要表、对比卡片、区间表、焦点大图、小倍数与折叠行一屏放下
+RICH_SAMPLES = 120
+GAP_INDICES = range(50, 65)    # 第 500–640 秒没有采样：间隔 150 秒 > 2.5 × 周期，画成空洞
+# 卡片区域平均亮度（0–255）：深色主题下卡片不应再有浅色矩形，浅色主题下应是浅底
+CARD_DARK_MAX_LUMINANCE = 80
+CARD_LIGHT_MIN_LUMINANCE = 200
+
+
+def _seed_rich_task(db, manager) -> str:
+    """比夹具任务晚开始（分析页默认选中它）：私有字节上涨、句柄平稳、GDI 爬升；
+    中间一段空洞；基线 + 3 轮打点。"""
+    from data.models import DataPoint, MonitorTask
+    from utils.metrics import MetricType
+
+    metrics = [MetricType.MEMORY_PRIVATE, MetricType.NUM_HANDLES, MetricType.NUM_GDI_OBJECTS]
+    start = (datetime.now() - timedelta(hours=1)).replace(microsecond=0)
+    duration = (RICH_SAMPLES - 1) * INTERVAL
+    task = MonitorTask(task_id=str(uuid.uuid4()), pid=1003, process_name="CADModeler.exe",
+                       metric_types=list(metrics), interval=float(INTERVAL),
+                       start_time=start, end_time=start + timedelta(seconds=duration),
+                       status="stopped", note="截图夹具 · 空洞 + 3 轮")
+    assert db.save_task(task)
+    points = []
+    for i in range(RICH_SAMPLES):
+        if i in GAP_INDICES:
+            continue
+        ts = start + timedelta(seconds=i * INTERVAL)
+        values = {
+            MetricType.MEMORY_PRIVATE: 520000.0 + i * 520 + (i % 5) * 60,
+            MetricType.NUM_HANDLES: 820.0 + (4 if i % 17 in (8, 9) else 0),
+            MetricType.NUM_GDI_OBJECTS: 1460.0 + i // 3,
+        }
+        points += [DataPoint(task.task_id, ts, value, metric) for metric, value in values.items()]
+    db.save_data_points(points)
+    for minutes, label in ((1, "基线"), (5, "第 1 轮"), (12, "第 2 轮"), (16, "第 3 轮")):
+        assert manager.add_marker(task.task_id, label, start + timedelta(minutes=minutes))
+    return task.task_id
+
+
+def _region_luminance(path, rect) -> float:
+    """图片中 rect=(x, y, w, h) 区域的平均亮度（Rec. 601，0–255）。"""
+    import numpy as np
+
+    image = load_image(path)
+    ptr = image.constBits()
+    ptr.setsize(image.byteCount())
+    rows = np.frombuffer(ptr, np.uint8).reshape(image.height(), image.bytesPerLine())
+    bgr = rows[:, :image.width() * 4].reshape(image.height(), image.width(), 4)[..., :3]
+    x, y, w, h = rect
+    x0, y0 = max(0, x), max(0, y)
+    x1, y1 = min(image.width(), x + w), min(image.height(), y + h)
+    assert x1 > x0 and y1 > y0, f"区域不在图内：{rect}"
+    region = bgr[y0:y1, x0:x1].astype(float)
+    return float((0.299 * region[..., 2] + 0.587 * region[..., 1]
+                  + 0.114 * region[..., 0]).mean())
+
+
+def test_analysis_rich_dual_theme(visual_snapshot, context):
+    ctx, services, hotkey, compare_task_id = context
+    rich_task_id = _seed_rich_task(ctx.db, ctx.manager)
+    rects = {}
+
+    def settle(window):
+        page = window.analysis_page
+        vm = page.vm
+        assert process_events_until(
+            lambda: vm.current_task_id == rich_task_id and vm.last_analysis is not None,
+            timeout=15), "分析页应默认选中最新任务并加载完分析"
+        page.toolbar.compare_button.setChecked(True)
+        # 与用户在对比下拉里选任务同一路径（selector.task_selected → vm.set_compare_task）
+        assert page.compare_panel.selector.select_by_id(compare_task_id)
+        assert process_events_until(lambda: vm.last_compare is not None, timeout=15), \
+            "对比任务应在期限内加载完"
+        assert process_events_until(lambda: not window.services.threads.entries(), timeout=10)
+        process_events_until(lambda: False, timeout=0.3)
+        # 平稳的句柄数折叠为一行迷你图，只有持续上涨的私有字节（焦点大图）与 GDI 有图
+        from utils.metrics import MetricType
+        charts = list(page.trend_panel.charts().values())
+        assert len(charts) == 2
+        assert page.trend_panel.folded_metrics() == [MetricType.NUM_HANDLES]
+        first = charts[0]
+        assert first.gap_items(), "夹具数据应画出空洞阴影"
+        assert len([b for _k, b, _l in first.marker_items() if b is not None]) == 4
+        # 记录各卡片在窗口中的位置（截图容器无边距，窗口坐标即图片坐标）
+        for name, widget in (("summary", page.summary_table), ("chart", first),
+                             ("compare", page.compare_panel)):
+            assert widget.isVisible(), name
+            top_left = widget.mapTo(window, widget.rect().topLeft())
+            rects[name] = (top_left.x(), top_left.y(), widget.width(), widget.height())
+
+    build = _window_builder(ctx, services, hotkey, "analysis_page")
+    light, dark = visual_snapshot(build, "analysis_rich", RICH_SIZE, settle=settle)
+    for path in (light, dark):
+        image = load_image(path)
+        assert (image.width(), image.height()) == RICH_SIZE, path
+    assert pixel_difference_ratio(light, dark) > MIN_DIFF_RATIO
+    assert set(rects) == {"summary", "chart", "compare"}
+    for name, rect in rects.items():
+        dark_value = _region_luminance(dark, rect)
+        light_value = _region_luminance(light, rect)
+        assert dark_value < CARD_DARK_MAX_LUMINANCE, \
+            f"深色主题下 {name} 卡片区域偏亮（平均亮度 {dark_value:.0f}），可能残留浅色矩形"
+        assert light_value > CARD_LIGHT_MIN_LUMINANCE, \
+            f"浅色主题下 {name} 卡片区域偏暗（平均亮度 {light_value:.0f}）"
+
+
+# ---------- 分析页首屏（1280×820）：结论条 + 摘要表 + 区间表前 3 行不滚动可见 ----------
+
+FIRST_SCREEN_SAMPLES = 150     # 10 秒一个点，25 分钟
+FIRST_SCREEN_ROWS = 3
+
+
+def _seed_leak_preset_task(db, manager) -> str:
+    """最新的任务（分析页默认选中）：泄漏排查预设 5 个指标，私有字节与句柄数持续上涨，
+    GDI / USER / 线程平稳；基线 + 3 轮打点。"""
+    from data.models import DataPoint, MonitorTask
+    from utils.metrics import MetricType
+
+    metrics = [MetricType.MEMORY_PRIVATE, MetricType.NUM_HANDLES, MetricType.NUM_GDI_OBJECTS,
+               MetricType.NUM_USER_OBJECTS, MetricType.NUM_THREADS]
+    start = (datetime.now() - timedelta(minutes=30)).replace(microsecond=0)
+    duration = (FIRST_SCREEN_SAMPLES - 1) * INTERVAL
+    task = MonitorTask(task_id=str(uuid.uuid4()), pid=1004, process_name="CADModeler.exe",
+                       metric_types=list(metrics), interval=float(INTERVAL),
+                       start_time=start, end_time=start + timedelta(seconds=duration),
+                       status="stopped", note="截图夹具 · 泄漏预设 3 轮")
+    assert db.save_task(task)
+    points = []
+    for i in range(FIRST_SCREEN_SAMPLES):
+        ts = start + timedelta(seconds=i * INTERVAL)
+        values = {
+            MetricType.MEMORY_PRIVATE: 512000.0 + i * 240 + (i % 7) * 30,
+            MetricType.NUM_HANDLES: 812.0 + i // 3,
+            MetricType.NUM_GDI_OBJECTS: 1450.0 + (2 if i % 19 in (5, 6) else 0),
+            MetricType.NUM_USER_OBJECTS: 230.0,
+            MetricType.NUM_THREADS: 24.0 + (1 if i % 29 == 7 else 0),
+        }
+        points += [DataPoint(task.task_id, ts, value, metric) for metric, value in values.items()]
+    db.save_data_points(points)
+    for minutes, label in ((1, "基线"), (7, "第 1 轮"), (13, "第 2 轮"), (19, "第 3 轮")):
+        assert manager.add_marker(task.task_id, label, start + timedelta(minutes=minutes))
+    return task.task_id
+
+
+def _window_rect(widget, window):
+    from PyQt5.QtCore import QPoint, QRect
+    return QRect(widget.mapTo(window, QPoint(0, 0)), widget.size())
+
+
+def test_analysis_first_screen_dual_theme(visual_snapshot, context):
+    from PyQt5.QtCore import QEvent, QPoint, QRect
+    from PyQt5.QtWidgets import QApplication
+
+    from ui.widgets.history.chart_view import ChartView
+    from utils.metrics import MetricType
+
+    ctx, services, hotkey, _task_id = context
+    task_id = _seed_leak_preset_task(ctx.db, ctx.manager)
+    seen = []
+
+    def settle(window):
+        page = window.analysis_page
+        vm = page.vm
+        assert process_events_until(
+            lambda: vm.current_task_id == task_id and vm.last_analysis is not None,
+            timeout=15), "分析页应默认选中最新任务并加载完分析"
+        assert process_events_until(lambda: not window.services.threads.entries(), timeout=10)
+        process_events_until(lambda: False, timeout=0.3)
+        assert page.verticalScrollBar().value() == 0
+        # 只为 2 项持续上涨建图（焦点大图 + 1 张小图），3 项平稳折叠
+        QApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+        views = [c for c in page.findChildren(ChartView) if type(c) is ChartView]
+        assert len(views) == 2
+        assert sorted(page.trend_panel.folded_metrics()) == sorted([
+            MetricType.NUM_GDI_OBJECTS, MetricType.NUM_USER_OBJECTS, MetricType.NUM_THREADS])
+        assert page.verdict_banner.sentence().startswith("2 / 5 项持续上涨：")
+        # 首屏（不滚动）可见：滚动区视口在窗口中的矩形
+        viewport = page.viewport()
+        visible = QRect(viewport.mapTo(window, QPoint(0, 0)), viewport.size())
+        for name, widget in (("结论条", page.verdict_banner), ("摘要表", page.summary_table)):
+            assert widget.isVisible(), name
+            assert visible.contains(_window_rect(widget, window)), \
+                f"{name}应在首屏完整可见：{_window_rect(widget, window)} 不在 {visible} 内"
+        table = page.interval_table.table
+        assert table.isVisible() and table.rowCount() >= FIRST_SCREEN_ROWS
+        for row in range(FIRST_SCREEN_ROWS):
+            cell = table.visualRect(table.model().index(row, 0))
+            rect = QRect(table.viewport().mapTo(window, cell.topLeft()), cell.size())
+            assert visible.contains(rect), f"区间表第 {row + 1} 行应在首屏可见：{rect} 不在 {visible} 内"
+        seen.append(window.isVisible())
+
+    build = _window_builder(ctx, services, hotkey, "analysis_page")
+    light, dark = visual_snapshot(build, "analysis_first_screen", SIZE, settle=settle)
+    assert seen == [True, True]
+    _assert_pair(light, dark)
+
+
+# ---------- 任务卡片：状态胶囊、选中色条、迷你图与打点刻度 ----------
+
+def test_task_cards_dual_theme(visual_snapshot):
+    from PyQt5.QtWidgets import QVBoxLayout, QWidget
+    from types import SimpleNamespace
+
+    from core.contracts import StopReason
+    from ui.components.task_card import TaskCard
+    from utils.metrics import MetricType
+
+    metrics = [MetricType.MEMORY_PRIVATE, MetricType.NUM_HANDLES, MetricType.NUM_GDI_OBJECTS]
+    start = datetime(2026, 11, 7, 9, 0, 0)
+
+    def card(task_id, paused=False, finished=None):
+        widget = TaskCard(task_id, "CADModeler.exe", 1002, list(metrics), interval=1.0,
+                          note="截图夹具")
+        widget.set_started_at(start)
+        for i in range(120):
+            widget.update_values({
+                MetricType.MEMORY_PRIVATE: 512000.0 + i * 410 + (i % 7) * 35,
+                MetricType.NUM_HANDLES: 812.0 + (3 if i % 23 in (11, 12) else 0),
+                MetricType.NUM_GDI_OBJECTS: 1450.0 + i // 4,
+            }, start + timedelta(seconds=i))
+        widget.set_markers([
+            SimpleNamespace(timestamp=start + timedelta(seconds=20), kind='baseline'),
+            SimpleNamespace(timestamp=start + timedelta(seconds=60), kind='user'),
+            SimpleNamespace(timestamp=start + timedelta(seconds=100), kind='user')])
+        if paused:
+            widget.set_paused(True)
+        if finished is not None:
+            widget.set_finished(finished, start + timedelta(seconds=120))
+        return widget
+
+    def build():
+        host = QWidget()
+        layout = QVBoxLayout(host)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(12)
+        layout.addWidget(card("running"))
+        layout.addWidget(card("paused", paused=True))
+        layout.addWidget(card("abnormal", finished=StopReason.PROCESS_EXITED))
+        layout.addWidget(card("finished", finished=StopReason.USER))
+        layout.addStretch()
+        return host
+
+    light, dark = visual_snapshot(build, "task_cards", (1100, 640))
+    assert pixel_difference_ratio(light, dark) > MIN_DIFF_RATIO
+    assert mean_luminance(dark) < DARK_MAX_LUMINANCE
+    assert mean_luminance(light) > LIGHT_MIN_LUMINANCE

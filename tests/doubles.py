@@ -8,6 +8,7 @@
 - 给出固定的进程表（FakeProcessQuery；读取列表可阻塞到测试放行的 BlockingProcessQuery），
 - 指定哪些任务仍在运行（FakeTaskStatus），
 - 给出固定的用户偏好（FakePreferences），
+- 启动 / 关闭被测程序而不真的启动进程（FakeLauncher），
 - 给出固定的全系统进程快照（FakeSnapshotSource、fake_process_sample、fake_system_snapshot，
   快照不可用的 unavailable_snapshot_hub）。
 替身都不弹出任何窗口、不触达本机进程与配置文件。
@@ -150,7 +151,7 @@ class ScriptedDialogs:
 
     需要返回值的方法（confirm / ask_marker_label / choose_metrics / ask_save_path /
     ask_open_file / ask_directory / ask_close_action）未预设即被调用时断言失败，避免测试在不知情时走了默认分支；
-    无需返回值的系统交互（open_folder / open_file / copy_pixmap）与 open_url
+    无需返回值的系统交互（open_folder / open_file / copy_pixmap / copy_text）与 open_url
     （默认返回 True）不预设也可调用，只做记录。
     """
 
@@ -163,6 +164,7 @@ class ScriptedDialogs:
         'open_file': None,
         'open_url': True,
         'copy_pixmap': None,
+        'copy_text': None,
     }
     METHODS = _REQUIRES_SCRIPT + tuple(_DEFAULTS)
 
@@ -277,6 +279,9 @@ class ScriptedDialogs:
 
     def copy_pixmap(self, pixmap) -> None:
         self._answer('copy_pixmap', pixmap=pixmap)
+
+    def copy_text(self, text: str) -> None:
+        self._answer('copy_text', text=text)
 
 
 # ---------------------------------------------------------------- 时钟
@@ -395,6 +400,49 @@ class BlockingProcessQuery(FakeProcessQuery):
     def list_calls(self) -> int:
         """list_processes 被调用的次数。"""
         return len(self.list_threads)
+
+
+# ---------------------------------------------------------------- 启动被测程序
+
+
+class FakeLauncher:
+    """启动被测程序的替身（与 core.process_launcher.ProcessLauncher 同接口），不启动任何进程。
+
+    - launch(spec)：记入 launched，按 results 队列（耗尽后用 result）返回 LaunchResult；
+      默认成功，PID 从 next_pid 起递增、创建时间 = PID + 0.5、进程名取程序文件名；
+    - fail(error)：之后的 launch 一律返回该错误；
+    - terminate(pid, create_time)：记入 terminated（线程安全，可在后台线程调用），返回 outcome。
+    """
+
+    def __init__(self, next_pid: int = 5001):
+        self.launched: List[Any] = []
+        self.terminated: List[Tuple[int, Optional[float]]] = []
+        self.results: deque = deque()
+        self.result = None
+        self.next_pid = next_pid
+        self.outcome = 'closed'
+        self._lock = threading.Lock()
+
+    def fail(self, error: str) -> "FakeLauncher":
+        from core.process_launcher import LaunchResult
+        self.result = LaunchResult(error=error)
+        return self
+
+    def launch(self, spec):
+        from core.process_launcher import LaunchResult
+        self.launched.append(spec)
+        if self.results:
+            return self.results.popleft()
+        if self.result is not None:
+            return self.result
+        pid = self.next_pid
+        self.next_pid += 1
+        return LaunchResult(pid=pid, create_time=pid + 0.5, name=spec.name)
+
+    def terminate(self, pid: int, create_time: Optional[float]) -> str:
+        with self._lock:
+            self.terminated.append((pid, create_time))
+        return self.outcome
 
 
 # ---------------------------------------------------------------- 任务状态

@@ -14,10 +14,10 @@ from datetime import datetime
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 from PyQt5.QtCore import Qt, QPointF
-from PyQt5.QtGui import QPainter, QPen, QColor, QPolygonF
+from PyQt5.QtGui import QPainter, QPen, QPolygonF
 from PyQt5.QtWidgets import QWidget, QSizePolicy
 
-from qfluentwidgets import isDarkTheme
+from ui.theme_tokens import ATTENTION, DATA, qcolor
 
 # 最小跨度规则按指标 kind 定义在 utils.metrics；常量在此再导出，保持原有导入路径可用
 from utils.metrics import (  # noqa: F401
@@ -31,14 +31,12 @@ FIXED_HEIGHT = 36
 # 缓冲区点数上限（必须为偶数，保证成对合并后没有落单点）
 DEFAULT_MAX_POINTS = 240
 
-# 折线取色：在 paintEvent 内动态调用 isDarkTheme()，不连接 qconfig.themeChanged——
-# 任务卡片随监控任务动态创建/销毁，这样实现不必在卡片销毁时手动断开主题信号连接，
-# 零信号残留。颜色自含常量，不依赖分析页的 ui/chart_theme.py。
-_LIGHT_COLOR = QColor("#0A8F8F")
-_DARK_COLOR = QColor("#44D7D1")
-# 打点刻度用注意色（与历史图表的打点竖线同色）
-_MARKER_LIGHT_COLOR = QColor("#C2410C")
-_MARKER_DARK_COLOR = QColor("#FFB454")
+# 取色：在 paintEvent 内按当前主题从 ui.theme_tokens 取，不连接 qconfig.themeChanged——
+# 任务卡片随监控任务动态创建/销毁，这样不必在卡片销毁时手动断开主题信号连接，零信号残留。
+# 背景不画（透明），底色来自所在卡片；折线用数据主色（对卡片底 ≥ 4.5:1），
+# 打点刻度用注意色（与分析页图表的打点竖线同色）。
+LINE_COLOR = DATA
+TICK_COLOR = ATTENTION
 
 # 画在迷你图上的打点类型：暂停/恢复系统打点不画，小图上只留用户关心的轮次边界
 TICK_KINDS = ('baseline', 'user')
@@ -246,7 +244,7 @@ class SparklineWidget(QWidget):
         count = len(values)
         width = self.width()
         height = self.height()
-        color = _DARK_COLOR if isDarkTheme() else _LIGHT_COLOR
+        color = qcolor(LINE_COLOR)
 
         if count == 1:
             painter.setPen(Qt.NoPen)
@@ -282,7 +280,7 @@ class SparklineWidget(QWidget):
         positions = self.tick_positions()
         if not positions:
             return
-        color = _MARKER_DARK_COLOR if isDarkTheme() else _MARKER_LIGHT_COLOR
+        color = qcolor(TICK_COLOR)
         for fraction, kind in positions:
             pen = QPen(color)
             if kind == 'baseline':

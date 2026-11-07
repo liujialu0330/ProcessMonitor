@@ -57,6 +57,9 @@ def page(qapp, db, manager, services, started):
     # 进程列表在后台线程读取：等首屏那次读取到达
     _wait_process_list(widget)
     yield widget
+    # 搜索框打字后 qfluentwidgets 用 50 ms 的 singleShot 弹补全菜单；在本用例内把它跑完，
+    # 不让它落到下一个用例的事件循环里去碰已经换掉的补全器
+    QTest.qWait(100)
     widget.close()
 
 
@@ -221,11 +224,13 @@ def test_invalid_target_shows_error_under_field_and_clears_on_edit(
 
 def test_page_has_no_separate_pid_box(page):
     """PID 直接在搜索框输入（P10）：表单里除搜索框外只剩备注一个单行输入框
-    （"自动化"折叠区里的日志路径、匹配规则与导出目录不算）"""
+    （"自动化"折叠区里的日志路径、匹配规则与导出目录，"启动被测程序"折叠区里的程序路径、
+    参数与工作目录不算）"""
     from qfluentwidgets import EditableComboBox, LineEdit
     edits = [w for w in page.form.findChildren(LineEdit)
              if not isinstance(w, EditableComboBox)
-             and not page.form.automation.isAncestorOf(w)]
+             and not page.form.automation.isAncestorOf(w)
+             and not page.form.launch_options.isAncestorOf(w)]
     assert edits == [page.form.note_input]
 
 
@@ -514,3 +519,51 @@ def test_card_analysis_button_requests_analysis(page, manager):
     page.history_requested.connect(requested.append)
     page.board.cards()[task_id].analysis_button.click()
     assert requested == [task_id]
+
+
+def test_pause_from_elsewhere_shows_paused_on_card(page, manager, db):
+    """命令行 / 托盘直接调真实 manager 的 pause_task：卡片随 task_paused 显示"已暂停"，
+    resume_task 后回到"运行中"。"""
+    task_id = _add_card(manager)
+    card = page.board.cards()[task_id]
+    from core.monitor_task import WorkerState
+    assert manager.get_task(task_id)._transition((WorkerState.WAITING,), WorkerState.RUNNING)
+
+    assert manager.pause_task(task_id)
+    assert card.is_paused and card.pause_button.text() == "恢复"
+    assert "已暂停" in card.status_label.text()
+
+    assert manager.resume_task(task_id)
+    assert not card.is_paused and card.status_label.text() == "● 运行中"
+    # 外部暂停 / 恢复同样只写一次系统打点
+    assert [m.kind for m in db.get_markers(task_id)] == ["pause", "resume"]
+
+
+def test_launch_section_start_launches_and_monitors(page, manager, services, started):
+    """勾选"开始时先启动程序"：开始按钮先经 launcher 启动，再以启动结果建任务。"""
+    import sys
+    form = page.form
+    form.launch_options.set_expanded(True)
+    form.set_launch_exe(sys.executable)
+    form.launch_options.close_check.setChecked(True)
+    assert form.start_button.text() == "启动并监控"
+
+    form.start_button.click()
+
+    assert [spec.exe for spec in services.launcher.launched] == [sys.executable]
+    [task_id] = page.presenter.task_ids()
+    info = manager.get_task_info(task_id)
+    assert info.pid == 5001 and info.create_time == 5001.5
+    assert started == [task_id]
+
+
+def test_launch_failure_shows_error_under_launch_section(page, manager, services):
+    import sys
+    services.launcher.fail("程序启动后立即退出（退出码 1），请检查参数与工作目录")
+    page.form.set_launch_exe(sys.executable)
+
+    page.form.start_button.click()
+
+    assert page.presenter.task_ids() == []
+    assert "立即退出" in page.form.launch_error_text()
+    assert page.form.launch_options.is_expanded()

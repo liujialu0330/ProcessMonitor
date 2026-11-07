@@ -321,3 +321,34 @@ def test_finished_card_is_single_row(card):
 ])
 def test_end_time_format(end, now, expected):
     assert format_end_time(end, now) == expected
+
+
+# ---------------------------------------------------------------- 悬停提示：被测目标摘要
+
+
+def _target_lines():
+    from core.target_info import TargetInfo
+    info = TargetInfo(pid=1234, exe_path=r"C:\Apps\demo.exe", file_version="1.2.3.4",
+                      cmdline=(r"C:\Apps\demo.exe", "--load", "a b.prj"),
+                      os_version="Windows 11 10.0.26200", logical_cores=16,
+                      tool_version="2.0.0-beta.1", tool_is_admin=False)
+    return info.summary_lines()
+
+
+def test_tooltip_appends_target_summary_after_plan(card):
+    lines = _target_lines()
+    assert lines[0] == r"被测程序: C:\Apps\demo.exe（文件版本 1.2.3.4）"
+    card.setToolTip("自动打点：每 10 分钟")
+    card.set_target_summary(lines)
+    assert card.toolTip() == "自动打点：每 10 分钟\n\n" + "\n".join(lines)
+    assert card.target_summary() == lines
+
+
+def test_tooltip_keeps_target_summary_when_plan_arrives_later(card):
+    lines = _target_lines()
+    card.set_target_summary(lines)
+    assert card.toolTip() == "\n".join(lines)
+    card.setToolTip("自动打点：每 10 分钟")
+    assert card.toolTip().startswith("自动打点：每 10 分钟\n\n被测程序: ")
+    card.setToolTip("")
+    assert card.toolTip() == "\n".join(lines)

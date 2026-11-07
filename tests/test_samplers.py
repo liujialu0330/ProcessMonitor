@@ -358,7 +358,7 @@ def test_snapshot_memory_percent_uses_working_set(monkeypatch):
 
 
 def test_snapshot_cpu_percent_is_time_delta_over_wall_delta():
-    """prime 记下起点（user+kernel=2.0 s，t=10），2 秒后 3.0 s → 50%；不预热首采为 0"""
+    """prime 记下起点（user+kernel=2.0 s，t=10），2 秒后 3.0 s → 50%"""
     hub, _ = _hub_of(_snap(10.0, user_time=1.25, kernel_time=0.75),
                      _snap(12.0, user_time=1.5, kernel_time=1.5),
                      _snap(13.0, user_time=1.5, kernel_time=3.5))
@@ -368,22 +368,160 @@ def test_snapshot_cpu_percent_is_time_delta_over_wall_delta():
     # 多核并行可超过 100%（与 psutil 同口径，按单核计）
     assert c.collect_metrics([MetricType.CPU_PERCENT]) == {MetricType.CPU_PERCENT: 200.0}
 
-    hub2, _ = _hub_of(_snap(10.0))
-    fresh = _snapshot_collector(hub2, _psutil_forbidden())
-    assert fresh.collect_metrics([MetricType.CPU_PERCENT]) == {MetricType.CPU_PERCENT: 0.0}
+
+def test_snapshot_cpu_percent_without_baseline_is_unavailable_not_zero():
+    """没有差分起点（未预热）：首个点记为不可用，不写 0.0；本点成为起点，下一周期有值"""
+    hub, _ = _hub_of(_snap(10.0, user_time=1.0, kernel_time=1.0),
+                     _snap(12.0, user_time=2.0, kernel_time=1.0))
+    c = _snapshot_collector(hub, _psutil_forbidden())
+    assert c.collect_metrics([MetricType.CPU_PERCENT]) == {}
+    assert c.last_unavailable == {MetricType.CPU_PERCENT: UnavailableReason.ERROR}
+    assert c.collect_metrics([MetricType.CPU_PERCENT]) == {MetricType.CPU_PERCENT: 50.0}
+    assert c.last_unavailable == {}
 
 
-def test_snapshot_cpu_percent_same_snapshot_twice_keeps_window():
+def test_snapshot_cpu_percent_zero_elapsed_is_unavailable_and_keeps_window():
+    """两份快照的单调时刻相同（窗口长度为 0）：不写 0.0，保留原起点，下次按完整窗口算"""
+    hub, _ = _hub_of(lambda: _snap(10.0, user_time=1.5, kernel_time=1.5),
+                     lambda: _snap(12.0, user_time=2.0, kernel_time=2.0))
+    c = _snapshot_collector(hub, _psutil_forbidden())
+    c._cpu_prev = (2.0, 10.0)
+    assert c.collect_metrics([MetricType.CPU_PERCENT]) == {}
+    assert c.last_unavailable == {MetricType.CPU_PERCENT: UnavailableReason.ERROR}
+    assert c._cpu_prev == (2.0, 10.0)
+    # (4.0-2.0)/(12-10) = 100%
+    assert c.collect_metrics([MetricType.CPU_PERCENT]) == {MetricType.CPU_PERCENT: 100.0}
+
+
+def test_snapshot_same_snapshot_twice_is_replaced_by_a_fresh_one():
+    """按截止时间取时，hub 把上次用过的那份快照又给了同一个采集器：强制取新的，不让累计量写两遍同一个值"""
     clock = ManualMonotonic()
     source = FakeSnapshotSource(snapshots=[
-        _snap(10.0, user_time=1.0, kernel_time=1.0), _snap(12.0, user_time=2.0, kernel_time=1.0)])
+        _snap(10.0, user_time=1.0, kernel_time=1.0, read_count=100),
+        _snap(12.0, user_time=2.0, kernel_time=1.0, read_count=200)])
     hub = SnapshotHub(source, clock=clock)
-    c = _snapshot_collector(hub, _psutil_forbidden(cpu_percent=lambda interval=None: 0.0),
-                            max_age_s=5)
+    c = _snapshot_collector(hub, _psutil_forbidden(), max_age_s=5)
     c.prime_cpu()
-    assert c.collect_metrics([MetricType.CPU_PERCENT]) == {MetricType.CPU_PERCENT: 0.0}
-    clock.advance(10)
+    c.snapshot_not_before = 0.0                 # 监控线程的周期：按截止时间取
+    # 缓存里仍是预热用的那份：直接命中会让窗口为 0 并重复 read_count
+    values = c.collect_metrics([MetricType.CPU_PERCENT, MetricType.IO_READ_COUNT])
+    assert values == {MetricType.CPU_PERCENT: 50.0, MetricType.IO_READ_COUNT: 200.0}
+    assert source.calls == 2
+
+
+def test_snapshot_age_semantics_accepts_reuse_without_refresh():
+    """没有截止时间（按年龄取）的调用方明确接受复用同一份快照，不额外取样"""
+    source = FakeSnapshotSource(snapshots=[_snap(10.0)])
+    hub = SnapshotHub(source, clock=ManualMonotonic())
+    c = _snapshot_collector(hub, _psutil_forbidden(), max_age_s=5)
+    for _ in range(3):
+        assert c.collect_metrics([MetricType.NUM_HANDLES]) == {MetricType.NUM_HANDLES: 345.0}
+    assert source.calls == 1
+
+
+def test_snapshot_not_before_is_passed_to_hub_when_set():
+    calls = []
+
+    class _Hub:
+        def available(self):
+            return True
+
+        def get(self, max_age_s, **kwargs):
+            calls.append(kwargs)
+            return _snap(10.0)
+
+        def refresh(self):
+            raise AssertionError("不应强制刷新")
+
+    c = _snapshot_collector(_Hub(), _psutil_forbidden())
+    c.collect_metrics([MetricType.NUM_THREADS])
+    c.snapshot_not_before = 123.0
+    c.collect_metrics([MetricType.NUM_THREADS])
+    assert calls == [{}, {'not_before': 123.0}]
+
+
+def test_psutil_fallback_cycle_cpu_percent_matches_snapshot_path(monkeypatch):
+    """偶发回退 psutil 的那个周期：CPU% 仍按 cpu_times 增量除以单调时钟间隔算，
+    与快照路径共用差分起点，既不用 cpu_percent（起点停在预热时），也不丢掉差分链"""
+    hub, _ = _hub_of(_snap(10.0, user_time=1.25, kernel_time=0.75),     # 预热：2.0 s @10
+                     SnapshotError("偶发"),
+                     _snap(14.0, user_time=3.0, kernel_time=2.0))        # 5.0 s @14
+    proc = _psutil_forbidden(
+        cpu_times=lambda: SimpleNamespace(user=2.0, system=1.0),         # 3.0 s
+        is_running=lambda: True,
+        memory_info=_fake_process().memory_info)
+    c = _snapshot_collector(hub, proc)
+    c.prime_cpu()
+    monkeypatch.setattr(pc, "_monotonic", lambda: 12.0)
+    # 回退周期：(3.0-2.0)/(12-10) = 50%，快照路径同口径
     assert c.collect_metrics([MetricType.CPU_PERCENT]) == {MetricType.CPU_PERCENT: 50.0}
+    assert c.last_source == 'psutil'
+    # 下一周期回到快照路径，起点是回退周期的点：(5.0-3.0)/(14-12) = 100%
+    assert c.collect_metrics([MetricType.CPU_PERCENT]) == {MetricType.CPU_PERCENT: 100.0}
+    assert c.last_source == 'snapshot'
+
+
+def test_psutil_fallback_cpu_percent_without_baseline_is_unavailable(monkeypatch):
+    hub, _ = _hub_of(available=False)
+    proc = _fake_process(cpu_times=lambda: SimpleNamespace(user=1.0, system=1.0),
+                         cpu_percent=_raiser(AssertionError("不应调用 cpu_percent")))
+    c = _snapshot_collector(hub, proc)
+    times = iter([20.0, 22.0])
+    monkeypatch.setattr(pc, "_monotonic", lambda: next(times))
+    assert c.collect_metrics([MetricType.CPU_PERCENT]) == {}
+    assert c.last_unavailable == {MetricType.CPU_PERCENT: UnavailableReason.ERROR}
+    proc.cpu_times = lambda: SimpleNamespace(user=2.0, system=1.0)
+    assert c.collect_metrics([MetricType.CPU_PERCENT]) == {MetricType.CPU_PERCENT: 50.0}
+
+
+def test_prime_cpu_with_unavailable_hub_seeds_baseline_from_psutil_cpu_times(monkeypatch):
+    hub, _ = _hub_of(available=False)
+    proc = _fake_process(cpu_times=lambda: SimpleNamespace(user=1.0, system=1.0))
+    c = _snapshot_collector(hub, proc)
+    monkeypatch.setattr(pc, "_monotonic", lambda: 30.0)
+    c.prime_cpu()
+    assert c._cpu_prev == (2.0, 30.0)
+
+
+def test_prime_cpu_target_newer_than_cached_snapshot_refreshes_hub():
+    """目标进程比缓存的快照还新：预热时快照里没有它，强制取新快照再找一次"""
+    older = fake_system_snapshot([fake_process_sample(1)], monotonic=9.0)
+    newer = _snap(10.0, user_time=1.25, kernel_time=0.75)
+    clock = ManualMonotonic()
+    source = FakeSnapshotSource(snapshots=[older, newer])
+    hub = SnapshotHub(source, clock=clock)
+    hub.get(5.0)                                # 缓存里是不含目标进程的旧快照
+    c = _snapshot_collector(hub, _psutil_forbidden(), max_age_s=5.0)
+    c.prime_cpu()
+    assert source.calls == 2
+    assert c._cpu_prev == (2.0, 10.0)
+
+
+def test_prime_cpu_target_still_missing_after_refresh_leaves_first_point_unavailable():
+    """刷新后快照里仍没有目标进程：不设起点，首个 CPU 点记为不可用而不是 0.0"""
+    gone = fake_system_snapshot([fake_process_sample(1)], monotonic=9.0)
+    still_gone = fake_system_snapshot([fake_process_sample(2)], monotonic=10.0)
+    hub, source = _hub_of(gone, still_gone, _snap(12.0, user_time=2.0, kernel_time=1.0))
+    c = _snapshot_collector(hub, _psutil_forbidden(is_running=_raiser(
+        AssertionError("预热不应走 psutil"))))
+    c.prime_cpu()
+    assert source.calls == 2                    # get 一次 + refresh 一次
+    assert c._cpu_prev is None
+    assert c.collect_metrics([MetricType.CPU_PERCENT]) == {}
+    assert c.last_unavailable == {MetricType.CPU_PERCENT: UnavailableReason.ERROR}
+
+
+@pytest.mark.skipif(os.name != "nt", reason="仅 Windows")
+@pytest.mark.parametrize("pid", [0, 4])
+def test_system_pids_create_time_agrees_between_psutil_and_snapshot(pid):
+    """psutil 对 PID 0/4 的 create_time() 为 0.0（快照口径同），监控它们不会被误判为 PID 复用"""
+    from core import system_snapshot
+    assert psutil.Process(pid).create_time() == 0.0
+    sample = system_snapshot.snapshot().processes[pid]
+    c = ProcessCollector(pid, hub=SnapshotHub())
+    assert c._same_process(sample)
+    assert c.collect_metrics([MetricType.NUM_THREADS]) is not None
+    assert c.last_source == 'snapshot'
 
 
 def test_snapshot_pid_reuse_returns_none():

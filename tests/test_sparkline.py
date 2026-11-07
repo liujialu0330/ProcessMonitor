@@ -208,3 +208,18 @@ def test_ticks_need_timestamps_and_skip_system_markers(qapp):
         widget.grab()
     assert "Traceback" not in stderr.getvalue()
     widget.deleteLater()
+
+
+# ---------- 取色 ----------
+
+def test_sparkline_colors_come_from_theme_tokens():
+    """折线与刻度取色统一在 ui.theme_tokens：折线为数据主色、刻度为打点注意色；
+    折线对卡片底（常态与悬停）≥ 4.5:1。"""
+    from ui import theme_tokens as tokens
+    from ui.color_contrast import TEXT_MIN_CONTRAST, contrast_ratio
+    from ui.components.sparkline import LINE_COLOR, TICK_COLOR
+
+    assert LINE_COLOR == tokens.DATA and TICK_COLOR == tokens.ATTENTION
+    for i in (0, 1):
+        for surface in (tokens.SURFACE[i], tokens.SURFACE_HOVER[i]):
+            assert contrast_ratio(LINE_COLOR[i], surface) >= TEXT_MIN_CONTRAST

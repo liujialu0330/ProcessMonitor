@@ -36,6 +36,73 @@ def qapp():
     yield app
 
 
+# 释放泄漏控件前等待其子线程结束的上限（毫秒）
+_LEAKED_THREAD_WAIT_MS = 3000
+# 只释放本项目的控件类（界面层与测试替身）：pyqtgraph 等第三方库自己持有的无父菜单/面板
+# 由其 Python 对象管理生命周期，从 C++ 侧提前删掉会在宿主析构时直接崩溃（abort）
+_OWN_WIDGET_MODULES = ('ui.', 'tests.')
+
+
+def _widget_key(widget) -> int:
+    from PyQt5 import sip
+    return int(sip.unwrapinstance(widget))
+
+
+def _is_own_widget(widget) -> bool:
+    return type(widget).__module__.startswith(_OWN_WIDGET_MODULES)
+
+
+def _stop_child_threads(widget) -> bool:
+    """控件下仍在运行的 QThread：请求结束并等待。等不到返回 False（此时不能释放控件，
+    否则线程对象随父对象析构会 "QThread: Destroyed while thread is still running" 直接崩溃）。"""
+    from PyQt5.QtCore import QThread
+    for thread in widget.findChildren(QThread):
+        if thread.isRunning():
+            thread.requestInterruption()
+            thread.quit()
+            if not thread.wait(_LEAKED_THREAD_WAIT_MS):
+                return False
+    return True
+
+
+def leaked_top_level_widgets(app, before) -> list:
+    """用例开始后新出现、仍存活的本项目无父顶层控件。"""
+    from PyQt5 import sip
+    return [w for w in app.topLevelWidgets()
+            if not sip.isdeleted(w) and w.parentWidget() is None
+            and _is_own_widget(w) and _widget_key(w) not in before]
+
+
+@pytest.fixture(autouse=True)
+def _dispose_leaked_widgets():
+    """
+    每个用例结束后释放它留下的、仍存活的无父顶层控件（页面、主窗口、卡片、图表等）。
+
+    无父的顶层控件不会随 Python 引用消失而析构：留下的设置页把 qconfig.themeChanged 连到
+    setTheme，之后每次切主题都多发一次 themeChanged（还会把主题模式改写成具体主题）；
+    qfluentwidgets 的样式表管理器给每个残留控件重刷样式表，主题切换越来越慢；残留控件的
+    定时器越积越多。用例开始前已存在的顶层控件不动；有父对象的弹出窗口随父对象一起释放。
+    """
+    from PyQt5 import sip
+    from PyQt5.QtWidgets import QApplication
+    from tests.helpers import dispose_widget
+
+    app = QApplication.instance()
+    before = {_widget_key(w) for w in app.topLevelWidgets()} if app is not None else set()
+    yield
+    app = QApplication.instance()
+    if app is None:
+        return
+    for widget in leaked_top_level_widgets(app, before):
+        if sip.isdeleted(widget):
+            continue
+        if not _stop_child_threads(widget):
+            import warnings
+            warnings.warn(f"用例留下的控件仍有子线程在运行，未释放：{type(widget).__name__}")
+            continue
+        dispose_widget(widget)
+
+
 @pytest.fixture(autouse=True)
 def _isolate_data_dir(tmp_path_factory, monkeypatch):
     """
@@ -109,6 +176,8 @@ def _reset_app_config():
         item_cfg.skipped_version.value = item_cfg.skipped_version.defaultValue
         item_cfg.keep_awake_while_monitoring.value = (
             item_cfg.keep_awake_while_monitoring.defaultValue)
+        item_cfg.automation_enabled.value = item_cfg.automation_enabled.defaultValue
+        item_cfg.report_color_scheme.value = item_cfg.report_color_scheme.defaultValue
         # 主题复位为本应用语义上的默认值 AUTO（跟随系统），而非 qfluentwidgets
         # 库自带的类默认值 Theme.LIGHT——与 load_app_config() 首启行为保持一致
         item_cfg.themeMode.value = Theme.AUTO

@@ -211,3 +211,76 @@ def test_theme_switch_restyles_pills_and_keeps_selection(table):
         qconfig._theme = original
         qconfig.themeChanged.emit(original)
     assert (_pill_color(table, 0), _pill_color(table, 1)) == light
+
+
+def test_pill_and_dimmed_colors_come_from_theme_tokens(table):
+    """胶囊底色按判定语气取自 ui.theme_tokens（与任务卡片状态胶囊同源），文字色也在那里；
+    置灰行文字对卡片底仍 ≥ 4.5:1。"""
+    from ui import theme_tokens as tokens
+    from ui.color_contrast import TEXT_MIN_CONTRAST, contrast_ratio
+
+    pill = table.table.cellWidget(0, VERDICT_COLUMN)
+    style = pill.styleSheet()
+    assert tokens.pill_background(tokens.verdict_tone(pill.text())) in style
+    assert _pill_color(table, 0) == tokens.pick(tokens.PILL_TEXT)
+    assert _pill_color(table, 1) == tokens.pick(tokens.PILL_TEXT_DIMMED)
+    dim = table.table.item(1, 1).foreground().color()
+    assert dim == tokens.qcolor(tokens.DIMMED_TEXT)
+    for i in (0, 1):
+        assert contrast_ratio(tokens.DIMMED_TEXT[i], tokens.SURFACE[i]) >= TEXT_MIN_CONTRAST
+
+
+# ---------- 分析页的显示规则（build_table_row）：平稳写"—"、上限占比只写百分比、样本不足 ⓘ ----------
+
+
+def test_table_row_stable_dash_and_usage_percent(db):
+    from ui.formatting import STABLE_DASH, STABLE_TIP_PREFIX, build_table_row
+    snapshot = _snapshot(db, GDI, 1200, lambda i: 300.0, baseline=100,
+                         markers=((400, "第 1 轮"), (700, "第 2 轮")))
+    original = build_summary_row(GDI, snapshot)
+    row = build_table_row(GDI, snapshot)
+    assert row.text("verdict") == "平稳"
+    assert (row.text("rate"), row.text("per_round")) == (STABLE_DASH, STABLE_DASH)
+    assert row.tooltips["rate"].startswith(STABLE_TIP_PREFIX + original.text("rate"))
+    assert row.tooltips["per_round"].startswith(STABLE_TIP_PREFIX + original.text("per_round"))
+    # 上限占比：单元格只写百分比，原文（占比 / 上限）与说明进 tooltip
+    assert original.text("usage") == "3.0% / 10000"
+    assert row.text("usage") == "3%"
+    assert "3.0% / 10000" in row.tooltips["usage"] and "上限" in row.tooltips["usage"]
+    assert not row.dimmed and row.note == ""
+
+
+def test_table_row_rising_keeps_rate(db):
+    from ui.formatting import build_table_row
+    snapshot = _snapshot(db, MEM, 1200, lambda i: 102400.0 + i * 10)
+    assert build_table_row(MEM, snapshot).texts == build_summary_row(MEM, snapshot).texts
+
+
+def test_insufficient_row_gets_info_mark_with_reason(qapp, db):
+    from ui.formatting import INFO_MARK, NO_DATA_NOTE, build_table_row
+    row = build_table_row(GDI, _snapshot(db, GDI, 11, lambda i: 300.0))
+    assert row.dimmed
+    assert row.note.startswith("数据不足（已采 10秒）；至少采集 10分钟")
+    assert build_table_row(MEM, None).note == NO_DATA_NOTE
+    widget = SummaryTable()
+    try:
+        widget.set_rows([build_table_row(MEM, _snapshot(db, MEM, 1200, lambda i: 102400.0 + i)),
+                         row])
+        assert widget.pill_text(0) == "持续上涨"
+        assert widget.pill_text(1) == f"数据不足 {INFO_MARK}"
+        assert row.note in widget.table.cellWidget(1, VERDICT_COLUMN).toolTip()
+        # 胶囊配色仍按判定取（不受 ⓘ 影响）
+        assert _pill_color(widget, 1) != _pill_color(widget, 0)
+    finally:
+        widget.close()
+
+
+def test_header_hidden_keeps_basis_text(qapp, db):
+    widget = SummaryTable(show_header=False)
+    try:
+        widget.set_rows([build_summary_row(MEM, None)], "21分钟 · 1,200 点")
+        widget.show()
+        assert not widget.title_label.isVisible() and not widget.basis_label.isVisible()
+        assert widget.basis() == "依据：21分钟 · 1,200 点"
+    finally:
+        widget.close()

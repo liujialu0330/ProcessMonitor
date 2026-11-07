@@ -3,7 +3,8 @@
 
 选第二个任务后：同一指标两条曲线叠加（各自相对起点的变化量；横轴为相对时间
 T+mm:ss，起点为各自的基线或首个点），下方并排两张分轮增量表（各任务的 rounds）。
-对比任务没有该指标、或读取失败时显示说明。
+对比任务没有该指标、或读取失败时显示说明。图例放在绘图区上方（不压打点徽标）。
+在分析页里位于判定摘要表之下、焦点区之上（打开对比时才显示）。
 """
 from typing import List, Optional, Sequence
 
@@ -15,7 +16,8 @@ from qfluentwidgets import (BodyLabel, CaptionLabel, CardWidget, FluentIcon,
 
 from ui.viewmodels.analysis_vm import CompareResult, analysis_origin
 from ui.widgets.analysis.overlay_chart import OverlayChart, OverlaySeries
-from ui.widgets.analysis.trend_panel import center_line, overlay_reference
+from ui.widgets.analysis.trend_panel import (
+    SeriesLegend, center_line, move_legend_out, overlay_reference)
 from ui.widgets.history.common import CARD_PADDING_H
 from ui.widgets.task_selector import TaskSelector
 from utils.metrics import (format_metric_delta, get_metric_display_name,
@@ -97,6 +99,7 @@ class ComparePanel(CardWidget):
         self.close_button.setToolTip("关闭对比")
         self.close_button.clicked.connect(self.close_requested)
         self.message_label = CaptionLabel("", self)
+        self.legend = SeriesLegend(self)
         self.chart = OverlayChart(self)
         self.chart.set_chart_min_height(COMPARE_CHART_MIN_HEIGHT)
         self.primary_rounds = _RoundTable("当前任务", self)
@@ -116,6 +119,7 @@ class ComparePanel(CardWidget):
         layout.setSpacing(8)
         layout.addLayout(head)
         layout.addWidget(self.message_label)
+        layout.addWidget(self.legend)
         layout.addWidget(self.chart)
         layout.addLayout(tables)
         self.set_result(None)
@@ -127,6 +131,7 @@ class ComparePanel(CardWidget):
         """显示对比结果；None 清空（等待选择对比任务）。"""
         if result is None:
             self.chart.clear()
+            self.legend.set_names([])
             self.primary_rounds.set_rows("当前任务", [])
             self.other_rounds.set_rows("对比任务", [])
             self.message_label.setText("选择第二个任务后，按当前焦点指标叠加对比")
@@ -149,6 +154,7 @@ class ComparePanel(CardWidget):
             series, primary.markers,
             axis_title=f"{unit_name} 较起点变化" + (f"（{unit}）" if unit else ""),
             formatter=lambda v, m=metric: format_metric_delta(m, v), display_unit=unit)
+        move_legend_out(self.chart, self.legend)
         other_name = getattr(result.other_task, 'process_name', '对比任务')
         self.primary_rounds.set_rows("当前任务 · 分轮增量", round_rows(metric, primary))
         self.other_rounds.set_rows(f"{other_name} · 分轮增量", round_rows(metric, result.other))

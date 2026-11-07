@@ -12,15 +12,19 @@
 - 按字节找换行切行、逐行解码（errors='replace'），因此编码需兼容 ASCII 换行
   （UTF-8、GBK 等）；还没写完换行的半行留到下次，同一行只会被处理一次。
 - 单次最多读 MAX_READ_BYTES，余下的下次再读，避免一次追读巨大增量卡住界面。
+- 编码必须是文本编码（构造时校验，base64 之类的 bytes→bytes 编解码器直接拒绝）；解码仍出错
+  时只记一次日志并按 UTF-8 替换解码，不让一个任务的日志触发拖垮整个自动打点服务。
+- 慢路径保护：日志在网络共享（UNC）上时 os.stat 可能卡住界面线程。某次 stat 用时超过
+  SLOW_STAT_S 即记 WARNING 并把该读尾器降级为每 SLOW_POLL_INTERVAL_S 秒才读一次。
 """
 import logging
 import os
 import re
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, Callable, List, Optional, Tuple, Union
 
-from core.automation.plan import DEFAULT_LOG_ENCODING, LABEL_GROUP
+from core.automation.plan import DEFAULT_LOG_ENCODING, LABEL_GROUP, encoding_problem
 from core.monitor_task import SYSTEM_CLOCK
 
 logger = logging.getLogger(__name__)
@@ -29,6 +33,9 @@ logger = logging.getLogger(__name__)
 MAX_READ_BYTES = 1024 * 1024
 # 没有换行的超长"行"上限：超过即按一行处理，防止缓冲无限增长
 MAX_LINE_BYTES = 64 * 1024
+# 一次 os.stat 超过这么久（秒）即视为慢路径（如断开的网络共享），之后每 SLOW_POLL_INTERVAL_S 秒读一次
+SLOW_STAT_S = 2.0
+SLOW_POLL_INTERVAL_S = 30.0
 
 # 文件身份：(索引号或创建时间的种类, 值)
 _Identity = Tuple[str, Any]
@@ -68,15 +75,29 @@ class LogWatcher:
         clock: 提供 now() 的时钟（ui.services.clock 或 core.monitor_task.SystemClock）；
             缺省为 core.monitor_task.SYSTEM_CLOCK
         start_at_end: 开始监听时文件已存在则从末尾开始（默认）；False 从头读
+        monotonic: 单调时钟（秒），只用于慢路径判定与降级后的读取间隔；缺省为
+            SYSTEM_CLOCK.monotonic，测试可注入
+
+    Raises:
+        ValueError: 编码不可用（不认识、不是文本编码、UTF-16/32）
     """
 
     def __init__(self, path: str, pattern: Union[str, "re.Pattern[str]"],
                  encoding: str = DEFAULT_LOG_ENCODING, clock=None, *,
-                 start_at_end: bool = True):
+                 start_at_end: bool = True,
+                 monotonic: Optional[Callable[[], float]] = None):
         self.path = path
         self.pattern = re.compile(pattern) if isinstance(pattern, str) else pattern
         self.encoding = encoding or DEFAULT_LOG_ENCODING
+        problem = encoding_problem(self.encoding)
+        if problem:
+            raise ValueError(problem)
         self._clock = clock if clock is not None else SYSTEM_CLOCK
+        self._monotonic = monotonic or SYSTEM_CLOCK.monotonic
+        # 慢路径降级：降级后只在距上次读取满 SLOW_POLL_INTERVAL_S 秒时才 stat
+        self.slow = False
+        self._last_poll_at: Optional[float] = None
+        self._decode_error_logged = False
         self._offset = 0
         self._pending = b''
         self._identity: Optional[_Identity] = None
@@ -100,10 +121,17 @@ class LogWatcher:
     # ---------- 读尾 ----------
 
     def _stat(self) -> Optional[os.stat_result]:
+        began = self._monotonic()
         try:
             return os.stat(self.path)
         except OSError:
             return None
+        finally:
+            took = self._monotonic() - began
+            if took > SLOW_STAT_S and not self.slow:
+                self.slow = True
+                logger.warning("读取日志文件状态用时 %.1f 秒（可能在网络共享上），之后每 %.0f 秒"
+                               "才检查一次: %s", took, SLOW_POLL_INTERVAL_S, self.path)
 
     def _now(self) -> datetime:
         return self._clock.now()
@@ -114,7 +142,13 @@ class LogWatcher:
         self._pending = b''
 
     def poll(self) -> List[LogMatch]:
-        """读新增的完整行并返回其中匹配的行（按出现顺序）。文件不存在、读失败都返回空列表。"""
+        """读新增的完整行并返回其中匹配的行（按出现顺序）。文件不存在、读失败都返回空列表。
+        已降级为慢路径时，距上次读取不满 SLOW_POLL_INTERVAL_S 秒直接返回空列表。"""
+        now = self._monotonic()
+        if (self.slow and self._last_poll_at is not None
+                and now - self._last_poll_at < SLOW_POLL_INTERVAL_S):
+            return []
+        self._last_poll_at = now
         stat = self._stat()
         if stat is None:
             self._present = False
@@ -155,7 +189,7 @@ class LogWatcher:
         matches: List[LogMatch] = []
         now = None
         for raw in lines:
-            text = raw.rstrip(b'\r').decode(self.encoding, errors='replace')
+            text = self._decode(raw.rstrip(b'\r'))
             match = self.pattern.search(text)
             if match is None:
                 continue
@@ -163,6 +197,16 @@ class LogWatcher:
                 now = self._now()
             matches.append(LogMatch(line=text, label=_label_of(match), timestamp=now))
         return matches
+
+    def _decode(self, raw: bytes) -> str:
+        try:
+            return raw.decode(self.encoding, errors='replace')
+        except Exception:   # noqa: BLE001 —— 编码已在构造时校验，这里兜底
+            if not self._decode_error_logged:
+                logger.error("按 %s 解码日志行失败，改按 UTF-8 解码: %s", self.encoding, self.path,
+                             exc_info=True)
+                self._decode_error_logged = True
+            return raw.decode('utf-8', errors='replace')
 
 
 def _label_of(match: "re.Match[str]") -> Optional[str]:

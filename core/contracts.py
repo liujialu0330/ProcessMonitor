@@ -6,7 +6,10 @@ core 与 ui 之间传递的枚举与只读快照。界面文案不放这里：�
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
+
+if TYPE_CHECKING:
+    from data.models import QualityStats
 
 
 class TaskStatus(str, Enum):
@@ -43,7 +46,8 @@ class TaskInfo:
     """manager 内存中某个任务的只读快照（界面只拿它，不接触任务线程对象）。
 
     status 取自线程实际状态：RUNNING 覆盖暂停中与停止收尾中，is_stopping 为 True
-    表示已请求停止但收尾尚未完成。
+    表示已请求停止但收尾尚未完成。quality 为采集数据质量快照（MonitorWorker.
+    quality_snapshot()，可选；尚未开始调度或调用方未提供时为 None）。
     """
     task_id: str
     pid: int
@@ -57,3 +61,4 @@ class TaskInfo:
     create_time: Optional[float]     # 所选进程的创建时间（epoch 秒），手动输入 PID 时为 None
     is_paused: bool
     is_stopping: bool
+    quality: Optional['QualityStats'] = None

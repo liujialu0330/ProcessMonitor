@@ -1,8 +1,15 @@
 """
 快照中心 SnapshotHub：多个采集线程与进程列表共享同一份全系统快照。
 
-- get(max_age_s)：缓存快照的年龄不超过 max_age_s 就直接返回，否则取新的；多个线程
-  同时请求时只取一次（锁外先查一次缓存，锁内再查一次，取快照本身在锁内）；
+- get(max_age_s, not_before=None)：两种"够新"的判据，多个线程同时请求时只取一次（锁外先
+  查一次缓存，锁内再查一次，取快照本身在锁内）：
+  - 采集线程传 not_before（本周期的截止时间减一个小容差）：缓存快照的取得时刻不早于它
+    才命中。按截止时间而不按年龄判，是因为数据点的时间戳是本周期写库时刻，而速率曲线
+    用时间戳作分母——周期不同的任务（1 s 与 1.5 s）、列表刷新、恢复后的非网格采样都会在
+    任意相位往缓存里放快照，按年龄判会让下一个周期拿到上一个时刻的快照；
+  - 没有截止时间的调用方（进程列表、按名等待）传 max_age_s：缓存年龄不超过它就命中；
+- 缓存时刻记"开始调用系统接口"的时刻：内核在调用期间采集数据，这个时刻是数据时刻的
+  下界，"不早于截止时间"的判断因此偏保守，不会把调用前已经过时的数据当成本周期的；
 - 相位对齐：以 hub 创建时的单调时钟为原点，采集线程把截止时间对齐到"原点 + k × 周期"
   的网格上，同周期的任务因此在同一时刻醒来，一次快照服务多个任务；
 - 快照不可用（available() 为 False）或取失败时由调用方回退 psutil，hub 只如实抛出。
@@ -17,11 +24,16 @@ from typing import NamedTuple, Optional, Tuple
 from core import system_snapshot
 from core.system_snapshot import SystemSnapshot
 
-# 同一周期内多个任务共用一份快照的最大年龄 = min(周期, 1 秒) × 该系数：
-# 周期 ≥ 1 秒时 0.5 秒，既能覆盖同一网格点上各线程的唤醒抖动，又不会让两个相邻周期
-# 共用同一份快照（那样 CPU 使用率的差分窗口会变成 0）
+# 没有截止时间的调用方（进程列表、按名等待）允许的最大年龄 = min(周期, 1 秒) × 该系数。
+# 它只管这类调用方之间互相复用；采集线程按截止时间判（见 not_before_for），不受它约束
 MAX_AGE_FACTOR = 0.5
 MAX_AGE_CAP_S = 1.0
+
+# 采集线程判断缓存是否够新的容差上限：快照取得时刻不早于"截止时间 - 容差"即算本周期的。
+# 容差必须能覆盖同一网格点上各线程的唤醒抖动与取样耗时（十几毫秒），又要明显小于
+# 半个周期，否则恢复后的非网格采样会被下一周期命中
+NOT_BEFORE_TOLERANCE_S = 0.05
+NOT_BEFORE_TOLERANCE_FRACTION = 0.25   # 短周期时取周期的 1/4
 
 
 class HubStats(NamedTuple):
@@ -50,7 +62,7 @@ class SnapshotHub:
         # 不必等正在进行的取样
         self._lock = threading.Lock()
         self._stats_lock = threading.Lock()
-        # (取得时刻（hub 时钟）, 快照)；整体替换，锁外读取是原子的
+        # (开始取快照的时刻（hub 时钟）, 快照)；整体替换，锁外读取是原子的
         self._cached: Optional[Tuple[float, SystemSnapshot]] = None
         self._samples = 0
         self._hits = 0
@@ -72,24 +84,37 @@ class SnapshotHub:
 
     # ---------- 取快照 ----------
 
-    def get(self, max_age_s: float) -> SystemSnapshot:
+    def get(self, max_age_s: float, *, not_before: Optional[float] = None) -> SystemSnapshot:
         """
-        年龄不超过 max_age_s 的快照：缓存够新直接返回，否则取一份新的。
+        够新的快照：缓存满足条件直接返回，否则取一份新的。
+
+        Args:
+            max_age_s: 缓存年龄（取得时刻到现在，hub 时钟）不超过它即命中；
+                给了 not_before 时不再按年龄判
+            not_before: 缓存的取得时刻（hub 时钟）不早于它才命中；采集线程传
+                not_before_for(本周期截止时间, 周期)
 
         Raises:
             SnapshotUnavailable / SnapshotError: 来源抛出的异常原样抛出（调用方回退 psutil）
         """
         cached = self._cached
-        if cached is not None and self._clock.monotonic() - cached[0] <= max_age_s:
+        if self._is_fresh(cached, max_age_s, not_before):
             self._count_hit()
             return cached[1]
         with self._lock:
             # 双检：等锁期间别的线程可能刚取过
             cached = self._cached
-            if cached is not None and self._clock.monotonic() - cached[0] <= max_age_s:
+            if self._is_fresh(cached, max_age_s, not_before):
                 self._count_hit()
                 return cached[1]
             return self._take_locked()
+
+    def _is_fresh(self, cached, max_age_s: float, not_before: Optional[float]) -> bool:
+        if cached is None:
+            return False
+        if not_before is not None:
+            return cached[0] >= not_before
+        return self._clock.monotonic() - cached[0] <= max_age_s
 
     def _count_hit(self) -> None:
         with self._stats_lock:
@@ -101,6 +126,7 @@ class SnapshotHub:
             return self._take_locked()
 
     def _take_locked(self) -> SystemSnapshot:
+        taken = self._clock.monotonic()
         begin = time.perf_counter()
         try:
             snapshot = self._source.snapshot()
@@ -113,7 +139,7 @@ class SnapshotHub:
             self._samples += 1
             self._total_ms += elapsed_ms
             self._last_ms = elapsed_ms
-        self._cached = (self._clock.monotonic(), snapshot)
+        self._cached = (taken, snapshot)
         return snapshot
 
     def stats(self) -> HubStats:
@@ -131,8 +157,14 @@ class SnapshotHub:
 
     @staticmethod
     def max_age_for(interval: float) -> float:
-        """周期为 interval 的任务取快照时允许的最大年龄。"""
+        """周期为 interval 的任务在没有截止时间可用时取快照允许的最大年龄。"""
         return min(float(interval), MAX_AGE_CAP_S) * MAX_AGE_FACTOR
+
+    @staticmethod
+    def not_before_for(deadline: float, interval: float) -> float:
+        """周期为 interval、截止时间为 deadline 的采样可接受的最早快照时刻。"""
+        tolerance = min(NOT_BEFORE_TOLERANCE_S, float(interval) * NOT_BEFORE_TOLERANCE_FRACTION)
+        return deadline - tolerance
 
     def align(self, t: float, period: float) -> float:
         """网格（原点 + k × period）上不早于 t 的第一个点。"""

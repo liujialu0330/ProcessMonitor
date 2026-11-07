@@ -120,6 +120,26 @@ def test_keep_awake_switch_roundtrips_config(setting, tmp_path):
         item.value = item.defaultValue
 
 
+def test_automation_switch_roundtrips_config(setting, tmp_path):
+    """"允许命令行与脚本控制"开关：默认开，点击写配置并落盘（命令处理器每条请求现读）"""
+    from ui.pages.setting_page import AUTOMATION_CONTENT, AUTOMATION_TITLE
+
+    config_path = tmp_path / "automation_config.json"
+    qconfig.load(str(config_path), cfg)
+    item = cfg.automation_enabled
+    try:
+        card = setting.automation_card
+        assert card.titleLabel.text() == AUTOMATION_TITLE
+        assert card.contentLabel.text() == AUTOMATION_CONTENT
+        assert card.isChecked() is True
+
+        card.switchButton.toggleChecked()
+        assert cfg.get(item) is False
+        assert '"Enabled": false' in config_path.read_text(encoding='utf-8')
+    finally:
+        item.value = item.defaultValue
+
+
 # ---------- 数据目录 ----------
 
 def test_open_data_dir_goes_through_dialogs(setting, dialogs, notifier):
@@ -710,3 +730,102 @@ def test_install_confirm_defaults_to_later(qapp):
         dialog.close()
     finally:
         host.close()
+
+
+# ---------- 诊断信息 ----------
+
+def _pumped(value):
+    """先处理事件（后台线程的结果经排队信号回到界面线程）再取值。"""
+    QApplication.processEvents()
+    return value() if callable(value) else value
+
+
+def test_copy_diagnostics_puts_text_on_clipboard_and_says_copied(setting, dialogs, notifier):
+    setting.copy_diagnostics_button.click()
+
+    copied = dialogs.calls_of("copy_text")
+    assert len(copied) == 1
+    # 诊断文本至少含版本与数据库两节（本页没有 provider 时只用 db 与 manager）
+    assert "【" in copied[0]["text"] and "数据库" in copied[0]["text"]
+    assert notifier.last().level == "success"
+    assert notifier.last().title == "已复制"
+
+
+def test_copy_diagnostics_uses_injected_provider(qapp, db, manager, notifier, dialogs):
+    """组合根经 MainWindow 注入的 provider 决定诊断部件（如自身监控、看门狗）。"""
+    from ui.pages.setting_page import SettingPage
+
+    asked = []
+
+    def provider():
+        asked.append(True)
+        return SimpleNamespace(db=db, manager=manager)
+
+    services = make_services(notifier=notifier, dialogs=dialogs,
+                             task_status=ManagerTaskStatus(manager))
+    page = SettingPage(db, manager, services, diagnostics_provider=provider)
+    try:
+        text = page.copy_diagnostics()
+    finally:
+        _close_setting_page(page)
+
+    assert asked == [True]
+    assert text is not None and dialogs.last_call("copy_text")["text"] == text
+
+
+def test_copy_diagnostics_failure_shows_error(setting, dialogs, notifier):
+    dialogs.push("copy_text", RuntimeError("剪贴板被占用"))
+
+    assert setting.copy_diagnostics() is None
+
+    assert notifier.last().level == "error"
+    assert "剪贴板被占用" in notifier.last().content
+
+
+def test_export_diagnostics_cancelled_starts_nothing(setting, dialogs, notifier):
+    dialogs.push("ask_directory", None)
+
+    assert setting.export_diagnostics() is None
+    assert notifier.notices == []
+
+
+def test_export_diagnostics_writes_zip_in_background_and_offers_open_folder(
+        setting, dialogs, notifier, tmp_path):
+    import zipfile
+    dialogs.push("ask_directory", str(tmp_path))
+
+    worker = setting.export_diagnostics()
+    assert worker is not None
+    # 导出中按钮不可再点，避免同时打两个包
+    assert not setting.export_diagnostics_button.isEnabled()
+    assert setting.export_diagnostics() is None
+    assert poll_until(lambda: _pumped(notifier.notices), timeout=10)
+
+    notice = notifier.last()
+    assert notice.level == "success"
+    assert notice.title == "诊断包已导出"
+    assert notice.content.endswith(".zip")
+    with zipfile.ZipFile(notice.content) as zf:
+        assert "diagnostics.txt" in zf.namelist()
+    assert poll_until(lambda: _pumped(setting.export_diagnostics_button.isEnabled), timeout=5)
+
+    # 完成提示带"打开文件夹"：点了才打开（不自动打开）
+    assert dialogs.calls_of("open_folder") == []
+    [button] = notice.bar.widgets
+    assert button.text() == "打开文件夹"
+    button.click()
+    assert dialogs.calls_of("open_folder") == [{"path": str(tmp_path)}]
+
+
+def test_export_diagnostics_failure_shows_error(setting, dialogs, notifier, tmp_path):
+    # 选中的"目录"其实是个文件：打包必然失败
+    blocker = tmp_path / "不是目录"
+    blocker.write_text("x", encoding="utf-8")
+    dialogs.push("ask_directory", str(blocker))
+
+    assert setting.export_diagnostics() is not None
+    assert poll_until(lambda: _pumped(notifier.notices), timeout=10)
+
+    assert notifier.last().level == "error"
+    assert notifier.last().title == "导出诊断包失败"
+    assert poll_until(lambda: _pumped(setting.export_diagnostics_button.isEnabled), timeout=5)

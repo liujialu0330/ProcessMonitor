@@ -6,7 +6,8 @@
   调度应当重置截止时间、不补采，库里留下一个空洞；
 - 每天一次采集失败：采集器返回空字典（全部指标不可用），该周期不落库、不算采样。
 
-结束后检查不变式：sample_count == 实际行数；last_sample_at == 最后一行时间；
+结束后检查不变式：数据质量（计划 == 完成 + 跳过；跳过次数 == 休眠注入次数，跳过周期数 ==
+每次休眠覆盖的周期数之和；除去注入的休眠，完成率 100%）；sample_count == 实际行数；last_sample_at == 最后一行时间；
 空洞数 == 休眠注入次数（db.analytics.gaps 口径，与分析页一致）；每指标行数相等；
 无重复时间戳；分钟汇总与写时空洞 == 从样本整体重算的结果（且写时空洞数 == 休眠次数）；
 原始路径与汇总路径的分析查询结果一致；分析页整批查询（'all', analysis=True）能算出判定。
@@ -120,6 +121,21 @@ def test_seven_days_accelerated_soak(db, qapp, tmp_path):
     # 6h、12h……168h 各一次（最后一次落在第 7 天整点，之后采一次即停止）
     assert len(clock.sleeps) == SIM_SECONDS // SLEEP_EVERY
     assert len(failures) == 7   # 每天一次
+
+    # 数据质量：每次休眠跳过 SLEEP_SECONDS / INTERVAL 个周期、记一次重置；采集失败
+    # （全部指标不可用）的周期照常算完成
+    quality = db.tasks.load_quality(task_id)
+    injected_missed = len(clock.sleeps) * int(SLEEP_SECONDS // INTERVAL)
+    assert worker.cycle_stats.resets == len(clock.sleeps)
+    assert quality.missed_cycles == injected_missed
+    assert quality.done_cycles == cycles
+    assert quality.planned_cycles == quality.done_cycles + quality.missed_cycles
+    assert quality.done_cycles / (quality.planned_cycles - injected_missed) >= 0.99
+    # 计划周期包含休眠时段：完成率 = 1 - 休眠占比（7 天里 28 次 × 5 分钟 ≈ 1.4%）
+    assert quality.completion_ratio >= 0.98
+    print(f"数据质量：计划 {quality.planned_cycles}，完成 {quality.done_cycles}，"
+          f"跳过 {quality.missed_cycles}，完成率 {quality.completion_ratio:.4f}，"
+          f"调度延迟 p95 {quality.lag_p95_ms} ms")
 
     # 每指标行数相等、无重复时间戳、同一周期各指标共用同一时间戳
     per_metric = {m: [p.timestamp for p in db.points.fetch(PointQuery(task_id, m))]

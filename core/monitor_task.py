@@ -12,9 +12,10 @@ from typing import TYPE_CHECKING, Dict, Optional, List
 from PyQt5.QtCore import QThread, pyqtSignal
 
 from core.contracts import StopReason, TaskStatus, UnavailableReason
+from core.cycle_stats import CycleStats
 from core.process_collector import ProcessCollector
 from core.snapshot_hub import SnapshotHub
-from data.models import TaskRecord, DataPoint
+from data.models import DataPoint, QualityStats, TaskRecord
 from utils.metrics import MetricType
 import config
 
@@ -42,10 +43,14 @@ class SystemClock:
     MonitorWorker 的调度（截止时间）、落库时间戳与等待全部经时钟对象，测试与加速
     浸泡注入假时钟即可在不真正睡眠的情况下驱动成千上万个周期。替身只需提供同名的
     三个方法：
-    - monotonic() -> float：单调秒数，只用于算截止时间与剩余等待；
+    - monotonic() -> float：单调秒数，用于算截止时间、剩余等待与调度延迟；
     - now() -> datetime：落库时间戳（任务开始/结束、数据点、默认打点时刻）；
     - wait(event, timeout) -> bool：等待调度事件，timeout 为 None 表示无超时；
       返回值与 threading.Event.wait 相同（事件已置位为 True）。
+
+    可选的 perf_counter() -> float：高精度计时，只用于量采集与写库耗时（周期统计）。
+    Windows 上 time.monotonic 的分辨率约 15.6 ms，量不出 1 ms 级的耗时；替身没有这个
+    方法时退回 monotonic()，测试照样能用拨动时钟的方式制造耗时。
     """
 
     def monotonic(self) -> float:
@@ -56,6 +61,9 @@ class SystemClock:
 
     def wait(self, event: threading.Event, timeout: Optional[float] = None) -> bool:
         return event.wait(timeout)
+
+    def perf_counter(self) -> float:
+        return time.perf_counter()
 
 
 # 无状态，所有任务共用一个实例
@@ -140,6 +148,11 @@ class MonitorWorker(QThread):
         self.note = note or ''
         self.expected_create_time = create_time
         self._clock = clock if clock is not None else SYSTEM_CLOCK
+        # 量耗时用的计时函数（见 SystemClock 说明）
+        self._timer = getattr(self._clock, 'perf_counter', None) or self._clock.monotonic
+
+        # 周期统计：只由工作线程写；收尾时写入 tasks 的数据质量列
+        self.cycle_stats = CycleStats(self.interval)
 
         # 显式状态：GUI 线程（start/stop/pause/resume）与工作线程（主循环、收尾）
         # 都会读写，一律经 _state_lock
@@ -290,16 +303,23 @@ class MonitorWorker(QThread):
         # 网格上的下一点，见 _next_deadline），避免"采集耗时 + 睡眠"造成的累积漂移；
         # 等待统一走时钟的 wait（默认即 Event.wait），stop/pause/resume 置位事件即可立即
         # 唤醒，无需轮询。不含 CPU 指标时启动即采一次（有 hub 时为下一个整秒网格点）。
+        stats = self.cycle_stats
+        timer = self._timer
         next_deadline = self._first_deadline(clock.monotonic(), cpu_primed)
+        stats.start_segment(next_deadline)
         while True:
             state = self.state
             if state not in ACTIVE_STATES:
                 break
-            # 暂停：无超时等待，直到 resume()/stop() 唤醒；恢复后立即采一次
+            # 暂停：无超时等待，直到 resume()/stop() 唤醒；恢复后立即采一次。
+            # 暂停段不计入计划周期
             if state is WorkerState.PAUSED:
+                stats.end_segment(clock.monotonic())
                 clock.wait(self._wake, None)
                 self._wake.clear()
                 next_deadline = clock.monotonic()
+                if self.state is WorkerState.RUNNING:
+                    stats.start_segment(next_deadline)
                 continue
 
             # 等到本周期截止时间；被唤醒后重新检查状态（调用方先改状态再 set 事件，
@@ -313,13 +333,26 @@ class MonitorWorker(QThread):
             if self.state is not WorkerState.RUNNING:
                 continue   # 暂停或停止：回到循环顶部按新状态处理
 
-            # 落后超过一个周期（如系统休眠唤醒、采集被严重拖慢）：重置为当前时间，不补采
+            # 落后超过一个周期（如系统休眠唤醒、采集被严重拖慢）：重置为当前时间，不补采，
+            # 跳过的周期计入统计
             now = clock.monotonic()
-            if now - next_deadline > self.interval:
+            behind = now - next_deadline
+            if behind > self.interval:
+                stats.skip(behind)
                 next_deadline = now
+            else:
+                stats.lag(behind)
+
+            if self._hub is not None:
+                # 告诉采集器本周期的截止时间：缓存的快照要不早于它（减容差）才能共用，
+                # 否则周期不同的任务会拿到上一个时刻的快照
+                self.collector.snapshot_not_before = SnapshotHub.not_before_for(
+                    next_deadline, self.interval)
 
             try:
+                begin = timer()
                 values = self.collector.collect_metrics(self.metric_types)
+                stats.collected(timer() - begin)
 
                 if values is not None:
                     # 同一采集周期的多个指标共用同一时间戳
@@ -342,7 +375,9 @@ class MonitorWorker(QThread):
 
                     # 批量保存（SAVE_BATCH_SIZE=1时语义为每周期一批）
                     if len(self._data_buffer) >= config.SAVE_BATCH_SIZE:
+                        begin = timer()
                         self._flush_buffer()
+                        stats.wrote(timer() - begin)
 
                 else:
                     # 进程已退出（运行中 PID 被另一个进程复用也走这里，采集器无从区分）
@@ -356,6 +391,7 @@ class MonitorWorker(QThread):
 
             next_deadline = self._next_deadline(next_deadline)
 
+        stats.end_segment(clock.monotonic())
         return stop_reason
 
     def _first_deadline(self, now: float, cpu_primed: bool) -> float:
@@ -455,10 +491,18 @@ class MonitorWorker(QThread):
         """获取任务信息"""
         return self.task_model
 
+    def quality_snapshot(self) -> Optional[QualityStats]:
+        """当前的采集数据质量（可在任意线程调用；运行中的段算到此刻为止）；
+        还没开始调度（未启动、启动即失败）时为 None"""
+        stats = self.cycle_stats
+        if not stats.has_data:
+            return None
+        return stats.summary(self._clock.monotonic())
+
     def _teardown(self, reason: StopReason):
         """
         收尾（由 run() 的 finally 在工作线程内调用且仅调用一次）：
-        最后一次 flush -> 写 stopped 状态 -> emit task_stopped。
+        最后一次 flush -> 写 stopped 状态 -> 写数据质量（周期统计）-> emit task_stopped。
         各步骤互不连累：任何一步异常都只记日志，task_stopped 一定会发出。
 
         Args:
@@ -481,12 +525,32 @@ class MonitorWorker(QThread):
                 self._task_saved = self.db.save_task(self.task_model)
         except Exception:
             logger.error("task_id=%s 写入停止状态失败", self.task_id, exc_info=True)
+        self._save_quality()
         logger.info("任务停止: task_id=%s 原因=%s", self.task_id, reason.value)
 
         # 先置 STOPPED 再发信号：界面收到 task_stopped 时运行计数已不含本任务
         # （此后线程不再写库，维护互斥也随之放行）
         self._transition(LIVE_STATES, WorkerState.STOPPED)
         self.task_stopped.emit(self.task_id, reason)
+
+    def _save_quality(self) -> None:
+        """收尾时把周期统计写入 tasks 的数据质量列。主循环异常退出时活动段可能未结束，
+        这里按此刻补结束；失败只记日志（数据质量只是辅助信息，不能连累收尾）。"""
+        stats = self.cycle_stats
+        try:
+            stats.end_segment(self._clock.monotonic())
+            if not stats.has_data or not self._task_saved:
+                return
+            quality = stats.summary()
+            self.task_model.quality = quality
+            self.db.tasks.save_quality(self.task_id, quality)
+            logger.info("task_id=%s 数据质量: 计划 %d 完成 %d 跳过 %d 周期，"
+                        "调度延迟 p95 %s ms，采集 p95 %s ms，写库 p95 %s ms",
+                        self.task_id, quality.planned_cycles, quality.done_cycles,
+                        quality.missed_cycles, quality.lag_p95_ms,
+                        quality.collect_p95_ms, quality.write_p95_ms)
+        except Exception:
+            logger.error("task_id=%s 写入数据质量失败", self.task_id, exc_info=True)
 
     def _ensure_task_row(self) -> bool:
         """确保任务行已入库（启动时 save_task 失败的补写，走 upsert）"""

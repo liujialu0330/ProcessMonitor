@@ -13,16 +13,20 @@
   任务列表本身（单条 SQL）仍在主线程读取。
 
 打点变化（manager.markers_changed）时静默重查当前任务：基线、编号与统计口径都随打点变。
+
+另有分析页共用的派生口径（纯函数）：ordered_metrics 按判定严重程度排序（持续上涨 → 波动 →
+平稳 → 数据不足 → 不判定，同组按相对增速降序），is_anomalous 决定哪些指标默认画图。
 """
 import logging
-from typing import Callable, Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from PyQt5.QtCore import QObject, QTimer, pyqtSignal, pyqtSlot
 
+from core.analysis.trend import Verdict
 from core.contracts import TaskStatus
 from core.history_query import (
     BASELINE_RANGE_KEY, CHART_MAX_BUCKETS, DEFAULT_RANGE_KEY, RANGE_KEYS,
-    TABLE_POINT_LIMIT, HistoryRequest, HistorySnapshot, build_request,
+    TABLE_POINT_LIMIT, HistoryRequest, HistorySnapshot, TaskAnalysis, build_request,
 )
 from core.history_refresh_worker import HistoryRefreshWorker
 from core.workers.base import LatestRequestGate
@@ -90,6 +94,63 @@ class HistoryWorkerRunner(QObject):
 
 def _defer_to_event_loop(fn: Callable[[], None]) -> None:
     QTimer.singleShot(0, fn)
+
+
+# ---------- 分析页的排序与折叠（纯函数，结论条、摘要表与趋势面板共用同一口径） ----------
+
+# 判定的严重程度：持续上涨 → 波动 → 平稳 → 数据不足；累计量 / 峰值类不做趋势判定，排最后
+VERDICT_RANK = {Verdict.RISING: 0, Verdict.FLUCTUATING: 1, Verdict.STABLE: 2,
+                Verdict.INSUFFICIENT: 3}
+UNJUDGED_RANK = 4
+# 默认展开为图表的判定（其余折叠为一行迷你图）
+ANOMALOUS_VERDICTS = (Verdict.RISING, Verdict.FLUCTUATING)
+
+
+def snapshot_verdict(snapshot: Optional[HistorySnapshot]) -> Optional[Verdict]:
+    """快照的判定；没有统计（所选范围内无数据）按数据不足，不做趋势判定的类别为 None。"""
+    if snapshot is None or not snapshot.stats:
+        return Verdict.INSUFFICIENT
+    judgement = snapshot.judgement
+    return Verdict(judgement.verdict) if judgement is not None else None
+
+
+def relative_rate(snapshot: Optional[HistorySnapshot]) -> float:
+    """同组排序用的增速：拟合斜率相对起点（基线值或统计首值）的比例，取绝对值。
+    各指标单位不同（KB、个），直接比斜率没有意义，比相对增速才能把"涨得最凶"的排前面；
+    起点为 0 时无法相对，记为无穷大（从 0 开始上涨本身就最显眼）；不能拟合时为 0。"""
+    if snapshot is None or not snapshot.stats:
+        return 0.0
+    judgement = snapshot.judgement
+    if judgement is None or judgement.fit is None:
+        return 0.0
+    baseline = snapshot.baseline
+    if (baseline is not None and baseline.value is not None
+            and snapshot.request.baseline_only):
+        reference = baseline.value
+    else:
+        reference = snapshot.stats['first']
+    slope = abs(judgement.fit.slope_per_hour)
+    if not reference:
+        return float('inf') if slope else 0.0
+    return slope / abs(reference)
+
+
+def severity_key(snapshot: Optional[HistorySnapshot]) -> Tuple[int, float]:
+    """排序键（升序即从严重到轻微）：判定严重程度，同组按相对增速绝对值降序。"""
+    verdict = snapshot_verdict(snapshot)
+    rank = VERDICT_RANK[verdict] if verdict is not None else UNJUDGED_RANK
+    return rank, -relative_rate(snapshot)
+
+
+def ordered_metrics(analysis: TaskAnalysis) -> List[str]:
+    """分析结果里的指标按严重程度排序（相同时保持任务的指标顺序）。"""
+    metrics = [m for m in analysis.snapshots if m]
+    return sorted(metrics, key=lambda m: severity_key(analysis.snapshots[m]))
+
+
+def is_anomalous(snapshot: Optional[HistorySnapshot]) -> bool:
+    """是否默认展开为图表：判定为持续上涨或波动。"""
+    return snapshot_verdict(snapshot) in ANOMALOUS_VERDICTS
 
 
 class HistoryViewModel(QObject):

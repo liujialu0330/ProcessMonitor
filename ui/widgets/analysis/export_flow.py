@@ -5,6 +5,8 @@
 - 报告：保存对话框里选 <任务>_报告.png，同目录同基名再写 <任务>.csv 与 <任务>_摘要.csv；
 - CSV：只写明细 CSV（含元数据、已运行秒数与空洞空行）；
 - 图片：只写报告图片；
+- 证据包：保存对话框里选 zip（默认名 core.evidence.evidence_filename），三件套先写到临时
+  工作目录，再连同 task.json、README.txt 与日志摘录打成一个 zip（core.evidence_worker）；
 - 复制：报告图片复制到剪贴板（与报告同一渲染管线，不经线程）。
 """
 import logging
@@ -16,17 +18,22 @@ from PyQt5.QtCore import QObject, QStandardPaths, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap
 from qfluentwidgets import PushButton
 
+from core.evidence import EVIDENCE_SUFFIX, evidence_filename
+from core.evidence_worker import EvidenceWorker
 from core.report import (DATA_CSV_SUFFIX, REPORT_IMAGE_SUFFIX, paths_from_image_choice,
                          task_basename)
 from ui.formatting import format_count
 from ui.viewmodels.analysis_vm import EXPORT_BUSY, EXPORT_MAINTENANCE
-from ui.widgets.analysis.toolbar import EXPORT_COPY, EXPORT_CSV, EXPORT_IMAGE, EXPORT_REPORT
+from ui.widgets.analysis.toolbar import (EXPORT_COPY, EXPORT_CSV, EXPORT_EVIDENCE, EXPORT_IMAGE,
+                                         EXPORT_REPORT)
 
 logger = logging.getLogger(__name__)
 
 NO_DATA = ("暂无可导出数据", "请先选择有数据的任务")
 MAINTENANCE = ("暂时无法导出", "正在清理数据库，请稍后再导出")
 BUSY = ("正在导出", "上一次导出尚未完成")
+EVIDENCE_DIALOG_TITLE = "导出证据包"
+EVIDENCE_FILTER = "ZIP 压缩包 (*.zip)"
 
 
 class AnalysisExportFlow(QObject):
@@ -87,6 +94,14 @@ class AnalysisExportFlow(QObject):
             if not chosen:
                 return False
             targets = dict(image_path=chosen)
+        elif kind == EXPORT_EVIDENCE:
+            chosen = self._ask(EVIDENCE_DIALOG_TITLE,
+                               evidence_filename(task, self._services.clock), EVIDENCE_FILTER)
+            if not chosen:
+                return False
+            if not chosen.lower().endswith(EVIDENCE_SUFFIX):
+                chosen += EVIDENCE_SUFFIX
+            targets = dict(out_path=chosen)
         else:
             raise ValueError(f"未知的导出项：{kind!r}")
         existing = [p for p in targets.values() if os.path.exists(p)]
@@ -95,12 +110,14 @@ class AnalysisExportFlow(QObject):
                 "以下文件已存在，是否覆盖？\n" + "\n".join(existing), "覆盖"):
             return False
         image = None
-        if 'image_path' in targets:
+        if 'image_path' in targets or kind == EXPORT_EVIDENCE:
             image = self._safe_render()
             if image is None:
                 return False
-        job = vm.report_job(image=image, **targets)
-        reason = vm.start_export(job)
+        if kind == EXPORT_EVIDENCE:
+            reason = self._start_evidence(base, image, chosen)
+        else:
+            reason = vm.start_export(vm.report_job(image=image, **targets))
         if reason == EXPORT_MAINTENANCE:
             self._warn(MAINTENANCE, 4000)
             return False
@@ -110,6 +127,32 @@ class AnalysisExportFlow(QObject):
         self.last_dir = os.path.dirname(chosen) or self.last_dir
         self.status_changed.emit("正在导出…")
         return True
+
+    def _start_evidence(self, base: str, image: QImage, out_path: str) -> Optional[str]:
+        """证据包：三件套按报告的文件名组装（证据包工作线程把它们写到临时目录再打包）。"""
+        vm = self._vm
+        names = paths_from_image_choice(base + REPORT_IMAGE_SUFFIX)
+        job = vm.report_job(image=image, image_path=names.image, csv_path=names.csv,
+                            summary_path=names.summary)
+        analysis = vm.last_analysis
+        log_path = self._log_path()
+        clock = self._services.clock
+
+        def factory(db, report_job):
+            return EvidenceWorker(db, report_job, analysis=analysis, out_path=out_path,
+                                  log_path=log_path, clock=clock)
+
+        return vm.start_export(job, worker_factory=factory)
+
+    def _log_path(self) -> Optional[str]:
+        provider = getattr(self._services, 'log_path', None)
+        if provider is None:
+            return None
+        try:
+            return provider() or None
+        except Exception:
+            logger.warning("取日志路径失败，证据包不收录日志摘录", exc_info=True)
+            return None
 
     def _ask(self, title: str, filename: str, name_filter: str) -> Optional[str]:
         default = os.path.normpath(os.path.join(self.last_dir, filename))

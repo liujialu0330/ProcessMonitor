@@ -3,7 +3,8 @@
 
 make_services(**overrides) 组装一份全替身的 UiServices，可按名字替换其中任意一项；
 线程登记表（threads）用真实的 ThreadRegistry（QObject，离屏可用），测试可从
-services.threads.entries() 断言页面登记了哪些后台线程。
+services.threads.entries() 断言页面登记了哪些后台线程；启动被测程序用 FakeLauncher
+（不会真的启动进程）。
 
 页面工厂按"页面构造函数必填注入"之后的签名编写：
     MonitorPage / AnalysisPage / SettingPage(db, manager, services, parent=None)
@@ -19,7 +20,7 @@ from typing import Any, Optional
 
 from core.shutdown import ThreadRegistry
 from tests.doubles import (
-    FakeClock, FakePreferences, FakeProcessQuery, FakeTaskStatus,
+    FakeClock, FakeLauncher, FakePreferences, FakeProcessQuery, FakeTaskStatus,
     RecordingNotifier, ScriptedDialogs,
 )
 from ui.services import ManagerTaskStatus, UiServices
@@ -35,6 +36,7 @@ def make_services(**overrides: Any) -> UiServices:
         task_status=FakeTaskStatus(),
         preferences=FakePreferences(),
         threads=ThreadRegistry(),
+        launcher=FakeLauncher(),
     )
     return replace(services, **overrides) if overrides else services
 

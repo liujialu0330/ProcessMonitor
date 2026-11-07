@@ -146,3 +146,60 @@ def test_start_at_beginning_option(log, clock):
     _append(log, "ROUND\n")
     watcher = LogWatcher(str(log), "ROUND", "utf-8", clock, start_at_end=False)
     assert len(watcher.poll()) == 1
+
+
+
+# ---------- 评审修复：编码校验、慢路径降级 ----------
+
+@pytest.mark.parametrize("encoding", ["base64", "rot13", "no-such-codec", "utf-16"])
+def test_unusable_encoding_is_rejected_at_construction(log, clock, encoding):
+    """修复前 base64 之类在每次读到新行时抛 LookupError（经自动打点服务每秒刷 ERROR）"""
+    with pytest.raises(ValueError):
+        LogWatcher(str(log), PATTERN, encoding, clock)
+
+
+class SteppingMonotonic:
+    """可编排的单调时钟：每次调用返回当前值；stat_cost 秒加在 os.stat 前后两次读数之间。"""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+def test_slow_stat_degrades_to_polling_every_30_seconds(log, clock, monkeypatch, caplog):
+    import logging
+    from core.automation import log_watcher as lw
+    log.write_text("")
+    mono = SteppingMonotonic()
+    real_stat = os.stat
+    stats = []
+    slow = {'value': False}
+
+    def fake_stat(path, *args, **kwargs):
+        stats.append(path)
+        if slow['value']:
+            mono.now += lw.SLOW_STAT_S + 0.5        # 这次 stat 卡了 2.5 秒
+        return real_stat(path, *args, **kwargs)
+
+    watcher = LogWatcher(str(log), PATTERN, "utf-8", clock, monotonic=mono)
+    monkeypatch.setattr(lw.os, 'stat', fake_stat)
+    _append(log, "ROUND\n")
+    assert len(watcher.poll()) == 1 and not watcher.slow
+    slow['value'] = True
+    with caplog.at_level(logging.WARNING, logger=lw.__name__):
+        _append(log, "ROUND\n")
+        assert len(watcher.poll()) == 1
+    assert watcher.slow and "网络共享" in caplog.text
+    slow['value'] = False
+    count = len(stats)
+    _append(log, "ROUND\n")
+    for _ in range(5):                                  # 30 秒内：不再 stat
+        mono.now += 5
+        assert watcher.poll() == []
+    assert len(stats) == count
+    mono.now += lw.SLOW_POLL_INTERVAL_S                 # 满 30 秒：读一次，补上积压的行
+    assert len(watcher.poll()) == 1
+    assert len(stats) == count + 1
+    assert lw.SLOW_STAT_S == 2.0 and lw.SLOW_POLL_INTERVAL_S == 30.0

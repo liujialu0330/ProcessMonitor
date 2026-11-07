@@ -881,3 +881,36 @@ def test_hotkey_wiring_and_unbind_on_quit(tmp_path, qapp, monkeypatch):
     finally:
         stop_and_join(manager)
         dispose_widget(win)
+
+
+# ---------- 界面看门狗 ----------
+
+class _RecordingWatchdog:
+    def __init__(self, order):
+        self.order = order
+
+    def stop(self):
+        self.order.append('watchdog.stop')
+
+
+def test_real_quit_stops_watchdog_before_shutdown(window, monkeypatch):
+    """真退出收尾会阻塞界面线程数秒：先停看门狗，免得把正常收尾当成卡死转储。"""
+    order = []
+    window.attach_watchdog(_RecordingWatchdog(order))
+    monkeypatch.setattr(window, '_run_shutdown', lambda: order.append('shutdown'))
+    monkeypatch.setattr(QApplication, 'quit', MagicMock())
+
+    window.closeEvent(_fake_event())
+
+    assert order == ['watchdog.stop', 'shutdown']
+
+
+def test_hide_to_tray_keeps_watchdog_running(window, monkeypatch):
+    _enable_close_to_tray(window)
+    window.tray = _FakeTray()
+    order = []
+    window.attach_watchdog(_RecordingWatchdog(order))
+
+    window.closeEvent(_fake_event())
+
+    assert order == []
