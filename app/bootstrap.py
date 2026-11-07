@@ -167,9 +167,9 @@ def run(argv: List[str], *, exit_process: Callable[[int], None] = os._exit) -> i
     app = _create_application(argv)
 
     # 单实例：已有实例时通知其激活窗口后直接返回；此时尚未创建任何线程与窗口，
-    # 正常结束解释器即可
+    # 正常结束解释器即可。实例按"用户 + 数据目录"区分，不同数据目录可以并存
     from app.single_instance import SingleInstanceGuard, activate_main_window
-    guard = SingleInstanceGuard()
+    guard = SingleInstanceGuard(data_dir=paths.data_dir)
     if guard.notify_existing_instance():
         logger.info("检测到已运行的实例，已通知其激活窗口，本进程退出")
         return 0

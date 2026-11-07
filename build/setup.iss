@@ -48,6 +48,15 @@ ShowLanguageDialog=no
 ; 许可协议（可选）
 ; LicenseFile=
 
+; 程序运行中时拦截安装/卸载：Setup 与 Uninstall 启动时按名称检查这些互斥量，任一存在
+; 即提示先关闭程序。主程序成为主实例后持有固定名互斥量 ProcessMonitor.Running（见
+; app/single_instance.py 的 INSTALLER_MUTEX_NAME，两处必须一致，名称区分大小写），
+; 会话局部名与 Global\ 各建一个。Inno Setup 6 文档（[Setup]: AppMutex）只说明按所列
+; 名称（逗号分隔）逐个检查，未说明会自动补查 Global\，故按文档示例
+; "AppMutex=MyProgramsMutexName,Global\MyProgramsMutexName" 把两个名称都列出：不带前缀
+; 的名称落在当前会话命名空间（即程序创建的 Local\ 名），Global\ 名覆盖其他会话里运行的实例
+AppMutex=ProcessMonitor.Running,Global\ProcessMonitor.Running
+
 ; 其他配置
 UninstallDisplayIcon={app}\{#MyAppExeName}
 UninstallDisplayName={#MyAppName}

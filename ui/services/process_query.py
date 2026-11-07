@@ -20,7 +20,9 @@ class ProcessQuery(Protocol):
     def list_processes(self) -> List[ProcessEntry]:
         """当前运行中的进程列表，按进程名（不区分大小写）排序。
 
-        创建时间用于启动任务时确认 PID 没有被别的进程复用。
+        创建时间用于启动任务时确认 PID 没有被别的进程复用。遍历全部进程较慢（psutil
+        冷启动约 2 秒），监控页在后台线程（ProcessListWorker）调用它：实现必须可在
+        非界面线程调用（只读，不碰任何 Qt 对象）。其余方法只查单个进程，仍在界面线程调用。
         """
         ...
 

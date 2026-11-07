@@ -34,6 +34,33 @@ FLUSH_FAILURE_LOG_INTERVAL = 100
 SYSTEM_MARKER_LABELS = {'pause': '暂停', 'resume': '恢复'}
 
 
+class SystemClock:
+    """
+    采集线程的默认时钟：单调时钟、墙钟与可唤醒等待都直接用标准库。
+
+    MonitorWorker 的调度（截止时间）、落库时间戳与等待全部经时钟对象，测试与加速
+    浸泡注入假时钟即可在不真正睡眠的情况下驱动成千上万个周期。替身只需提供同名的
+    三个方法：
+    - monotonic() -> float：单调秒数，只用于算截止时间与剩余等待；
+    - now() -> datetime：落库时间戳（任务开始/结束、数据点、默认打点时刻）；
+    - wait(event, timeout) -> bool：等待调度事件，timeout 为 None 表示无超时；
+      返回值与 threading.Event.wait 相同（事件已置位为 True）。
+    """
+
+    def monotonic(self) -> float:
+        return time.monotonic()
+
+    def now(self) -> datetime:
+        return datetime.now()
+
+    def wait(self, event: threading.Event, timeout: Optional[float] = None) -> bool:
+        return event.wait(timeout)
+
+
+# 无状态，所有任务共用一个实例
+SYSTEM_CLOCK = SystemClock()
+
+
 class WorkerState(Enum):
     """监控线程的显式状态。
 
@@ -74,7 +101,8 @@ class MonitorWorker(QThread):
 
     def __init__(self, pid: int, process_name: str, metric_types: List[str],
                  interval: float = None, task_id: str = None, db: "Database" = None,
-                 note: str = '', create_time: Optional[float] = None):
+                 note: str = '', create_time: Optional[float] = None,
+                 *, clock: Optional[SystemClock] = None):
         """
         初始化监控任务
 
@@ -90,6 +118,8 @@ class MonitorWorker(QThread):
             create_time: 用户所选进程的创建时间（来自进程列表）。线程启动时与该 PID
                 当前进程比对，不一致说明 PID 已被别的进程复用；为 None（如手动输入
                 PID）时跳过比对
+            clock: 时钟对象（接口见 SystemClock），None 用系统时钟；测试注入假时钟
+                以免真实睡眠
         """
         if db is None:
             raise TypeError("MonitorWorker 需要注入 db（不再自建数据库连接）")
@@ -103,6 +133,7 @@ class MonitorWorker(QThread):
         self.interval = interval or config.DEFAULT_INTERVAL
         self.note = note or ''
         self.expected_create_time = create_time
+        self._clock = clock if clock is not None else SYSTEM_CLOCK
 
         # 显式状态：GUI 线程（start/stop/pause/resume）与工作线程（主循环、收尾）
         # 都会读写，一律经 _state_lock
@@ -211,7 +242,8 @@ class MonitorWorker(QThread):
         Returns:
             StopReason: 停止原因
         """
-        self.task_model.start_time = datetime.now()
+        clock = self._clock
+        self.task_model.start_time = clock.now()
         self.task_model.status = TaskStatus.RUNNING
         self._task_saved = self.db.save_task(self.task_model)
         logger.info("任务启动: task_id=%s pid=%s process=%s metrics=%s",
@@ -244,9 +276,9 @@ class MonitorWorker(QThread):
         stop_reason = StopReason.USER
 
         # 调度：用单调时钟的截止时间驱动，每周期 deadline += interval，避免
-        # "采集耗时 + 睡眠"造成的累积漂移；等待统一走 Event.wait，stop/pause/resume
+        # "采集耗时 + 睡眠"造成的累积漂移；等待统一走时钟的 wait（默认即 Event.wait），stop/pause/resume
         # 置位事件即可立即唤醒，无需轮询。不含 CPU 指标时启动即采一次。
-        next_deadline = time.monotonic()
+        next_deadline = clock.monotonic()
         if cpu_primed:
             next_deadline += self.interval
         while True:
@@ -255,24 +287,24 @@ class MonitorWorker(QThread):
                 break
             # 暂停：无超时等待，直到 resume()/stop() 唤醒；恢复后立即采一次
             if state is WorkerState.PAUSED:
-                self._wake.wait()
+                clock.wait(self._wake, None)
                 self._wake.clear()
-                next_deadline = time.monotonic()
+                next_deadline = clock.monotonic()
                 continue
 
             # 等到本周期截止时间；被唤醒后重新检查状态（调用方先改状态再 set 事件，
             # 故 clear 之后读到的状态一定是最新的）
             while self.state is WorkerState.RUNNING:
-                remaining = next_deadline - time.monotonic()
+                remaining = next_deadline - clock.monotonic()
                 if remaining <= 0:
                     break
-                self._wake.wait(remaining)
+                clock.wait(self._wake, remaining)
                 self._wake.clear()
             if self.state is not WorkerState.RUNNING:
                 continue   # 暂停或停止：回到循环顶部按新状态处理
 
             # 落后超过一个周期（如系统休眠唤醒、采集被严重拖慢）：重置为当前时间，不补采
-            now = time.monotonic()
+            now = clock.monotonic()
             if now - next_deadline > self.interval:
                 next_deadline = now
 
@@ -281,7 +313,7 @@ class MonitorWorker(QThread):
 
                 if values is not None:
                     # 同一采集周期的多个指标共用同一时间戳
-                    timestamp = datetime.now()
+                    timestamp = clock.now()
                     for metric_type, value in values.items():
                         self._data_buffer.append(DataPoint(
                             task_id=self.task_id,
@@ -369,7 +401,7 @@ class MonitorWorker(QThread):
         """写暂停/恢复系统打点。在调用 pause()/resume() 的线程（GUI 线程）同步写库：
         时间取点击时刻，不受工作线程调度延迟影响。写库失败只记日志——打点只是
         辅助信息，不能因此让暂停/恢复本身失败。"""
-        when = timestamp if timestamp is not None else datetime.now()
+        when = timestamp if timestamp is not None else self._clock.now()
         try:
             self.db.markers.add(self.task_id, when, SYSTEM_MARKER_LABELS[kind], kind)
         except Exception:
@@ -404,7 +436,7 @@ class MonitorWorker(QThread):
         except Exception:
             logger.error("task_id=%s 收尾 flush 异常", self.task_id, exc_info=True)
 
-        self.task_model.end_time = datetime.now()
+        self.task_model.end_time = self._clock.now()
         self.task_model.status = TaskStatus.STOPPED
         try:
             if self._task_saved:
