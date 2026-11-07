@@ -68,26 +68,26 @@ def test_env_var_overrides_data_dir(monkeypatch, tmp_path):
     target = str(tmp_path / "custom_data")
     monkeypatch.setenv(config.DATA_DIR_ENV, target)
     assert config.DATA_DIR_ENV == "PROCESS_MONITOR_DATA_DIR"
-    assert config.get_data_dir() == os.path.abspath(target)
+    assert config.DATA_DIR == os.path.abspath(target)
 
     # 打包环境下环境变量同样优先
     monkeypatch.setattr(sys, 'frozen', True, raising=False)
-    assert config.get_data_dir() == os.path.abspath(target)
+    assert config.DATA_DIR == os.path.abspath(target)
 
 
 def test_default_data_dir_unchanged_without_env(monkeypatch):
     monkeypatch.delenv(config.DATA_DIR_ENV, raising=False)
 
     monkeypatch.setattr(sys, 'frozen', False, raising=False)
-    assert config.get_data_dir() == os.path.join(config.BASE_DIR, "data")
+    assert config.DATA_DIR == os.path.join(config.BASE_DIR, "data")
 
     monkeypatch.setattr(sys, 'frozen', True, raising=False)
     monkeypatch.setenv('LOCALAPPDATA', r'C:\Users\someone\AppData\Local')
-    assert config.get_data_dir() == os.path.join(
+    assert config.DATA_DIR == os.path.join(
         r'C:\Users\someone\AppData\Local', config.APP_NAME, "data")
 
 
 def test_empty_env_var_is_ignored(monkeypatch):
     monkeypatch.setenv(config.DATA_DIR_ENV, "")
     monkeypatch.setattr(sys, 'frozen', False, raising=False)
-    assert config.get_data_dir() == os.path.join(config.BASE_DIR, "data")
+    assert config.DATA_DIR == os.path.join(config.BASE_DIR, "data")

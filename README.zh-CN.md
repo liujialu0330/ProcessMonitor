@@ -72,15 +72,13 @@
 
 ## 📸 界面截图
 
-> 以下截图为改版前（v1.4）的界面，监控页、分析页与设置页的新截图待补拍。
-
-| 监控 | 分析（旧版历史数据页） |
+| 监控 | 分析 |
 |---|---|
-| ![监控页面](screenshots/monitor-page.png) | ![分析页面](screenshots/history-page.png) |
+| ![监控页面](screenshots/monitor-page.png) | ![分析页面](screenshots/analysis-page.png) |
 
-| 报告导出（旧版数据导出页） | 设置（含关于与更新） |
-|---|---|
-| ![导出页面](screenshots/export-page.png) | ![设置页面](screenshots/setting-page.png)<br>![关于与更新](screenshots/about-page.png) |
+| 设置（含关于与更新） |
+|---|
+| ![设置页面](screenshots/setting-page.png) |
 
 ## 🚀 快速开始
 

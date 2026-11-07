@@ -56,8 +56,6 @@ RANGE_KEYS = (BASELINE_RANGE_KEY, *TIME_RANGE_SECONDS)
 DEFAULT_RANGE_KEY = 'all'
 # "自定义"范围键（分析页刷选）：起止时刻由请求直接给出，不随锚点换算
 CUSTOM_RANGE_KEY = 'custom'
-# 分析页可用的全部范围键（预设 + 自定义）
-ANALYSIS_RANGE_KEYS = (*RANGE_KEYS, CUSTOM_RANGE_KEY)
 
 # 表格取数上限：只取最近 N 条采集，避免大数据量下界面卡顿
 TABLE_POINT_LIMIT = 2000

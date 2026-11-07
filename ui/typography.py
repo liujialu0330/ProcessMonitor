@@ -35,10 +35,8 @@ class TypeScale:
     """应用排版层级，单位为 Qt/QFluentWidgets 使用的逻辑像素。"""
 
     PAGE_TITLE = 24
-    SECTION_TITLE = 16
     BODY = 14
     CAPTION = 12
-    STAT_VALUE = 18
     # 任务卡片指标格的实时值（设计规范 Subtitle：20px Semibold，关键数值）
     METRIC_VALUE = 20
     CHART_TICK = 12
@@ -85,14 +83,6 @@ class PageTitleLabel(BodyLabel):
         self.setFont(ui_font(TypeScale.PAGE_TITLE, QFont.DemiBold))
 
 
-class SectionTitleLabel(BodyLabel):
-    """页面内区域标题。"""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.setFont(ui_font(TypeScale.SECTION_TITLE, QFont.DemiBold))
-
-
 class DataLabel(BodyLabel):
     """主要遥测数值：沿用 Fluent UI 字体并提高字重。"""
 
@@ -115,11 +105,3 @@ class MetricValueLabel(DataLabel):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.setFont(ui_font(TypeScale.METRIC_VALUE, QFont.DemiBold))
-
-
-class StatValueLabel(DataLabel):
-    """历史统计等需要优先扫读的核心数值。"""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.setFont(ui_font(TypeScale.STAT_VALUE, QFont.DemiBold))

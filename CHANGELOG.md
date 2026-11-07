@@ -72,7 +72,7 @@
 - 退出时后台线程收尾有 30 秒总期限并记录日志，不再可能无限等待；收尾期间窗口先隐藏，托盘图标悬停文字显示进度
 - 清理数据库与开始监控/导出的互斥改为界面线程先占锁，消除确认清理后、后台线程真正开始前任务或导出趁机开始的竞争
 - 深色主题下判定摘要表里置灰行的“判定”胶囊文字几乎看不清：胶囊文字色改为随主题与置灰状态显式指定，并随主题切换即时更新
-- 判定摘要表“上限占比”列在其它列撑满时被压窄截断：有空间时由“指标”列吸收多余宽度，空间不足时各列按内容定宽并出现横向滚动条，任何一列都不再截断；没有 GDI/USER 对象指标时整列隐藏
+- 判定摘要表“上限占比”列在其它列撑满时被压窄截断：有空间时由“指标”列吸收多余宽度，空间不足时各列按内容定宽并出现横向滚动条，任何一列都不再截断；单元格左右内边距由库默认的 16 px 收紧到 6 px，1150 px 宽即可放下全部列；没有 GDI/USER 对象指标时整列隐藏
 - 两次打点只相隔几秒时趋势图顶部的编号徽标重叠：屏幕上挨得太近的徽标自动错开高度，缩放、平移或改变窗口大小后重新排布
 - `logs\crash.log` 超过 1 MB 时启动轮转为 `crash.log.1`，不再无限增长；读屏、UI 自动化等辅助功能工具会让 faulthandler 把首次机会 COM 异常（0x8001010d / 0x80040155）记成“Windows fatal exception”，程序并未崩溃，判断是否崩溃以进程是否退出与 `app.log` 为准
 
@@ -103,6 +103,8 @@
 - 任务下拉：选项模型 `TaskOptionsModel`（纯 Python）+ 控件 `TaskSelector`（只发 `task_selected(task_id, explicit)` 一个信号），分析页任务选择与对比任务共用
 - 分析查询共享模块 `core/history_query.py`（`HistoryRequest` → `HistorySnapshot`），用户操作的加载与自动刷新共用；`HistoryRefreshWorker` 只剩线程外壳
 - 删除已被分析页取代的旧页面与控件：`HistoryPage`、`ExportPage`、`FilterBar`、`StatsStrip` 及其测试（仍有价值的断言迁入分析页测试）；关于页改为设置页分组 `ui/pages/about_update.py` 的 `AboutUpdateGroup`
+- 清理无生产引用的符号与文件：`config.get_data_dir` 兼容垫片、`MigrationError`、`ANALYSIS_RANGE_KEYS`、`INTERVAL_COLUMNS`、`SectionTitleLabel` / `StatValueLabel` 及对应排版刻度、`EXPORT_NO_DATA`、`ERROR_KINDS`、`_KB_DISPLAY_DIVISORS`，测试里的未使用导入；删除依赖 PIL 的一次性脚本 `build/create_icon.py` 与打包流程不再引用的 `build/app_icon.ico`，打包说明补齐 build 目录各文件用途；`doc/架构重构方案.md` 标注已全部实施
+- README 截图重拍为现行的监控 / 分析 / 设置三页，删除旧的历史、导出、关于页截图
 - 清理无生产调用的死代码：纯 CSV 导出线程 `ExportWorker` / `ExportResult`、`core/export.py` 的 `build_csv_header` / `pivot_rows`、`VisibleTimer`、`TaskOptionsModel` 与任务下拉文案的 `full_date` 参数；报告线程模块改名 `core/report_worker.py`，临时文件清理、写入失败与注入数据库等用例移植到 `ReportWorker` 的测试
 
 ### v1.4.1 (2026-07-16)

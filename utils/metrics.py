@@ -256,7 +256,6 @@ KB_UNIT_DIVISORS: Dict[str, float] = {
     "GB": 1024.0 ** 2,
     "TB": 1024.0 ** 3,
 }
-_KB_DISPLAY_DIVISORS = KB_UNIT_DIVISORS
 
 # 迷你图/图表纵轴最小跨度：字节类 max(当前值 1%, 64 KB)；计数类至少 4；
 # 百分比至少 1 个百分点；其余按当前值 1%

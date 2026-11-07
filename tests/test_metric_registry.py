@@ -176,7 +176,6 @@ def test_kb_unit_divisors_single_source():
     """图表坐标轴的换算表就是 utils.metrics 的同一个对象"""
     from ui.components.chart_axes import DISPLAY_UNIT_DIVISORS
     assert DISPLAY_UNIT_DIVISORS is KB_UNIT_DIVISORS
-    assert metrics._KB_DISPLAY_DIVISORS is KB_UNIT_DIVISORS
     assert KB_UNIT_DIVISORS == {
         "KB": 1.0, "MB": 1024.0, "GB": 1024.0 ** 2, "TB": 1024.0 ** 3}
 

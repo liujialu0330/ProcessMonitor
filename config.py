@@ -64,20 +64,6 @@ def get_icon_path():
 DATA_DIR_ENV = "PROCESS_MONITOR_DATA_DIR"
 
 
-def get_data_dir():
-    """
-    获取数据目录（兼容接口，规则见 app.paths.AppPaths.resolve）
-
-    Returns:
-        str: 数据目录路径
-            - 设置了环境变量 PROCESS_MONITOR_DATA_DIR：使用该目录（便于测试/便携运行）
-            - 开发环境：返回项目根目录下的data文件夹
-            - 打包环境：返回用户本地应用数据目录，避免Program Files权限问题
-    """
-    from app.paths import AppPaths
-    return AppPaths.resolve().data_dir
-
-
 # 由数据目录派生的兼容路径常量：不在导入期计算（导入本模块不得有创建目录等副作用，
 # 也不能把导入那一刻的环境变量固化下来），每次访问时按 AppPaths.resolve() 现算。
 # 新代码请直接用组合根注入的 AppPaths。

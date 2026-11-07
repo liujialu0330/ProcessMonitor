@@ -54,7 +54,6 @@ RANGE_TEXTS = {
 # 导出被拒的原因
 EXPORT_BUSY = 'busy'
 EXPORT_MAINTENANCE = 'maintenance'
-EXPORT_NO_DATA = 'no_data'
 
 COMPARE_MISSING_METRIC = "对比任务没有采集该指标"
 

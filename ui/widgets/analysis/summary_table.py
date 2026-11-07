@@ -17,13 +17,15 @@ from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (QHBoxLayout, QHeaderView, QLabel, QTableWidgetItem,
                              QVBoxLayout)
 from qfluentwidgets import (CaptionLabel, CardWidget, StrongBodyLabel, TableWidget,
-                            isDarkTheme, qconfig)
+                            isDarkTheme, qconfig, setCustomStyleSheet)
 
 from ui.formatting import SUMMARY_COLUMNS, SUMMARY_HEADERS, SummaryRow
 from ui.typography import TypeScale, data_font
 from ui.widgets.history.common import CARD_PADDING_H
 
 ROW_HEIGHT = 36
+# 单元格左右内边距（库默认 16 px）
+CELL_PADDING_H = 6
 HEADER_HEIGHT = 36
 VERDICT_COLUMN = SUMMARY_COLUMNS.index("verdict")
 USAGE_COLUMN = SUMMARY_COLUMNS.index("usage")
@@ -93,6 +95,11 @@ class SummaryTable(CardWidget):
         self.table.setBorderVisible(True)
         self.table.setBorderRadius(8)
         self.table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # 库的 qss 给单元格左右各 16 px 内边距，9 列下来多占近 300 px；
+        # 用 setCustomStyleSheet 追加（随主题切换保留），收紧到 CELL_PADDING_H
+        cell_qss = (f"QTableView::item{{padding-left: {CELL_PADDING_H}px;"
+                    f"padding-right: {CELL_PADDING_H}px;}}")
+        setCustomStyleSheet(self.table, cell_qss, cell_qss)
         self.table.cellClicked.connect(self._on_cell_clicked)
 
         title_row = QHBoxLayout()
