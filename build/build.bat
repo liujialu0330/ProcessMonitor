@@ -90,10 +90,14 @@ echo.
 echo [5/8] 清理旧的打包文件...
 echo.
 
-if exist "dist\进程监控助手" (
-    rmdir /s /q "dist\进程监控助手"
-    echo %GREEN%√ 已删除旧的onedir产物%NC%
+if exist "dist" (
+    rmdir /s /q "dist"
 )
+if exist "dist" (
+    echo %RED%错误: 无法清空 dist\（有文件被占用？请关闭正在运行的进程监控助手后重试）%NC%
+    exit /b 1
+)
+echo %GREEN%√ 已清空 dist\（旧的onedir产物与安装包一并删除）%NC%
 
 if exist "build\ProcessMonitor" (
     rmdir /s /q "build\ProcessMonitor"
@@ -118,7 +122,7 @@ echo.
 echo %GREEN%√ PyInstaller打包完成%NC%
 echo.
 
-echo [7/8] 验证打包结果并冒烟测试...
+echo [7/8] 验证打包结果并运行打包自检...
 echo.
 
 :: 检查onedir产物exe是否生成
@@ -142,19 +146,16 @@ echo   目录路径: dist\进程监控助手\
 echo   目录大小: %sizeMB% MB（%filecount% 个文件）
 echo.
 
-:: 冒烟测试：启动exe，等待数秒，用tasklist确认进程存在，再收尾
-echo 正在冒烟测试: 启动exe进行快速验证...
-start "" "dist\进程监控助手\进程监控助手.exe"
-%SystemRoot%\System32\ping.exe -n 6 127.0.0.1 >nul
-
-tasklist /fi "imagename eq 进程监控助手.exe" | %SystemRoot%\System32\find.exe /i "进程监控助手.exe" >nul
+:: 打包自检（取代旧的"启动5秒后看进程在不在"）：用临时空目录当数据目录，迁移golden旧库 ->
+:: 建窗 -> 读进程列表 -> 监控自身3点 -> 导出 -> pmctl ping -> 真退出。窗口程序没有控制台、
+:: 出错时可能卡在模态框，所以经 run_self_test.py 带超时地运行并拿到输出与退出码
+echo 正在打包自检: --self-test ...
+python build\run_self_test.py "dist\进程监控助手\进程监控助手.exe"
 if %errorlevel% neq 0 (
-    echo %RED%错误: 冒烟测试失败，未检测到进程运行%NC%
+    echo %RED%错误: 打包自检失败（上面是各步骤的结果；数据目录已保留供查看）%NC%
     exit /b 1
 )
-echo %GREEN%√ 冒烟测试通过，进程正常运行%NC%
-
-taskkill /f /im "进程监控助手.exe" >nul 2>&1
+echo %GREEN%√ 打包自检通过%NC%
 echo.
 
 echo [8/8] 制作安装包（Inno Setup）...
@@ -194,17 +195,19 @@ if %errorlevel% neq 0 (
 echo %GREEN%√ 安装包编译完成%NC%
 echo.
 
-:: 产物重命名: 保留中文名安装包（现有 setup.iss OutputBaseFilename 未改），
-:: 同时复制一份英文名，符合 release 资产命名惯例
-set "SRC_INSTALLER=dist\installer\进程监控助手_v%VER%_Setup.exe"
-set "DST_INSTALLER=dist\installer\Windows_v%VER%_Setup.exe"
-if exist "%SRC_INSTALLER%" (
-    copy /y "%SRC_INSTALLER%" "%DST_INSTALLER%" >nul
-    echo %GREEN%√ 已生成 release 资产命名副本: %DST_INSTALLER%%NC%
-) else (
+:: 安装包文件名由 setup.iss 的 OutputBaseFilename 直接定为 Windows_v{版本}_Setup.exe
+:: （Release 资产固定的 ASCII 名），不再另存中文名副本
+set "SRC_INSTALLER=dist\installer\Windows_v%VER%_Setup.exe"
+if not exist "%SRC_INSTALLER%" (
     echo %RED%错误: 未找到 Inno Setup 输出的安装包 %SRC_INSTALLER%%NC%
     exit /b 1
 )
+for %%I in ("%SRC_INSTALLER%") do set "SETUP_BYTES=%%~zI"
+set /a SETUP_MB=!SETUP_BYTES! / 1048576
+echo %GREEN%√ 安装包: %SRC_INSTALLER%（!SETUP_MB! MB）%NC%
+:: 体积门槛（安装包 36 MB、onedir 105 MB）只提示不拦截：包体裁剪与体积门禁是另一项工作
+if !SETUP_MB! gtr 36 echo %YELLOW%提示: 安装包超过规划门槛 36 MB%NC%
+if %sizeMB% gtr 105 echo %YELLOW%提示: onedir 超过规划门槛 105 MB%NC%
 echo.
 
 echo ========================================
@@ -213,7 +216,6 @@ echo ========================================
 echo.
 echo 安装包位置:
 echo   %SRC_INSTALLER%
-echo   %DST_INSTALLER%
 echo.
 echo ========================================
 

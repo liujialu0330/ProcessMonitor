@@ -17,8 +17,8 @@
 ## 🎯 打包方案概述
 
 本项目采用 **PyInstaller + Inno Setup** 的双阶段打包方案，`build\build.bat` 已封装为
-无人值守一键脚本（含版本号读取、version_info.txt 生成、PyInstaller 打包、冒烟测试、
-Inno Setup 编译、产物命名，全流程一次跑完）：
+无人值守一键脚本（含版本号读取、清空 `dist\`、version_info.txt 生成、PyInstaller 打包、
+打包自检 `--self-test`、Inno Setup 编译，全流程一次跑完）：
 
 ```
 源代码 → PyInstaller打包成onedir目录 → Inno Setup制作安装包 → 最终安装包
@@ -26,8 +26,8 @@ Inno Setup 编译、产物命名，全流程一次跑完）：
 
 **打包产物**（v1.2.0 起改为 onedir 模式，不再是单文件exe）：
 - **onedir目录**：`dist\进程监控助手\`（主exe + `_internal\` 依赖目录）
-- **安装包**：`dist\installer\进程监控助手_v{版本}_Setup.exe`（另附一份
-  `dist\installer\Windows_v{版本}_Setup.exe`，供 release 资产命名使用）
+- **安装包**：`dist\installer\Windows_v{版本}_Setup.exe`（ASCII 文件名，就是 Release 资产名，
+  不再另存中文名副本）
 
 > 为什么改用 onedir：onefile 模式每次启动都要把依赖解压到系统临时目录，
 > 启动慢且临时文件可能被杀毒软件误报；onedir 模式启动更快、覆盖安装更可控。
@@ -90,8 +90,8 @@ Inno Setup 编译、产物命名，全流程一次跑完）：
 ### 一键打包（推荐，无人值守）
 
 `build\build.bat` 已是全流程无人值守脚本，一次运行完成
-"读取版本号 → 生成 version_info.txt → PyInstaller 打包 onedir → 冒烟测试 →
-Inno Setup 编译安装包 → 产物重命名"，中途任何一步失败都会 `exit /b 1` 并停止，
+"读取版本号 → 清空 `dist\` → 生成 version_info.txt → PyInstaller 打包 onedir → 打包自检 →
+Inno Setup 编译安装包"，中途任何一步失败都会 `exit /b 1` 并停止，
 不会卡在交互提示上：
 
 ```bash
@@ -101,8 +101,8 @@ build.bat
 
 完成后：
 - onedir 产物位于 `dist\进程监控助手\`
-- 安装包位于 `dist\installer\进程监控助手_v{版本}_Setup.exe` 与
-  `dist\installer\Windows_v{版本}_Setup.exe`（内容相同，仅文件名不同）
+- 安装包位于 `dist\installer\Windows_v{版本}_Setup.exe`
+- 终端末尾会提示 onedir / 安装包体积是否超过规划门槛（onedir 105 MB、安装包 36 MB，只提示、不拦截）
 
 ### 手动分步执行（调试用）
 
@@ -182,6 +182,7 @@ spec 里第二组 `Analysis` / `PYZ` / `EXE` 生成 `pmctl.exe`，与主程序�
 - 打包后冒烟：在 `dist\进程监控助手\` 下执行
   `pmctl.exe --data-dir %TEMP%\pm_smoke ping`（应自动拉起无窗口实例并打印版本）、
   `pmctl.exe --data-dir %TEMP%\pm_smoke quit`，两条都应以退出码 0 结束，任务管理器里不应残留进程。
+- 打包自检第 10 步已用同目录的 `pmctl.exe` 对自检进程做一次 ping。
 - 用法与退出码见仓库 `tools\README.md`。
 
 ---
@@ -203,13 +204,12 @@ spec 里第二组 `Analysis` / `PYZ` / `EXE` 生成 `pmctl.exe`，与主程序�
 3. **编译安装包**
    - 菜单：`Build` → `Compile`
    - 或按快捷键：`Ctrl + F9`
-   - 注意：直接用 IDE 编译时版本号取 `setup.iss` 内 `#ifndef MyAppVersion`
-     兜底值，可能与 `config.py` 不一致，正式发布请用 `build.bat` 或命令行
-     显式传参
+   - 注意：`setup.iss` 没有默认版本号，直接用 IDE 编译会因 `#ifndef MyAppVersion` 里的
+     `#error` 中止；请用 `build.bat` 或命令行以 `/DMyAppVersion=<版本>` 传入
 
 4. **查看结果**
    - 编译成功后，安装包位于：
-   - `dist\installer\进程监控助手_v{版本}_Setup.exe`
+   - `dist\installer\Windows_v{版本}_Setup.exe`
 
 #### 命令行编译（高级）
 
@@ -222,7 +222,9 @@ spec 里第二组 `Analysis` / `PYZ` / `EXE` 生成 `pmctl.exe`，与主程序�
 
 | 配置项 | 值 | 说明 |
 |-------|-----|------|
-| `MyAppVersion` | 外部 `/DMyAppVersion` 传入，未传时取 `#ifndef` 兜底值 | 与 `config.APP_VERSION` 保持一致 |
+| `MyAppVersion` | 只能由 `/DMyAppVersion` 传入（`build.bat` 读 `config.APP_VERSION` 后传入），未传则 `#error` | 不存在写死的兜底版本号 |
+| `OutputBaseFilename` | `Windows_v{#MyAppVersion}_Setup` | ASCII 文件名即 Release 资产名（对已安装版本更新器的契约） |
+| `[InstallDelete]` | `Type: filesandordirs; Name: "{app}\_internal"` | 覆盖安装前先清掉旧版本的运行库目录，避免新旧文件混用或残留 |
 | `DefaultDirName` | `{autopf}\进程监控助手` | 默认安装目录 |
 | `PrivilegesRequired` | `lowest` | 普通用户即可安装 |
 | `Compression` | `lzma2/max` | 最大压缩率 |
@@ -249,7 +251,9 @@ build\
 ├── ProcessMonitor.spec       # PyInstaller配置文件（onedir模式）
 ├── gen_version_info.py       # 从config.APP_VERSION生成version_info.txt
 ├── setup.iss                 # Inno Setup脚本
-├── build.bat                 # 一键打包脚本（无人值守，含冒烟测试）
+├── build.bat                 # 一键打包脚本（无人值守，含打包自检）
+├── run_self_test.py          # 带超时地运行 `--self-test`（build.bat 与 installer_smoke.ps1 共用）
+├── installer_smoke.ps1       # 安装包冒烟：1.4.1 → 当前构建的覆盖升级（CI release 工作流调用，本机也能跑）
 ├── check_dependencies.py     # 打包前依赖检查
 ├── dist_stats.py             # 统计onedir产物总大小与文件数（build.bat 验证打包结果时调用）
 ├── verify_release.py         # GitHub Release 发布校验（版本一致、安装包资产、digest、prerelease，见“发布校验”）
@@ -299,10 +303,10 @@ Inno Setup安装脚本，主要功能：
 2. 读取版本号（`config.APP_VERSION` 单源）
 3. 检查项目依赖与PyInstaller
 4. 生成 `version_info.txt`
-5. 清理旧的打包文件
+5. 清空 `dist\`（旧的 onedir 与历史安装包一并删除）与 PyInstaller 临时目录
 6. 执行 `python -m PyInstaller` 打包（onedir）
-7. 验证打包结果（体积/文件数）并冒烟测试（启动exe → `tasklist` 确认 → `taskkill` 收尾）
-8. 探测 ISCC 并编译安装包，产物重命名为发布资产命名
+7. 验证打包结果（体积/文件数），运行打包自检（`run_self_test.py` → `进程监控助手.exe --self-test`）
+8. 探测 ISCC 并编译安装包（文件名直接是 `Windows_v{版本}_Setup.exe`），提示体积是否超门槛
 
 ---
 
@@ -374,6 +378,68 @@ DLL 导致，属一次性开销。
 ---
 
 ## 🧪 发布前冒烟
+
+### 打包自检（`--self-test`）
+
+`build.bat` 第 7 步用它取代了旧的"启动 5 秒后 `taskkill`"：后者只能证明引导程序没崩，
+挡不住 `_internal\` 里少一个 Qt 插件、少一个 DLL、少一份数据文件。手动运行：
+
+```bat
+python build\run_self_test.py dist\进程监控助手\进程监控助手.exe
+```
+
+外壳 `run_self_test.py` 建一个临时空目录当 `--data-dir`、带超时（缺省 240 秒，超时结束进程树，
+因为窗口程序出错时可能卡在模态错误框里）运行自检，通过后删除临时目录，失败时保留
+（其中 `self_test_report.txt` 与 `logs\app.log` 记录失败的步骤）。退出码：0 通过；5 某一步失败；
+2 参数不合规（没有 `--data-dir`，或目录里已有 `monitor.db`——自检会写数据，拒绝指向真实数据）；
+124 超时；进程在启动阶段就崩溃时是系统给的其他非 0 码。
+
+自检按固定顺序走一遍主要功能链，任何一步失败都立即停止，把失败的步骤与原因写到标准输出、
+报告文件与应用日志（`app/self_test.py`）：
+
+1. 数据目录与参数 → 2. QApplication 与配置 → 3. 放入 golden 旧库（v1.4.1 写出的 v1 库）并迁移到
+   v5，核对 `.bak_v1` → 4. 组装应用上下文，核对三个 golden 任务的采样数 → 5. 单实例与命令行监听
+   → 6. 建主窗口（全透明显示一下再隐藏）→ 7. 读进程列表 → 8. 监控自身，收到 3 个数据点并打 1 个点
+   → 9. 导出明细 CSV、摘要 CSV 与报告图片并读回核对 → 10. 同目录的 `pmctl.exe ping` 本进程
+   → 11. 走与托盘"退出"相同的真退出路径，事件循环正常结束。
+
+golden 库由 `ProcessMonitor.spec` 的 `datas` 带进包里（`_internal\selftest\v1.4.1_v1.db.gz`，约 64 KB），
+迁移走的是真实升级路径，同时验证数据文件确实被收进了包。验收要求"故意多排除一个必需文件时自检必须失败"，
+已实测：删掉 `PyQt5\Qt5\bin\Qt5Svg.dll`（第 2 步 `ImportError: DLL load failed while importing QtSvg`）、
+`Qt5Network.dll`（第 5 步 QtNetwork）、`_sqlite3.pyd`（启动导入阶段 `No module named '_sqlite3'`）、
+`selftest\v1.4.1_v1.db.gz`（第 3 步"包里没有 golden 旧库"）均以退出码 5 结束。
+
+### 安装包冒烟（`installer_smoke.ps1`）
+
+```powershell
+powershell -File build\installer_smoke.ps1                       # 下载 1.4.1 并校验 digest
+powershell -File build\installer_smoke.ps1 -OldInstaller D:\old\Windows_v1.4.1_Setup.exe   # 离线：用本地旧安装包
+```
+
+全部路径在工作目录（缺省为系统临时目录下的新目录，`-WorkDir` 可指定）内：旧版与新版都以
+`/DIR=` 静默安装到其中的临时目录（`/NOICONS /TASKS=""`，不建快捷方式），数据目录用 `--data-dir`
+指向其中的另一个目录；本机已正式安装本程序（按 `setup.iss` 的 AppId 查注册表）或有实例在运行时
+直接拒绝，绝不动它。步骤：
+
+1. 下载 `Windows_v1.4.1_Setup.exe`（GitHub Releases，取 API 返回的 `digest` 校验 sha256；
+   `-OldInstaller` 给本地文件时跳过下载，`-OldSha256` 可指定期望摘要）
+2. 静默安装旧版，在 `_internal\` 里放一个只有旧版才有的残留文件与目录
+3. 放入 golden 旧库、旧版 `update_prefs.json`、1.x 风格的 `config.json`
+4. 静默覆盖安装当前构建
+5. 安装目录的文件清单（路径、大小、SHA-256）与 `dist\进程监控助手\` 完全一致（另有安装器复制的图标，
+   卸载程序 `unins*` 除外），旧版残留已被 `[InstallDelete]` 清掉
+6. 在安装目录里再跑一遍打包自检（`-SkipSelfTest` 可跳过）
+7. 启动新版，等日志出现"数据库迁移完成"：`monitor.db.bak_v1` 存在、`update_prefs.json` 已被程序导入并
+   删除（`app_config._import_legacy_update_prefs`）、配置里的旧设置保留
+8. `taskkill /PID`（不加 `/F`，等价于点关闭）：程序自行退出、退出码 0、日志有"应用退出，退出码=0"、
+   会话锁已删除
+9. 静默卸载：程序文件与 `_internal` 被删，数据目录（`monitor.db` 与 `.bak_v1`）保留
+
+每一步输出 `[通过]` 行，失败时输出原因、保留工作目录并以退出码 1 结束。`.github/workflows/release.yml`
+（tag `v*` 推送或手动触发）依次运行 `build.bat`、本脚本并把安装包留作 artifact，**不创建也不修改
+GitHub Release**；Release 仍由人手动创建，随后用 `verify_release.py` 复核。
+
+### 其余发布前检查
 
 除完整集 `python -m pytest tests/ -v -m "not perf and not soak and not gui_real"`（含 `slow` 标记的用例，即 `tests/e2e/` 的 offscreen 断言态冒烟、真实进程与管道用例；本地默认 `python -m pytest tests/` 只跑快速集、不含它们）全绿外，
 正式发布前建议额外用真窗口观察态跑一次 GUI 端到端冒烟测试（`tests/e2e/test_gui_smoke.py`），

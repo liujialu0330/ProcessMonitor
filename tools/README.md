@@ -94,3 +94,21 @@ python tools\pmclient.py marker "{\"task_id\":\"all\"}"
 - 管道只对当前用户开放（DACL）；服务端核对客户端进程的完整性级别，低于本程序时拒绝
   `start` / `stop` / `export` / `quit`（`forbidden`）。
 - pmctl 连接后核对管道服务端的 PID 与 `ping` 报告的一致、且属于当前用户，防止被冒名的管道骗取数据。
+
+## 浸泡工具（24 小时浸泡与缩短演练）
+
+回答“监控工具自己有没有在泄漏”：用独立探针记录本工具的资源曲线，再用与分析页同一套趋势判定
+（`core.analysis.trend.judge`）判这次浸泡过没过。完整步骤、中途操作与要留的产物见
+`doc小时浸泡手册.md`。
+
+| 文件 | 作用 |
+|---|---|
+| `tools\soak_run.ps1` | 一条命令拉起：负载 → 本工具（缺省 `-Exe` 不给 = 源码无窗口；给 = 启动安装版）→ 用 `pmctl` 建 26 指标任务 → 探针；`-Stop -OutDir 目录` 收尾（各任务 `verdict`、导出证据包、停负载与探针、跑判定）；`-Wait` 等探针结束后自动收尾 |
+| `tools\soak_probe.py` | 独立探针（标准库 + psutil，IPC 只用 `core.ipc.client`）：每 10 秒记本工具的私有字节 / 工作集 / 句柄 / GDI / USER / 线程 / CPU，并经 `status` 记各任务的 `planned_cycles` / `done_cycles` / `missed_cycles`；输出目录里的 `soak_probe.csv`、`soak_tasks.csv`、`soak_events.csv`（事件：`probe_start` / `target_found` / `target_exited` / `target_not_found` / `ipc_lost` / `ipc_ok` / `probe_stop`）；每行即时 flush、已有文件时追加；本工具退出后默认继续等它重新出现（`--on-exit exit` 则一并退出）；目录里出现 `STOP` 文件、到 `--hours` 或 Ctrl+C 正常收尾。找目标：`--pid` / `--name`（缺省 `进程监控助手.exe`）/ `--by-ipc`（经 ping 取 PID，需 `--data-dir`） |
+| `tools\soak_verdict.py` | 读探针 CSV 判定：窗口 `--hours`（缺省 20）内私有字节增长 ≤ `--max-growth-mb`（30）且判定非“持续上涨”；句柄 / GDI / USER / 线程非“持续上涨”（小容差内只提示）；每个任务采样完成率 ≥ `--min-completion`（0.995）；工具未退出；记录覆盖。退出码 0 通过 / 1 未通过 / 2 输入错误；`--json` 机读 |
+| `testsixtures\soak_target.py` | 被测负载：`--mode leak`（泄漏内存与句柄，速率可配）/ `stable`（锯齿不涨）/ `restart`（定时退出，`--exit-code 0xC0000005` 模拟崩溃，`--supervise` 由监督进程重新拉起，使本工具能按“重启”续接） |
+
+```bat
+python tools\soak_probe.py --out-dir D:\soakun1 --by-ipc --data-dir D:\soakun1\data --hours 24
+python tools\soak_verdict.py D:\soakun1 --hours 20
+```

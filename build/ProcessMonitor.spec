@@ -26,6 +26,9 @@ a = Analysis(
     datas=[
         # 打包图标文件到exe同目录
         ('app_green_icon.ico', '.'),
+        # 打包自检（--self-test，见 app/self_test.py）用的 golden 旧库：v1.4.1 写出的真实 v1 库，
+        # 约 64 KB，放在 _internal 下的 selftest 目录
+        ('../tests/fixtures/legacy_db/v1.4.1_v1.db.gz', 'selftest'),
     ],
     hiddenimports=[
         # PyQt5核心模块和子模块
