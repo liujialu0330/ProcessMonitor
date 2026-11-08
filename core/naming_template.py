@@ -9,7 +9,8 @@
 - build：被测程序的文件版本（任务的 build 列优先，其次是被测目标元数据里的文件版本）；
 - scenario：场景，暂无来源，恒为空（留给参考基线库）；
 - note：任务备注，截断到 NOTE_MAX_CHARS 字；
-- date：任务开始时间 YYYYMMDD_HHMM；
+- date：导出时刻 YYYYMMDD_HHMMSS（不是任务开始时间：同一任务按不同范围多次导出时不会每次
+  撞名弹覆盖确认，也和 1.x 的命名习惯一致）；
 - kind：这份文件的类别（报告 / 明细 / 摘要 / 证据包）；
 - pid：被测进程 PID（进程组任务没有，为空）——要在同一分钟里区分同名进程时用。
 
@@ -35,7 +36,7 @@ DEFAULT_TEMPLATE = '{process}_{build}_{note}_{date}'
 FIELD_NAMES = ('process', 'build', 'scenario', 'note', 'date', 'kind', 'pid')
 NOTE_MAX_CHARS = 20
 MAX_NAME_LENGTH = 120
-DATE_FORMAT = '%Y%m%d_%H%M'
+DATE_FORMAT = '%Y%m%d_%H%M%S'
 
 KIND_REPORT = '报告'
 KIND_DETAIL = '明细'
@@ -161,7 +162,8 @@ def render_name(template: str, fields: Mapping[str, str]) -> str:
 
 
 def fields_for_task(task, *, kind: str = '', now: Optional[datetime] = None) -> Dict[str, str]:
-    """任务 → 模板字段值（未清洗；render_name 统一清洗）。"""
+    """任务 → 模板字段值（未清洗；render_name 统一清洗）。now 是导出时刻（{date} 的来源），
+    缺省取当前时间。"""
     name = task.process_name or ''
     if name.lower().endswith('.exe'):
         name = name[:-4]
@@ -169,14 +171,14 @@ def fields_for_task(task, *, kind: str = '', now: Optional[datetime] = None) -> 
     if not build:
         info = target_info_from_json_or_none(getattr(task, 'meta_json', None))
         build = info.file_version if info is not None else None
-    start = task.start_time or now
+    exported_at = now if now is not None else datetime.now()
     pid = getattr(task, 'pid', None)
     return {
         'process': name,
         'build': str(build or ''),
         'scenario': str(getattr(task, 'scenario', None) or ''),
         'note': ' '.join((task.note or '').split())[:NOTE_MAX_CHARS],
-        'date': start.strftime(DATE_FORMAT) if start is not None else '',
+        'date': exported_at.strftime(DATE_FORMAT),
         'kind': kind,
         'pid': str(pid) if pid else '',
     }
@@ -204,9 +206,13 @@ def sample_task() -> MonitorTask:
         meta_json=TargetInfo(file_version='120.0.6099.109').to_json())
 
 
+# 预览用的示例导出时刻（固定值：预览不随时间跳动，也便于测试）
+SAMPLE_EXPORT_TIME = datetime(2026, 7, 16, 9, 45, 30)
+
+
 def preview_filename(template: str, kind: str = KIND_REPORT) -> str:
-    """用示例任务渲染的默认文件名（设置页的实时预览）。"""
-    return default_filename(template, sample_task(), kind)
+    """用示例任务与示例导出时刻渲染的默认文件名（设置页的实时预览）。"""
+    return default_filename(template, sample_task(), kind, now=SAMPLE_EXPORT_TIME)
 
 
 def available_fields_text() -> str:

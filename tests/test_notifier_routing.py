@@ -212,20 +212,63 @@ def test_bar_survives_page_switches_in_the_real_main_window(tmp_path, qapp):
         dispose_widget(window)
 
 
+def test_marker_echo_with_undo_follows_the_window_state(env):
+    """打点回显（带"撤销"）：前台是带按钮的提示条，窗口不在前台时是系统通知（没有按钮）。"""
+    from ui.services import EVENT_MARKER_ADDED
+    undo = NoticeAction("撤销", lambda: None)
+    text = "第 7 轮 · 句柄数 +18 个（较上轮）"
+    env.state = STATE_FOREGROUND
+    bar = env.route("success", event=EVENT_MARKER_ADDED, action=undo, key=EVENT_MARKER_ADDED,
+                    title="已打点 · demo.exe", content=text)
+    assert bar is not None and bar.duration == ACTION_DURATION_MS
+    assert [b.text() for b in bar.findChildren(PushButton)] == ["撤销"]
+    assert env.tray.messages == []
+
+    env.state = STATE_INACTIVE
+    assert env.route("success", event=EVENT_MARKER_ADDED, action=undo, key=EVENT_MARKER_ADDED,
+                     title="已打点 · demo.exe", content=text) is None
+    assert env.tray.messages == [("已打点 · demo.exe", text, "info")]
+
+
 # ========== 同 key 合并 ==========
 
-def test_same_key_shows_at_most_two_bars_and_merges_the_rest(env):
+def test_same_key_keeps_the_latest_two_bars_and_closes_the_oldest(env):
     first = env.route("warning", key="k", content="第 1 条")
     second = env.route("warning", key="k", content="第 2 条")
-    third = env.route("warning", key="k", content="第 3 条")
     assert MAX_BARS_PER_KEY == 2
-    # 第 2 条被带"另有 1 条"的第 3 条取代，最早的一条留着
-    assert _alive(first) and not _alive(second) and _alive(third)
+    assert "另有" not in first.content + second.content
+    third = env.route("warning", key="k", content="第 3 条")
+    # 第 3 条来了：最旧的第 1 条关掉，留下最近的两条，最新一条写"另有 1 条"
+    assert not _alive(first) and _alive(second) and _alive(third)
+    assert second.content == "第 2 条"
     assert third.content == "第 3 条（另有 1 条同类提示）"
     fourth = env.route("warning", key="k", content="第 4 条")
-    assert not _alive(third) and _alive(first) and _alive(fourth)
+    assert not _alive(second) and _alive(third) and _alive(fourth)
     assert fourth.content == "第 4 条（另有 2 条同类提示）"
+    # "另有 N 条"只写在最新一条上：上一条的后缀撤掉
+    assert third.content == "第 3 条"
     assert len(env.live_bars()) == 2
+
+
+def test_merge_never_leaves_the_earliest_bar_hanging(env):
+    bars = [env.route("warning", key="k", content=f"第 {n} 条") for n in range(1, 7)]
+    assert [_alive(b) for b in bars] == [False] * 4 + [True] * 2
+    assert bars[-1].content == "第 6 条（另有 4 条同类提示）"
+    assert bars[-2].content == "第 5 条"
+
+
+def test_bars_added_right_after_a_merge_still_slide_into_the_window(env):
+    """同类合并会关掉最旧一条再紧接着弹新的：新条的滑入动画曾被库的下沉动画顶掉，
+    条就停在窗口右边界之外。"""
+    from PyQt5.QtTest import QTest
+    for n in range(5):
+        env.route("success", key="k", content=f"第 {n} 条")
+        QTest.qWait(30)
+    QTest.qWait(600)
+    bars = env.live_bars()
+    assert len(bars) == 2
+    for bar in bars:
+        assert 0 <= bar.x() and bar.geometry().right() <= env.host.width(), bar.content
 
 
 def test_different_keys_and_no_key_do_not_merge(env):

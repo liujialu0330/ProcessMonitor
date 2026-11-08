@@ -11,6 +11,7 @@ import contextlib
 import io
 
 import pytest
+from PyQt5.QtCore import Qt
 
 from ui.components.sparkline import (
     MIN_SPAN_BYTES_KB, MIN_SPAN_COUNT, MIN_SPAN_PERCENT, SparklineWidget,
@@ -223,3 +224,53 @@ def test_sparkline_colors_come_from_theme_tokens():
     for i in (0, 1):
         for surface in (tokens.SURFACE[i], tokens.SURFACE_HOVER[i]):
             assert contrast_ratio(LINE_COLOR[i], surface) >= TEXT_MIN_CONTRAST
+
+
+# ---------------------------------------------------------------- 高 DPI
+
+def test_tick_pens_are_cosmetic_with_device_pixel_widths():
+    """笔宽按设备像素计：QPainter 在 125% / 150% 缩放下不会把 1 px 的刻度线放大成糊的两条。"""
+    from ui.components.sparkline import EVENT_TICK_KINDS, cosmetic_pen, tick_pen
+    for kind in ('baseline', 'user') + tuple(EVENT_TICK_KINDS):
+        for ratio in (1.0, 1.25, 1.5, 2.0):
+            pen = tick_pen(kind, ratio)
+            assert pen.isCosmetic(), (kind, ratio)
+            assert pen.widthF() >= 1.0
+    assert tick_pen('user', 1.0).widthF() == 1.0
+    assert tick_pen('user', 1.5).widthF() == 1.5           # 1 逻辑 px = 1.5 设备 px
+    assert cosmetic_pen(Qt.red, 1.5, 1.25).widthF() == 2.0  # 1.875 取到半像素
+    assert cosmetic_pen(Qt.red, 1.5).isCosmetic()
+
+
+def test_sparkline_line_pen_is_cosmetic_and_ticks_snap_to_device_pixels(qapp, monkeypatch):
+    """折线与刻度都用 cosmetic 笔；竖线的 x 对齐到设备像素中心（逻辑坐标 × 比例 = 整数 + 0.5）。"""
+    from datetime import datetime, timedelta
+    from PyQt5.QtGui import QPainter
+    from data.models import Marker
+    from ui.components.sparkline import SparklineWidget
+
+    used = []
+    original = QPainter.setPen
+
+    def spy(self, pen, *args):
+        used.append(pen)
+        return original(self, pen, *args)
+
+    widget = SparklineWidget()
+    widget.resize(333, 36)
+    t0 = datetime(2026, 11, 7, 10, 0, 0)
+    for i in range(30):
+        widget.append(float(i), t0 + timedelta(seconds=i))
+    widget.set_markers([Marker("t", t0 + timedelta(seconds=11), "第 1 轮", 1, "user")])
+    monkeypatch.setattr(widget, "devicePixelRatioF", lambda: 1.5)
+    monkeypatch.setattr(QPainter, "setPen", spy)
+    drawn = []
+    original_line = QPainter.drawLine
+    monkeypatch.setattr(QPainter, "drawLine",
+                        lambda self, *a: (drawn.append(a), original_line(self, *a))[1])
+    widget.grab()
+    pens = [p for p in used if hasattr(p, "isCosmetic") and p.style() != Qt.NoPen]
+    assert pens and all(p.isCosmetic() for p in pens)
+    (p1, p2), = drawn
+    assert ((p1.x() * 1.5) % 1.0) == pytest.approx(0.5)
+    widget.deleteLater()

@@ -7,7 +7,8 @@ Notifier 发出，由它按"事件级别 × 主窗口状态"选择渠道，测�
 
 渠道（InfoBarNotifier.route）：
 - 主窗口可见且在前台：InfoBar，挂在主窗口上（不挂在某个页面上，切页不丢），统一在右下角。
-  同一个 key 最多同时显示 2 条，更多的合并进最新一条的"另有 N 条同类提示"。
+  同一个 key 最多同时显示 2 条：再来一条时关掉最旧的一条，留下最近的两条，并在最新一条上
+  写"另有 N 条同类提示"（N 为已被关掉的条数；上一条的后缀随之撤掉，数字只出现在最新一条上）。
 - 主窗口最小化、隐藏到托盘或不在前台：托盘气泡（受设置项"窗口不在前台时用系统通知提醒"
   控制）。常驻提示（错误、不自动消失的警告）另在主窗口上保留一条 InfoBar，用户回来时仍在；
   气泡发不出去（开关关闭、没有托盘）时，所有提示都留在主窗口上。
@@ -51,6 +52,13 @@ EVENT_GENERIC = "generic"
 EVENT_TASK_ABNORMAL = "task.abnormal_end"
 EVENT_TASK_ERROR = "task.error"
 EVENT_QUICK_MARKER = "marker.quick"
+EVENT_MARKER_ADDED = "marker.added"
+EVENT_MARKER_UNDONE = "marker.undone"
+EVENT_EXPORT_BLOCKED = "export.blocked"
+EVENT_EXPORT_DONE = "export.done"
+EVENT_EXPORT_FAILED = "export.failed"
+EVENT_COPY_DONE = "copy.done"
+EVENT_COPY_FAILED = "copy.failed"
 EVENT_UPDATE_AVAILABLE = "update.available"
 EVENT_STORAGE_SPACE = "storage.space"
 EVENT_STORAGE_INTEGRITY = "storage.integrity"
@@ -169,11 +177,36 @@ class Notifier(Protocol):
 
 
 class NoticeBar(InfoBar):
-    """在 InfoBar 上补一件事：显示之后再追加按钮会让提示条变宽，右下角的位置要跟着重算
-    （库只在显示那一刻按当时的宽度排位，按钮后加会让条的右端伸出窗口）。"""
+    """在 InfoBar 上补两件事（都靠库的内部接口，失败只是位置不精确，不影响提示本身）：
+
+    - 显示之后再追加按钮会让提示条变宽，右下角的位置要跟着重算（库只在显示那一刻按当时的
+      宽度排位，按钮后加会让条的右端伸出窗口）；
+    - 库给"不是第一条"的提示条另配一个"下沉"动画并放进同一个动画组，起止值要等某条提示
+      关闭后才补上。关闭后 200 毫秒内新来的提示条（同类合并时关掉最旧一条紧接着再弹新的）
+      拿到的是没有起止值的下沉动画，它顶掉自己的滑入动画，提示条就停在窗口右边界外。
+      显示时把下沉动画的起止值补成与滑入动画一致。"""
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        try:
+            drop, slide = self.property('dropAni'), self.property('slideAni')
+            if drop is not None and slide is not None and drop.endValue() is None:
+                drop.setStartValue(slide.startValue())
+                drop.setEndValue(slide.endValue())
+        except Exception:
+            logger.debug("补提示条下沉动画的起止值失败", exc_info=True)
 
     def addWidget(self, widget: QWidget, stretch=0):
         super().addWidget(widget, stretch)
+        self._relayout()
+
+    def set_content(self, content: str) -> None:
+        """改写正文（同类合并时撤掉上一条的"另有 N 条"）；宽度变了，位置跟着重算。"""
+        self.content = content
+        self._adjustText()
+        self._relayout()
+
+    def _relayout(self) -> None:
         if not self.isVisible():
             return
         self.adjustSize()
@@ -181,10 +214,11 @@ class NoticeBar(InfoBar):
             manager = InfoBarManager.make(self.position)
             target = manager._pos(self)
             self.move(target)
-            slide = self.property('slideAni')
-            if slide is not None:
-                slide.setEndValue(target)
-        except Exception:   # 依赖库内部接口，失败只是位置不精确
+            for name in ('slideAni', 'dropAni'):
+                animation = self.property(name)
+                if animation is not None:
+                    animation.setEndValue(target)
+        except Exception:
             logger.debug("重排提示条位置失败", exc_info=True)
 
 
@@ -209,7 +243,8 @@ class _KeyGroup:
     def __init__(self) -> None:
         self.bars: List[InfoBar] = []
         self.overflow = 0                 # 已合并掉的条数
-        self.summary: Optional[InfoBar] = None   # 带"另有 N 条"的那一条
+        self.summary: Optional[NoticeBar] = None   # 带"另有 N 条"的那一条
+        self.summary_content = ""         # 它不带后缀的原文
 
 
 class InfoBarNotifier:
@@ -347,17 +382,25 @@ class InfoBarNotifier:
             self._track(key, group, bar)
             return bar
 
-        # 已满：关掉最新的一条，换成带"另有 N 条"的新条，最早的一条留着
+        # 已满：关掉最旧的一条，保留最近的两条，最新一条带"另有 N 条"
         group.overflow += 1
-        latest = group.bars[-1]
-        self._forget(group, latest)   # 先摘掉再关：关闭信号不能把计数清零
+        oldest = group.bars[0]
+        previous_summary, previous_content = group.summary, group.summary_content
+        self._forget(group, oldest)   # 先摘掉再关：关闭信号不能把计数清零
         try:
-            latest.close()
+            oldest.close()
         except RuntimeError:
             pass   # 已随窗口销毁
+        if previous_summary is not None and previous_summary in group.bars:
+            # "另有 N 条"只写在最新一条上：上一条的后缀撤掉，免得两条各写一个数字
+            try:
+                previous_summary.set_content(previous_content)
+            except RuntimeError:
+                pass
         merged = content + MERGED_SUFFIX.format(count=group.overflow)
         bar = self._make_bar(parent, level, title, merged, duration, action)
         group.summary = bar
+        group.summary_content = content
         self._track(key, group, bar)
         return bar
 

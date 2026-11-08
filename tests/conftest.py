@@ -140,6 +140,26 @@ def _dispose_leaked_widgets():
         dispose_widget(widget)
 
 
+@pytest.fixture(autouse=True)
+def _no_stale_quit_state():
+    """用例不得留下"已请求退出"的状态（它会让同进程之后所有局部 QEventLoop 立即返回）。
+
+    真主窗口的 closeEvent 走真退出路径并调 QApplication.quit()；测试进程没有主事件循环，
+    Qt 5 把 quitNow 一直记着，后面用 qtbot.waitSignal / waitUntil 的用例全部"超时"，
+    且失败出现在别的文件里、很难追到源头。这里在用例收尾时检测：发现残留就清除，并让
+    留下它的那个用例失败，错误信息直接点名（用例应改用 tests/helpers.dispose_widget 释放
+    窗口，或像 tests/e2e 那样在自己的 fixture 里清除）。
+    """
+    yield
+    from PyQt5.QtWidgets import QApplication
+    if QApplication.instance() is None:
+        return
+    from tests.helpers import reset_qt_quit_state
+    if reset_qt_quit_state():
+        pytest.fail("用例留下了 QApplication.quit() 的残留退出状态，会让之后的 waitSignal 全部超时；"
+                    "窗口收尾请用 tests/helpers.dispose_widget 而不是 close()", pytrace=False)
+
+
 @pytest.fixture(scope='session')
 def _fast_tmp_root(tmp_path_factory) -> Path:
     """本次会话所有用例临时目录的根（在 pytest 的会话基础目录里，随其保留策略清理）。

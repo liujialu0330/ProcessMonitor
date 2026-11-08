@@ -258,6 +258,8 @@ class TaskCard(CardWidget):
     pause_requested = pyqtSignal(str)
     resume_requested = pyqtSignal(str)
     marker_requested = pyqtSignal(str)
+    # 迷你图上的打点刻度右键 (task_id, 打点对象, 全局坐标)：菜单由 Presenter 弹出
+    marker_menu_requested = pyqtSignal(str, object, object)
     history_requested = pyqtSignal(str)    # "分析"/"查看分析"（运行中与已结束卡片都有）
     restart_requested = pyqtSignal(str)    # 已结束卡片："同配置再测"
     close_requested = pyqtSignal(str)      # 已结束卡片：行尾 ✕（从列表移除）
@@ -510,6 +512,8 @@ class TaskCard(CardWidget):
         trend_layout.addLayout(trend_header)
 
         self.sparkline = SparklineWidget(metric_type=self.trend_metric)
+        self.sparkline.marker_menu_requested.connect(
+            lambda marker, pos: self.marker_menu_requested.emit(self.task_id, marker, pos))
         trend_layout.addWidget(self.sparkline)
         layout.addWidget(self.trend_box)
         self._refresh_trend_header()
@@ -824,8 +828,9 @@ class TaskCard(CardWidget):
         self._refresh_deltas()
 
     def set_markers(self, markers: Iterable) -> None:
-        """在迷你趋势图上画打点刻度。markers 为带 timestamp/kind 属性的打点对象。"""
-        self.sparkline.set_markers([(m.timestamp, m.kind) for m in markers])
+        """在迷你趋势图上画打点刻度。markers 为带 timestamp / kind / label 属性的打点对象
+        （刻度据此提供悬停文字与右键菜单）。"""
+        self.sparkline.set_markers(list(markers))
 
     # ========== 状态切换 ==========
 

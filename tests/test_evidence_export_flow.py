@@ -115,7 +115,7 @@ def test_evidence_export_writes_complete_zip(env, tmp_path, work_root):
 
     ask = services.dialogs.last_call('ask_save_path')
     assert ask['title'] == EVIDENCE_DIALOG_TITLE and ask['name_filter'] == EVIDENCE_FILTER
-    assert os.path.basename(ask['default_path']) == "demo_1.2.3.4_建模_200_次_20260716_1600.zip"
+    assert os.path.basename(ask['default_path']) == "demo_1.2.3.4_建模_200_次_20260716_180000.zip"
     assert page.export_status_label.text() == "正在导出…"
     assert begun == [1] and manager.has_running_exports()
     assert [e.name for e in services.threads.entries()] == ["导出报告"]

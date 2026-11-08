@@ -36,6 +36,9 @@ class AnalysisMemory:
     range_key: str = ""
     view_mode: str = ""
     time_mode: str = ""
+    # 摘要表用户勾选的列（键见 ui.formatting.SUMMARY_COLUMNS，含始终可见的两列）；
+    # 空元组 = 没有勾选过，列随窗口宽度的档位走
+    summary_columns: Tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -63,6 +66,17 @@ class WindowMemoryStore(Protocol):
     def screens(self) -> List[Rect]:
         """各屏幕的可用区域（去掉任务栏），主屏在前。"""
         ...
+
+
+def split_columns(raw) -> Tuple[str, ...]:
+    """配置里逗号分隔的列键 → 元组（空 / 非字符串为空元组）；键是否认识由摘要表判断。"""
+    if not isinstance(raw, str):
+        return ()
+    return tuple(part for part in (p.strip() for p in raw.split(",")) if part)
+
+
+def join_columns(columns: Sequence[str]) -> str:
+    return ",".join(columns)
 
 
 def default_window_size(area: Rect, min_size: Tuple[int, int] = (0, 0)) -> Tuple[int, int]:
@@ -145,7 +159,8 @@ class ConfigWindowMemory:
                 task_id=str(cfg.get(cfg.analysis_task) or ""),
                 range_key=str(cfg.get(cfg.analysis_range) or ""),
                 view_mode=str(cfg.get(cfg.analysis_view_mode) or ""),
-                time_mode=str(cfg.get(cfg.analysis_time_mode) or "")))
+                time_mode=str(cfg.get(cfg.analysis_time_mode) or ""),
+                summary_columns=split_columns(cfg.get(cfg.analysis_summary_columns))))
 
     def save(self, memory: WindowMemory) -> bool:
         analysis = memory.analysis
@@ -157,6 +172,7 @@ class ConfigWindowMemory:
             (cfg.analysis_range, analysis.range_key),
             (cfg.analysis_view_mode, analysis.view_mode),
             (cfg.analysis_time_mode, analysis.time_mode),
+            (cfg.analysis_summary_columns, join_columns(analysis.summary_columns)),
         ])
 
     def screens(self) -> List[Rect]:

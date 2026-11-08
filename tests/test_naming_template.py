@@ -29,7 +29,9 @@ from ui.widgets.analysis.toolbar import (EXPORT_CSV, EXPORT_EVIDENCE, EXPORT_IMA
 from utils.metrics import MetricType
 
 START = datetime(2026, 7, 16, 9, 30, 45)
-DATE = '20260716_0930'
+# {date} 是导出时刻，不是任务开始时间 START
+EXPORTED = datetime(2026, 7, 16, 18, 5, 9)
+DATE = '20260716_180509'
 
 
 def fields(**override):
@@ -160,7 +162,7 @@ def make_task(**override):
 
 def test_fields_for_task_sources():
     task = make_task()
-    got = fields_for_task(task, kind=KIND_REPORT)
+    got = fields_for_task(task, kind=KIND_REPORT, now=EXPORTED)
     assert got == dict(process='Demo', build='1.2.3.4', scenario='', note='建模 200 次',
                        date=DATE, kind='报告', pid='4321')
     # 版本：任务自己的 build 列（参考库预留）优先于被测目标元数据的文件版本
@@ -174,29 +176,45 @@ def test_fields_for_task_sources():
     assert fields_for_task(make_task(note='长' * 50))['note'] == '长' * 20
     assert fields_for_task(make_task(process_name='my.exe.exe'))['process'] == 'my.exe'
     assert fields_for_task(make_task(process_name='微信.exe'))['process'] == '微信'
-    # 日期取任务开始时间；任务还没有开始时间时退回传入的当前时间
-    assert fields_for_task(make_task(start_time=None), now=datetime(2030, 1, 2, 3, 4))[
-        'date'] == '20300102_0304'
+    # 日期取导出时刻，与任务开始时间无关（含没有开始时间的任务）
+    assert fields_for_task(make_task(start_time=None), now=datetime(2030, 1, 2, 3, 4, 5))[
+        'date'] == '20300102_030405'
+    assert fields_for_task(task, now=datetime(2030, 1, 2, 3, 4, 5))['date'] == '20300102_030405'
+
+
+def test_date_defaults_to_the_current_time_when_no_export_time_is_given():
+    before = datetime.now().replace(microsecond=0)
+    got = datetime.strptime(fields_for_task(make_task())['date'], '%Y%m%d_%H%M%S')
+    assert before <= got <= datetime.now()
+
+
+def test_exporting_twice_gives_different_default_names():
+    # 同一任务按不同范围连续导出：两次的默认名不同，不会每次都弹覆盖确认
+    task = make_task()
+    first = default_filename(DEFAULT_TEMPLATE, task, KIND_REPORT, now=EXPORTED)
+    second = default_filename(DEFAULT_TEMPLATE, task, KIND_REPORT,
+                              now=EXPORTED + timedelta(seconds=7))
+    assert first != second and first.count('20260716_') == second.count('20260716_') == 1
 
 
 def test_default_filename_suffixes_depend_on_kind_field():
     task = make_task()
     stem = f"Demo_1.2.3.4_建模_200_次_{DATE}"
     # 模板里没有 {kind}：沿用报告 _报告.png、摘要 _摘要.csv 的后缀
-    assert default_filename(DEFAULT_TEMPLATE, task, KIND_REPORT) == stem + "_报告.png"
-    assert default_filename(DEFAULT_TEMPLATE, task, KIND_DETAIL) == stem + ".csv"
-    assert default_filename(DEFAULT_TEMPLATE, task, KIND_SUMMARY) == stem + "_摘要.csv"
-    assert default_filename(DEFAULT_TEMPLATE, task, KIND_EVIDENCE) == stem + ".zip"
+    assert default_filename(DEFAULT_TEMPLATE, task, KIND_REPORT, now=EXPORTED) == stem + "_报告.png"
+    assert default_filename(DEFAULT_TEMPLATE, task, KIND_DETAIL, now=EXPORTED) == stem + ".csv"
+    assert default_filename(DEFAULT_TEMPLATE, task, KIND_SUMMARY, now=EXPORTED) == stem + "_摘要.csv"
+    assert default_filename(DEFAULT_TEMPLATE, task, KIND_EVIDENCE, now=EXPORTED) == stem + ".zip"
     # 有 {kind}：类别已经在名字里，只加扩展名
     template = '{process}_{kind}_{date}'
-    assert default_filename(template, task, KIND_REPORT) == f"Demo_报告_{DATE}.png"
-    assert default_filename(template, task, KIND_DETAIL) == f"Demo_明细_{DATE}.csv"
-    assert default_filename(template, task, KIND_SUMMARY) == f"Demo_摘要_{DATE}.csv"
-    assert default_filename(template, task, KIND_EVIDENCE) == f"Demo_证据包_{DATE}.zip"
+    assert default_filename(template, task, KIND_REPORT, now=EXPORTED) == f"Demo_报告_{DATE}.png"
+    assert default_filename(template, task, KIND_DETAIL, now=EXPORTED) == f"Demo_明细_{DATE}.csv"
+    assert default_filename(template, task, KIND_SUMMARY, now=EXPORTED) == f"Demo_摘要_{DATE}.csv"
+    assert default_filename(template, task, KIND_EVIDENCE, now=EXPORTED) == f"Demo_证据包_{DATE}.zip"
 
 
 def test_preview_uses_sample_task():
-    assert preview_filename(DEFAULT_TEMPLATE) == "chrome_120.0.6099.109_内存回归_20260716_0930_报告.png"
+    assert preview_filename(DEFAULT_TEMPLATE) == "chrome_120.0.6099.109_内存回归_20260716_094530_报告.png"
     assert preview_filename('{process}_{kind}') == "chrome_报告.png"
 
 
@@ -248,7 +266,7 @@ def test_setting_card_lives_in_export_group_and_shows_default(setting_page):
     assert card.titleLabel.text() == "文件命名模板"
     assert page.name_template_edit.text() == DEFAULT_TEMPLATE
     assert card.contentLabel.text() == (
-        "预览：chrome_120.0.6099.109_内存回归_20260716_0930_报告.png")
+        "预览：chrome_120.0.6099.109_内存回归_20260716_094530_报告.png")
     assert page.name_template_reset_button.text() == "恢复默认"
 
 
@@ -256,7 +274,7 @@ def test_setting_card_preview_is_live_but_saving_waits_for_editing_finished(sett
     page = setting_page
     edit = page.name_template_edit
     edit.setText("{process}_{kind}_{date}")
-    assert page.name_template_card.contentLabel.text() == "预览：chrome_报告_20260716_0930.png"
+    assert page.name_template_card.contentLabel.text() == "预览：chrome_报告_20260716_094530.png"
     # 键入过程中只刷新预览，不写配置
     assert app_config.get_export_name_template() == DEFAULT_TEMPLATE
     edit.editingFinished.emit()
@@ -273,7 +291,7 @@ def test_setting_card_round_trip_reopen_page_and_file(setting_page, db, tmp_path
     try:
         assert reopened.name_template_edit.text() == "{process}-{date}"
         assert reopened.name_template_card.contentLabel.text() == (
-            "预览：chrome-20260716_0930_报告.png")
+            "预览：chrome-20260716_094530_报告.png")
     finally:
         reopened.close()
         reopened.deleteLater()
@@ -283,7 +301,7 @@ def test_setting_card_warns_about_unknown_fields_and_keeps_them(setting_page):
     page = setting_page
     page.name_template_edit.setText("{process}_{foo}_{date}")
     content = page.name_template_card.contentLabel.text()
-    assert content.splitlines()[0] == "预览：chrome_{foo}_20260716_0930_报告.png"
+    assert content.splitlines()[0] == "预览：chrome_{foo}_20260716_094530_报告.png"
     assert "未知字段 {foo} 将原样写进文件名" in content and "{process}" in content
     assert page.name_template_card.height() > 70
     page.name_template_edit.setText("{process}_{date}")
@@ -352,34 +370,34 @@ def _default_path(page, services, kind):
 ])
 def test_save_dialogs_use_the_naming_template(export_env, kind, suffix):
     page, services, templates = export_env
-    stem = "demo_1.2.3.4_建模_200_次_20260716_1600"
+    stem = "demo_1.2.3.4_建模_200_次_20260716_180000"
     assert os.path.basename(_default_path(page, services, kind)) == stem + suffix
     # 换模板立即生效（每次导出现读）
     templates[0] = "{process}-{date}"
-    assert os.path.basename(_default_path(page, services, kind)) == "demo-20260716_1600" + suffix
+    assert os.path.basename(_default_path(page, services, kind)) == "demo-20260716_180000" + suffix
 
 
 def test_kind_field_names_each_file_by_its_own_kind(export_env, tmp_path):
     page, services, templates = export_env
     templates[0] = "{process}_{kind}_{date}"
     assert os.path.basename(_default_path(page, services, EXPORT_REPORT)) == (
-        "demo_报告_20260716_1600.png")
+        "demo_报告_20260716_180000.png")
     assert os.path.basename(_default_path(page, services, EXPORT_CSV)) == (
-        "demo_明细_20260716_1600.csv")
+        "demo_明细_20260716_180000.csv")
     assert os.path.basename(_default_path(page, services, EXPORT_EVIDENCE)) == (
-        "demo_证据包_20260716_1600.zip")
+        "demo_证据包_20260716_180000.zip")
 
     # 报告三件套：没改默认名时 CSV 与摘要各取自己的类别
     out = tmp_path / "out"
     out.mkdir()
-    services.dialogs.push('ask_save_path', str(out / "demo_报告_20260716_1600.png"))
+    services.dialogs.push('ask_save_path', str(out / "demo_报告_20260716_180000.png"))
     page.toolbar.export_requested.emit(EXPORT_REPORT)
     assert process_events_until(
         lambda: services.threads.entries() == [] and services.notifier.messages('success'),
         timeout=30)
     assert sorted(os.listdir(out)) == [
-        "demo_报告_20260716_1600.png", "demo_摘要_20260716_1600.csv",
-        "demo_明细_20260716_1600.csv"]
+        "demo_报告_20260716_180000.png", "demo_摘要_20260716_180000.csv",
+        "demo_明细_20260716_180000.csv"]
 
 
 def test_kind_field_with_renamed_report_keeps_same_base(export_env, tmp_path):

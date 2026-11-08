@@ -30,6 +30,8 @@ from core.naming_template import (KIND_DETAIL, KIND_EVIDENCE, KIND_REPORT, KIND_
 from core.report import (DATA_CSV_SUFFIX, REPORT_IMAGE_SUFFIX, SUMMARY_CSV_SUFFIX,
                          paths_from_image_choice, task_basename)
 from ui.formatting import format_count
+from ui.services.notifier import (EVENT_COPY_DONE, EVENT_COPY_FAILED, EVENT_EXPORT_BLOCKED,
+                                  EVENT_EXPORT_DONE, EVENT_EXPORT_FAILED)
 from ui.viewmodels.analysis_vm import EXPORT_BUSY, EXPORT_MAINTENANCE
 from ui.widgets.analysis.toolbar import (EXPORT_COPY, EXPORT_CSV, EXPORT_EVIDENCE, EXPORT_IMAGE,
                                          EXPORT_REPORT)
@@ -78,8 +80,14 @@ class AnalysisExportFlow(QObject):
         vm.export_finished.connect(self._on_finished)
         vm.export_failed.connect(self._on_failed)
 
+    def _notify(self, event: str, level: str, title: str, content: str,
+                duration: Optional[int] = None):
+        """所有提示都经 Notifier.route：同一事件按 key 合并，窗口在后台时走托盘气泡。"""
+        return self._services.notifier.route(
+            event, level, title, content, key=event, duration=duration, anchor=self._host)
+
     def _warn(self, notice, duration: int = 3000) -> None:
-        self._services.notifier.warning(self._host, *notice, duration=duration)
+        self._notify(EVENT_EXPORT_BLOCKED, 'warning', *notice, duration=duration)
 
     def run(self, kind: str) -> bool:
         """执行一个导出菜单项；返回是否已启动（复制为是否已复制）。"""
@@ -207,7 +215,7 @@ class AnalysisExportFlow(QObject):
             return self._render()
         except Exception:
             logger.error("渲染报告图片失败", exc_info=True)
-            self._services.notifier.error(self._host, "导出失败", "生成报告图片失败，请查看日志")
+            self._notify(EVENT_EXPORT_FAILED, 'error', "导出失败", "生成报告图片失败，请查看日志")
             return None
 
     def _copy(self) -> bool:
@@ -218,10 +226,9 @@ class AnalysisExportFlow(QObject):
             self._services.dialogs.copy_pixmap(QPixmap.fromImage(image))
         except Exception:
             logger.error("复制报告图片失败", exc_info=True)
-            self._services.notifier.error(self._host, "复制失败", "复制报告图片失败，请查看日志")
+            self._notify(EVENT_COPY_FAILED, 'error', "复制失败", "复制报告图片失败，请查看日志")
             return False
-        self._services.notifier.success(self._host, "复制成功", "报告图片已复制到剪贴板",
-                                        duration=2000)
+        self._notify(EVENT_COPY_DONE, 'success', "复制成功", "报告图片已复制到剪贴板", 2000)
         return True
 
     # ---------- 复制结论 ----------
@@ -251,11 +258,10 @@ class AnalysisExportFlow(QObject):
             self._services.dialogs.copy_text(render(conclusion, fmt))
         except Exception:
             logger.error("复制结论失败", exc_info=True)
-            self._services.notifier.error(self._host, *COPY_CONCLUSION_FAILED)
+            self._notify(EVENT_COPY_FAILED, 'error', *COPY_CONCLUSION_FAILED)
             return False
-        self._services.notifier.success(
-            self._host, COPY_CONCLUSION_TITLE,
-            COPY_CONCLUSION_CONTENT.format(kind=FORMAT_LABELS[fmt]), duration=2000)
+        self._notify(EVENT_COPY_DONE, 'success', COPY_CONCLUSION_TITLE,
+                     COPY_CONCLUSION_CONTENT.format(kind=FORMAT_LABELS[fmt]), 2000)
         return True
 
     # ---------- 线程结果 ----------
@@ -270,7 +276,11 @@ class AnalysisExportFlow(QObject):
         detail = f"已导出 {names}"
         if result.row_count:
             detail += f"（{format_count(result.row_count)} 次采集）"
-        bar = self._services.notifier.success(self._host, "导出成功", detail, duration=8000)
+        bar = self._notify(EVENT_EXPORT_DONE, 'success', "导出成功", detail, 8000)
+        if bar is None:
+            # 窗口在后台时只发了托盘气泡：没有地方放按钮
+            self.open_folder_button = self.copy_path_button = None
+            return
         self.open_folder_button = PushButton("打开文件夹")
         self.open_folder_button.clicked.connect(lambda: self._open_folder(folder))
         bar.addWidget(self.open_folder_button)
@@ -280,7 +290,7 @@ class AnalysisExportFlow(QObject):
 
     def _on_failed(self, message: str) -> None:
         self.status_changed.emit("")
-        self._services.notifier.error(self._host, "导出失败", message)
+        self._notify(EVENT_EXPORT_FAILED, 'error', "导出失败", message)
 
     def _copy_path(self, paths, folder: str) -> bool:
         """导出完成提示上的"复制路径"：一个文件复制完整路径，多个文件复制所在文件夹。"""
@@ -291,11 +301,10 @@ class AnalysisExportFlow(QObject):
             self._services.dialogs.copy_text(text)
         except Exception:
             logger.error("复制导出路径失败", exc_info=True)
-            self._services.notifier.error(self._host, *COPY_PATH_FAILED)
+            self._notify(EVENT_COPY_FAILED, 'error', *COPY_PATH_FAILED)
             return False
-        self._services.notifier.success(
-            self._host, COPY_PATH_TITLE, COPY_PATH_FILE if single else COPY_PATH_FOLDER,
-            duration=2000)
+        self._notify(EVENT_COPY_DONE, 'success', COPY_PATH_TITLE,
+                     COPY_PATH_FILE if single else COPY_PATH_FOLDER, 2000)
         return True
 
     def _open_folder(self, folder: str) -> None:

@@ -9,6 +9,7 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QHBoxLayout, QScrollArea, QVBoxLayout, QWidget
 from qfluentwidgets import CaptionLabel
 
+from ui.layout_breakpoints import LayoutBreakpoints
 from ui.typography import PageTitleLabel
 
 # 页边距与区块间距（4px 网格）
@@ -28,11 +29,15 @@ class PageScaffold(QScrollArea):
         header_layout: 页头整行（标题组 | 伸缩 | 命令区）
         command_layout: 页头右侧命令区，按添加顺序从左到右排列
         content_layout: 页头之下的内容区（纵向，区块间距 SECTION_SPACING）
+        breakpoints: 档位广播器（按页面宽度 = 内容区宽度分 compact / regular / wide），页内控件
+            订阅它的 tier_changed，不必各自在 resizeEvent 里判断宽度
     """
 
     def __init__(self, title: str, subtitle: str = "", parent=None, *,
                  spacing: int = SECTION_SPACING):
         super().__init__(parent)
+        self.breakpoints = LayoutBreakpoints(self)
+        self.breakpoints.track(self)
         self.setWidgetResizable(True)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         # 去掉边框与底色，透出主窗口的 Fluent 背景

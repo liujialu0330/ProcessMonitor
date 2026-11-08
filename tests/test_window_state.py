@@ -97,7 +97,8 @@ def test_no_screen_information_is_treated_as_a_1080p_primary():
 @pytest.fixture
 def restore_cfg():
     items = [cfg.window_geometry, cfg.window_maximized, cfg.window_page, cfg.analysis_task,
-             cfg.analysis_range, cfg.analysis_view_mode, cfg.analysis_time_mode]
+             cfg.analysis_range, cfg.analysis_view_mode, cfg.analysis_time_mode,
+             cfg.analysis_summary_columns]
     saved = [(item, item.value) for item in items]
     yield
     for item, value in saved:
@@ -108,7 +109,8 @@ def test_config_memory_roundtrip(restore_cfg):
     store = ConfigWindowMemory(screens=lambda: [SCREEN])
     memory = WindowMemory(
         geometry=(100, 120, 1100, 760), maximized=True, page=PAGE_ANALYSIS,
-        analysis=AnalysisMemory("t-1", "1h", VIEW_OVERLAY, TIME_RELATIVE))
+        analysis=AnalysisMemory("t-1", "1h", VIEW_OVERLAY, TIME_RELATIVE,
+                                 ("metric", "tail", "verdict")))
     assert store.save(memory) is True
     assert store.load() == memory
     assert store.screens() == [SCREEN]

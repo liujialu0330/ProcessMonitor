@@ -561,8 +561,9 @@ k32.CloseHandle(h)
 
 
 @pytest.mark.skipif(sys.platform != 'win32', reason="命名管道客户端身份只在 Windows 上可取")
+@pytest.mark.parametrize("foreign_late_reply", [False, True], ids=["alone", "with_foreign_late_reply"])
 def test_stop_written_right_before_client_exits_is_executed(ready_dispatcher, manager, sleeper,
-                                                            monkeypatch):
+                                                            monkeypatch, foreign_late_reply):
     """短命客户端：写完 stop 就断开并退出，进程已不在了服务端才处理——命令照常执行
     （修复前事后按 PID 查完整性查不到，按最低处理而误拒）。处理器先等客户端进程退出、
     关掉测试自己持有的进程句柄，再交给命令处理器，保证"处理时客户端已经退出"；此时身份
@@ -572,16 +573,33 @@ def test_stop_written_right_before_client_exits_is_executed(ready_dispatcher, ma
     original_send = server_mod.IpcConnection._send
 
     def recording_send(self, encode, request_id):
-        sent.append(json.loads(encode()))
+        # 补丁打在类上，进程里别的服务端 / 早先用例遗留连接的延迟回包也会经过这里（机器忙时
+        # 它们的定时器恰好落进本用例的事件循环）：只记本用例这台服务端的连接
+        if self in server.connections():
+            sent.append(json.loads(encode()))
         return original_send(self, encode, request_id)
     monkeypatch.setattr(server_mod.IpcConnection, '_send', recording_send)
     client, identified = {}, []
+    if foreign_late_reply:
+        # 复现全量高负载下的偶发失败：别处遗留连接的延迟回包落进本用例的事件循环
+        # （曾被类级补丁记成"服务端已回复"，此时处理器根本还没跑）
+        from PyQt5.QtCore import QTimer
+        stale = server_mod.IpcConnection(None, None)
+        QTimer.singleShot(0, lambda: stale.send_ok(7, {'late': True}))
+
+    handler_errors = []
 
     def handle_after_client_exit(conn, request):
-        proc = client['proc']
-        proc.wait(10)
-        proc._handle.Close()        # 测试自己不再持有客户端进程句柄
-        identified.append((conn.identity_source, conn.client_integrity()))
+        # 处理器里的异常会被服务端吞成 internal 回复、让失败看起来像"命令没执行"：
+        # 记下真实原因，断言时一并给出
+        try:
+            proc = client['proc']
+            proc.wait(10)
+            proc._handle.Close()        # 测试自己不再持有客户端进程句柄
+            identified.append((conn.identity_source, conn.client_integrity()))
+        except BaseException as exc:
+            handler_errors.append(repr(exc))
+            raise
         ready_dispatcher.handle(conn, request)
 
     server = IpcServer(_unique_name(), handle_after_client_exit)
@@ -595,11 +613,13 @@ def test_stop_written_right_before_client_exits_is_executed(ready_dispatcher, ma
         client['proc'] = subprocess.Popen(
             [sys.executable, '-c', CLIENT_WRITE_AND_EXIT, '\\\\.\\pipe\\' + server.name, line],
             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-        assert process_events_until(lambda: sent, 15.0)
+        assert process_events_until(lambda: sent, 15.0), (
+            f"15 秒内服务端没有回复：处理器异常={handler_errors} 客户端退出码={client['proc'].poll()}")
+        assert not handler_errors, handler_errors
         assert client['proc'].returncode == 0
-        assert identified[0][0] in (server_mod.IDENTITY_TOKEN, server_mod.IDENTITY_PROCESS)
-        assert identified[0][1] is not None
-        assert sent[0].get('ok') is True, sent
+        assert identified[0][0] in (server_mod.IDENTITY_TOKEN, server_mod.IDENTITY_PROCESS), identified
+        assert identified[0][1] is not None, identified
+        assert sent[0].get('ok') is True, (sent, identified)
         info = manager.get_task_info(task_id)
         assert info is None or info.is_stopping or info.status == TaskStatus.STOPPED
     finally:
