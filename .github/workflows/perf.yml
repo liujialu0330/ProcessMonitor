@@ -32,7 +32,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements-lock.txt
-          pip install pytest
+          pip install -r requirements-dev.txt
 
       - name: Run perf suite
         run: pytest tests/perf -m perf -v

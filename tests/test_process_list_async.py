@@ -25,8 +25,9 @@ from ui.widgets.monitor.process_picker import (
 PROCESSES = [(1001, "alpha.exe", 1001.5), (1002, "beta.exe", 1002.5),
              (1003, "MPrintExp.exe", 1003.5)]
 
-# 构造函数的时间上限：同步读取时会一直阻塞到放行（BlockingProcessQuery 最长 5 秒）
-CONSTRUCT_BUDGET_SECONDS = 0.2
+# 构造函数的时间上限：同步读取时会一直阻塞到放行（BlockingProcessQuery 最长 5 秒），1 秒足以区分；
+# 太紧会让机器忙（多个测试同时在跑）时偶发失败，构造本身单独跑约 0.05 秒
+CONSTRUCT_BUDGET_SECONDS = 1.0
 
 
 @pytest.fixture

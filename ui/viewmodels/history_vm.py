@@ -242,6 +242,9 @@ class HistoryViewModel(QObject):
         self._refresh_guard: Callable[[], bool] = lambda: False
         # 打点变化触发的静默重查：结果不受"跳过定时刷新"的判断影响
         self._forced_seqs: Set[int] = set()
+        # 启动时从上次状态恢复的任务：下一次载入列表时按用户选过的任务选中；任务已被删除则
+        # 静默退回默认选择（见 restore_selection）
+        self._restore_id: Optional[str] = None
 
         # 打点增删改后重查（manager 尚无该信号时不连接，兼容旧 manager 与测试替身）
         markers_changed = getattr(manager, 'markers_changed', None)
@@ -307,6 +310,11 @@ class HistoryViewModel(QObject):
         self._running = {t.task_id for t in self.tasks if status.is_running(t.task_id)}
         self.tasks_changed.emit(list(self.tasks), set(self._running), now)
 
+        restore, self._restore_id = self._restore_id, None
+        if restore and not prev_id and self._find_task(restore) is not None:
+            prev_id, prev_metric = restore, None
+            self.selection_is_auto = False
+
         if not self.tasks:
             self.cancel_pending()
             self._clear_selection()
@@ -335,6 +343,11 @@ class HistoryViewModel(QObject):
             self.selection_is_auto = True
             self._apply_selection(self.tasks[0], None)
         self._request_load()
+
+    def restore_selection(self, task_id: str) -> None:
+        """启动时恢复上次选中的任务：只在下一次载入列表时生效，且只当用户此前没有选过别的
+        任务；该任务已被删除（或没有数据）就当没有这回事，走默认的"自动选中最新任务"。"""
+        self._restore_id = task_id or None
 
     def refresh(self) -> None:
         """手动刷新：整体重载任务列表与当前任务数据。"""

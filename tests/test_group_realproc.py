@@ -82,6 +82,7 @@ def series(db, task_id, metric, member=None):
     return [p.value for p in db.points.fetch(PointQuery(task_id, key))]
 
 
+@pytest.mark.slow   # 真实进程树，约 1.7 秒；快速覆盖：test_group_worker（假时钟 + 假进程树）
 @pytest.mark.real_exit_probe
 def test_tree_task_over_real_processes(db, qapp, started, process_tree):  # noqa: F811
     root, kids = process_tree

@@ -42,9 +42,9 @@ def _spin(ms: int) -> None:
 
 def test_blocked_ui_thread_dumps_all_thread_stacks(crash_file):
     path, install = crash_file
-    wd = install(timeout_s=1.0)
+    wd = install(timeout_s=0.3)
     assert wd is not None and wd.running
-    time.sleep(1.5)            # 阻塞界面线程：QTimer 无法续期
+    time.sleep(0.6)            # 阻塞界面线程：QTimer 无法续期（超过阈值即转储，不会因机器忙而不触发）
     wd.stop()
 
     text = path.read_text(encoding='utf-8', errors='replace')
@@ -60,17 +60,17 @@ def test_normal_event_loop_keeps_renewing_without_dump(crash_file):
     后段残留控件很多，进程的 Win32 定时器配额可能用尽（registerTimer 失败、QTimer 永不
     触发），原先"空转事件循环数续期次数"的写法会因此偶发失败。QTimer 的接线单独断言。"""
     path, install = crash_file
-    wd = install(timeout_s=2.0, beat_ms=100)
+    wd = install(timeout_s=1.0, beat_ms=100)
     # 接线：定时器按 beat_ms 运行，timeout 即续期
     assert wd._timer.isActive() and wd._timer.interval() == 100
     before = wd.beats
     wd._timer.timeout.emit()
     assert wd.beats == before + 1
 
-    # 每 0.2 秒续期一次、持续 3 秒（跨过阈值 1.5 倍；单次间隔离阈值有 10 倍余量）：真实的定时转储始终没有到期
-    deadline = time.monotonic() + 3.0
+    # 每 0.1 秒续期一次、持续 1.5 秒（跨过阈值 1.5 倍；单次间隔离阈值有 10 倍余量）：真实的定时转储始终没有到期
+    deadline = time.monotonic() + 1.5
     while time.monotonic() < deadline:
-        time.sleep(0.2)
+        time.sleep(0.1)
         wd.beat()
     wd.stop()
 
@@ -91,10 +91,10 @@ def test_beat_interval_follows_threshold(qapp, tmp_path):
 
 def test_stop_cancels_pending_dump(crash_file):
     path, install = crash_file
-    wd = install(timeout_s=1.0)
+    wd = install(timeout_s=0.3)
     wd.stop()
     wd.stop()                  # 可重复调用
-    time.sleep(1.3)
+    time.sleep(0.5)
     assert not wd.running
     assert path.read_text(encoding='utf-8', errors='replace') == ""
     assert crash_handler.active_ui_watchdog() is None

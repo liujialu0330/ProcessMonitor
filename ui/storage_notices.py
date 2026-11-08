@@ -11,20 +11,17 @@ core.storage_guard.StorageGuard 只发信号、不碰界面；有窗口模式下
 - quick_check 未通过：主窗口一条常驻警告 + 设置页"数据"分组的警告卡片，各一次。
 
 磁盘空间类提示同一时刻最多一条：新的空间提示出现前先关掉上一条（"不足 1 GB"、常驻的"严重不足"、
-"已恢复"），状态以最新一条为准。提示条一律挂在同一个锚点（主窗口）上、由 Notifier 居中靠顶显示，
-与其他提示一致。
-
-窗口隐藏在托盘时另补一条托盘气泡（提示条挂在隐藏的窗口上用户看不到）。文案是纯函数，
+"已恢复"），状态以最新一条为准。提示经 Notifier.route 发出，渠道（主窗口右下角提示条或
+窗口在后台时的托盘气泡）由 Notifier 按窗口状态选择；这一类提示只有常驻的才保证有提示条
+（Notifier 在窗口后台、气泡已发出时对不常驻的提示不留提示条，返回 None）。文案是纯函数，
 不依赖 Qt 控件，便于测试。
 """
-import logging
 from typing import Any, Callable, Optional
 
 from PyQt5.QtCore import QObject
 
 from core.storage_guard import GB, MB, PAUSE_FREE_BYTES, WARN_FREE_BYTES, format_size
-
-logger = logging.getLogger(__name__)
+from ui.services import EVENT_STORAGE_INTEGRITY, EVENT_STORAGE_SPACE
 
 
 def format_threshold(num_bytes: int) -> str:
@@ -81,17 +78,15 @@ class StorageNotices(QObject):
     def __init__(self, guard, notifier, anchor, *, db_path: Optional[str] = None,
                  set_pause_marks: Optional[Callable[[Any], None]] = None,
                  show_integrity: Optional[Callable[[str], None]] = None,
-                 tray_message: Optional[Callable[[str, str], None]] = None,
                  parent: Optional[QObject] = None):
         """
         Args:
             guard: StorageGuard
             notifier: ui.services 的 Notifier
-            anchor: 提示条挂靠的控件（主窗口）
+            anchor: 没有主窗口接入 Notifier 时提示条挂靠的控件（主窗口）
             db_path: 数据库路径（写进提示）；缺省取 guard.db_path
             set_pause_marks: 守卫暂停的任务 id 集合变化时调用（监控页标注暂停原因）
             show_integrity: quick_check 未通过时调用（设置页警告卡片）
-            tray_message: 窗口隐藏在托盘时补发气泡 (标题, 内容)；None 不补发
         """
         super().__init__(parent)
         self._notifier = notifier
@@ -100,7 +95,6 @@ class StorageNotices(QObject):
         self._db_path = db_path or getattr(guard, 'db_path', '')
         self._set_pause_marks = set_pause_marks
         self._show_integrity = show_integrity
-        self._tray_message = tray_message
         self._space_bar: Any = None   # 当前显示的磁盘空间类提示条（至多一条）
         self._integrity_shown = False
 
@@ -119,24 +113,21 @@ class StorageNotices(QObject):
     def _show_space_bar(self, level: str, title: str, text: str, duration: int) -> None:
         """显示一条磁盘空间提示；上一条空间提示（不论哪一种）先关掉。"""
         self._close(self._space_bar)
-        show = getattr(self._notifier, level)
-        self._space_bar = show(self._anchor, title, text, duration=duration)
+        self._space_bar = self._notifier.route(
+            EVENT_STORAGE_SPACE, level, title, text, duration=duration, anchor=self._anchor)
 
     def _on_low_space(self, free: int) -> None:
         self._show_space_bar("warning", LOW_SPACE_TITLE,
                              low_space_text(free, self._db_path), LOW_SPACE_DURATION_MS)
-        self._tray(LOW_SPACE_TITLE, f"剩余 {format_size(free)}")
 
     def _on_critical(self, free: int, newly_paused) -> None:
         count = len(self._guard.paused_task_ids())
         self._show_space_bar("warning", CRITICAL_TITLE,
                              critical_text(free, self._db_path, count), -1)
-        self._tray(CRITICAL_TITLE, f"剩余 {format_size(free)}，已暂停监控任务")
 
     def _on_recovered(self, free: int) -> None:
         count = len(self._guard.paused_task_ids())
         self._show_space_bar("success", RECOVERED_TITLE, recovered_text(free, count), -1)
-        self._tray(RECOVERED_TITLE, f"剩余 {format_size(free)}")
 
     def _on_paused_changed(self, ids) -> None:
         if self._set_pause_marks is not None:
@@ -148,9 +139,9 @@ class StorageNotices(QObject):
         if self._integrity_shown:
             return
         self._integrity_shown = True
-        self._notifier.warning(self._anchor, INTEGRITY_TITLE, integrity_text(summary),
-                               duration=-1)
-        self._tray(INTEGRITY_TITLE, "请在设置页复制诊断信息并联系作者")
+        self._notifier.route(
+            EVENT_STORAGE_INTEGRITY, 'warning', INTEGRITY_TITLE, integrity_text(summary),
+            duration=-1, anchor=self._anchor)
         if self._show_integrity is not None:
             self._show_integrity(summary)
 
@@ -164,12 +155,4 @@ class StorageNotices(QObject):
             bar.close()
         except RuntimeError:
             pass   # 提示条已随窗口销毁
-
-    def _tray(self, title: str, content: str) -> None:
-        if self._tray_message is None:
-            return
-        try:
-            self._tray_message(title, content)
-        except Exception:
-            logger.warning("补发托盘气泡失败", exc_info=True)
 

@@ -25,6 +25,7 @@ import dataclasses
 import os
 import time
 
+import pytest
 from PyQt5.QtTest import QTest
 from qfluentwidgets import Theme, qconfig, isDarkTheme
 
@@ -82,6 +83,7 @@ def _wait_more_samples(card, more=2):
         f"15s 内采集次数未增加到 {target}，实际 count={card.count}"
 
 
+@pytest.mark.slow   # 全链路冒烟约 10 秒；各环节的快速覆盖见架构说明 §8 的 slow 清单
 def test_gui_smoke_full_lifecycle(qapp, e2e_db, tmp_path):
     """主线冒烟：开始 -> 基线 -> 两轮打点 -> 停止 -> 分析页判定与区间 -> 导出报告 -> 关窗收尾"""
     # 与 main.py 相同的组装方式，只替换对话框：打开文件夹只做记录；关闭确认是模态

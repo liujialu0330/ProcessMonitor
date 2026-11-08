@@ -42,8 +42,8 @@ def _saved(paths):
 
 # ========== migrate_config（纯函数） ==========
 
-def test_current_version_is_2():
-    assert CURRENT_CONFIG_VERSION == 2
+def test_current_version_is_3():
+    assert CURRENT_CONFIG_VERSION == 3
 
 
 def test_migration_table_covers_every_version_below_current():
@@ -75,13 +75,16 @@ V1 = {
 
 
 @pytest.mark.parametrize("data, expected, steps", [
-    # 没有版本键的旧文件：1 → 2，只写版本号，其余内容原样
-    (V1, dict(V1, **{CONFIG_VERSION_KEY: 2}), ["1 → 2"]),
-    ({CONFIG_VERSION_KEY: 1, "X": {"y": 1}}, {CONFIG_VERSION_KEY: 2, "X": {"y": 1}}, ["1 → 2"]),
+    # 没有版本键的旧文件：1 → 2 → 3，只写版本号，其余内容原样
+    (V1, dict(V1, **{CONFIG_VERSION_KEY: 3}), ["1 → 2", "2 → 3"]),
+    ({CONFIG_VERSION_KEY: 1, "X": {"y": 1}}, {CONFIG_VERSION_KEY: 3, "X": {"y": 1}},
+     ["1 → 2", "2 → 3"]),
+    # 2 → 3（新增窗口状态与通知开关，缺键即缺省）：只写版本号
+    ({CONFIG_VERSION_KEY: 2, "X": {"y": 1}}, {CONFIG_VERSION_KEY: 3, "X": {"y": 1}}, ["2 → 3"]),
     # 非法版本号按 1 处理
-    ({CONFIG_VERSION_KEY: "abc"}, {CONFIG_VERSION_KEY: 2}, ["1 → 2"]),
+    ({CONFIG_VERSION_KEY: "abc"}, {CONFIG_VERSION_KEY: 3}, ["1 → 2", "2 → 3"]),
     # 已是当前版本：不迁移
-    ({CONFIG_VERSION_KEY: 2, "X": 1}, {CONFIG_VERSION_KEY: 2, "X": 1}, []),
+    ({CONFIG_VERSION_KEY: 3, "X": 1}, {CONFIG_VERSION_KEY: 3, "X": 1}, []),
     # 高于当前版本：原样返回，不迁移
     ({CONFIG_VERSION_KEY: 9, "New": {"k": 1}}, {CONFIG_VERSION_KEY: 9, "New": {"k": 1}}, []),
 ])
@@ -132,10 +135,10 @@ def test_load_migrates_v1_file_and_writes_back(tmp_path):
     app_config.load_app_config(paths)
 
     saved = _saved(paths)
-    assert saved[CONFIG_VERSION_KEY] == 2
+    assert saved[CONFIG_VERSION_KEY] == CURRENT_CONFIG_VERSION
     assert {k: v for k, v in saved.items() if k != CONFIG_VERSION_KEY} == V1
     assert cfg.get(cfg.retention_days) == 30
-    assert cfg.get(cfg.config_version) == 2
+    assert cfg.get(cfg.config_version) == CURRENT_CONFIG_VERSION
     metrics = cfg.get(cfg.last_metrics)
     assert "memory_private" in metrics and "num_ctx_switches_involuntary" not in metrics
     assert not os.path.exists(paths.config_path + ".tmp")
@@ -143,7 +146,7 @@ def test_load_migrates_v1_file_and_writes_back(tmp_path):
 
 def test_load_current_version_does_not_rewrite(tmp_path):
     paths = AppPaths.under(str(tmp_path))
-    _write(paths, '{"config_version": 2, "Data": {"RetentionDays": 7}}')
+    _write(paths, '{"config_version": 3, "Data": {"RetentionDays": 7}}')
     before = _read_bytes(paths)
 
     app_config.load_app_config(paths)
@@ -154,7 +157,7 @@ def test_load_current_version_does_not_rewrite(tmp_path):
 
 def test_load_newer_version_keeps_file_and_warns(tmp_path, caplog):
     paths = AppPaths.under(str(tmp_path))
-    newer = {CONFIG_VERSION_KEY: 3, "Data": {"RetentionDays": 30, "Future": 1},
+    newer = {CONFIG_VERSION_KEY: 4, "Data": {"RetentionDays": 30, "Future": 1},
              "FutureGroup": {"A": [1, 2]}}
     _write(paths, newer)
     before = _read_bytes(paths)
@@ -167,20 +170,20 @@ def test_load_newer_version_keeps_file_and_warns(tmp_path, caplog):
                for r in caplog.records)
     # 能识别的键照常读取
     assert cfg.get(cfg.retention_days) == 30
-    assert cfg.get(cfg.config_version) == 3
+    assert cfg.get(cfg.config_version) == 4
 
 
 def test_saving_under_newer_version_keeps_unknown_keys(tmp_path):
     """回退到旧版后改一项设置：新版写下的未知键与版本号不被抹掉"""
     paths = AppPaths.under(str(tmp_path))
-    _write(paths, {CONFIG_VERSION_KEY: 3, "Data": {"RetentionDays": 30, "Future": 1},
+    _write(paths, {CONFIG_VERSION_KEY: 4, "Data": {"RetentionDays": 30, "Future": 1},
                    "FutureGroup": {"A": [1, 2]}})
     app_config.load_app_config(paths)
 
     app_config.set_skipped_version("2.0.1")
 
     saved = _saved(paths)
-    assert saved[CONFIG_VERSION_KEY] == 3
+    assert saved[CONFIG_VERSION_KEY] == 4
     assert saved["FutureGroup"] == {"A": [1, 2]}
     assert saved["Data"] == {"RetentionDays": 30, "Future": 1}
     assert saved["Update"]["SkippedVersion"] == "2.0.1"
@@ -188,7 +191,7 @@ def test_saving_under_newer_version_keeps_unknown_keys(tmp_path):
 
 def test_newer_state_does_not_leak_into_next_load(tmp_path):
     newer = AppPaths.under(str(tmp_path / "newer"))
-    _write(newer, {CONFIG_VERSION_KEY: 3, "FutureGroup": {"A": 1}})
+    _write(newer, {CONFIG_VERSION_KEY: 4, "FutureGroup": {"A": 1}})
     app_config.load_app_config(newer)
 
     fresh = AppPaths.under(str(tmp_path / "fresh"))
@@ -212,6 +215,22 @@ def test_corrupt_or_non_object_file_behaves_as_before(tmp_path, content):
     assert _read_bytes(paths) == before
     assert cfg.get(cfg.retention_days) == cfg.retention_days.defaultValue
     assert cfg.get(cfg.config_version) == CURRENT_CONFIG_VERSION
+
+
+@pytest.mark.parametrize("content", ["{not json", "[1, 2, 3]", "", "\x00\x00\x00"])
+def test_corrupt_file_is_replaced_by_a_valid_one_on_first_save(tmp_path, content):
+    """损坏的配置文件：加载按默认值不抛异常，用户改一项设置后写回的是合法的当前版本文件，
+    不再留着坏文件让每次启动都读失败"""
+    paths = AppPaths.under(str(tmp_path))
+    _write(paths, content)
+
+    app_config.load_app_config(paths)
+    assert cfg.get(cfg.retention_days) == cfg.retention_days.defaultValue
+    app_config.set_skipped_version("1.0.0")
+
+    saved = _saved(paths)
+    assert saved[CONFIG_VERSION_KEY] == CURRENT_CONFIG_VERSION
+    assert saved["Update"]["SkippedVersion"] == "1.0.0"
 
 
 def test_first_launch_saves_current_version(tmp_path):

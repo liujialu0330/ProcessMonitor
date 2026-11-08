@@ -39,6 +39,7 @@ print("ACTIVATIONS=%d" % count[0], flush=True)
 '''
 
 
+@pytest.mark.slow   # 真实并发 10 个进程；快速覆盖：test_single_instance（可注入互斥量、睡眠与时钟）
 @pytest.mark.skipif(sys.platform != 'win32', reason="命名互斥量判据仅 Windows 可用")
 def test_ten_concurrent_launches_elect_exactly_one_primary():
     name = f"ProcessMonitorTest_{uuid.uuid4().hex}"

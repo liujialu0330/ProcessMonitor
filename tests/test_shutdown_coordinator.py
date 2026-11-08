@@ -242,7 +242,7 @@ class _StuckThread(QThread):
 
 def test_total_budget_bounds_every_wait(qapp, db):
     """5 个永不结束的任务 + 3 个永不结束的登记表线程：单项超时（3s/5s）累加远超
-    预算，但总耗时不超过 2 秒预算加少量余量；登记表线程在等待任务之前就已统一取消；
+    预算，但总耗时不超过 0.6 秒预算加少量余量；登记表线程在等待任务之前就已统一取消；
     进度文案顺序不变，仍关闭数据库"""
     log, progress = [], []
     manager = MonitorManager(db=db)
@@ -257,12 +257,12 @@ def test_total_budget_bounds_every_wait(qapp, db):
             assert thread.started_evt.wait(5)
 
         coordinator = ShutdownCoordinator(manager, registry, task_timeout_ms=3000,
-                                          total_budget_ms=2000, db=_FakeDb(log))
+                                          total_budget_ms=600, db=_FakeDb(log))
         t0 = time.monotonic()
         assert coordinator.run(progress.append) is False
         elapsed = time.monotonic() - t0
 
-        assert elapsed <= 2.0 + 0.5
+        assert elapsed <= 0.6 + 0.5
         assert progress == [PROGRESS_STOPPING_TASKS, PROGRESS_STOPPING_THREADS,
                             PROGRESS_SAVING]
         cancels = [entry for entry in log if entry[0] == "cancel"]

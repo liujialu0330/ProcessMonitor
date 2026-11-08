@@ -59,7 +59,7 @@ def page(qapp, db, manager, services, started):
     yield widget
     # 搜索框打字后 qfluentwidgets 用 50 ms 的 singleShot 弹补全菜单；在本用例内把它跑完，
     # 不让它落到下一个用例的事件循环里去碰已经换掉的补全器
-    QTest.qWait(100)
+    QTest.qWait(60)
     widget.close()
 
 
@@ -342,15 +342,14 @@ def test_stopped_card_is_kept_in_finished_group(page, manager, monkeypatch):
     assert other_id in page.board.cards()
 
 
-def test_abnormal_stop_signals_main_window(page, manager, services):
+def test_abnormal_stop_is_announced_through_the_notifier(page, manager, services):
     task_id = _add_card(manager)
-    received = []
-    page.task_ended_abnormally.connect(lambda title, content: received.append(content))
 
     manager.task_stopped.emit(task_id, StopReason.PROCESS_EXITED)
 
-    assert received and "进程已终止" in received[0] and "demo.exe" in received[0]
-    assert services.notifier.last().parent is page
+    last = services.notifier.last()
+    assert "进程已终止" in last.content and "demo.exe" in last.content
+    assert last.parent is page
     assert "进程已终止" in page.board.cards()[task_id].finished_detail_label.text()
 
 

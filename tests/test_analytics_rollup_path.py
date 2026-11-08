@@ -116,6 +116,24 @@ def _seed_long(db):
     return 'long', 1.0, (MEM, CPU)
 
 
+def _seed_compact(db):
+    """_seed_long 的缩小版（快速替身）：同样的结构——毫秒抖动、分钟中间 25 秒空洞、整段多分钟空洞、
+    CPU 晚开始 / 单独缺采 / 早结束、数值并列——只是把 9000 秒压到 2400 秒"""
+    _task(db, 'compact', 1.0, (MEM, CPU))
+    rng = random.Random(20261108)
+    points = []
+    for k in range(2400):
+        if 1215 <= k < 1240 or 1500 <= k < 1800:
+            continue
+        ts = T0 + timedelta(seconds=k, milliseconds=rng.choice([0, 0, 3, 997]))
+        points.append(DataPoint('compact', ts, 1000.0 + k * 0.01 + rng.randint(0, 20), MEM))
+        if 300 <= k < 2300 and not 2000 <= k < 2040:
+            points.append(DataPoint('compact', ts, float(rng.randint(0, 100)), CPU))
+    for i in range(0, len(points), 997):
+        db.points.append(points[i:i + 997])
+    return 'compact', 1.0, (MEM, CPU)
+
+
 def _seed_minute(db):
     """60 秒周期 300 点，中间 20 分钟空洞"""
     _task(db, 'minute', 60.0, (MEM,))
@@ -138,7 +156,7 @@ def _seed_single(db):
     return 'single', 1.0, (MEM,)
 
 
-SEEDS = {'long': _seed_long, 'minute': _seed_minute, 'tiny': _seed_tiny, 'single': _seed_single}
+SEEDS = {'long': _seed_long, 'compact': _seed_compact, 'minute': _seed_minute, 'tiny': _seed_tiny, 'single': _seed_single}
 
 
 def _ranges(stamps):
@@ -161,7 +179,10 @@ def _ranges(stamps):
     ]
 
 
-@pytest.fixture(params=list(SEEDS))
+# 约 9000 秒的 long 单个对拍用例就要 3 秒，标 slow（CI 完整集运行）；缩小版 compact 在默认集里
+# 守住同一批结构，other 的 minute / tiny / single 守住边界形状
+@pytest.fixture(params=[pytest.param(name, marks=pytest.mark.slow) if name == 'long' else name
+                        for name in SEEDS])
 def dataset(request, db):
     task_id, interval, metrics = SEEDS[request.param](db)
     points = db.points.fetch(PointQuery(task_id, None))

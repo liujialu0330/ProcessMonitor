@@ -27,7 +27,7 @@ from PyQt5.QtGui import QImage
 from PyQt5.QtWidgets import QSizePolicy, QStackedWidget, QVBoxLayout, QWidget
 from qfluentwidgets import CaptionLabel, FluentIcon, IndeterminateProgressBar
 
-from core.history_query import CUSTOM_RANGE_KEY, HistorySnapshot, TaskAnalysis
+from core.history_query import CUSTOM_RANGE_KEY, RANGE_KEYS, HistorySnapshot, TaskAnalysis
 from ui.formatting import (
     GROUP_USAGE_NOTE, MEMBER_USAGE_NOTE, basis_text, build_member_rows, build_table_row,
     group_verdict_summary, member_view_summary, overall_summary, refresh_status_text,
@@ -35,7 +35,7 @@ from ui.formatting import (
 from ui.models.task_options import TaskOptionsModel
 from ui.services import UiServices
 from ui.viewmodels.analysis_vm import (
-    TIME_RELATIVE, AnalysisViewModel, analysis_origin, range_text)
+    TIME_MODES, TIME_RELATIVE, VIEW_MODES, AnalysisViewModel, analysis_origin, range_text)
 from ui.viewmodels.history_auto_refresh import HistoryAutoRefresh
 from ui.viewmodels.history_vm import EMPTY_NO_TASKS, HistoryRunner, ordered_metrics
 from ui.widgets.analysis.compare_panel import ComparePanel
@@ -54,6 +54,7 @@ from ui.widgets.history.chart_view import chart_display_unit
 from ui.widgets.history.common import VIEWPORT_TO_CONTENT_OFFSET
 from ui.widgets.page_scaffold import PageScaffold
 from ui.widgets.task_selector import TaskSelector
+from ui.window_state import AnalysisMemory
 from utils.metrics import PROCESS_COUNT, VALUE_CLASS_RATE, split_member_key
 
 if TYPE_CHECKING:
@@ -178,6 +179,7 @@ class AnalysisPage(PageScaffold):
         trend.metric_activated.connect(vm.select_metric)
         self.interval_table.interval_activated.connect(
             lambda start, end: trend.zoom_to(start.timestamp(), end.timestamp()))
+        self.verdict_banner.copy_requested.connect(self.export_flow.copy_conclusion)
         self.export_flow.status_changed.connect(self._on_export_status)
         # 视图模型 → 控件
         vm.tasks_changed.connect(self._on_tasks_changed)
@@ -213,6 +215,29 @@ class AnalysisPage(PageScaffold):
         任务尚无采样数据时不在列表中：清空选择并提示，不静默选中其他任务。"""
         if not self.vm.select_task(task_id, explicit=True):
             self.services.notifier.info(self, *TASK_HAS_NO_DATA)
+
+    def memory_snapshot(self) -> AnalysisMemory:
+        """要记住的状态：用户亲手选过的任务（默认自动选中的最新任务不记，下次仍自动跟随）、
+        预设时间范围（刷选出的自定义范围是绝对时刻，不记）、视图与时间模式。"""
+        vm = self.vm
+        task_id = vm.current_task_id if not vm.selection_is_auto else None
+        range_key = vm.range_key if vm.range_key != CUSTOM_RANGE_KEY else ""
+        return AnalysisMemory(task_id=task_id or "", range_key=range_key,
+                              view_mode=vm.view_mode, time_mode=vm.time_mode)
+
+    def restore_memory(self, memory: AnalysisMemory) -> None:
+        """启动时恢复上次的范围、视图与任务（任务在页面第一次显示、载入列表时才选中；
+        已被删除就静默退回默认选择）。记录里不认识的取值一律忽略。"""
+        vm = self.vm
+        if memory.range_key in RANGE_KEYS:
+            self.toolbar.set_range(memory.range_key)
+            vm.set_range(memory.range_key)
+        if memory.view_mode in VIEW_MODES:
+            vm.set_view_mode(memory.view_mode)
+        if memory.time_mode in TIME_MODES:
+            vm.set_time_mode(memory.time_mode)
+        if memory.task_id:
+            vm.restore_selection(memory.task_id)
 
     def render_report(self) -> QImage:
         """按当前分析结果离屏渲染报告图片（导出与复制共用）。"""

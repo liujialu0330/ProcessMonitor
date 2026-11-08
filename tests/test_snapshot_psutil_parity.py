@@ -136,6 +136,7 @@ def test_pid_set_matches_psutil(snapper):
     assert len((listed ^ stable) - churn) <= PID_SYMMETRIC_DIFF_MAX
 
 
+@pytest.mark.slow   # 逐个比对整机进程（开发机上约 2 秒）；快速覆盖：test_snapshot_psutil_realproc_parity（本进程与子进程逐字段）
 def test_create_times_match_psutil_for_all_processes(snapper):
     snap = snapper.snapshot()
     mismatched = []

@@ -1,6 +1,6 @@
 """
 分析页"导出报告 ▾ → 证据包（.zip）"的完整流程（离屏、真实后台线程）：默认文件名取
-core.evidence.evidence_filename；三件套先写到临时工作目录、再连同 task.json / README.txt /
+设置页的命名模板（core.naming_template）；三件套先写到临时工作目录、再连同 task.json / README.txt /
 日志摘录打成一个 zip；完成提示带"打开文件夹"；导出登记 begin_export/end_export 与线程
 登记表；失败常驻提示、不留半个 zip、工作目录清理干净。
 """
@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from core.evidence import LOG_EXCERPT_NAME, README_NAME, TASK_JSON_NAME, evidence_filename
+from core.evidence import LOG_EXCERPT_NAME, README_NAME, TASK_JSON_NAME
 from core.monitor_manager import MonitorManager
 from core.report import task_basename
 from core.target_info import TargetInfo
@@ -115,7 +115,7 @@ def test_evidence_export_writes_complete_zip(env, tmp_path, work_root):
 
     ask = services.dialogs.last_call('ask_save_path')
     assert ask['title'] == EVIDENCE_DIALOG_TITLE and ask['name_filter'] == EVIDENCE_FILTER
-    assert os.path.basename(ask['default_path']) == evidence_filename(task, services.clock)
+    assert os.path.basename(ask['default_path']) == "demo_1.2.3.4_建模_200_次_20260716_1600.zip"
     assert page.export_status_label.text() == "正在导出…"
     assert begun == [1] and manager.has_running_exports()
     assert [e.name for e in services.threads.entries()] == ["导出报告"]

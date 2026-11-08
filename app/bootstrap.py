@@ -628,8 +628,12 @@ def _schedule_recovery(ctx: AppContext, window, *, resume_all: bool = False) -> 
 
     def _go() -> None:
         try:
-            run_recovery(ctx, auto_marker=window.monitor_page.presenter.auto_marker,
-                         prompt=default_prompt(window), resume_all=resume_all)
+            outcome = run_recovery(
+                ctx, auto_marker=window.monitor_page.presenter.auto_marker,
+                prompt=default_prompt(window), resume_all=resume_all)
+            if outcome is not None and outcome.resumed:
+                # 续采之后用户第一眼应看到正在跑的任务，不管上次停在哪一页
+                window.show_monitor_page()
         except Exception:
             logger.error("处理续采任务失败", exc_info=True)
 

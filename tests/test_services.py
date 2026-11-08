@@ -115,8 +115,12 @@ def test_production_services_binds_task_status_to_manager():
 def test_resolve_duration_defaults_and_explicit_values():
     assert resolve_duration("info", None) == 2000
     assert resolve_duration("success", None) == 2000
-    assert resolve_duration("warning", None) == 3000
+    assert resolve_duration("warning", None) == 5000
     assert resolve_duration("error", None) == -1
+    # 带操作按钮：6 秒；错误即使带按钮也常驻
+    assert resolve_duration("success", None, has_action=True) == 6000
+    assert resolve_duration("warning", None, has_action=True) == 6000
+    assert resolve_duration("error", None, has_action=True) == -1
     assert resolve_duration("warning", 10000) == 10000
     with pytest.raises(ValueError):
         resolve_duration("fatal", None)
@@ -133,10 +137,10 @@ def test_infobar_notifier_shows_bars_with_expected_duration(host):
     QApplication.processEvents()
 
     assert {level: bar.duration for level, bar in bars.items()} == {
-        "info": 2000, "success": 2000, "warning": 3000, "error": -1}
+        "info": 2000, "success": 2000, "warning": 5000, "error": -1}
     for level, bar in bars.items():
         assert isinstance(bar, InfoBar)
-        assert bar.position == InfoBarPosition.TOP
+        assert bar.position == InfoBarPosition.BOTTOM_RIGHT
         assert bar.isClosable
         assert bar.parent() is host
     assert bars["warning"].title == "注意"

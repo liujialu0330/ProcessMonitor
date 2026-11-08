@@ -375,7 +375,7 @@ DLL 导致，属一次性开销。
 
 ## 🧪 发布前冒烟
 
-除 `python -m pytest tests/ -v`（含 `tests/e2e/` 的 offscreen 断言态冒烟）全绿外，
+除完整集 `python -m pytest tests/ -v -m "not perf and not soak and not gui_real"`（含 `slow` 标记的用例，即 `tests/e2e/` 的 offscreen 断言态冒烟、真实进程与管道用例；本地默认 `python -m pytest tests/` 只跑快速集、不含它们）全绿外，
 正式发布前建议额外用真窗口观察态跑一次 GUI 端到端冒烟测试（`tests/e2e/test_gui_smoke.py`），
 用肉眼确认"创建监控任务 → 采集数据 → 停止任务并落库 → 历史页查看图表/表格 →
 导出页导出 CSV → 关闭窗口"全链路在真实窗口下无异常——断言逻辑与 offscreen 跑法
@@ -384,7 +384,7 @@ DLL 导致，属一次性开销。
 ```powershell
 $env:QT_QPA_PLATFORM = 'windows'
 $env:GUI_SMOKE_VISIBLE = '1'
-python -m pytest tests/e2e/test_gui_smoke.py -s
+python -m pytest tests/e2e/test_gui_smoke.py -s -m slow
 ```
 
 该命令会短暂弹出真实主窗口并自动完成整条链路操作（无需人工点击），肉眼确认无异常
@@ -394,7 +394,7 @@ offscreen 断言态供日常回归/CI 使用：
 ```powershell
 Remove-Item Env:\QT_QPA_PLATFORM -ErrorAction SilentlyContinue
 Remove-Item Env:\GUI_SMOKE_VISIBLE -ErrorAction SilentlyContinue
-python -m pytest tests/e2e/ -q
+python -m pytest tests/e2e/ -q -m "slow or not slow"
 ```
 
 ---
@@ -492,7 +492,7 @@ python build\verify_release.py --tag v2.0.0 --release-json release.json [--lates
 ## 🎯 完整打包流程总结
 
 ### 开发阶段
-1. 完成代码开发和测试（`python -m pytest tests/ -v` 全绿）
+1. 完成代码开发和测试（本地快速集 `python -m pytest tests/ -v` 全绿；发版前再跑完整集 `-m "not perf and not soak and not gui_real"`，见架构说明 §8）
 2. 更新版本号（仅需改 `config.py` 的 `APP_VERSION`，单源）
 3. 更新更新日志
 

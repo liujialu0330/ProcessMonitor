@@ -25,7 +25,8 @@ from core.ipc import protocol as p
 from core.monitor_manager import BASELINE_LABEL, round_label
 from utils.instance_name import pipe_path, single_instance_name
 
-pytestmark = pytest.mark.skipif(sys.platform != 'win32', reason="命名管道与无窗口模式只在 Windows")
+pytestmark = [pytest.mark.skipif(sys.platform != 'win32', reason="命名管道与无窗口模式只在 Windows"),
+              pytest.mark.slow]   # 拉起真实无窗口子进程；快速覆盖：test_ipc_server / test_ipc_client / test_pmctl / test_headless
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PMCTL = os.path.join(ROOT, 'pmctl.py')

@@ -29,6 +29,7 @@ from ui.presenters.monitor_presenter import (
     MonitorPresenter, resolve_error_text,
 )
 from ui.formatting import plan_summary
+from ui.services import EVENT_TASK_ABNORMAL
 from ui.widgets.monitor.new_task_form import TaskRequest, WaitRequest
 from ui.widgets.monitor.process_picker import (
     ERROR_EMPTY, ERROR_NO_MATCH, ERROR_NOT_A_NUMBER, ERROR_NOT_FOUND, ResolveError,
@@ -830,30 +831,27 @@ def test_marker_ignored_for_finished_task(presenter, manager, board, services):
 def test_user_stop_finishes_card_removes_task_and_informs(presenter, manager, board,
                                                           services, form):
     task_id = _add_task(manager, pid=1002)
-    received = []
-    presenter.task_ended_abnormally.connect(lambda *args: received.append(args))
 
     manager.task_stopped.emit(task_id, StopReason.USER)
 
     assert board.finished[task_id] == (StopReason.USER, DEFAULT_FAKE_NOW)
     assert ("remove", task_id) in manager.commands
     assert form.forgotten == [1002]
-    assert received == []
     # 用户自己点的停止：卡片转为"已结束"即是结果，不再弹提示
     assert services.notifier.notices == []
 
 
-def test_abnormal_stop_is_prominent_and_signals_main_window(presenter, manager, services, host):
+def test_abnormal_stop_is_prominent_and_routed_as_task_event(presenter, manager, services, host):
+    """异常结束经 Notifier.route 发出：事件名决定窗口在后台时闪任务栏，渠道由 Notifier 选"""
     task_id = _add_task(manager)
-    received = []
-    presenter.task_ended_abnormally.connect(lambda title, content: received.append(content))
 
     manager.task_stopped.emit(task_id, StopReason.PROCESS_EXITED)
 
     last = services.notifier.last()
     assert last.level == "warning" and last.effective_duration == ABNORMAL_STOP_INFOBAR_MS
     assert last.parent is host
-    assert received and "进程已终止" in received[0] and "demo.exe（PID 1001）" in received[0]
+    assert last.event == EVENT_TASK_ABNORMAL and last.key == EVENT_TASK_ABNORMAL
+    assert "进程已终止" in last.content and "demo.exe（PID 1001）" in last.content
 
 
 def test_stop_of_unknown_task_still_removes_it(presenter, manager, services):

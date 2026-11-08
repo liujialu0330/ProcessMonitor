@@ -2,7 +2,7 @@
 import time
 
 
-def poll_until(condition, timeout: float = 10.0, interval: float = 0.01) -> bool:
+def poll_until(condition, timeout: float = 10.0, interval: float = 0.002) -> bool:
     """轮询等待 condition() 为真，最长 timeout 秒；超时返回最后一次判定结果"""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -45,7 +45,7 @@ def process_events_until(condition, timeout: float = 5.0) -> bool:
         QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
         if condition():
             return True
-        time.sleep(0.01)
+        time.sleep(0.002)
     QCoreApplication.processEvents()
     return bool(condition())
 
@@ -60,8 +60,28 @@ def dispose_widget(widget) -> None:
     from PyQt5.QtCore import QCoreApplication, QEvent
 
     widget.hide()
+    release_plot_menus(widget)
     widget.deleteLater()
     QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+
+
+def release_plot_menus(widget) -> None:
+    """释放控件内全部 pyqtgraph 图表的 PlotItem.ctrlMenu（约 30 个无父 QMenu）。
+
+    pyqtgraph 的 PlotItem 构造时无条件建这个菜单，只在 PlotItem.close() 里释放；控件被删后
+    它们仍作为无父顶层控件留在应用里，全量里积到上千个，拖慢每个用例的 topLevelWidgets()。
+    只做 close() 里释放菜单的那两行（不动 ViewBox 与坐标轴），只在控件即将被删除时调用。
+    """
+    try:
+        import pyqtgraph as pg
+        for plot in widget.findChildren(pg.PlotWidget):
+            item = plot.getPlotItem()
+            menu = getattr(item, 'ctrlMenu', None)
+            if menu is not None:
+                menu.setParent(None)
+                item.ctrlMenu = None
+    except Exception:   # 释放失败只是多留一些菜单，不应让用例收尾失败
+        pass
 
 
 def record_stop_reasons(task) -> list:

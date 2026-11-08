@@ -21,7 +21,7 @@ from tests.factories import make_main_window, make_services
 from tests.helpers import dispose_widget, stop_and_join
 from ui import storage_notices as notices
 from ui.components.task_card import TaskCard
-from ui.services import ManagerTaskStatus
+from ui.services import EVENT_STORAGE_INTEGRITY, EVENT_STORAGE_SPACE, ManagerTaskStatus
 from ui.storage_notices import StorageNotices
 from utils.metrics import MetricType
 
@@ -47,17 +47,16 @@ class FakeGuard(QObject):
 def parts(qapp):
     guard = FakeGuard()
     notifier = RecordingNotifier()
-    marks, integrity, tray = [], [], []
+    marks, integrity = [], []
     anchor = QObject()
     n = StorageNotices(guard, notifier, anchor, set_pause_marks=marks.append,
-                       show_integrity=integrity.append,
-                       tray_message=lambda t, c: tray.append((t, c)))
+                       show_integrity=integrity.append)
 
     class P:
         pass
     p = P()
-    p.guard, p.notifier, p.marks, p.integrity, p.tray, p.notices = (
-        guard, notifier, marks, integrity, tray, n)
+    p.guard, p.notifier, p.marks, p.integrity, p.notices = (
+        guard, notifier, marks, integrity, n)
     p.anchor = anchor
     return p
 
@@ -180,24 +179,30 @@ def test_pause_marks_are_forwarded(parts):
     assert parts.marks == [frozenset({"a", "b"}), frozenset()]
 
 
-def test_tray_bubble_is_added_for_each_space_notice(parts):
+def test_space_notices_go_through_route_with_storage_events(parts):
+    """渠道（提示条 / 窗口在后台时的托盘气泡）由 Notifier 按窗口状态选，这里只管事件名"""
     parts.guard.low_space.emit(900 * MB)
     parts.guard.space_critical.emit(150 * MB, ())
     parts.guard.space_recovered.emit(1 * GB)
-    assert [t for t, _ in parts.tray] == [notices.LOW_SPACE_TITLE, notices.CRITICAL_TITLE,
-                                          notices.RECOVERED_TITLE]
+    parts.guard.integrity_problem.emit("x")
+    assert [n.event for n in parts.notifier.messages()] == [
+        EVENT_STORAGE_SPACE] * 3 + [EVENT_STORAGE_INTEGRITY]
 
 
-def test_tray_failure_does_not_break_the_notice(qapp):
-    guard = FakeGuard()
-    notifier = RecordingNotifier()
-
-    def boom(title, content):
-        raise RuntimeError("tray")
-    n = StorageNotices(guard, notifier, QObject(), tray_message=boom)
+def test_space_bar_semantics_hold_when_the_new_notice_has_no_bar(qapp):
+    """窗口在后台时不常驻的提示只发气泡、没有提示条（route 返回 None）：上一条空间提示
+    仍要先关掉，不留下过期的"严重不足"。"""
+    class BubbleOnly(RecordingNotifier):
+        def route(self, event, level, title, content, **kwargs):
+            bar = super().route(event, level, title, content, **kwargs)
+            return None if kwargs.get('duration', 0) >= 0 else bar
+    guard, notifier = FakeGuard(), BubbleOnly()
+    keep = StorageNotices(guard, notifier, QObject())
+    guard.space_critical.emit(150 * MB, ())
+    critical = notifier.last("warning").bar
     guard.low_space.emit(900 * MB)
-    assert notifier.last("warning").title == notices.LOW_SPACE_TITLE
-    del n
+    assert critical.closed
+    del keep
 
 
 # ========== 完整性警告：主窗口与设置页各一次 ==========
@@ -388,28 +393,3 @@ def test_real_quit_stops_the_guard_before_shutdown(window, monkeypatch):
     window.close()
     assert order == ['guard.stop', 'shutdown']
     assert not guard.is_running and not guard._timer.isActive()
-
-
-def test_tray_bubble_only_when_the_window_is_hidden(window):
-    class Tray:
-        def __init__(self):
-            self.messages = []
-
-        def is_available(self):
-            return True
-
-        def show_message(self, title, content, kind='info'):
-            self.messages.append((title, kind))
-
-        def set_tooltip(self, text):
-            pass
-
-        def hide(self):
-            pass
-
-    window.tray = Tray()
-    window._storage_tray_message("t", "c")
-    assert window.tray.messages == []                   # 窗口可见：只用窗口内提示条
-    window.hide()
-    window._storage_tray_message("t", "c")
-    assert window.tray.messages == [("t", "warning")]

@@ -2,7 +2,7 @@
 用户偏好读取（MonitorPreferences）
 
 页面需要的用户偏好（上次选择的指标、默认采集间隔、保留天数、关窗到托盘、打点
-快捷键）及其取值范围（采集间隔范围、保留天数可选值）统一
+快捷键、后台通知开关）及其取值范围（采集间隔范围、保留天数可选值）统一
 经由注入的 MonitorPreferences 读取：测试可以给出固定偏好，不必改动全局 cfg 单例。
 
 设置页上直接绑定 ConfigItem 的设置卡片不经过本服务：那是 qfluentwidgets 设置卡
@@ -36,6 +36,10 @@ class MonitorPreferences(Protocol):
 
     def close_to_tray(self) -> bool:
         """关闭主窗口时是否最小化到系统托盘。"""
+        ...
+
+    def notify_in_background(self) -> bool:
+        """窗口不在前台时是否用托盘气泡（系统通知）提醒。"""
         ...
 
     def interval_range(self) -> Tuple[int, int]:
@@ -77,6 +81,10 @@ class ConfigPreferences:
     def close_to_tray(self) -> bool:
         """关窗时是否最小化到托盘。"""
         return bool(cfg.get(cfg.close_to_tray))
+
+    def notify_in_background(self) -> bool:
+        """窗口不在前台时是否发托盘气泡。"""
+        return bool(cfg.get(cfg.notify_in_background))
 
     def interval_range(self) -> Tuple[int, int]:
         """采集周期范围：委托 app_config.interval_range（来自 ConfigItem 校验器）。"""

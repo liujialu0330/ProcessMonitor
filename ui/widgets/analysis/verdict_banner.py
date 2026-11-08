@@ -4,15 +4,18 @@
 左：判定胶囊（持续上涨 / 波动 / 平稳 / 数据不足，配色与摘要表胶囊同源）+ 主句，如
 "2 / 5 项持续上涨：私有字节 +35 MB/小时、句柄数 +120 个/小时"；
 右：统计依据（"基线 16:37:33 起 · 2小时15分 · 8,100 点"）与运行中任务的自动刷新状态
-（"自动刷新 · 15 秒前"）。文案由 ui.formatting.verdict_summary / basis_text /
-refresh_status_text 生成，控件只负责摆放与配色。
+（"自动刷新 · 15 秒前"）；最右是"复制结论 ▾"（纯文本 / Markdown），只发 copy_requested，
+复制什么由 AnalysisExportFlow 取当前显示的结论与摘要表。文案由 ui.formatting.verdict_summary /
+basis_text / refresh_status_text 生成，控件只负责摆放与配色。
 """
 from typing import Optional
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import QHBoxLayout, QLabel, QSizePolicy
-from qfluentwidgets import BodyLabel, CaptionLabel, CardWidget, qconfig
+from qfluentwidgets import (Action, BodyLabel, CaptionLabel, CardWidget, FluentIcon,
+                            RoundMenu, TransparentDropDownPushButton, qconfig)
 
+from core.conclusion_text import FORMAT_LABELS, FORMAT_MARKDOWN, FORMAT_TEXT
 from ui.formatting import VerdictSummary
 from ui.widgets.analysis.summary_table import pill_style
 from ui.widgets.history.common import CARD_PADDING_H
@@ -20,10 +23,15 @@ from ui.widgets.history.common import CARD_PADDING_H
 BANNER_PADDING_V = 10
 BASIS_PREFIX = "依据："
 SEPARATOR = " · "
+COPY_TEXT = "复制结论"
+COPY_TIP = "把当前结论（元数据、整体结论与各指标）复制成文字，贴进聊天、工单或文档"
+COPY_ITEMS = ((FORMAT_TEXT, FluentIcon.DOCUMENT), (FORMAT_MARKDOWN, FluentIcon.CODE))
 
 
 class VerdictBanner(CardWidget):
-    """结论条。set_* 不发信号。"""
+    """结论条。set_* 不发信号；copy_requested(格式) 只在用户从"复制结论"菜单选择时发。"""
+
+    copy_requested = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -37,6 +45,17 @@ class VerdictBanner(CardWidget):
         self.basis_label = CaptionLabel("", self)
         self.refresh_label = CaptionLabel("", self)
         self.refresh_label.setVisible(False)
+        self.copy_button = TransparentDropDownPushButton(FluentIcon.COPY, COPY_TEXT, self)
+        self.copy_button.setToolTip(COPY_TIP)
+        self.copy_button.setVisible(False)
+        self.copy_menu = RoundMenu(parent=self)
+        self.copy_actions = {}
+        for fmt, icon in COPY_ITEMS:
+            action = Action(icon, FORMAT_LABELS[fmt], self)
+            action.triggered.connect(lambda _=False, f=fmt: self.copy_requested.emit(f))
+            self.copy_menu.addAction(action)
+            self.copy_actions[fmt] = action
+        self.copy_button.setMenu(self.copy_menu)
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(CARD_PADDING_H, BANNER_PADDING_V,
@@ -46,6 +65,7 @@ class VerdictBanner(CardWidget):
         layout.addWidget(self.sentence_label, 1)
         layout.addWidget(self.basis_label)
         layout.addWidget(self.refresh_label)
+        layout.addWidget(self.copy_button)
         qconfig.themeChanged.connect(self._on_theme_changed)
 
     # ---------- 数据 ----------
@@ -62,6 +82,7 @@ class VerdictBanner(CardWidget):
         tooltip = "\n".join(t for t in (sentence, summary.tooltip if summary else "") if t)
         self.sentence_label.setToolTip(tooltip)
         self.pill.setToolTip(tooltip)
+        self.copy_button.setVisible(bool(verdict or sentence))
         self._apply_theme()
 
     def set_basis(self, basis: str) -> None:
@@ -79,7 +100,11 @@ class VerdictBanner(CardWidget):
         self.set_basis("")
         self.set_refresh_status("")
 
-    # ---------- 查询（测试用） ----------
+    # ---------- 查询 ----------
+
+    def summary(self) -> Optional[VerdictSummary]:
+        """当前显示的结论（复制结论用）；没有为 None。"""
+        return self._summary
 
     def verdict(self) -> str:
         return self.pill.text()

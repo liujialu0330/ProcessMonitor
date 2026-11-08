@@ -16,7 +16,10 @@ from ui.services.dialogs import (
     Dialogs, QtDialogs,
 )
 from ui.services.notifier import (
-    DEFAULT_DURATIONS, NOTICE_LEVELS, InfoBarNotifier, Notifier, resolve_duration,
+    ACTION_DURATION_MS, ALERT_EVENTS, DEFAULT_DURATIONS, EVENT_GENERIC, EVENT_QUICK_MARKER,
+    EVENT_STORAGE_INTEGRITY, EVENT_STORAGE_SPACE, EVENT_TASK_ABNORMAL, EVENT_TASK_ERROR,
+    EVENT_TRAY_HIDDEN, EVENT_UPDATE_AVAILABLE, NOTICE_LEVELS, InfoBarNotifier, NoticeAction,
+    Notifier, resolve_duration, window_state,
 )
 from ui.services.preferences import ConfigPreferences, MonitorPreferences
 from ui.services.process_query import ProcessEntry, ProcessQuery, PsutilProcessQuery
@@ -47,6 +50,9 @@ class UiServices:
     dpi_scale: Optional[Callable[[], Optional[float]]] = None
     # 取应用日志 app.log 路径的函数，证据包据此摘录日志；None 或返回 None 时不收录日志
     log_path: Optional[Callable[[], Optional[str]]] = None
+    # 窗口与工作状态记忆（ui.window_state.WindowMemoryStore 或同接口的替身）；None 表示
+    # 不记忆：主窗口按默认大小居中、停在监控页，也不写配置
+    window_memory: Any = None
 
 
 # 应用日志文件名（与 utils.logger.setup_logging 一致）
@@ -80,6 +86,7 @@ def production_services(manager: "MonitorManager",
     线程登记表由组合根创建并同时交给退出协调器。启动被测程序的 launcher 与命令处理器
     共用这一份（组合根从这里取）。"""
     from core.process_launcher import ProcessLauncher
+    from ui.window_state import ConfigWindowMemory
     return UiServices(
         notifier=InfoBarNotifier(),
         dialogs=QtDialogs(),
@@ -91,12 +98,16 @@ def production_services(manager: "MonitorManager",
         launcher=ProcessLauncher(),
         dpi_scale=primary_screen_dpi_scale,
         log_path=current_log_path,
+        window_memory=ConfigWindowMemory(),
     )
 
 
 __all__ = [
     'UiServices', 'production_services', 'primary_screen_dpi_scale', 'current_log_path',
-    'Notifier', 'InfoBarNotifier', 'DEFAULT_DURATIONS', 'NOTICE_LEVELS', 'resolve_duration',
+    'Notifier', 'InfoBarNotifier', 'NoticeAction', 'DEFAULT_DURATIONS', 'ACTION_DURATION_MS',
+    'NOTICE_LEVELS', 'resolve_duration', 'window_state', 'ALERT_EVENTS', 'EVENT_GENERIC',
+    'EVENT_TASK_ABNORMAL', 'EVENT_TASK_ERROR', 'EVENT_QUICK_MARKER', 'EVENT_UPDATE_AVAILABLE',
+    'EVENT_STORAGE_SPACE', 'EVENT_STORAGE_INTEGRITY', 'EVENT_TRAY_HIDDEN',
     'Dialogs', 'QtDialogs',
     'CLOSE_ACTION_QUIT', 'CLOSE_ACTION_TRAY', 'CLOSE_ACTION_CANCEL', 'CLOSE_ACTIONS',
     'Clock', 'SystemClock',
