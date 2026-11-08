@@ -4,8 +4,10 @@
 FluentWindow 外壳：侧栏 监控 / 分析 / 设置（底部），窗口宽度 ≥ 1200 时侧栏展开显示文字。
 主窗口只做页面之间、页面与托盘/全局快捷键之间的中转，不承担业务流程：
 - 监控卡片"分析"→ 切到分析页并选中该任务；
-- 托盘菜单"打点"、全局快捷键 → 监控页的快速打点，结果用托盘气泡确认；
+- 托盘菜单"打点"、全局快捷键 → 监控页的快速打点，结果经 Notifier 提示（窗口在后台时是托盘气泡）；
 - 静默检查到新版本 → 非模态提示，"查看"跳到设置页"关于与更新"。
+窗口几何、是否最大化、当前页与分析页的上次状态经 services.window_memory 记忆并在启动时恢复。
+主窗口也是通知的落点：创建后把自己与托盘交给 Notifier（attach），提示条挂在主窗口上。
 启动提示也在这里：数据库迁移结果（三态失败提示、升级成功时旧文件的备份位置）、只读库的
 常驻横幅（同时让监控页禁止开始监控与打点）、数据目录位于同步盘的警告。
 """
@@ -17,7 +19,7 @@ from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import QApplication, QSystemTrayIcon
 from qfluentwidgets import (
-    FluentWindow, NavigationItemPosition, FluentIcon, PushButton
+    FluentWindow, NavigationItemPosition, FluentIcon
 )
 
 from core.shutdown import ShutdownCoordinator
@@ -26,10 +28,16 @@ from ui.pages.analysis_page import AnalysisPage
 from ui.pages.monitor_page import MonitorPage
 from ui.pages.setting_page import SettingPage
 from ui.presenters.monitor_presenter import QUICK_MARKER_OK
-from ui.services import CLOSE_ACTION_CANCEL, CLOSE_ACTION_TRAY, UiServices
+from ui.services import (
+    CLOSE_ACTION_CANCEL, CLOSE_ACTION_TRAY, EVENT_QUICK_MARKER, EVENT_TRAY_HIDDEN,
+    EVENT_UPDATE_AVAILABLE, NoticeAction, UiServices,
+)
 from ui.storage_notices import StorageNotices
 from ui.theme_follow import SystemThemeWatcher
 from ui.tray import TrayController
+from ui.window_state import (
+    PAGE_ANALYSIS, PAGE_MONITOR, PAGE_SETTING, WindowMemory, available_screen_areas, place_window,
+)
 from core.monitor_manager import MonitorManager
 from data.database import Database
 from data.db.schema import SCHEMA_VERSION
@@ -63,12 +71,17 @@ NAV_EXPAND_WIDTH = 150
 
 # 启动提示延迟到窗口显示之后再弹出
 STARTUP_TIP_DELAY_MS = 500
+# 窗口几何 / 当前页变化后等这么久没有新的变化才写入记忆（拖动与缩放过程中不写盘）
+WINDOW_STATE_SAVE_DELAY_MS = 1000
 # 数据目录位于同步盘的提示标题（内容由组合根给出）
 SYNC_DIR_TIP_TITLE = "存储位置风险"
 
 
 class MainWindow(FluentWindow):
     """主窗口类"""
+
+    # 父类构造期间就可能触发 resize / move 事件，此时实例属性还没建好
+    _state_tracking = False
 
     def __init__(self, db: Database, manager: MonitorManager, services: UiServices, *,
                  hotkey: Optional[MarkerHotkey] = None,
@@ -134,11 +147,23 @@ class MainWindow(FluentWindow):
         if dpi_scale is not None and set_dpi_provider is not None:
             set_dpi_provider(dpi_scale)
 
+        # 窗口状态记忆：几何 / 页面变化后防抖写入，真退出时再写一次
+        self._window_memory = getattr(services, 'window_memory', None)
+        self._state_tracking = False
+        self._state_timer = QTimer(self)
+        self._state_timer.setSingleShot(True)
+        self._state_timer.setInterval(WINDOW_STATE_SAVE_DELAY_MS)
+        self._state_timer.timeout.connect(self._save_window_state)
+        self._saved_memory = (self._window_memory.load()
+                              if self._window_memory is not None else WindowMemory())
+
         # 初始化界面
         self._init_window()
         self._init_navigation()
         self._init_tray()
+        self._attach_notifier()
         self._init_hotkey()
+        self._apply_startup_state()
 
         # "跟随系统"主题：系统切换深浅色后界面跟上（只在 AUTO 模式下生效，见 ui.theme_follow）
         self.theme_watcher = SystemThemeWatcher(self).start()
@@ -245,14 +270,16 @@ class MainWindow(FluentWindow):
         # 设置窗口标题（包含版本号）
         self.setWindowTitle(f"{config.APP_NAME} v{config.APP_VERSION}")
 
-        # 设置窗口大小
-        self.resize(config.WINDOW_WIDTH, config.WINDOW_HEIGHT)
+        # 窗口位置与大小：沿用上次记住的（还在某块屏幕上时），否则默认大小居中到主屏
         self.setMinimumSize(config.WINDOW_MIN_WIDTH, config.WINDOW_MIN_HEIGHT)
-
-        # 居中显示
-        desktop = self.screen().geometry()
-        w, h = desktop.width(), desktop.height()
-        self.move(w // 2 - self.width() // 2, h // 2 - self.height() // 2)
+        screens = (self._window_memory.screens() if self._window_memory is not None
+                   else available_screen_areas())
+        x, y, width, height = place_window(
+            self._saved_memory.geometry, screens,
+            (config.WINDOW_MIN_WIDTH, config.WINDOW_MIN_HEIGHT))
+        self.setGeometry(x, y, width, height)
+        if self._saved_memory.maximized:
+            self.setWindowState(self.windowState() | Qt.WindowMaximized)
 
         # 设置窗口背景为透明，让Fluent Design的背景效果生效
         self.setStyleSheet("MainWindow{background: transparent}")
@@ -260,6 +287,7 @@ class MainWindow(FluentWindow):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._sync_navigation_expand(event.oldSize().width(), event.size().width())
+        self._schedule_state_save()
 
     def _sync_navigation_expand(self, old_width: int, new_width: int) -> None:
         """宽度跨过 1200 时展开侧栏（窄于阈值时 qfluentwidgets 自己会收起）。
@@ -301,11 +329,8 @@ class MainWindow(FluentWindow):
         # （不影响已创建任务，只影响下一次新建）
         cfg.default_interval.valueChanged.connect(self.monitor_page.set_default_interval)
 
-        # 监控页的页面间请求由主窗口中转：去分析 / 被测进程异常结束时的托盘提醒 /
-        # 快速打点的结果反馈
+        # 监控页的页面间请求由主窗口中转：去分析 / 快速打点的结果反馈
         self.monitor_page.history_requested.connect(self._show_history_for_task)
-        self.monitor_page.task_ended_abnormally.connect(
-            self._on_task_ended_abnormally)
         self.monitor_page.presenter.quick_marker_feedback.connect(
             self._on_quick_marker_feedback)
 
@@ -316,8 +341,83 @@ class MainWindow(FluentWindow):
         self.addSubInterface(
             self.setting_page, FluentIcon.SETTING, '设置', NavigationItemPosition.BOTTOM)
 
-        # 默认显示监控页面
+        # 默认显示监控页面（启动时 _apply_startup_state 再按记忆调整）
         self.switchTo(self.monitor_page)
+        self.stackedWidget.currentChanged.connect(self._schedule_state_save)
+        self.analysis_page.vm.selection_changed.connect(self._schedule_state_save)
+        self.analysis_page.vm.view_mode_changed.connect(self._schedule_state_save)
+        self.analysis_page.vm.time_mode_changed.connect(self._schedule_state_save)
+        self.analysis_page.toolbar.range_changed.connect(self._schedule_state_save)
+
+    # ========== 通知渠道 ==========
+
+    def _attach_notifier(self) -> None:
+        """把主窗口与托盘交给 Notifier：提示条挂在主窗口上，窗口在后台时改发托盘气泡。
+        替身通知服务没有 attach 时跳过。"""
+        attach = getattr(self.services.notifier, 'attach', None)
+        if attach is None:
+            return
+        preferences = self.services.preferences
+        attach(self, tray=self.tray,
+               background_enabled=lambda: preferences.notify_in_background())
+
+    # ========== 窗口与工作状态记忆 ==========
+
+    def _page_key(self) -> str:
+        current = self.stackedWidget.currentWidget()
+        if current is self.analysis_page:
+            return PAGE_ANALYSIS
+        if current is self.setting_page:
+            return PAGE_SETTING
+        return PAGE_MONITOR
+
+    def _page_for_key(self, key: str):
+        return {PAGE_ANALYSIS: self.analysis_page,
+                PAGE_SETTING: self.setting_page}.get(key, self.monitor_page)
+
+    def _apply_startup_state(self) -> None:
+        """按记忆恢复启动页与分析页状态；有运行中任务时启动页固定为监控页。"""
+        memory = self._saved_memory
+        self.analysis_page.restore_memory(memory.analysis)
+        if self.monitor_manager.has_running_tasks():
+            self.show_monitor_page()
+        else:
+            self.switchTo(self._page_for_key(memory.page))
+        self._state_tracking = self._window_memory is not None
+
+    def show_monitor_page(self) -> None:
+        """切到监控页（续采之后用户第一眼应看到正在跑的任务）。"""
+        self.switchTo(self.monitor_page)
+
+    def current_window_memory(self) -> WindowMemory:
+        """窗口当前状态的快照：最大化 / 最小化 / 全屏时几何取还原后的位置与大小。"""
+        if self.isMaximized() or self.isMinimized() or self.isFullScreen():
+            rect = self.normalGeometry()
+            if rect.width() <= 0 or rect.height() <= 0:   # 还没有还原几何可用
+                rect = self.geometry()
+        else:
+            rect = self.geometry()
+        return WindowMemory(
+            geometry=(rect.x(), rect.y(), rect.width(), rect.height()),
+            maximized=self.isMaximized(), page=self._page_key(),
+            analysis=self.analysis_page.memory_snapshot())
+
+    def _schedule_state_save(self, *_args) -> None:
+        if self._state_tracking:
+            self._state_timer.start()
+
+    def _save_window_state(self) -> None:
+        """写入窗口状态（内容没变时不写盘）；出错只记日志，不影响使用与退出。"""
+        if self._window_memory is None:
+            return
+        try:
+            self._window_memory.save(self.current_window_memory())
+        except Exception:
+            logger.warning("保存窗口状态失败", exc_info=True)
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        self._schedule_state_save()
 
     def attach_watchdog(self, watchdog) -> None:
         """组合根装好界面看门狗后交给主窗口：真退出时先停掉它。"""
@@ -351,13 +451,7 @@ class MainWindow(FluentWindow):
         self.storage_notices = StorageNotices(
             guard, self.services.notifier, self, db_path=getattr(guard, 'db_path', None),
             set_pause_marks=self.monitor_page.presenter.set_space_paused,
-            show_integrity=self.setting_page.show_integrity_warning,
-            tray_message=self._storage_tray_message, parent=self)
-
-    def _storage_tray_message(self, title: str, content: str) -> None:
-        """窗口隐藏在托盘时，补发存储提示的托盘气泡（提示条挂在隐藏的窗口上看不到）"""
-        if self.isHidden() and self._tray_available():
-            self.tray.show_message(title, content, 'warning')
+            show_integrity=self.setting_page.show_integrity_warning, parent=self)
 
     def _stop_storage_guard(self) -> None:
         if self.storage_guard is None:
@@ -398,17 +492,11 @@ class MainWindow(FluentWindow):
         self.quick_marker(task_id or None)
 
     def _on_quick_marker_feedback(self, kind: str, title: str, content: str) -> None:
-        """快速打点的结果：用户此时多半在被测程序里，托盘气泡是不抢焦点的确认方式；
-        没有托盘时退回窗口内提示。"""
-        if self._tray_available():
-            self.tray.show_message(
-                title, content, 'info' if kind == QUICK_MARKER_OK else 'warning')
-            return
-        notifier = self.services.notifier
-        if kind == QUICK_MARKER_OK:
-            notifier.success(self, title, content, duration=2000)
-        else:
-            notifier.warning(self, title, content, duration=3000)
+        """快速打点的结果：用户此时多半在被测程序里，窗口不在前台时由 Notifier 发不抢焦点
+        的托盘气泡；窗口在前台（或没有托盘）时是主窗口上的提示条。同类提示最多叠两条。"""
+        self.services.notifier.route(
+            EVENT_QUICK_MARKER, 'success' if kind == QUICK_MARKER_OK else 'warning',
+            title, content, key=EVENT_QUICK_MARKER, anchor=self)
 
     @property
     def tray_icon(self) -> Optional[QSystemTrayIcon]:
@@ -499,22 +587,14 @@ class MainWindow(FluentWindow):
         self.close()
 
     def _on_update_available_silent(self, info: dict) -> None:
-        """静默检查更新发现新版本：不直接弹出模态对话框打断用户，改为顶部非模态
-        提示+「查看」按钮，点击后切到设置页"关于与更新"并弹出与手动检查一致的
-        确认对话框。
-
-        若此时主窗口处于托盘隐藏态，提示条挂在隐藏窗口上不会被用户看到，
-        需额外补一条托盘气泡。
+        """静默检查更新发现新版本：不直接弹出模态对话框打断用户，改为非模态提示+「查看」
+        按钮，点击后切到设置页"关于与更新"并弹出与手动检查一致的确认对话框。
+        窗口在后台时由 Notifier 改发托盘气泡（气泡没有按钮，用户回到窗口后在设置页查看）。
         """
-        info_bar = self.services.notifier.info(
-            self, f"发现新版本 {info['version']}", "点击查看详情", duration=10000)
-        view_button = PushButton("查看")
-        view_button.clicked.connect(lambda: self._show_update_detail(info))
-        info_bar.addWidget(view_button)
-
-        if self.isHidden() and self._tray_available():
-            self.tray.show_message(
-                f"发现新版本 {info['version']}", "打开主界面查看", 'info')
+        self.services.notifier.route(
+            EVENT_UPDATE_AVAILABLE, 'info', f"发现新版本 {info['version']}", "点击查看详情",
+            action=NoticeAction("查看", lambda: self._show_update_detail(info)),
+            duration=10000, anchor=self)
 
     def _show_update_detail(self, info: dict) -> None:
         """更新提示条「查看」按钮点击：切到设置页"关于与更新"并弹出更新确认对话框"""
@@ -526,14 +606,6 @@ class MainWindow(FluentWindow):
         """监控卡片的"分析"/"查看分析"：切到分析页并选中该任务"""
         self.switchTo(self.analysis_page)
         self.analysis_page.select_task(task_id)
-
-    def _on_task_ended_abnormally(self, title: str, content: str) -> None:
-        """被测进程自行结束（不是用户点停止）：主窗口隐藏或不在前台时补一条托盘气泡
-        （窗口在前台时监控页自身的提示条已足够显眼）。托盘不可用时短路。"""
-        if not self._tray_available():
-            return
-        if self.isHidden() or not self.isActiveWindow():
-            self.tray.show_message(title, content, 'warning')
 
     def _ask_close_action(self) -> str:
         """仍有任务在监控时关闭窗口：询问用户的选择。
@@ -564,8 +636,9 @@ class MainWindow(FluentWindow):
         """隐藏到托盘：不停止任务、不做任何清理，忽略本次关闭事件。"""
         self.hide()
         if not self._tray_tip_shown:  # 每次运行只提示一次，避免反复打扰
-            self.tray.show_message(
-                config.APP_NAME, "已最小化到系统托盘，监控仍在后台运行", 'info')
+            self.services.notifier.route(
+                EVENT_TRAY_HIDDEN, 'info', config.APP_NAME,
+                "已最小化到系统托盘，监控仍在后台运行", anchor=self)
             self._tray_tip_shown = True
         event.ignore()
 
@@ -640,6 +713,9 @@ class MainWindow(FluentWindow):
         # 拆掉了"closeEvent 异常也能退出"的隐性保险丝，退出全靠这里显式调用 quit()；
         # 收尾中途抛异常又不放 finally，事件循环不会退出而窗口已隐藏，用户无从恢复。
         self._shutdown_started = True
+        # 窗口状态在收尾之前存：收尾会隐藏窗口并阻塞界面线程
+        self._state_timer.stop()
+        self._save_window_state()
         # 收尾会阻塞界面线程（最长 30 秒），看门狗不能把它当成卡死
         self._stop_watchdog()
         # 守卫的定时器与在途后台作业也先停（作业的等待交给登记表）

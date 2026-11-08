@@ -34,7 +34,9 @@ from tests.doubles import FakePreferences, RecordingNotifier, ScriptedDialogs
 from tests.factories import make_main_window, make_services
 from tests.helpers import dispose_widget, stop_and_join
 from ui.components.dialogs import CloseActionDialog
-from ui.services import ManagerTaskStatus
+from ui.services import (
+    EVENT_QUICK_MARKER, EVENT_TRAY_HIDDEN, EVENT_UPDATE_AVAILABLE, ManagerTaskStatus,
+)
 from utils.metrics import MetricType
 
 
@@ -241,13 +243,16 @@ def test_close_hides_when_tray_enabled(window, monkeypatch):
     event.ignore.assert_called_once()
     event.accept.assert_not_called()
     assert window._tray_tip_shown is True
-    assert window.tray.messages, "首次隐藏到托盘应弹一次提示气泡"
+    # 首次隐藏到托盘的提示经 Notifier 发出（隐藏后它会改发托盘气泡）
+    tips = [n for n in window.services.notifier.messages() if n.event == EVENT_TRAY_HIDDEN]
+    assert len(tips) == 1
 
     # 首次提示只弹一次：再关闭一次（先还原可见性，模拟用户从托盘还原后再关）
     # 不应重复追加气泡
     window.show()
     window.closeEvent(_fake_event())
-    assert len(window.tray.messages) == 1
+    assert len([n for n in window.services.notifier.messages()
+                if n.event == EVENT_TRAY_HIDDEN]) == 1
 
 
 def test_really_quit_bypasses_tray(window, monkeypatch):
@@ -666,22 +671,6 @@ def test_close_action_dialog_default_is_never_destructive(qapp, can_tray):
         dispose_widget(host)
 
 
-def test_abnormal_end_bubble_only_when_window_not_in_front(window):
-    """异常结束提醒：无托盘时短路；有托盘且窗口隐藏时弹气泡；窗口在前台不重复提醒"""
-    window._on_task_ended_abnormally("标题", "内容")   # 托盘不可用，不应抛错
-
-    window.tray = _FakeTray()
-    window.hide()
-    window._on_task_ended_abnormally("任务已结束", "demo.exe 进程已终止")
-    assert window.tray.messages == [("任务已结束", "demo.exe 进程已终止")]
-
-    window.tray.messages.clear()
-    window.show()
-    window.isActiveWindow = lambda: True
-    window._on_task_ended_abnormally("任务已结束", "x")
-    assert window.tray.messages == []
-
-
 # ========== 退出时经线程登记表收尾后台线程 ==========
 
 class _SlowThread(QThread):
@@ -764,7 +753,9 @@ def test_silent_update_notice_offers_view_button(window, monkeypatch):
 
     notice = window.services.notifier.last("info")
     assert notice.title == "发现新版本 9.9.9" and notice.duration == 10000
-    notice.bar.widgets[0].click()
+    assert notice.event == EVENT_UPDATE_AVAILABLE
+    assert notice.action.text == "查看"
+    notice.action.callback()
     assert window.stackedWidget.currentWidget() is window.setting_page
     assert window.about_group is window.setting_page.about_group
     assert shown == [info]
@@ -843,18 +834,15 @@ def test_navigation_expands_when_crossing_1200(window):
     assert not panel.isCollapsed()
 
 
-def test_quick_marker_feedback_goes_to_tray_balloon(window):
-    tray = _FakeTray()
-    window.tray = tray
-    window.monitor_page.presenter.quick_marker_feedback.emit('ok', "已打点：第 2 轮 16:41:03", "x")
-    window.monitor_page.presenter.quick_marker_feedback.emit('none', "没有可打点的任务", "y")
-    assert tray.messages == [("已打点：第 2 轮 16:41:03", "x"), ("没有可打点的任务", "y")]
-
-
-def test_quick_marker_feedback_without_tray_uses_notice(window):
-    window.monitor_page.presenter.quick_marker_feedback.emit('ok', "已打点：基线 16:41:03", "x")
-    notice = window.services.notifier.last()
-    assert (notice.level, notice.title) == ("success", "已打点：基线 16:41:03")
+def test_quick_marker_feedback_is_routed_as_a_mergeable_notice(window):
+    """渠道（窗口在前台是提示条，后台是托盘气泡）由 Notifier 选；这里只管级别、事件与合并键"""
+    feedback = window.monitor_page.presenter.quick_marker_feedback
+    feedback.emit('ok', "已打点：基线 16:41:03", "x")
+    feedback.emit('none', "没有可打点的任务", "y")
+    ok, none = window.services.notifier.messages()
+    assert (ok.level, ok.title, ok.event) == ("success", "已打点：基线 16:41:03", EVENT_QUICK_MARKER)
+    assert (none.level, none.title) == ("warning", "没有可打点的任务")
+    assert ok.key == none.key == EVENT_QUICK_MARKER
 
 
 def test_tray_marker_request_marks_through_presenter(window, monkeypatch):

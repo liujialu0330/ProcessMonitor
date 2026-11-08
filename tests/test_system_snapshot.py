@@ -451,17 +451,25 @@ def _own_process_query(thread_count_of, seen):
     return query
 
 
+def _real_thread_count() -> int:
+    """真正由 threading 创建的线程数：不算 _DummyThread——别的用例遗留的 Qt 工作线程在收尾时
+    调一下 logging / current_thread 就会给应用多登记一个 Dummy-N，让计数在用例中途变化"""
+    return len([t for t in threading.enumerate() if not isinstance(t, threading._DummyThread)])
+
+
 def test_self_check_starts_idle_thread_when_own_process_has_one_thread():
     """本进程只有一个线程时线程结构步长验证不到：自检临时起空闲线程再查一遍，查完结束它"""
-    baseline = threading.active_count()
+    from tests.helpers import wait_stable
+    wait_stable(_real_thread_count, quiet=0.1, timeout=3.0)   # 让前面用例遗留的线程先收尾
+    baseline = _real_thread_count()
     seen = []
     # 假内核：线程数 = 当前 Python 线程数 - 基线 + 1（主线程算 1 个）
-    query = _own_process_query(lambda: threading.active_count() - baseline + 1, seen)
+    query = _own_process_query(lambda: _real_thread_count() - baseline + 1, seen)
     snapper = NtProcessSnapshotter(query)
     assert snapper.available() is True, snapper.unavailable_reason
     assert seen == [1, 2]
     assert snapper.diagnostics['thread_stride_verified'] is True
-    assert threading.active_count() == baseline
+    assert _real_thread_count() == baseline
     assert not [t for t in threading.enumerate() if t.name == "snapshot-selfcheck-idle"]
 
 

@@ -248,7 +248,32 @@ def test_snapshot_source_same_snapshot_twice_forces_refresh_when_not_before_give
     assert hub.refreshed == 1
 
 
-def test_snapshot_source_falls_back_to_psutil_when_hub_unavailable():
+def _only_own_process(monkeypatch):
+    """psutil.process_iter 只枚举本进程：枚举整机进程在开发机上要好几秒，回退路径的逻辑
+    （按名字筛选、取创建时间、组装观察结果）并不依赖整机枚举"""
+    import os
+    import psutil
+
+    def own_only(attrs=None, ad_value=None):
+        proc = psutil.Process(os.getpid())
+        proc.info = proc.as_dict(attrs or ['pid'])
+        return iter([proc])
+
+    monkeypatch.setattr(psutil, 'process_iter', own_only)
+
+
+def test_snapshot_source_falls_back_to_psutil_when_hub_unavailable(monkeypatch):
+    import os
+    _only_own_process(monkeypatch)
+    source = SnapshotTreeSource(FakeHub(None, available=False), exclude_pids=[])
+    own_name = __import__('psutil').Process(os.getpid()).name()
+    observation = source.observe(GroupSpec.by_name(own_name), [])
+    assert observation.source == 'psutil'
+    assert os.getpid() in {i.pid for i in observation.instances}
+
+
+@pytest.mark.slow   # 枚举整机进程（开发机上 8 秒左右）；快速替身是上面只枚举本进程的同名用例
+def test_snapshot_source_falls_back_to_psutil_over_whole_machine():
     import os
     source = SnapshotTreeSource(FakeHub(None, available=False), exclude_pids=[])
     own_name = __import__('psutil').Process(os.getpid()).name()

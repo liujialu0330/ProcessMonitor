@@ -1,10 +1,11 @@
 """
 设置页面
 
-三个分组：
+四个分组：
 - 常规：应用主题 · 默认采集间隔 · 关闭行为 · 监控期间阻止睡眠 · 打点快捷键
 - 数据：历史数据保留 · 压缩数据库（按保留策略决定是否同时清理过期任务）· 重建分钟汇总 · 数据目录
   · 报告配色（导出的报告图片固定浅色 / 跟随主题）· 诊断信息（复制诊断信息到剪贴板 / 在后台导出 zip 诊断包）
+- 导出：文件命名模板（报告、明细 CSV、证据包的默认文件名，带实时预览）
 - 关于与更新：版本与项目主页 · 检查更新（原"关于"页并入，见 ui/pages/about_update）
 """
 import logging
@@ -21,8 +22,13 @@ from qfluentwidgets import (
     FluentIcon as FIF, setTheme, qconfig, Theme
 )
 
-from app_config import cfg
+from app_config import (
+    DEFAULT_EXPORT_NAME_TEMPLATE, cfg, get_export_name_template, set_export_name_template,
+)
 from core.diagnostics import collect_diagnostics, write_diagnostic_bundle
+from core.naming_template import (
+    available_fields_text, preview_filename, unknown_fields,
+)
 from core.maintenance_service import (
     BUSY_EXPORT_RUNNING, BUSY_MAINTENANCE_RUNNING, BUSY_STORAGE_JOB_RUNNING,
     BUSY_TASKS_RUNNING, MaintenanceBusy, MaintenanceService,
@@ -55,10 +61,24 @@ KEEP_AWAKE_TITLE = "监控期间阻止电脑睡眠"
 KEEP_AWAKE_CONTENT = "有运行中任务时阻止系统因空闲进入睡眠；挡不住合上盖子、手动睡眠与电源按钮"
 AUTOMATION_TITLE = "允许命令行与脚本控制"
 AUTOMATION_CONTENT = "允许 pmctl 与脚本经本机管道开始/停止监控、打点和导出；只对当前用户开放"
+NOTIFY_BACKGROUND_TITLE = "窗口不在前台时用系统通知提醒"
+NOTIFY_BACKGROUND_CONTENT = "最小化、隐藏到托盘或被其他窗口盖住时，任务异常结束、导出完成等提示改发托盘气泡"
 # 报告配色卡片：选项文案与 app_config.REPORT_COLOR_SCHEMES（light / follow）逐一对应
 REPORT_COLOR_TITLE = "报告配色"
 REPORT_COLOR_CONTENT = "导出的报告图片默认用浅色，便于贴进文档与邮件；也可跟随当前界面主题"
 REPORT_COLOR_TEXTS = ("固定浅色", "跟随主题")
+# 导出分组：文件命名模板卡片
+NAME_TEMPLATE_TITLE = "文件命名模板"
+NAME_TEMPLATE_PLACEHOLDER = DEFAULT_EXPORT_NAME_TEMPLATE
+NAME_TEMPLATE_PREVIEW = "预览：{name}"
+NAME_TEMPLATE_UNKNOWN = "未知字段 {fields} 将原样写进文件名；可用字段：{available}"
+NAME_TEMPLATE_RESET_TEXT = "恢复默认"
+NAME_TEMPLATE_TIP = (
+    "报告、明细 CSV 与证据包的默认文件名；空字段连同旁边的分隔符一起省略\n"
+    "{process} 进程名　{build} 文件版本　{scenario} 场景（暂无）　{note} 备注（前 20 字）\n"
+    "{date} 开始时间 YYYYMMDD_HHMM　{kind} 文件类别（报告/明细/证据包）　{pid} 进程 PID")
+NAME_TEMPLATE_CARD_HEIGHT = 70
+NAME_TEMPLATE_WARN_HEIGHT = 92
 # 诊断信息卡片
 DIAGNOSTICS_TITLE = "诊断信息"
 DIAGNOSTICS_CONTENT = "反馈问题时附上：版本与环境、数据库、各任务数据质量、本程序资源占用与最近日志"
@@ -263,7 +283,9 @@ class SettingPage(ScrollArea):
         self.expand_layout = ExpandLayout(self.scroll_widget)
 
         self._init_general_group()
+        self._init_notify_group()
         self._init_data_group()
+        self._init_export_group()
         self.about_group = AboutUpdateGroup(services, self.scroll_widget)
 
         self._init_layout()
@@ -324,6 +346,15 @@ class SettingPage(ScrollArea):
         self.hotkey_card.hBoxLayout.addWidget(self.hotkey_reset_button, 0, Qt.AlignRight)
         self.hotkey_card.hBoxLayout.addSpacing(16)
         self.general_group.addSettingCard(self.hotkey_card)
+
+    def _init_notify_group(self):
+        """通知：窗口不在前台时是否用系统通知提醒"""
+        self.notify_group = SettingCardGroup("通知", self.scroll_widget)
+        # 通知渠道每次发提示时现读该配置项，切换即生效
+        self.notify_background_card = CnSwitchSettingCard(
+            FIF.RINGER, NOTIFY_BACKGROUND_TITLE, NOTIFY_BACKGROUND_CONTENT,
+            configItem=cfg.notify_in_background, parent=self.notify_group)
+        self.notify_group.addSettingCard(self.notify_background_card)
 
     def _init_data_group(self):
         """数据：历史数据保留 · 压缩数据库 · 重建汇总 · 数据目录 · 报告配色 · 诊断信息"""
@@ -386,6 +417,61 @@ class SettingPage(ScrollArea):
         self.diagnostics_card.hBoxLayout.addSpacing(16)
         self.data_group.addSettingCard(self.diagnostics_card)
 
+    def _init_export_group(self) -> None:
+        """导出：文件命名模板（输入框 + 实时预览 + 恢复默认）。预览随输入实时更新，模板在输入
+        完成（回车或失去焦点）时才写入配置，免得键入一半的 {pro 被存下来。"""
+        self.export_group = SettingCardGroup("导出", self.scroll_widget)
+        self.name_template_card = SettingCard(
+            FIF.EDIT, NAME_TEMPLATE_TITLE, "", parent=self.export_group)
+        self.name_template_edit = LineEdit(self.name_template_card)
+        self.name_template_edit.setFixedWidth(340)
+        self.name_template_edit.setPlaceholderText(NAME_TEMPLATE_PLACEHOLDER)
+        self.name_template_edit.setClearButtonEnabled(True)
+        self.name_template_edit.setToolTip(NAME_TEMPLATE_TIP)
+        self.name_template_edit.setText(get_export_name_template())
+        self.name_template_reset_button = PushButton(
+            NAME_TEMPLATE_RESET_TEXT, self.name_template_card)
+        self.name_template_card.hBoxLayout.addWidget(self.name_template_edit, 0, Qt.AlignRight)
+        self.name_template_card.hBoxLayout.addSpacing(8)
+        self.name_template_card.hBoxLayout.addWidget(
+            self.name_template_reset_button, 0, Qt.AlignRight)
+        self.name_template_card.hBoxLayout.addSpacing(16)
+        self.export_group.addSettingCard(self.name_template_card)
+        self.name_template_edit.textChanged.connect(self._refresh_name_template_preview)
+        self.name_template_edit.editingFinished.connect(self._on_name_template_edited)
+        self.name_template_reset_button.clicked.connect(self.reset_name_template)
+        self._refresh_name_template_preview()
+
+    def _refresh_name_template_preview(self, *_args) -> None:
+        """卡片说明行：用示例任务渲染的文件名；模板里有未知字段时再提示一行。"""
+        text = self.name_template_edit.text().strip() or DEFAULT_EXPORT_NAME_TEMPLATE
+        lines = [NAME_TEMPLATE_PREVIEW.format(name=preview_filename(text))]
+        unknown = unknown_fields(text)
+        if unknown:
+            lines.append(NAME_TEMPLATE_UNKNOWN.format(
+                fields="、".join(unknown), available=available_fields_text()))
+        self.name_template_card.setContent("\n".join(lines))
+        self.name_template_card.setFixedHeight(
+            NAME_TEMPLATE_WARN_HEIGHT if unknown else NAME_TEMPLATE_CARD_HEIGHT)
+        # 卡片高度变了：分组要重新量高，否则下一张卡片会压住它或把它截掉
+        self.export_group.adjustSize()
+
+    def _on_name_template_edited(self) -> None:
+        self.apply_name_template(self.name_template_edit.text())
+
+    def apply_name_template(self, text: str) -> str:
+        """把输入的模板写入配置（空白视为恢复默认）并同步输入框；返回实际保存的模板。"""
+        set_export_name_template(text)
+        saved = get_export_name_template()
+        if self.name_template_edit.text() != saved:
+            self.name_template_edit.setText(saved)
+        return saved
+
+    def reset_name_template(self) -> None:
+        """"恢复默认"：输入框与配置都回到默认模板。"""
+        self.name_template_edit.setText(DEFAULT_EXPORT_NAME_TEMPLATE)
+        self.apply_name_template(DEFAULT_EXPORT_NAME_TEMPLATE)
+
     def _init_integrity_card(self) -> None:
         """"数据"分组的第一张卡片：数据库完整性检查未通过时的警告，平时隐藏。
         卡片先加入再隐藏：ExpandLayout 不处理中途插入，显示时只需让分组重新量高。"""
@@ -422,7 +508,9 @@ class SettingPage(ScrollArea):
         self.page_title = PageTitleLabel("设置", self.scroll_widget)
         self.expand_layout.addWidget(self.page_title)
         self.expand_layout.addWidget(self.general_group)
+        self.expand_layout.addWidget(self.notify_group)
         self.expand_layout.addWidget(self.data_group)
+        self.expand_layout.addWidget(self.export_group)
         self.expand_layout.addWidget(self.about_group)
 
         self.setWidget(self.scroll_widget)

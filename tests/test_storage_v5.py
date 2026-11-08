@@ -569,6 +569,9 @@ def _task_metrics(path):
         conn.close()
 
 
+# 六份真实旧库样本逐项对拍，每份 4~6 秒，标 slow（CI 完整集运行）；同一套 _assert_same_results 在默认集里
+# 由 test_history_dataset_queries_match_v4（合成数据集）守住，样本迁移保真由 test_migration_golden 守住
+@pytest.mark.slow
 @pytest.mark.parametrize('sample', [pytest.param(s, id=_ids(s)) for s in SAMPLES])
 def test_golden_queries_match_v4(sample, tmp_path):
     for name in ('v4', 'v5'):

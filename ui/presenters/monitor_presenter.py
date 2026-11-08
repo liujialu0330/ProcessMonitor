@@ -64,7 +64,7 @@ from ui.formatting import (
     restarted_hint_text, stage_snapshot_failed_text, stop_detail_text, truncate_text,
     unavailable_reason_text,
 )
-from ui.services import UiServices
+from ui.services import EVENT_TASK_ABNORMAL, EVENT_TASK_ERROR, UiServices
 from ui.storage_notices import SPACE_PAUSE_REASON
 from ui.widgets.analysis.report_sheet import render_report_for
 from ui.widgets.monitor.new_task_form import TaskRequest, WaitRequest
@@ -212,14 +212,11 @@ class MonitorPresenter(QObject):
 
     信号：
         history_requested(str): 卡片"分析"：请求切到分析页并选中该任务（主窗口处理）
-        task_ended_abnormally(str, str): 被测进程自行结束（不是用户停止）：(标题, 内容)，
-            主窗口不在前台时据此弹托盘气泡
         quick_marker_feedback(str, str, str): 免弹窗打点的结果 (种类, 标题, 内容)，
-            种类见 QUICK_MARKER_*；主窗口据此弹托盘气泡
+            种类见 QUICK_MARKER_*；主窗口据此经 Notifier 提示（窗口在后台时是托盘气泡）
     """
 
     history_requested = pyqtSignal(str)
-    task_ended_abnormally = pyqtSignal(str, str)
     quick_marker_feedback = pyqtSignal(str, str, str)
 
     def __init__(self, manager, services: UiServices, form, board, host: QWidget,
@@ -938,12 +935,12 @@ class MonitorPresenter(QObject):
             # 用户自己点的停止：卡片当场转为已结束，不再弹提示
             return
 
-        # 被测进程崩溃/退出等自行结束：提示要显眼且停留更久，并通知主窗口在后台时补托盘气泡
+        # 被测进程崩溃/退出等自行结束：提示要显眼且停留更久；窗口在后台时 Notifier 改发托盘
+        # 气泡并闪任务栏
         name = entry.display_name if entry is not None else task_id
-        title = "监控任务异常结束"
-        content = f"{name}：{reason_text}"
-        self.services.notifier.warning(self.host, title, content, ABNORMAL_STOP_INFOBAR_MS)
-        self.task_ended_abnormally.emit(title, content)
+        self.services.notifier.route(
+            EVENT_TASK_ABNORMAL, 'warning', "监控任务异常结束", f"{name}：{reason_text}",
+            duration=ABNORMAL_STOP_INFOBAR_MS, key=EVENT_TASK_ABNORMAL, anchor=self.host)
 
     def _exit_code_of(self, task_id: str) -> Optional[int]:
         """被测进程最近一次退出的退出码（任务快照里取，没有或替身管理器不提供为 None）。"""
@@ -1042,7 +1039,8 @@ class MonitorPresenter(QObject):
         key = (task_id, error_msg)
         if key in self._error_bars:
             return
-        bar = self.services.notifier.error(self.host, "错误", error_msg)
+        bar = self.services.notifier.route(
+            EVENT_TASK_ERROR, 'error', "错误", error_msg, anchor=self.host)
         if bar is not None:
             self._error_bars[key] = bar
             bar.closedSignal.connect(lambda k=key: self._error_bars.pop(k, None))

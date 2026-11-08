@@ -22,7 +22,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Un
 from PyQt5.QtCore import QObject, pyqtSignal
 
 import app_config
-from ui.services.notifier import NOTICE_LEVELS, resolve_duration
+from ui.services.notifier import EVENT_GENERIC, NOTICE_LEVELS, NoticeAction, resolve_duration
 from utils.metrics import LEAK_CHECK_PRESET
 
 ProcessEntry = Tuple[int, str, Optional[float]]
@@ -66,10 +66,14 @@ class Notice:
     duration: Optional[int]
     parent: Any
     bar: FakeInfoBar
+    # 经 route 发出时才有的信息：事件名、合并键、操作按钮（便捷写法 info/... 记 EVENT_GENERIC）
+    event: str = EVENT_GENERIC
+    key: Optional[str] = None
+    action: Optional[NoticeAction] = None
 
     @property
     def effective_duration(self) -> int:
-        return resolve_duration(self.level, self.duration)
+        return resolve_duration(self.level, self.duration, self.action is not None)
 
 
 class RecordingNotifier:
@@ -79,10 +83,18 @@ class RecordingNotifier:
         self.notices: List[Notice] = []
 
     def _record(self, level: str, parent, title: str, content: str,
-                duration: Optional[int]) -> FakeInfoBar:
+                duration: Optional[int], **extra: Any) -> FakeInfoBar:
         bar = FakeInfoBar()
-        self.notices.append(Notice(level, title, content, duration, parent, bar))
+        self.notices.append(Notice(level, title, content, duration, parent, bar, **extra))
         return bar
+
+    def route(self, event: str, level: str, title: str, content: str, *,
+              action: Optional[NoticeAction] = None, key: Optional[str] = None,
+              duration: Optional[int] = None, anchor=None) -> FakeInfoBar:
+        if level not in NOTICE_LEVELS:
+            raise ValueError(f"未知的提示级别：{level!r}")
+        return self._record(level, anchor, title, content, duration,
+                            event=event, key=key, action=action)
 
     def info(self, parent, title: str, content: str,
              duration: Optional[int] = None) -> FakeInfoBar:
@@ -122,6 +134,36 @@ class RecordingNotifier:
 
     def clear(self) -> None:
         self.notices.clear()
+
+
+# ---------------------------------------------------------------- 窗口状态记忆
+
+
+class FakeWindowMemory:
+    """内存里的窗口状态记忆：不碰配置文件，屏幕列表（可用区域，主屏在前）由测试指定。
+
+    memory 是"当前已存的状态"，saves 记下每次真的发生了变化的保存（内容相同不记，对应
+    生产实现"没变就不写盘"）。
+    """
+
+    def __init__(self, memory=None, screens=None):
+        from ui.window_state import WindowMemory
+        self.memory = memory if memory is not None else WindowMemory()
+        self.screen_areas = list(screens) if screens is not None else [(0, 0, 1920, 1040)]
+        self.saves: List[Any] = []
+
+    def load(self):
+        return self.memory
+
+    def save(self, memory) -> bool:
+        if memory == self.memory:
+            return False
+        self.memory = memory
+        self.saves.append(memory)
+        return True
+
+    def screens(self):
+        return list(self.screen_areas)
 
 
 # ---------------------------------------------------------------- 对话框
@@ -520,6 +562,12 @@ class FakePreferences:
 
     def retention_options(self) -> List[int]:
         return list(self.retention_choices)
+
+    # 窗口不在前台时是否发托盘气泡：属性可直接改写
+    background_notify = True
+
+    def notify_in_background(self) -> bool:
+        return self.background_notify
 
     # 全局打点快捷键：属性 hotkey 可直接改写；set_marker_hotkey 的历次调用记在 hotkeys_set
     hotkey = "Ctrl+Alt+M"

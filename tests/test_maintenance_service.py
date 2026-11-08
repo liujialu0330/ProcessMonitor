@@ -126,6 +126,32 @@ def test_startup_reconcile_on_real_db(db):
     assert db.get_task("old-40") is None
 
 
+def test_startup_reconcile_purges_markers_of_deleted_tasks(db):
+    """任务已不存在的打点（1.4.1 删任务只删它认识的表）由启动校正清掉，仍存在任务的打点不动；
+    再校正一次无事可做"""
+    now = datetime.now()
+    for task_id in ("keep", "gone"):
+        db.save_task(MonitorTask(task_id=task_id, pid=1, process_name="a.exe",
+                                 metric_types=["memory_rss"], interval=1.0, start_time=now,
+                                 end_time=now + timedelta(minutes=1), status="stopped"))
+        db.markers.add(task_id, now, f"{task_id}-基线", kind='baseline')
+        db.markers.add(task_id, now + timedelta(seconds=30), f"{task_id}-打点")
+    with db._factory.connect() as conn:
+        conn.execute("DELETE FROM tasks WHERE task_id = 'gone'")   # 1.4.1 的删除：附属表留下孤儿行
+        assert conn.execute("SELECT COUNT(*) FROM task_markers WHERE task_id = 'gone'"
+                            ).fetchone()[0] == 2
+
+    MaintenanceService(db, FakeManager()).startup_reconcile(0)
+
+    assert db.markers.list("gone") == []
+    assert [m.label for m in db.markers.list("keep")] == ["keep-基线", "keep-打点"]
+    with db._factory.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM task_markers").fetchone()[0] == 2
+    # 再校正一次：没有新的孤儿，保留的打点原样
+    MaintenanceService(db, FakeManager()).startup_reconcile(0)
+    assert len(db.markers.list("keep")) == 2
+
+
 # ========== cleanup_and_vacuum ==========
 
 def test_cleanup_holds_and_releases_lock(db):

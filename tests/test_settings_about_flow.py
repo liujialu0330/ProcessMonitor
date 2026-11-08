@@ -140,6 +140,30 @@ def test_automation_switch_roundtrips_config(setting, tmp_path):
         item.value = item.defaultValue
 
 
+def test_notification_group_has_the_background_bubble_switch(setting, tmp_path):
+    """"通知"分组："窗口不在前台时用系统通知提醒"开关，默认开，点击写配置并落盘；
+    偏好服务现读该项（Notifier 每次发提示时判断）"""
+    from ui.pages.setting_page import NOTIFY_BACKGROUND_CONTENT, NOTIFY_BACKGROUND_TITLE
+    from ui.services import ConfigPreferences
+
+    config_path = tmp_path / "notify_config.json"
+    qconfig.load(str(config_path), cfg)
+    item = cfg.notify_in_background
+    try:
+        assert setting.notify_group.titleLabel.text() == "通知"
+        card = setting.notify_background_card
+        assert card.parent() is setting.notify_group
+        assert card.titleLabel.text() == NOTIFY_BACKGROUND_TITLE == "窗口不在前台时用系统通知提醒"
+        assert card.contentLabel.text() == NOTIFY_BACKGROUND_CONTENT
+        assert card.isChecked() is True and ConfigPreferences().notify_in_background() is True
+
+        card.switchButton.toggleChecked()
+        assert cfg.get(item) is False and ConfigPreferences().notify_in_background() is False
+        assert '"BackgroundBubble": false' in config_path.read_text(encoding='utf-8')
+    finally:
+        item.value = item.defaultValue
+
+
 # ---------- 数据目录 ----------
 
 def test_open_data_dir_goes_through_dialogs(setting, dialogs, notifier):
@@ -666,8 +690,8 @@ def test_update_downloader_registered_with_cancel(about, monkeypatch):
 def test_three_groups_in_order(setting):
     from qfluentwidgets import SettingCardGroup
     groups = [w for w in setting.scroll_widget.children() if isinstance(w, SettingCardGroup)]
-    assert [g.titleLabel.text() for g in groups] == ["常规", "数据", "关于与更新"]
-    assert setting.about_group is groups[2]
+    assert [g.titleLabel.text() for g in groups] == ["常规", "通知", "数据", "导出", "关于与更新"]
+    assert setting.about_group is groups[-1]
     general = [setting.theme_card, setting.default_interval_card,
                setting.close_to_tray_card, setting.hotkey_card]
     assert all(card.parent() is not None for card in general)

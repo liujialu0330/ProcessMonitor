@@ -179,6 +179,7 @@ def test_held_handle_process_is_not_alive_to_the_snapshot_collector(spawn):
         probe.close()
 
 
+@pytest.mark.slow   # 真实进程 + 真实快照中心，约 1.6 秒；快速覆盖：本文件里线程数为 0 / 句柄已结束的假快照用例与 test_soak_watch
 @pytestmark_win
 @pytest.mark.real_exit_probe
 def test_real_exit_with_snapshot_hub_is_noticed_within_two_cycles(db, spawn, real_exe, started):

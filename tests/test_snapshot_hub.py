@@ -435,7 +435,7 @@ class _TimedCollector(ScriptedCollector):
 
 
 def test_same_interval_workers_sample_together_and_share_snapshots(db, qapp):
-    interval = 0.25
+    interval = 0.2
     source = FakeSnapshotSource(snapshots=[lambda: fake_system_snapshot()])
     hub = SnapshotHub(source)
     workers = []
@@ -448,7 +448,7 @@ def test_same_interval_workers_sample_together_and_share_snapshots(db, qapp):
         workers[0].start()
         time.sleep(0.11)                     # 错开启动
         workers[1].start()
-        time.sleep(2.2)
+        time.sleep(1.5)
     finally:
         for w in workers:
             w.stop()

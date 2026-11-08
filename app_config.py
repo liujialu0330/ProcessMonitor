@@ -88,12 +88,57 @@ class MarkerHotkeyValidator(ConfigValidator):
         return value.strip() if self.validate(value) else DEFAULT_MARKER_HOTKEY
 
 
+# 默认导出命名模板（与 core.naming_template.DEFAULT_TEMPLATE 一致，由测试守护；本模块不依赖业务层）
+DEFAULT_EXPORT_NAME_TEMPLATE = "{process}_{build}_{note}_{date}"
+EXPORT_NAME_TEMPLATE_MAX_LENGTH = 200
+
+
+class ExportNameTemplateValidator(ConfigValidator):
+    """导出命名模板校验器：必须是非空字符串、不超过上限；否则回落到默认模板。"""
+
+    def validate(self, value) -> bool:
+        return (isinstance(value, str) and bool(value.strip())
+                and len(value) <= EXPORT_NAME_TEMPLATE_MAX_LENGTH)
+
+    def correct(self, value) -> str:
+        return value if self.validate(value) else DEFAULT_EXPORT_NAME_TEMPLATE
+
+
+WINDOW_PAGE_KEYS = ["monitor", "analysis", "setting"]
+SHORT_TEXT_MAX_LENGTH = 80
+
+
+class WindowRectValidator(ConfigValidator):
+    """窗口几何（x, y, 宽, 高）校验器：空列表表示没有记录；其余必须是 4 个整数且宽高为正，
+    配置文件被手改成别的形状时按"没有记录"处理。"""
+
+    def validate(self, value) -> bool:
+        if value == []:
+            return True
+        return (isinstance(value, list) and len(value) == 4
+                and all(isinstance(v, int) and not isinstance(v, bool) for v in value)
+                and value[2] > 0 and value[3] > 0)
+
+    def correct(self, value) -> list:
+        return list(value) if self.validate(value) else []
+
+
+class ShortTextValidator(ConfigValidator):
+    """短文本校验器（任务 ID、范围键等标识）：非字符串或过长按空串处理。"""
+
+    def validate(self, value) -> bool:
+        return isinstance(value, str) and len(value) <= SHORT_TEXT_MAX_LENGTH
+
+    def correct(self, value) -> str:
+        return value if self.validate(value) else ""
+
+
 # ========== 配置文件版本 ==========
 
 # config.json 根上的版本号键；没有该键的旧文件视为版本 1
 CONFIG_VERSION_KEY = "config_version"
 LEGACY_CONFIG_VERSION = 1
-CURRENT_CONFIG_VERSION = 2
+CURRENT_CONFIG_VERSION = 3
 
 
 def _migrate_v1_to_v2(data: dict) -> dict:
@@ -108,10 +153,21 @@ def _migrate_v1_to_v2(data: dict) -> dict:
     return dict(data)
 
 
+def _migrate_v2_to_v3(data: dict) -> dict:
+    """2 → 3：内容无变更，只写入版本号。
+
+    v3 新增窗口与工作状态记忆（Window / Analysis 两节）和通知开关（Notification 节）；
+    缺少这些键时读到的就是缺省值（没有窗口记录 = 居中的默认大小与监控页，通知开关默认开），
+    旧文件不需要改写。
+    """
+    return dict(data)
+
+
 # 表驱动迁移：键为源版本，函数把该版本的配置字典变换为"源版本 + 1"（不必写版本号，
 # migrate_config 统一写）。新增版本时在这里加一项并调大 CURRENT_CONFIG_VERSION
 CONFIG_MIGRATIONS: Dict[int, Callable[[dict], dict]] = {
     1: _migrate_v1_to_v2,
+    2: _migrate_v2_to_v3,
 }
 
 
@@ -197,6 +253,28 @@ class AppConfig(QConfig):
     report_color_scheme = OptionsConfigItem(
         "Export", "ReportColorScheme", REPORT_SCHEME_LIGHT,
         OptionsValidator(REPORT_COLOR_SCHEMES))
+
+    # 导出文件命名模板（core.naming_template 的语法）：报告、明细 CSV、证据包的默认文件名；
+    # 清空或写成非字符串时回落到默认模板
+    export_name_template = ConfigItem(
+        "Export", "NameTemplate", DEFAULT_EXPORT_NAME_TEMPLATE, ExportNameTemplateValidator())
+
+    # 窗口不在前台（最小化、隐藏到托盘、被别的窗口盖住）时，是否用托盘气泡（系统通知）提醒
+    notify_in_background = ConfigItem(
+        "Notification", "BackgroundBubble", True, BoolValidator())
+
+    # 窗口与工作状态记忆（正常退出时与几何变化后防抖写入，见 ui/window_state）：
+    # 窗口几何 [x, y, 宽, 高]（最大化时为还原后的位置与大小）、是否最大化、当前页
+    window_geometry = ConfigItem("Window", "Geometry", [], WindowRectValidator())
+    window_maximized = ConfigItem("Window", "Maximized", False, BoolValidator())
+    window_page = OptionsConfigItem(
+        "Window", "Page", WINDOW_PAGE_KEYS[0], OptionsValidator(WINDOW_PAGE_KEYS))
+    # 分析页上次选中的任务、时间范围、视图与时间模式（空串 = 没有记录）；键是否仍有效由
+    # 分析页读取时判断，这里只保证是不太长的字符串
+    analysis_task = ConfigItem("Analysis", "LastTask", "", ShortTextValidator())
+    analysis_range = ConfigItem("Analysis", "Range", "", ShortTextValidator())
+    analysis_view_mode = ConfigItem("Analysis", "ViewMode", "", ShortTextValidator())
+    analysis_time_mode = ConfigItem("Analysis", "TimeMode", "", ShortTextValidator())
 
     def __init__(self):
         super().__init__()
@@ -365,6 +443,33 @@ def get_marker_hotkey() -> str:
 def set_marker_hotkey(text: str) -> None:
     """记录全局打点快捷键；与 set_skipped_version 相同，配置未接管时只改内存值。"""
     qconfig.set(cfg.marker_hotkey, str(text or '').strip(), save=_is_loaded())
+
+
+def get_export_name_template() -> str:
+    """导出文件命名模板（始终非空）"""
+    value = cfg.get(cfg.export_name_template)
+    return value if isinstance(value, str) and value.strip() else DEFAULT_EXPORT_NAME_TEMPLATE
+
+
+def set_export_name_template(text: str) -> None:
+    """记录导出命名模板；与 set_marker_hotkey 相同，配置未接管时只改内存值。"""
+    qconfig.set(cfg.export_name_template, str(text or '').strip(), save=_is_loaded())
+
+
+def update_values(pairs: Iterable[Tuple[ConfigItem, object]]) -> bool:
+    """批量写配置项：只写真的变了的项，且整批只落盘一次（窗口状态一次要写好几项）。
+
+    与 set_skipped_version 相同，配置未被 load_app_config() 接管时只改内存值。
+    返回是否有项目发生变化。
+    """
+    changed = False
+    for item, value in pairs:
+        if cfg.get(item) != value:
+            qconfig.set(item, value, save=False)
+            changed = True
+    if changed and _is_loaded():
+        qconfig.save()
+    return changed
 
 
 def interval_range() -> Tuple[int, int]:

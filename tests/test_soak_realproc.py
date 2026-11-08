@@ -25,7 +25,8 @@ from data.repos.point_repo import PointQuery
 from tests.helpers import poll_until
 
 pytestmark = [pytest.mark.skipif(sys.platform != 'win32', reason="退出码句柄是 Win32 实现"),
-              pytest.mark.real_exit_probe]
+              pytest.mark.real_exit_probe,
+              pytest.mark.slow]   # 真实子进程；快速覆盖：test_soak_watch（假时钟 + 假探针）与 test_exit_forensics（真实探针读真实退出码）
 
 METRIC = 'memory_rss'
 JOIN_MS = 30000

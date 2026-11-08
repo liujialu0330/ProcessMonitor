@@ -33,8 +33,6 @@ class MonitorPage(PageScaffold):
 
     # 请求切换到分析页并选中该任务（由 MainWindow 处理，页面之间不互相引用）
     history_requested = pyqtSignal(str)
-    # 被测进程自行结束（不是用户点停止）：(标题, 内容)。主窗口隐藏/不在前台时据此弹托盘气泡
-    task_ended_abnormally = pyqtSignal(str, str)
 
     def __init__(self, db, manager: MonitorManager, services: UiServices, parent=None, *,
                  hotkey_text: str = ''):
@@ -74,7 +72,6 @@ class MonitorPage(PageScaffold):
 
         self.presenter = MonitorPresenter(manager, services, self.form, self.board, self, self)
         self.presenter.history_requested.connect(self.history_requested)
-        self.presenter.task_ended_abnormally.connect(self.task_ended_abnormally)
         self.summary_label.setText(self.board.summary())
 
         self._shortcuts: List[QShortcut] = []
