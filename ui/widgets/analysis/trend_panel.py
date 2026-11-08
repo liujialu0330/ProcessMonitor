@@ -7,8 +7,8 @@
 - 小倍数：只为判定"持续上涨 / 波动"的指标各建一张小图（compact，不显示轴标题，单位写进
   卡片标题）；平稳、数据不足与不做趋势判定的指标折叠为一行迷你图（指标名 · 当前值 ·
   判定胶囊），点一行即设为焦点、在大图里展开；"全部展开"一次给全部指标建小图。
-  各图共享 X 轴（setXLink 到焦点大图），悬停任一张时其余各图的十字线与读数跟随；
-  列数按宽度 1–2 列；每张图右键发 context_menu_requested（页面弹打点菜单）；
+  各图共享 X 范围（见 _share_x，不用 pyqtgraph 的 setXLink），悬停任一张时其余各图的十字线与读数跟随；
+  列数随档位（wide 3 / regular 2 / compact 1）；每张图右键发 context_menu_requested（页面弹打点菜单）；
 - 叠加 Δ%：各指标中心线相对基线值（无基线时为显示范围首个桶均值）的百分比，替换小倍数区；
   累计量与参考值为 0 的指标不画，在图下方说明。图例放在绘图区外（不压打点徽标）。
 排序与"是否异常"的口径在 ui.viewmodels.history_vm（与摘要表、结论条一致）。
@@ -16,6 +16,7 @@
 from collections import namedtuple
 from typing import Dict, List, Optional, Sequence
 
+import pyqtgraph as pg
 from PyQt5.QtCore import QRectF, Qt, pyqtSignal
 from PyQt5.QtGui import QPainter
 from PyQt5.QtWidgets import (QGridLayout, QHBoxLayout, QLabel, QSizePolicy, QStackedWidget,
@@ -28,6 +29,7 @@ from ui import theme_tokens as tokens
 from ui.chart_theme import series_colors
 from ui.components.sparkline import SparklineWidget
 from ui.formatting import build_summary_row, percent_change
+from ui.layout_breakpoints import REGULAR, small_multiple_columns
 from ui.typography import DataLabel
 from ui.viewmodels.analysis_vm import VIEW_OVERLAY
 from ui.viewmodels.history_vm import is_anomalous
@@ -38,11 +40,10 @@ from ui.widgets.history.chart_view import ChartView, value_axis_title
 from ui.widgets.history.common import CARD_PADDING_H
 from utils.metrics import VALUE_CLASS_RATE, get_metric_display_name, split_member_key
 
-# 焦点大图、小倍数单图的绘图区最小高度；两列布局所需的最小内容宽度
+# 焦点大图、小倍数单图的绘图区最小高度
 FOCUS_CHART_MIN_HEIGHT = 280
 SMALL_CHART_MIN_HEIGHT = 180
 OVERLAY_MIN_HEIGHT = 340
-TWO_COLUMNS_MIN_WIDTH = 900
 GRID_SPACING = 12
 
 # 折叠行：高度、指标名列宽、当前值列宽、迷你图缓冲点数
@@ -333,8 +334,8 @@ class TrendPanel(QWidget):
         self._focus: Optional[str] = None
         self._expanded = False
         self._columns = 1
-        # 最近一次布局的内容宽度：小图数量随展开/切焦点变化时据此重算列数
-        self._content_width = 0
+        # 当前档位允许的最大列数：小图数量随展开/切焦点变化时据此重算列数
+        self._max_columns = small_multiple_columns(REGULAR)
         self._view_mode = 'small'
         self._origin: Optional[float] = None
 
@@ -343,6 +344,9 @@ class TrendPanel(QWidget):
         self.focus_chart.set_chart_min_height(FOCUS_CHART_MIN_HEIGHT)
         self.focus_chart.setVisible(False)
         self._wire_chart(self.focus_chart)
+        # 共享横轴时防止各图互相触发：_share_x 写其他图的范围期间置位
+        self._sharing_x = False
+        self._watch_x(self.focus_chart)
         self.overview = OverviewStrip(self)
         self.overview.region_selected.connect(self.region_selected)
 
@@ -516,16 +520,47 @@ class TrendPanel(QWidget):
         self.folded_panel.set_rows([(m, self._snapshots[m]) for m in folded], self._expanded,
                                    len([m for m in others if m not in self._anomalous]))
         if not keep_view:
-            for chart in self.charts().values():
-                chart.reset_view()
+            self.focus_chart.reset_view()
+            for chart in self._small.values():
+                chart.reset_view(follow_x=True)
 
     def _make_small(self) -> ChartView:
         chart = ChartView(self.grid_host, compact=True)
         chart.set_tools_visible(False)
         chart.set_chart_min_height(SMALL_CHART_MIN_HEIGHT)
         self._wire_chart(chart)
-        chart.chart_widget.setXLink(self.focus_chart.chart_widget)
+        # 小图的横轴只跟随共享范围，不按自己的数据自适应（否则恒定值指标等会把所有图拉走）
+        chart.chart_widget.getPlotItem().vb.disableAutoRange(pg.ViewBox.XAxis)
+        self._watch_x(chart)
+        if self.focus_chart.has_data():
+            vb = chart.chart_widget.getPlotItem().vb
+            vb.setXRange(*self.focus_chart.chart_widget.getPlotItem().vb.viewRange()[0], padding=0)
         return chart
+
+    def _watch_x(self, chart: ChartView) -> None:
+        """任一张图的横向范围变了（用户缩放 / 平移、zoom_to、焦点图自适应）就同步给其余各图。"""
+        vb = chart.chart_widget.getPlotItem().vb
+        vb.sigXRangeChanged.connect(lambda _vb, rng, src=chart: self._share_x(src, rng))
+
+    def _share_x(self, source: ChartView, x_range) -> None:
+        """把 source 的横向范围写给焦点大图与全部小图，使它们显示同一段时间。
+
+        不用 pyqtgraph 的 setXLink：它在两张图的屏幕位置重叠时按屏幕坐标对齐（同一像素比例、
+        错开位置），而不是显示同一范围；各小图宽度、位置都不同，会得到互相错开的时间轴，
+        且小图按自己数据自适应时（恒定值指标的曲线跨度与别的图不同）还会反过来把焦点图拉走。"""
+        if self._sharing_x:
+            return
+        self._sharing_x = True
+        try:
+            low, high = float(x_range[0]), float(x_range[1])
+            for chart in self.charts().values():
+                if chart is source:
+                    continue
+                vb = chart.chart_widget.getPlotItem().vb
+                if tuple(vb.viewRange()[0]) != (low, high):
+                    vb.setXRange(low, high, padding=0)
+        finally:
+            self._sharing_x = False
 
     def _sync_crosshair(self, source: ChartView, x) -> None:
         for chart in self.charts().values():
@@ -555,14 +590,15 @@ class TrendPanel(QWidget):
             return None
         return tuple(self.focus_chart.chart_widget.getPlotItem().vb.viewRange()[0])
 
-    def update_columns(self, content_width: int) -> bool:
-        """按内容宽度定小倍数列数（1–2 列）；列数变了才重排，返回是否重排。"""
-        self._content_width = content_width
+    def set_tier(self, tier: str) -> bool:
+        """按档位定小倍数列数（wide 3 / regular 2 / compact 1）；列数变了才重排，
+        返回是否重排。"""
+        self._max_columns = small_multiple_columns(tier)
         return self._fit_columns()
 
     def _fit_columns(self) -> bool:
-        wide = self._content_width >= TWO_COLUMNS_MIN_WIDTH
-        columns = 2 if wide and len(self._small) > 1 else 1
+        # 小图不足一整行时不留空列：只有 2 张图的 wide 档位也是 2 列
+        columns = max(1, min(self._max_columns, len(self._small)))
         if columns == self._columns:
             return False
         self._columns = columns

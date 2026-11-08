@@ -9,7 +9,7 @@ import os
 import re
 from dataclasses import dataclass
 from datetime import datetime
-from typing import TYPE_CHECKING, List, Optional, Sequence
+from typing import TYPE_CHECKING, List, Mapping, Optional, Sequence
 
 from core.analysis.intervals import mean_round_delta
 from core.analysis.trend import (
@@ -354,6 +354,51 @@ def marker_badge(number: int) -> str:
     if 1 <= number <= _CIRCLED_MAX:
         return chr(0x2460 + number - 1)
     return f"({number})"
+
+
+# ---------- 监控页：打点回显与迷你图刻度 ----------
+
+# 打点回显里列出变化量的指标个数（取任务指标的前几个）
+ECHO_METRIC_LIMIT = 3
+
+
+def marker_echo_text(label: str, metrics: Sequence[str],
+                     current: Optional[Mapping[str, float]],
+                     previous: Optional[Mapping[str, float]], *,
+                     previous_is_baseline: bool = False) -> str:
+    """打点后的即时回显，如 "第 7 轮 · 句柄数 +18 · GDI对象 ±0 · 私有字节 +1.2 MB（较上轮）"。
+
+    变化量 = 本次打点时刻的值 - 上一个打点时刻的值，只列任务的前 ECHO_METRIC_LIMIT 个
+    指标；某个指标本次或上次没有值时跳过它。没有上一个打点（本次是基线）或一个变化量也
+    算不出时只写名称。previous_is_baseline 表示上一个打点是基线，后缀写"较基线"。
+    """
+    parts = []
+    if current is not None and previous is not None:
+        for metric in list(metrics)[:ECHO_METRIC_LIMIT]:
+            if metric in current and metric in previous:
+                parts.append(f"{get_metric_display_name(metric)} "
+                             f"{format_metric_delta(metric, current[metric] - previous[metric])}")
+    if not parts:
+        return label
+    basis = "较基线" if previous_is_baseline else "较上轮"
+    return f"{label} · {' · '.join(parts)}（{basis}）"
+
+
+def marker_tick_text(marker, round_number: Optional[int]) -> str:
+    """迷你图上打点刻度的悬停文字："第 3 轮 · 10:21:05 · 建模 200 次"。
+
+    round_number 是用户打点的序号（基线、系统打点为 None）：基线写"基线"，系统打点直接写
+    它自己的说明。名称就是默认的"基线"/"第 N 轮"时不重复写；自定义名称作为最后一段。
+    """
+    clock = marker.timestamp.strftime("%H:%M:%S")
+    label = str(getattr(marker, "label", "") or "")
+    if marker.kind == 'baseline':
+        head = "基线"
+    elif marker.kind == 'user' and round_number is not None:
+        head = f"第 {round_number} 轮"
+    else:
+        return f"{label} · {clock}"
+    return f"{head} · {clock}" if label in ("", head) else f"{head} · {clock} · {label}"
 
 
 # ---------- 判定摘要表与报告共用：统计依据 ----------

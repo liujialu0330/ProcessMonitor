@@ -65,9 +65,16 @@ class _ClickRunner:
     def __call__(self, dialog) -> bool:
         self.ran += 1
         dialog.show()
-        QTest.qWait(300)  # 淡入动画 200ms
+        # 等淡入动画结束（它收尾时撤掉对话框的透明度特效），不能按固定毫秒数猜：淡入没结束就
+        # 点按钮的话，淡出开始后淡入的收尾回调才触发、把淡出的特效一并撤掉，淡出动画随目标
+        # 销毁而停止、永远不发 finished，对话框就留在屏幕上（机器忙时 300 毫秒不一定够）
+        for _ in range(500):
+            if dialog.graphicsEffect() is None:
+                break
+            QTest.qWait(20)
+        assert dialog.graphicsEffect() is None, "对话框淡入没有结束"
         self.action(dialog, self.seen)
-        for _ in range(50):  # 淡出动画 100ms 后才真正 done()
+        for _ in range(500):  # 淡出动画 100ms 后才真正 done()，条件满足即退出
             if not dialog.isVisible():
                 break
             QTest.qWait(20)

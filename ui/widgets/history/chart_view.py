@@ -510,9 +510,13 @@ class ChartView(CardWidget):
         self.value_axis.set_display_unit('')
         self._redraw()
 
-    def reset_view(self) -> None:
-        """重新自适应范围；数据几乎是平线时把纵向跨度扩到下限。"""
-        self.chart_widget.enableAutoRange()
+    def reset_view(self, follow_x: bool = False) -> None:
+        """重新自适应范围；数据几乎是平线时把纵向跨度扩到下限。follow_x 为真时横轴不自适应
+        （由外部同步，如小倍数图跟随焦点大图），只自适应纵轴。"""
+        if follow_x:
+            self.chart_widget.enableAutoRange(axis='y')
+        else:
+            self.chart_widget.enableAutoRange()
         self._apply_min_y_span()
 
     def _apply_min_y_span(self) -> None:

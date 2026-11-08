@@ -64,8 +64,10 @@ from ui.formatting import (
     restarted_hint_text, stage_snapshot_failed_text, stop_detail_text, truncate_text,
     unavailable_reason_text,
 )
+from ui.presenters.marker_feedback import CardMarkerCommands, MarkerFeedback
 from ui.services import EVENT_TASK_ABNORMAL, EVENT_TASK_ERROR, UiServices
 from ui.storage_notices import SPACE_PAUSE_REASON
+from ui.widgets.analysis.marker_menu import MarkerEditFlow
 from ui.widgets.analysis.report_sheet import render_report_for
 from ui.widgets.monitor.new_task_form import TaskRequest, WaitRequest
 from ui.widgets.monitor.process_picker import (
@@ -109,7 +111,8 @@ LAUNCHED_NOT_MONITORED_TITLE = "程序已启动，但没能开始监控"
 LAUNCHED_NOT_MONITORED_TEXT = "{name}（PID {pid}）已启动，监控任务没能创建；程序仍在运行，请稍后在进程列表里选它"
 LAUNCH_MAINTENANCE_TEXT = "正在清理数据库，请稍后再试"
 
-# 免弹窗打点（托盘菜单 / 全局快捷键）的反馈种类
+# 免弹窗打点（托盘菜单 / 全局快捷键）的反馈种类。成功不走这个信号：回显带"撤销"按钮，
+# 由 Presenter 直接经 Notifier 发出（见 MarkerFeedback）
 QUICK_MARKER_OK = 'ok'
 QUICK_MARKER_NONE = 'none'          # 没有可打点的任务
 QUICK_MARKER_FAILED = 'failed'      # 写库失败
@@ -212,8 +215,9 @@ class MonitorPresenter(QObject):
 
     信号：
         history_requested(str): 卡片"分析"：请求切到分析页并选中该任务（主窗口处理）
-        quick_marker_feedback(str, str, str): 免弹窗打点的结果 (种类, 标题, 内容)，
-            种类见 QUICK_MARKER_*；主窗口据此经 Notifier 提示（窗口在后台时是托盘气泡）
+        quick_marker_feedback(str, str, str): 免弹窗打点没打成的结果 (种类, 标题, 内容)，
+            种类见 QUICK_MARKER_*；主窗口据此经 Notifier 提示（窗口在后台时是托盘气泡）。
+            打点成功的回显（带"撤销"）由 Presenter 自己经 Notifier 发
     """
 
     history_requested = pyqtSignal(str)
@@ -258,6 +262,11 @@ class MonitorPresenter(QObject):
         # 当前显示中的错误提示 {(task_id, 内容): 提示对象}：错误提示不自动消失，
         # 同一任务同一错误重复上报时不再叠加
         self._error_bars: Dict[Tuple[str, str], Any] = {}
+        # 打点回显与撤销；卡片迷你图打点刻度的右键菜单也在这里
+        self._marker_feedback = MarkerFeedback(manager, services, host, self._tasks.get)
+        # 每个任务一个迷你图右键菜单流程：菜单弹出后是非阻塞的，动作触发时流程对象必须还在，
+        # 所以按任务缓存、随卡片一起释放
+        self._marker_flows: Dict[str, MarkerEditFlow] = {}
 
         # 每秒刷新运行中卡片的"已运行"等时间文案（有运行中卡片时才走）
         self._tick_timer = QTimer(self)
@@ -283,6 +292,7 @@ class MonitorPresenter(QObject):
         self.board.pause_requested.connect(self.on_pause)
         self.board.resume_requested.connect(self.on_resume)
         self.board.marker_requested.connect(self.on_marker)
+        self.board.marker_menu_requested.connect(self.on_marker_menu)
         self.board.history_requested.connect(self.history_requested)
         self.board.restart_requested.connect(self.on_restart)
         self.board.close_requested.connect(self.on_close)
@@ -1138,9 +1148,33 @@ class MonitorPresenter(QObject):
         if marker is None:
             self.services.notifier.error(self.host, "打点失败", "未能保存打点，请查看日志")
             return
-        self.services.notifier.success(
-            self.host, "已打点",
-            f"{marker.label} · {marker.timestamp.strftime('%H:%M:%S')}", 2000)
+        self._marker_feedback.announce([(task_id, marker)])
+
+    def undo_last_marker(self) -> None:
+        """撤销最近一次新增的打点（主窗口的 Ctrl+Z）：30 秒内有效，结果经 Notifier 提示。"""
+        self._marker_feedback.undo_last()
+
+    def marker_flow(self, task_id: str) -> MarkerEditFlow:
+        """卡片迷你图打点刻度的右键菜单逻辑：复用分析页的 MarkerEditFlow（重命名 / 删除 /
+        设为基线），写库命令经 CardMarkerCommands 交给 manager。"""
+        flow = self._marker_flows.get(task_id)
+        if flow is None:
+            card = self.board.card(task_id)
+            flow = self._marker_flows[task_id] = MarkerEditFlow(
+                CardMarkerCommands(self.manager, task_id, self._tasks.get(task_id)),
+                self.services, card if card is not None else self.host, parent=self)
+        return flow
+
+    def _drop_marker_flow(self, task_id: str) -> None:
+        flow = self._marker_flows.pop(task_id, None)
+        if flow is not None:
+            flow.deleteLater()
+
+    def on_marker_menu(self, task_id: str, marker, global_pos) -> None:
+        """迷你图上的用户打点 / 基线刻度右键：弹出菜单（系统打点的刻度发不出这个信号）。"""
+        if self._reject_if_read_only():
+            return
+        self.marker_flow(task_id).show_menu(0.0, marker, global_pos, include_add=False)
 
     # ========== 免弹窗打点（托盘菜单 / 全局快捷键） ==========
 
@@ -1149,7 +1183,8 @@ class MonitorPresenter(QObject):
 
         task_id 给出时只打这个任务（托盘子菜单）；为 None 时打全部运行中/已暂停的
         任务（全局快捷键、只有一个任务时的托盘菜单）——同一轮操作对各被测进程是同一个
-        时刻。结果经 quick_marker_feedback 交给主窗口弹托盘气泡。
+        时刻。成功时回显增量并带"撤销"（窗口在后台时是托盘气泡，没有按钮，Ctrl+Z 回到窗口
+        后仍可撤销）；失败与没有可打点的任务经 quick_marker_feedback 交给主窗口提示。
         """
         if self._read_only_reason is not None:
             # 托盘与全局快捷键也不能写只读库（正常情况下只读时本来就没有运行中的任务）
@@ -1167,30 +1202,22 @@ class MonitorPresenter(QObject):
         when = self.services.clock.now()
         added: List[Tuple[_TaskEntry, Any]] = []
         failed: List[_TaskEntry] = []
+        batch = object()    # 这一次操作打的几个点一起撤销
         for tid in ids:
             entry = self._tasks[tid]
             label = self.manager.next_marker_label(tid)
             marker = self.manager.add_marker(
-                tid, label, when, kind=default_marker_kind(label, label))
+                tid, label, when, kind=default_marker_kind(label, label), undo_group=batch)
             if marker is None:
                 failed.append(entry)
             else:
                 added.append((entry, marker))
 
-        clock_text = when.strftime('%H:%M:%S')
         if failed:
             names = "、".join(entry.process_name for entry in failed)
             self.quick_marker_feedback.emit(
                 QUICK_MARKER_FAILED, "打点失败", f"{names}：未能保存打点，请查看日志")
-        if len(added) == 1:
-            entry, marker = added[0]
-            self.quick_marker_feedback.emit(
-                QUICK_MARKER_OK, f"已打点：{marker.label} {clock_text}",
-                entry.identity_text())
-        elif added:
-            self.quick_marker_feedback.emit(
-                QUICK_MARKER_OK, f"已打点：{len(added)} 个任务 {clock_text}",
-                "；".join(f"{entry.process_name}：{marker.label}" for entry, marker in added))
+        self._marker_feedback.announce([(entry.task_id, marker) for entry, marker in added])
         return [marker for _entry, marker in added]
 
     def on_restart(self, task_id: str) -> Optional[str]:
@@ -1250,6 +1277,7 @@ class MonitorPresenter(QObject):
         """从列表移除卡片（历史数据仍保留）。"""
         had_tasks = self._has_items()
         self._tasks.pop(task_id, None)
+        self._drop_marker_flow(task_id)
         self.board.remove_card(task_id)
         self.snapshot_writer.forget(task_id)
         self._sync_counts()
@@ -1263,6 +1291,7 @@ class MonitorPresenter(QObject):
         had_tasks = self._has_items()
         for task_id in finished:
             self._tasks.pop(task_id, None)
+            self._drop_marker_flow(task_id)
             self.board.remove_card(task_id)
             self.snapshot_writer.forget(task_id)
         self._sync_counts()

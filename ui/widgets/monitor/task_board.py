@@ -29,6 +29,7 @@ _FORWARDED = (
     ('pause_requested', 'pause_requested'),
     ('resume_requested', 'resume_requested'),
     ('marker_requested', 'marker_requested'),
+    ('marker_menu_requested', 'marker_menu_requested'),
     ('history_requested', 'history_requested'),
     ('restart_requested', 'restart_requested'),
     ('close_requested', 'close_requested'),
@@ -57,6 +58,7 @@ class TaskBoard(QWidget):
 
     信号（参数均为 task_id）：stop_requested / pause_requested / resume_requested /
     marker_requested / history_requested / restart_requested / close_requested；
+    marker_menu_requested(str, object, object)：迷你图打点刻度右键（任务、打点、全局坐标）；
     clear_finished_requested()：点"清除全部"；
     wait_cancel_requested(str)：占位卡的"取消等待"，参数为等待 ID；
     summary_changed(str)：配额摘要变了。
@@ -66,6 +68,7 @@ class TaskBoard(QWidget):
     pause_requested = pyqtSignal(str)
     resume_requested = pyqtSignal(str)
     marker_requested = pyqtSignal(str)
+    marker_menu_requested = pyqtSignal(str, object, object)
     history_requested = pyqtSignal(str)
     restart_requested = pyqtSignal(str)
     close_requested = pyqtSignal(str)

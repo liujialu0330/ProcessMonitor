@@ -15,6 +15,9 @@
 - 其余指标：持续上涨 / 波动的小倍数图，平稳与数据不足的折叠为一行（点一行设为焦点），
   或叠加 Δ%；右键编辑打点。
 1280×820 窗口首屏能同时看到结论条、摘要表与区间表前 3 行。
+响应式：页面按自身宽度（内容区）分 compact / regular / wide 三档（PageScaffold.breakpoints），
+工具条、结论条、摘要表与小倍数图订阅档位变化各自调整（摘要表的列、小图的列数、范围下拉等），
+页面只在这里把订阅接上，不写宽度判断。
 业务状态与查询在 AnalysisViewModel（异步、多指标并行、过期丢弃）；导出交互在
 AnalysisExportFlow，右键打点编辑在 MarkerEditFlow；页面只把信号接到一起。
 """
@@ -51,7 +54,6 @@ from ui.widgets.analysis.trend_panel import TrendPanel, center_line
 from ui.widgets.analysis.verdict_banner import VerdictBanner
 from ui.widgets.empty_state import EmptyStateCard
 from ui.widgets.history.chart_view import chart_display_unit
-from ui.widgets.history.common import VIEWPORT_TO_CONTENT_OFFSET
 from ui.widgets.page_scaffold import PageScaffold
 from ui.widgets.task_selector import TaskSelector
 from ui.window_state import AnalysisMemory
@@ -91,6 +93,8 @@ class AnalysisPage(PageScaffold):
         # 最近一次拿到分析结果的时刻（结论条的"N 秒前"）
         self._analysis_at = None
         self._init_ui()
+        self.breakpoints.tier_changed.connect(self._apply_tier)
+        self._apply_tier(self.breakpoints.tier)
         self.auto_refresh = HistoryAutoRefresh(self.vm, self._should_skip_refresh, parent=self)
         self.marker_flow = MarkerEditFlow(self.vm, services, self, parent=self)
         self.export_flow = AnalysisExportFlow(
@@ -200,6 +204,13 @@ class AnalysisPage(PageScaffold):
         vm.export_busy.connect(lambda busy: bar.set_export_enabled(not busy))
         vm.error.connect(lambda title, content: self.services.notifier.error(self, title, content))
 
+    def _apply_tier(self, tier: str) -> None:
+        """档位变化：各控件自己决定怎么调整（页面不判断宽度）。"""
+        self.toolbar.set_tier(tier)
+        self.verdict_banner.set_tier(tier)
+        self.summary_table.set_tier(tier)
+        self.trend_panel.set_tier(tier)
+
     # ========== 公开接口 ==========
 
     @property
@@ -218,17 +229,19 @@ class AnalysisPage(PageScaffold):
 
     def memory_snapshot(self) -> AnalysisMemory:
         """要记住的状态：用户亲手选过的任务（默认自动选中的最新任务不记，下次仍自动跟随）、
-        预设时间范围（刷选出的自定义范围是绝对时刻，不记）、视图与时间模式。"""
+        预设时间范围（刷选出的自定义范围是绝对时刻，不记）、视图与时间模式、摘要表用户勾选的列。"""
         vm = self.vm
         task_id = vm.current_task_id if not vm.selection_is_auto else None
         range_key = vm.range_key if vm.range_key != CUSTOM_RANGE_KEY else ""
         return AnalysisMemory(task_id=task_id or "", range_key=range_key,
-                              view_mode=vm.view_mode, time_mode=vm.time_mode)
+                              view_mode=vm.view_mode, time_mode=vm.time_mode,
+                              summary_columns=self.summary_table.user_columns())
 
     def restore_memory(self, memory: AnalysisMemory) -> None:
         """启动时恢复上次的范围、视图与任务（任务在页面第一次显示、载入列表时才选中；
         已被删除就静默退回默认选择）。记录里不认识的取值一律忽略。"""
         vm = self.vm
+        self.summary_table.set_user_columns(memory.summary_columns)
         if memory.range_key in RANGE_KEYS:
             self.toolbar.set_range(memory.range_key)
             vm.set_range(memory.range_key)
@@ -332,7 +345,6 @@ class AnalysisPage(PageScaffold):
         self._analysis_at = self.services.clock.now()
         self.update_refresh_status()
         self.trend_panel.set_relative_origin(self._origin_epoch())
-        self.trend_panel.update_columns(self._content_width())
         self.trend_panel.set_analysis(analysis, keep_view=analysis.auto_refresh,
                                       order=order, focus=focus)
 
@@ -486,15 +498,6 @@ class AnalysisPage(PageScaffold):
         return task_title_text(task)
 
     # ========== 事件 ==========
-
-    def _content_width(self) -> int:
-        return self.viewport().width() - VIEWPORT_TO_CONTENT_OFFSET
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        width = self._content_width()
-        self.toolbar.update_layout(width)
-        self.trend_panel.update_columns(width)
 
     def showEvent(self, event):
         """每次显示都重新载入任务列表，并开始运行中任务的自动刷新计时。"""

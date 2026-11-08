@@ -470,3 +470,29 @@ def test_copy_path_failure_is_reported(env, tmp_path):
     services.dialogs.push('copy_text', OSError("剪贴板被占用"))
     page.export_flow.copy_path_button.click()
     assert services.notifier.last('error').title == "复制失败"
+
+
+def test_export_notices_go_through_route_with_meaningful_events(env, tmp_path):
+    """导出流程的提示都经 Notifier.route：事件名区分成功 / 失败 / 复制，同类用事件名合并。"""
+    from ui.services import (EVENT_COPY_DONE, EVENT_COPY_FAILED, EVENT_EXPORT_BLOCKED,
+                             EVENT_EXPORT_DONE, EVENT_EXPORT_FAILED)
+    page, _task, services = env
+    export_and_wait(page, services, EXPORT_CSV, str(tmp_path / "a.csv"))
+    done = services.notifier.last('success')
+    assert (done.event, done.key) == (EVENT_EXPORT_DONE, EVENT_EXPORT_DONE)
+
+    page.export_flow.copy_path_button.click()
+    copied_notice = services.notifier.last('success')
+    assert (copied_notice.event, copied_notice.key) == (EVENT_COPY_DONE, EVENT_COPY_DONE)
+
+    services.dialogs.push('copy_text', OSError("剪贴板被占用"))
+    page.export_flow.copy_path_button.click()
+    assert services.notifier.last('error').event == EVENT_COPY_FAILED
+
+    page.vm.export_failed.emit("导出失败：磁盘已满")
+    assert services.notifier.last('error').event == EVENT_EXPORT_FAILED
+
+    page.export_flow._warn(NO_DATA, 2000)
+    blocked = services.notifier.last('warning')
+    assert (blocked.event, blocked.key, blocked.duration) == (
+        EVENT_EXPORT_BLOCKED, EVENT_EXPORT_BLOCKED, 2000)

@@ -275,6 +275,8 @@ class AppConfig(QConfig):
     analysis_range = ConfigItem("Analysis", "Range", "", ShortTextValidator())
     analysis_view_mode = ConfigItem("Analysis", "ViewMode", "", ShortTextValidator())
     analysis_time_mode = ConfigItem("Analysis", "TimeMode", "", ShortTextValidator())
+    # 摘要表用户勾选的列（逗号分隔的列键；空串 = 没有勾选过，列随窗口宽度的档位走）
+    analysis_summary_columns = ConfigItem("Analysis", "SummaryColumns", "", ShortTextValidator())
 
     def __init__(self):
         super().__init__()

@@ -5,6 +5,7 @@ FluentWindow 外壳：侧栏 监控 / 分析 / 设置（底部），窗口宽度
 主窗口只做页面之间、页面与托盘/全局快捷键之间的中转，不承担业务流程：
 - 监控卡片"分析"→ 切到分析页并选中该任务；
 - 托盘菜单"打点"、全局快捷键 → 监控页的快速打点，结果经 Notifier 提示（窗口在后台时是托盘气泡）；
+  Ctrl+Z 撤销最近一次打点；
 - 静默检查到新版本 → 非模态提示，"查看"跳到设置页"关于与更新"。
 窗口几何、是否最大化、当前页与分析页的上次状态经 services.window_memory 记忆并在启动时恢复。
 主窗口也是通知的落点：创建后把自己与托盘交给 Notifier（attach），提示条挂在主窗口上。
@@ -16,14 +17,15 @@ import os
 from typing import Any, Callable, List, Optional
 
 from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QIcon
-from PyQt5.QtWidgets import QApplication, QSystemTrayIcon
+from PyQt5.QtGui import QIcon, QKeySequence
+from PyQt5.QtWidgets import QApplication, QShortcut, QSystemTrayIcon
 from qfluentwidgets import (
-    FluentWindow, NavigationItemPosition, FluentIcon
+    FluentWindow, NavigationDisplayMode, NavigationItemPosition, FluentIcon
 )
 
 from core.shutdown import ShutdownCoordinator
 from ui.hotkey import MarkerHotkey
+from ui.layout_breakpoints import COMPACT, LayoutBreakpoints
 from ui.pages.analysis_page import AnalysisPage
 from ui.pages.monitor_page import MonitorPage
 from ui.pages.setting_page import SettingPage
@@ -301,6 +303,16 @@ class MainWindow(FluentWindow):
         if new_width >= NAV_EXPAND_MIN_WIDTH > old_width and panel.isCollapsed():
             panel.expand(useAni=False)
 
+    def _on_layout_tier_changed(self, tier: str) -> None:
+        """进入 compact 档位时把挤占内容区的展开侧栏收成图标栏。窗口窄于 1200 时
+        qfluentwidgets 本来就会收起，这里兜住内容区被手动展开的侧栏挤窄的情形；
+        侧栏以浮层形式展开（MENU 模式）时不占内容区，不动它。"""
+        if tier != COMPACT:
+            return
+        panel = self.navigationInterface.panel
+        if panel.displayMode == NavigationDisplayMode.EXPAND:
+            panel.collapse()
+
     def _init_navigation(self):
         """初始化导航栏和页面"""
         nav = self.navigationInterface
@@ -308,6 +320,10 @@ class MainWindow(FluentWindow):
         # 只有三个一级页面，没有可返回的层级
         nav.setReturnButtonVisible(False)
         nav.setMinimumExpandWidth(NAV_EXPAND_MIN_WIDTH)
+        # 档位按页面区域（侧栏之外）的宽度分；窄档位下侧栏只留图标，把宽度让给内容
+        self.breakpoints = LayoutBreakpoints(self)
+        self.breakpoints.track(self.stackedWidget)
+        self.breakpoints.tier_changed.connect(self._on_layout_tier_changed)
 
         hotkey_text = self.hotkey.active_text() if self.hotkey is not None else ''
         # 创建页面实例：统一注入同一数据库、监控管理器与服务集合
@@ -333,6 +349,12 @@ class MainWindow(FluentWindow):
         self.monitor_page.history_requested.connect(self._show_history_for_task)
         self.monitor_page.presenter.quick_marker_feedback.connect(
             self._on_quick_marker_feedback)
+        # Ctrl+Z 撤销最近一次打点（30 秒内）。窗口内快捷键：文本框获得焦点时 Ctrl+Z 仍归
+        # 文本框自己（它会在 ShortcutOverride 里拿走），对话框是别的窗口也不受影响
+        self.undo_marker_shortcut = QShortcut(QKeySequence("Ctrl+Z"), self)
+        self.undo_marker_shortcut.setContext(Qt.WindowShortcut)
+        self.undo_marker_shortcut.activated.connect(
+            self.monitor_page.presenter.undo_last_marker)
 
         self.addSubInterface(
             self.monitor_page, FluentIcon.SPEED_HIGH, '监控', NavigationItemPosition.TOP)
@@ -348,6 +370,7 @@ class MainWindow(FluentWindow):
         self.analysis_page.vm.view_mode_changed.connect(self._schedule_state_save)
         self.analysis_page.vm.time_mode_changed.connect(self._schedule_state_save)
         self.analysis_page.toolbar.range_changed.connect(self._schedule_state_save)
+        self.analysis_page.summary_table.columns_changed.connect(self._schedule_state_save)
 
     # ========== 通知渠道 ==========
 

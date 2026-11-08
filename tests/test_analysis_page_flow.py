@@ -129,7 +129,7 @@ def test_loads_summary_small_multiples_and_intervals(loaded):
     assert list(charts) == METRICS
     assert all(chart.has_data() for chart in charts.values())
     assert charts[MEM].band_items()                     # min/max 带
-    assert page.trend_panel.columns() == 2
+    assert page.trend_panel.columns() == min(3, len(charts) - 1)   # wide 档 3 列；小图不足一行不留空列
     assert [r[0] for r in page.interval_table.row_texts()] == [
         "开始 → 基线", "基线 → 第 1 轮", "第 1 轮 → 第 2 轮", "第 2 轮 → 结束"]
     assert page.trend_panel.overview.has_data()

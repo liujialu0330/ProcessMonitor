@@ -44,6 +44,66 @@ _BASELINE_WINDOW_SLACK = timedelta(seconds=5)
 # 被测目标元数据探针线程名前缀（日志与排查用）
 TARGET_PROBE_THREAD_PREFIX = "目标元数据探针"
 
+# 打点撤销：新增后多少秒内可以撤销（含基线打点）；最多记住的待撤销打点数
+UNDO_WINDOW_SECONDS = 30
+_UNDO_KEEP = 20
+# 撤销结果：成功 / 已超过时限 / 没有可撤销的打点（含已被删除）/ 写库失败
+UNDO_OK = 'ok'
+UNDO_EXPIRED = 'expired'
+UNDO_NOTHING = 'nothing'
+UNDO_FAILED = 'failed'
+
+
+@dataclass(frozen=True)
+class UndoOutcome:
+    """撤销打点的结果。markers 为这次撤销掉的打点（成功时非空；同一批打点一起撤销）。"""
+    status: str
+    markers: Tuple[Marker, ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        return self.status == UNDO_OK
+
+
+@dataclass
+class _UndoEntry:
+    """一条可撤销的新增打点。demoted_ids 是新增基线时被降为普通打点的旧基线：撤销时
+    要恢复，否则它们会多算一个用户打点，下一个默认名的编号就错了。"""
+    marker: Marker
+    added_at: datetime
+    group: object
+    demoted_ids: Tuple[int, ...] = ()
+
+# 打点撤销：新增后多少秒内可以撤销（含基线打点）；最多记住的待撤销打点数
+UNDO_WINDOW_SECONDS = 30
+_UNDO_KEEP = 20
+# 撤销结果：成功 / 已超过时限 / 没有可撤销的打点（含已被删除）/ 写库失败
+UNDO_OK = 'ok'
+UNDO_EXPIRED = 'expired'
+UNDO_NOTHING = 'nothing'
+UNDO_FAILED = 'failed'
+
+
+@dataclass(frozen=True)
+class UndoOutcome:
+    """撤销打点的结果。markers 为这次撤销掉的打点（成功时非空；同一批打点一起撤销）。"""
+    status: str
+    markers: Tuple[Marker, ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        return self.status == UNDO_OK
+
+
+@dataclass
+class _UndoEntry:
+    """一条可撤销的新增打点。demoted_ids 是新增基线时被降为普通打点的旧基线：撤销时
+    要恢复，否则它们会多算一个用户打点，下一个默认名的编号就错了。"""
+    marker: Marker
+    added_at: datetime
+    group: object
+    demoted_ids: Tuple[int, ...] = ()
+
 
 def round_label(n: int) -> str:
     """第 n 轮的默认打点标签。"""
@@ -207,6 +267,8 @@ class MonitorManager(QObject):
         # 打点 ID -> 所属任务：改名/删除只给 marker_id，发 markers_changed 需要 task_id。
         # 经 add_marker / list_markers 见过的打点都会登记
         self._marker_owner: Dict[int, str] = {}
+        # 最近新增、还可以撤销的打点（按新增先后）
+        self._undo_entries: List[_UndoEntry] = []
 
         self.db = db
 
@@ -801,7 +863,8 @@ class MonitorManager(QObject):
 
     def add_marker(self, task_id: str, label: str,
                    timestamp: Optional[datetime] = None,
-                   kind: str = 'user') -> Optional[Marker]:
+                   kind: str = 'user', undo_group: Optional[object] = None
+                   ) -> Optional[Marker]:
         """
         为任务添加一个打点，成功后发 markers_changed。
 
@@ -812,6 +875,9 @@ class MonitorManager(QObject):
                 取确认时刻会让竖线落在事件之后；为 None 时取当前时间
             kind: 打点类型（MARKER_KINDS）。名称恰为"基线"时一律记为基线；新增基线
                 时同一任务原有的基线降为普通打点（每个任务至多一个基线）
+            undo_group: 用户打点与基线在 UNDO_WINDOW_SECONDS 内可撤销（undo_marker /
+                undo_last_marker）。同一个 undo_group 的打点一起撤销（一次操作给多个任务
+                打点）；None 表示只撤销它自己
 
         Returns:
             Optional[Marker]: 带数据库 ID 的打点；任务不存在、名称为空或写库失败返回 None
@@ -833,12 +899,16 @@ class MonitorManager(QObject):
             logger.error("添加打点失败: task_id=%s", task_id, exc_info=True)
             return None
         self._marker_owner[marker_id] = task_id
+        demoted: List[int] = []
         if kind == 'baseline':
-            self._demote_other_baselines(task_id, keep_id=marker_id)
+            demoted = self._demote_other_baselines(task_id, keep_id=marker_id)
         logger.info("添加打点: task_id=%s marker_id=%s kind=%s", task_id, marker_id, kind)
+        marker = Marker(task_id=task_id, timestamp=timestamp, label=label,
+                        id=marker_id, kind=kind)
+        if kind in ('user', 'baseline'):
+            self._remember_undo(marker, undo_group, tuple(demoted))
         self.markers_changed.emit(task_id)
-        return Marker(task_id=task_id, timestamp=timestamp, label=label,
-                      id=marker_id, kind=kind)
+        return marker
 
     def rename_marker(self, marker_id: int, label: str,
                       task_id: Optional[str] = None) -> bool:
@@ -884,6 +954,7 @@ class MonitorManager(QObject):
             logger.error("删除打点失败: marker_id=%s", marker_id, exc_info=True)
             return False
         if deleted:
+            self._forget_undo(marker_id)
             self._emit_markers_changed_for(marker_id, task_id)
             self._marker_owner.pop(marker_id, None)
         return deleted
@@ -909,6 +980,40 @@ class MonitorManager(QObject):
         self._demote_other_baselines(task_id, keep_id=marker_id, markers=markers)
         self.markers_changed.emit(task_id)
         return True
+
+    def undo_marker(self, marker_id: int) -> UndoOutcome:
+        """撤销刚新增的打点（含同一 undo_group 的其他打点）：从库里删除，成功后发
+        markers_changed。撤销的是基线时，新增它时被降级的旧基线一并恢复，回到撤销前的
+        基线状态；"第 N 轮"的编号随之回退。
+
+        只在新增后 UNDO_WINDOW_SECONDS 秒内有效，超时返回 UNDO_EXPIRED；打点不在待撤销
+        列表里（从未登记、已撤销或已被删除）返回 UNDO_NOTHING。
+        """
+        entry = next((e for e in self._undo_entries if e.marker.id == marker_id), None)
+        if entry is None:
+            return UndoOutcome(UNDO_NOTHING)
+        return self._undo_group(entry)
+
+    def undo_last_marker(self) -> UndoOutcome:
+        """撤销最近一次新增的打点（Ctrl+Z）；结果含义同 undo_marker。"""
+        if not self._undo_entries:
+            return UndoOutcome(UNDO_NOTHING)
+        return self._undo_group(self._undo_entries[-1])
+
+    def sample_values_at(self, task_id: str, metrics: Sequence[str],
+                         when: datetime) -> Dict[str, float]:
+        """各指标在 when 时刻（含）之前最近一个样本的值；没有样本的指标不在结果里，
+        读库失败返回空字典。采集每周期落库，刚发生的时刻也读得到。"""
+        values: Dict[str, float] = {}
+        try:
+            for metric in metrics:
+                points = self.db.points.fetch(PointQuery(task_id, metric, until=when, limit=1))
+                if points:
+                    values[metric] = points[-1].value
+        except StorageError:
+            logger.error("读取打点时刻的指标值失败: task_id=%s", task_id, exc_info=True)
+            return {}
+        return values
 
     def list_markers(self, task_id: str) -> List[Marker]:
         """任务的全部打点（含系统打点，按时间升序）；读库失败返回空列表。"""
@@ -989,17 +1094,76 @@ class MonitorManager(QObject):
         return BaselineSamples(marker=baseline, samples=samples, settled=settled)
 
     def _demote_other_baselines(self, task_id: str, keep_id: int,
-                                markers: Optional[List[Marker]] = None) -> None:
-        """把除 keep_id 外的基线降为普通打点（每个任务至多一个基线）。失败只记日志：
-        get_baseline 在残留多个基线时取最后添加的，结论不会乱。"""
+                                markers: Optional[List[Marker]] = None) -> List[int]:
+        """把除 keep_id 外的基线降为普通打点（每个任务至多一个基线），返回降级成功的打点 ID。
+        失败只记日志：get_baseline 在残留多个基线时取最后添加的，结论不会乱。"""
         if markers is None:
             markers = self.list_markers(task_id)
+        demoted: List[int] = []
         for marker in markers:
             if marker.kind == 'baseline' and marker.id != keep_id:
                 try:
                     self.db.markers.set_kind(marker.id, 'user')
                 except StorageError:
                     logger.error("旧基线降级失败: marker_id=%s", marker.id, exc_info=True)
+                else:
+                    demoted.append(marker.id)
+        return demoted
+
+    # ---------- 撤销登记 ----------
+
+    def _remember_undo(self, marker: Marker, group: Optional[object],
+                       demoted_ids: Tuple[int, ...]) -> None:
+        now = self._clock.now()
+        window = timedelta(seconds=UNDO_WINDOW_SECONDS)
+        self._undo_entries = [e for e in self._undo_entries if now - e.added_at <= window]
+        self._undo_entries.append(_UndoEntry(
+            marker, now, group if group is not None else object(), demoted_ids))
+        del self._undo_entries[:-_UNDO_KEEP]
+
+    def _forget_undo(self, marker_id: int) -> None:
+        self._undo_entries = [e for e in self._undo_entries if e.marker.id != marker_id]
+
+    def _undo_group(self, anchor: _UndoEntry) -> UndoOutcome:
+        age = (self._clock.now() - anchor.added_at).total_seconds()
+        if age > UNDO_WINDOW_SECONDS:
+            # 过期的不再保留；更早登记的只会更旧
+            self._undo_entries = [e for e in self._undo_entries
+                                  if e.added_at > anchor.added_at]
+            return UndoOutcome(UNDO_EXPIRED)
+        group = [e for e in self._undo_entries if e.group is anchor.group]
+        undone: List[Marker] = []
+        failed = False
+        for entry in reversed(group):
+            try:
+                if self.db.markers.delete(entry.marker.id):
+                    undone.append(entry.marker)
+                    self._restore_baselines(entry)
+            except StorageError:
+                logger.error("撤销打点失败: marker_id=%s", entry.marker.id, exc_info=True)
+                failed = True
+                continue
+            self._undo_entries.remove(entry)
+            self._marker_owner.pop(entry.marker.id, None)
+        for task_id in dict.fromkeys(m.task_id for m in undone):
+            self.markers_changed.emit(task_id)
+        if undone:
+            logger.info("撤销打点: %s", [m.id for m in undone])
+            return UndoOutcome(UNDO_OK, tuple(reversed(undone)))
+        return UndoOutcome(UNDO_FAILED if failed else UNDO_NOTHING)
+
+    def _restore_baselines(self, entry: _UndoEntry) -> None:
+        """撤销一条基线打点：它新增时降级的旧基线恢复为基线。撤销之前用户已另设了基线
+        时不动，免得出现两个基线。"""
+        if entry.marker.kind != 'baseline' or not entry.demoted_ids:
+            return
+        if self.get_baseline(entry.marker.task_id) is not None:
+            return
+        for marker_id in entry.demoted_ids:
+            try:
+                self.db.markers.set_kind(marker_id, 'baseline')
+            except StorageError:
+                logger.error("恢复旧基线失败: marker_id=%s", marker_id, exc_info=True)
 
     def _emit_markers_changed_for(self, marker_id: int, task_id: Optional[str]) -> None:
         owner = self._marker_owner.get(marker_id, task_id)

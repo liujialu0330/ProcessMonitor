@@ -17,7 +17,10 @@ from PyQt5.QtWidgets import QWidget
 
 from core.automation.plan import AutomationPlan
 from core.contracts import StopReason, TaskInfo, TaskStatus, UnavailableReason
-from core.monitor_manager import BASELINE_LABEL, BaselineSamples, round_label
+from core.monitor_manager import (
+    BASELINE_LABEL, UNDO_EXPIRED, UNDO_FAILED, UNDO_NOTHING, UNDO_OK, BaselineSamples,
+    UndoOutcome, round_label,
+)
 from core.process_launcher import LaunchSpec
 from core.report_worker import ReportResult, ReportWorker
 from data.errors import StorageError
@@ -29,7 +32,7 @@ from ui.presenters.monitor_presenter import (
     MonitorPresenter, resolve_error_text,
 )
 from ui.formatting import plan_summary
-from ui.services import EVENT_TASK_ABNORMAL
+from ui.services import EVENT_MARKER_ADDED, EVENT_MARKER_UNDONE, EVENT_TASK_ABNORMAL
 from ui.widgets.monitor.new_task_form import TaskRequest, WaitRequest
 from ui.widgets.monitor.process_picker import (
     ERROR_EMPTY, ERROR_NO_MATCH, ERROR_NOT_A_NUMBER, ERROR_NOT_FOUND, ResolveError,
@@ -75,6 +78,10 @@ class FakeManager(QObject):
         self.pause_result = True
         self.resume_result = True
         self.marker_ok = True
+        # 撤销与打点时刻取值：Presenter 只转发，规则由 test_marker_undo 覆盖
+        self.undo_groups: list = []
+        self.samples: Dict[tuple, Dict[str, float]] = {}    # (task_id, 时刻) -> {指标: 值}
+        self.undo_results: list = []
         self.paused_ids = set()
         self.maintenance = False
         self.exports = 0
@@ -140,8 +147,9 @@ class FakeManager(QObject):
         self.infos.pop(task_id, None)
         return True
 
-    def add_marker(self, task_id, label, timestamp=None, kind='user'):
+    def add_marker(self, task_id, label, timestamp=None, kind='user', undo_group=None):
         self.commands.append(("marker", task_id, label, timestamp, kind))
+        self.undo_groups.append(undo_group)
         if not self.marker_ok:
             return None
         markers = self.markers.setdefault(task_id, [])
@@ -157,6 +165,18 @@ class FakeManager(QObject):
 
     def list_markers(self, task_id):
         return list(self.markers.get(task_id, []))
+
+    def sample_values_at(self, task_id, metrics, when):
+        values = self.samples.get((task_id, when), {})
+        return {m: values[m] for m in metrics if m in values}
+
+    def undo_last_marker(self):
+        self.commands.append(("undo_last",))
+        return self.undo_results.pop(0)
+
+    def undo_marker(self, marker_id):
+        self.commands.append(("undo", marker_id))
+        return self.undo_results.pop(0)
 
     def get_baseline(self, task_id, markers=None):
         markers = self.list_markers(task_id) if markers is None else markers
@@ -229,6 +249,7 @@ class FakeBoard(QObject):
     pause_requested = pyqtSignal(str)
     resume_requested = pyqtSignal(str)
     marker_requested = pyqtSignal(str)
+    marker_menu_requested = pyqtSignal(str, object, object)
     history_requested = pyqtSignal(str)
     restart_requested = pyqtSignal(str)
     close_requested = pyqtSignal(str)
@@ -723,7 +744,7 @@ def test_marker_time_is_click_time_not_confirm_time(presenter, manager, board, s
     assert _marker_commands(manager)[-1] == (task_id, "开始第 3 轮", clicked, "baseline")
     assert services.dialogs.last_call("ask_marker_label")["timestamp"] == clicked
     assert services.clock.now() == clicked + timedelta(seconds=12)
-    assert "10:00:00" in services.notifier.last("success").content
+    assert services.notifier.last("success").event == EVENT_MARKER_ADDED
 
 
 # ---------------------------------------------------------------- 卡片基线
@@ -1023,13 +1044,17 @@ def test_quick_marker_single_task_uses_default_label_and_now(presenter, manager,
 
     assert [(m.label, m.kind) for m in markers] == [(BASELINE_LABEL, "baseline")]
     assert ("marker", task_id, BASELINE_LABEL, DEFAULT_FAKE_NOW, "baseline") in manager.commands
-    clock = DEFAULT_FAKE_NOW.strftime("%H:%M:%S")
-    assert received == [(QUICK_MARKER_OK, f"已打点：基线 {clock}", "demo.exe · PID 1001")]
+    # 成功的回显不走 quick_marker_feedback，而是带"撤销"的提示
+    assert received == []
+    notice = presenter.services.notifier.last("success")
+    assert (notice.event, notice.title, notice.content) == (
+        EVENT_MARKER_ADDED, "已打点 · demo.exe", BASELINE_LABEL)
+    assert notice.action.text == "撤销"
     # 不弹任何对话框
     assert presenter.services.dialogs.methods_called() == []
 
     presenter.quick_marker()
-    assert received[-1][1] == f"已打点：第 1 轮 {clock}"
+    assert presenter.services.notifier.last("success").content.startswith("第 1 轮")
 
 
 def test_quick_marker_all_tasks_share_one_moment(presenter, manager):
@@ -1041,8 +1066,12 @@ def test_quick_marker_all_tasks_share_one_moment(presenter, manager):
 
     assert {m.task_id for m in markers} == {first, second}
     assert {m.timestamp for m in markers} == {DEFAULT_FAKE_NOW}
-    assert received[-1][0] == QUICK_MARKER_OK
-    assert received[-1][1].startswith("已打点：2 个任务")
+    assert received == []
+    notice = presenter.services.notifier.last("success")
+    assert notice.title == "已打点：2 个任务"
+    assert "demo.exe：基线" in notice.content and "beta.exe：基线" in notice.content
+    # 一次操作打的几个点属于同一个撤销组
+    assert len(set(manager.undo_groups)) == 1 and manager.undo_groups[0] is not None
 
 
 def test_quick_marker_one_task_from_tray_submenu(presenter, manager):
@@ -1636,3 +1665,138 @@ def test_browse_snapshot_dir_goes_through_dialogs(snap_presenter, services, form
 def test_default_snapshot_writer_renders_with_report_sheet(presenter):
     from ui.widgets.analysis.report_sheet import render_report_for
     assert presenter.snapshot_writer._renderer is render_report_for
+
+
+# ---------------------------------------------------------------- 打点回显与撤销
+
+T_BASE = DEFAULT_FAKE_NOW
+T_NEXT = T_BASE + timedelta(seconds=60)
+FOUR_METRICS = (MetricType.MEMORY_PRIVATE, MetricType.NUM_GDI_OBJECTS, MetricType.NUM_HANDLES,
+                MetricType.NUM_THREADS)
+
+
+def _mark(presenter, board, manager, services, task_id, label, when, samples=None):
+    """弹窗打点一次：时钟拨到 when，manager 在该时刻的样本为 samples。"""
+    services.clock.set(when)
+    if samples is not None:
+        manager.samples[(task_id, when)] = samples
+    services.dialogs.push("ask_marker_label", label)
+    board.marker_requested.emit(task_id)
+    return services.notifier.last("success")
+
+
+def test_echo_shows_increments_against_the_previous_marker_with_undo(
+        presenter, manager, board, services):
+    task_id = _add_task(manager)
+    first = _mark(presenter, board, manager, services, task_id, "基线", T_BASE, {
+        MetricType.MEMORY_PRIVATE: 100000.0, MetricType.NUM_GDI_OBJECTS: 10})
+    # 第一个打点就是基线：没有参照，只写名称
+    assert first.content == "基线" and first.title == "已打点 · demo.exe"
+
+    second = _mark(presenter, board, manager, services, task_id, "第 1 轮", T_NEXT, {
+        MetricType.MEMORY_PRIVATE: 101229.0, MetricType.NUM_GDI_OBJECTS: 28})
+    assert second.content == "第 1 轮 · 私有字节 +1.2 MB · GDI对象数 +18 个（较基线）"
+    assert (second.event, second.key, second.level) == (
+        EVENT_MARKER_ADDED, EVENT_MARKER_ADDED, "success")
+    assert second.action.text == "撤销"
+
+    third = _mark(presenter, board, manager, services, task_id, "第 2 轮",
+                  T_NEXT + timedelta(seconds=60), {
+                      MetricType.MEMORY_PRIVATE: 101229.0, MetricType.NUM_GDI_OBJECTS: 25})
+    # 参照换成上一轮；没变化写 ±0，减少写负号
+    assert third.content == "第 2 轮 · 私有字节 ±0 · GDI对象数 -3 个（较上轮）"
+
+
+def test_echo_uses_only_the_first_three_metrics_and_skips_missing_values(
+        presenter, manager, board, services):
+    task_id = _add_task(manager, metrics=FOUR_METRICS)
+    _mark(presenter, board, manager, services, task_id, "基线", T_BASE, {
+        MetricType.MEMORY_PRIVATE: 100000.0, MetricType.NUM_HANDLES: 100,
+        MetricType.NUM_THREADS: 10})
+    notice = _mark(presenter, board, manager, services, task_id, "第 1 轮", T_NEXT, {
+        MetricType.MEMORY_PRIVATE: 100000.0, MetricType.NUM_GDI_OBJECTS: 7,
+        MetricType.NUM_HANDLES: 118, MetricType.NUM_THREADS: 99})
+    # GDI 在基线时刻没有值：跳过它；第 4 个指标（线程数）不列
+    assert notice.content == "第 1 轮 · 私有字节 ±0 · 句柄数 +18 个（较基线）"
+
+
+def test_echo_without_any_value_is_just_the_label(presenter, manager, board, services):
+    task_id = _add_task(manager)
+    _mark(presenter, board, manager, services, task_id, "基线", T_BASE)
+    notice = _mark(presenter, board, manager, services, task_id, "第 1 轮", T_NEXT)
+    assert notice.content == "第 1 轮"
+
+
+def test_echo_compares_with_the_nearest_earlier_round_not_the_baseline(
+        presenter, manager, board, services):
+    task_id = _add_task(manager)
+    values = {MetricType.NUM_GDI_OBJECTS: 5}
+    _mark(presenter, board, manager, services, task_id, "基线", T_BASE, values)
+    _mark(presenter, board, manager, services, task_id, "第 1 轮", T_NEXT,
+          {MetricType.NUM_GDI_OBJECTS: 9})
+    notice = _mark(presenter, board, manager, services, task_id, "第 2 轮",
+                   T_NEXT + timedelta(seconds=30), {MetricType.NUM_GDI_OBJECTS: 12})
+    assert notice.content.endswith("GDI对象数 +3 个（较上轮）")
+
+
+def test_echo_undo_button_undoes_the_marker_and_closes_the_notice(
+        presenter, manager, board, services):
+    task_id = _add_task(manager)
+    notice = _mark(presenter, board, manager, services, task_id, "基线", T_BASE)
+    marker_id = manager.list_markers(task_id)[0].id
+    manager.undo_results.append(UndoOutcome(UNDO_OK, tuple(manager.list_markers(task_id))))
+
+    notice.action.callback()
+
+    assert ("undo", marker_id) in manager.commands
+    assert notice.bar.closed
+    undone = services.notifier.last("success")
+    assert (undone.event, undone.title, undone.content) == (
+        EVENT_MARKER_UNDONE, "已撤销打点", "基线（demo.exe）")
+
+
+def test_undo_button_after_the_time_limit_says_so(presenter, manager, board, services):
+    task_id = _add_task(manager)
+    notice = _mark(presenter, board, manager, services, task_id, "基线", T_BASE)
+    manager.undo_results.append(UndoOutcome(UNDO_EXPIRED))
+
+    notice.action.callback()
+
+    warned = services.notifier.last("warning")
+    assert warned.content == "已超过 30 秒，无法撤销" and warned.event == EVENT_MARKER_UNDONE
+    assert notice.bar.closed
+
+
+@pytest.mark.parametrize("outcome, level, text", [
+    (UndoOutcome(UNDO_NOTHING), "info", "只能撤销最近 30 秒内新增的打点"),
+    (UndoOutcome(UNDO_EXPIRED), "warning", "已超过 30 秒，无法撤销"),
+    (UndoOutcome(UNDO_FAILED), "error", "未能撤销打点，请查看日志"),
+])
+def test_undo_last_marker_reports_every_outcome(presenter, manager, services,
+                                                 outcome, level, text):
+    manager.undo_results.append(outcome)
+    presenter.undo_last_marker()
+    assert manager.commands[-1] == ("undo_last",)
+    assert services.notifier.last(level).content == text
+
+
+def test_undo_last_marker_success_names_what_was_undone(presenter, manager, services):
+    task_id = _add_task(manager)
+    marker = Marker(task_id, T_BASE, "第 3 轮", 5, "user")
+    manager.undo_results.append(UndoOutcome(UNDO_OK, (marker,)))
+    presenter.undo_last_marker()
+    assert services.notifier.last("success").content == "第 3 轮（demo.exe）"
+
+
+def test_quick_marker_undo_button_undoes_the_whole_batch(presenter, manager, services):
+    first = _add_task(manager, pid=1001)
+    _add_task(manager, pid=1002, name="beta.exe")
+    presenter.quick_marker()
+    notice = services.notifier.last("success")
+    marker_id = manager.list_markers(first)[0].id
+    manager.undo_results.append(UndoOutcome(UNDO_NOTHING))
+
+    notice.action.callback()
+
+    assert [c for c in manager.commands if c[0] == "undo"] == [("undo", marker_id)]
+    assert len(set(manager.undo_groups)) == 1

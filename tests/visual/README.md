@@ -39,6 +39,7 @@ python -m pytest tests/visual --visual --visual-out D:\tmp\shots
 | `monitor_light.png` / `monitor_dark.png` | 主窗口 · 监控页（空任务引导、新建表单） |
 | `analysis_light.png` / `analysis_dark.png` | 主窗口 · 分析页（一条已结束任务：基线 + 2 轮打点，3 个指标共 300 点） |
 | `setting_light.png` / `setting_dark.png` | 主窗口 · 设置页（快捷键为假后端“已启用”） |
+| `e1_{monitor,analysis,analysis_group,analysis_member,analysis_full}_{800,1000,1280,1920}_{light,dark}.png` | 响应式布局四档宽度（800 宽高 700，其余高 820；`full` 为拉高到 2000 的整页长图，小倍数图全部展开）：监控页、分析页（普通任务、进程组任务及其成员视图），见 `test_responsive_layout.py` |
 
 均为 1280×820。用例断言：PNG 存在、尺寸正确、浅深两张像素差异 > 1%、深色整图平均亮度 < 100、浅色 > 170。
 画得好不好（对比度、裁切、重叠）仍需人看。

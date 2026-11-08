@@ -14,6 +14,7 @@ from qfluentwidgets import Theme, qconfig
 from core.history_query import build_request, run_history_query
 from data.models import DataPoint, MonitorTask
 from ui.formatting import SUMMARY_COLUMNS, build_summary_row, percent_change
+from ui.layout_breakpoints import WIDE
 from ui.widgets.analysis.summary_table import (
     H_SCROLLBAR_SPACE, USAGE_COLUMN, VERDICT_COLUMN, SummaryTable)
 from utils.metrics import MetricType
@@ -88,6 +89,7 @@ def table(qapp, db):
         build_summary_row(GDI, _snapshot(db, GDI, 11, lambda i: 300.0)),
     ]
     widget = SummaryTable()
+    widget.set_tier(WIDE)   # 全部列；各档位的列取舍见 tests/test_responsive_layout.py
     widget.set_rows(rows, "21分钟 · 1,200 点", focus=MEM)
     yield widget
     widget.close()

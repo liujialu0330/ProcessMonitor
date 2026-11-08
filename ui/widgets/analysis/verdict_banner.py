@@ -7,16 +7,18 @@
 （"自动刷新 · 15 秒前"）；最右是"复制结论 ▾"（纯文本 / Markdown），只发 copy_requested，
 复制什么由 AnalysisExportFlow 取当前显示的结论与摘要表。文案由 ui.formatting.verdict_summary /
 basis_text / refresh_status_text 生成，控件只负责摆放与配色。
+compact 档位（ui.layout_breakpoints）下统计依据、刷新状态与"复制结论"挪到第二行，主句才不会被挤成省略号。
 """
 from typing import Optional
 
 from PyQt5.QtCore import Qt, pyqtSignal
-from PyQt5.QtWidgets import QHBoxLayout, QLabel, QSizePolicy
+from PyQt5.QtWidgets import QHBoxLayout, QLabel, QSizePolicy, QVBoxLayout
 from qfluentwidgets import (Action, BodyLabel, CaptionLabel, CardWidget, FluentIcon,
                             RoundMenu, TransparentDropDownPushButton, qconfig)
 
 from core.conclusion_text import FORMAT_LABELS, FORMAT_MARKDOWN, FORMAT_TEXT
 from ui.formatting import VerdictSummary
+from ui.layout_breakpoints import COMPACT
 from ui.widgets.analysis.summary_table import pill_style
 from ui.widgets.history.common import CARD_PADDING_H
 
@@ -57,16 +59,49 @@ class VerdictBanner(CardWidget):
             self.copy_actions[fmt] = action
         self.copy_button.setMenu(self.copy_menu)
 
-        layout = QHBoxLayout(self)
+        self._compact = False
+        # 第一行：胶囊 · 主句 · [依据 · 刷新状态] · 复制；compact 档位依据与刷新状态改放第二行
+        self._main_row = QHBoxLayout()
+        self._main_row.setSpacing(12)
+        self._main_row.addWidget(self.pill)
+        self._main_row.addWidget(self.sentence_label, 1)
+        self._main_row.addWidget(self.basis_label)
+        self._main_row.addWidget(self.refresh_label)
+        self._main_row.addWidget(self.copy_button)
+        self._detail_row = QHBoxLayout()
+        self._detail_row.setSpacing(0)
+        layout = QVBoxLayout(self)
         layout.setContentsMargins(CARD_PADDING_H, BANNER_PADDING_V,
                                   CARD_PADDING_H, BANNER_PADDING_V)
-        layout.setSpacing(12)
-        layout.addWidget(self.pill)
-        layout.addWidget(self.sentence_label, 1)
-        layout.addWidget(self.basis_label)
-        layout.addWidget(self.refresh_label)
-        layout.addWidget(self.copy_button)
+        layout.setSpacing(0)
+        layout.addLayout(self._main_row)
+        layout.addLayout(self._detail_row)
         qconfig.themeChanged.connect(self._on_theme_changed)
+
+    def set_tier(self, tier: str) -> None:
+        """切换档位：compact 时统计依据、刷新状态与"复制结论"挪到第二行。"""
+        compact = tier == COMPACT
+        if compact == self._compact:
+            return
+        self._compact = compact
+        for widget in (self.basis_label, self.refresh_label, self.copy_button):
+            self._main_row.removeWidget(widget)
+            self._detail_row.removeWidget(widget)
+        self._detail_row.setContentsMargins(0, 2 if compact else 0, 0, 0)
+        if compact:
+            self._detail_row.addWidget(self.basis_label)
+            self._detail_row.addWidget(self.refresh_label)
+            self._detail_row.addStretch(1)
+            self._detail_row.addWidget(self.copy_button)
+        else:
+            self._main_row.insertWidget(2, self.basis_label)
+            self._main_row.insertWidget(3, self.refresh_label)
+            self._main_row.addWidget(self.copy_button)
+            while self._detail_row.count():
+                self._detail_row.takeAt(0)
+
+    def details_on_second_row(self) -> bool:
+        return self._compact
 
     # ---------- 数据 ----------
 
