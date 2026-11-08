@@ -24,7 +24,9 @@ DefaultGroupName={#MyAppName}
 
 ; 输出配置
 OutputDir=..\dist\installer
-OutputBaseFilename=进程监控助手_v{#MyAppVersion}_Setup
+; 文件名固定为 ASCII 的 Windows_v{版本}_Setup：Release 资产命名是对已安装版本更新器的契约
+; （1.4.1 取第一个文件名含 setup 的 .exe），不另存中文名副本
+OutputBaseFilename=Windows_v{#MyAppVersion}_Setup
 ; 应用图标（在build目录下）
 SetupIconFile=app_green_icon.ico
 
@@ -68,6 +70,11 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加图标:"
+
+[InstallDelete]
+; 覆盖安装前先清掉旧版本的运行库目录：新版本的 _internal 里文件名可能已变（少了的 DLL、
+; 改名的 Qt 插件），只靠 [Files] 覆盖会留下旧文件，与新文件混用或白占体积
+Type: filesandordirs; Name: "{app}\_internal"
 
 [Files]
 ; onedir 打包产物（主exe + _internal依赖目录），整体复制到安装目录

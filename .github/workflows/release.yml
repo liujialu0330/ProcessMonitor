@@ -1,0 +1,61 @@
+name: Release
+
+# 发版构建与安装包冒烟：tag（v*）推送或手动触发。只构建、验证并把安装包留作 artifact，
+# 不创建、不修改任何 GitHub Release：Release 的创建与上传由人在冒烟通过后手动完成，
+# 随后用 build/verify_release.py 复核（步骤见 build/README_打包说明.md）。
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-and-smoke:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      PYTHONIOENCODING: utf-8
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements-lock.txt
+
+      # 打包用 lock 复现验证过的精确依赖（含 pyinstaller）；pytest 只在测试步骤用
+      - name: Install dependencies
+        run: pip install -r requirements-lock.txt
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          $iscc = @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe") |
+              Where-Object { Test-Path $_ } | Select-Object -First 1
+          if ($iscc) { Write-Host "已有 Inno Setup：$iscc" } else { choco install innosetup --no-progress -y }
+
+      # 打包（含打包自检 --self-test，任何一步失败即中止）。build.bat 以 GBK 保存、批处理里
+      # 有中文路径，运行器默认代码页不是 936 时会对不上，先切到 936
+      - name: Build
+        shell: cmd
+        run: |
+          chcp 936 >nul
+          call build\build.bat
+
+      # 旧版 1.4.1（从 Release 下载并校验 digest）→ 当前构建的覆盖升级、迁移、正常退出、卸载
+      - name: Installer smoke
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ./build/installer_smoke.ps1
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer
+          path: dist/installer/Windows_v*_Setup.exe
+          if-no-files-found: error

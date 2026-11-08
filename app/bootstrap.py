@@ -40,6 +40,9 @@ build_context，HeadlessRuntime 持有自动打点服务并每秒驱动（阶段
 全局快捷键与界面看门狗。quit 命令、Ctrl+C 或 --idle-exit-s 空闲到时经
 ShutdownCoordinator 收尾后退出，退出码 0。
 
+--self-test（打包自检，见 app.self_test）在 run() 的最开头分流，不走上面的顺序：它自己解析
+必须显式给出的空数据目录，再按自己的步骤表调用本模块的组装函数。
+
 退出收尾（停任务、等线程、关闭数据库）只在主窗口的真退出路径里经 ShutdownCoordinator
 做一次，这里不再重复关闭数据库。
 
@@ -63,6 +66,7 @@ import config
 from app.paths import (
     AppPaths, DataDirError, parse_data_dir_arg, strip_data_dir_args, sync_dir_hint,
 )
+from app.self_test import SELF_TEST_ARG
 
 if TYPE_CHECKING:
     from core.maintenance_service import MaintenanceService, ReconcileResult
@@ -753,6 +757,11 @@ def run(argv: List[str], *, exit_process: Callable[[int], None] = os._exit,
         数据库升级失败且旧库没能回到原路径时为 EXIT_MIGRATION_FAILED；无窗口模式没能开始
         IPC 监听时为 EXIT_IPC_UNAVAILABLE
     """
+    if SELF_TEST_ARG in argv[1:]:
+        # 打包自检自己解析数据目录（必须显式给出且是空目录），不能先走下面会建默认目录的路径解析
+        from app.self_test import run_self_test
+        return run_self_test(argv, exit_process=exit_process)
+
     # 启动计时的起点尽量早；StartupTrace 要等日志初始化之后才导入（见下）
     started_at = time.monotonic()
     try:
