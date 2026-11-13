@@ -10,7 +10,9 @@ import logging
 import os
 import sys
 import threading
+from types import SimpleNamespace
 
+import psutil
 import pytest
 
 from core import system_snapshot as ss
@@ -161,7 +163,7 @@ def test_parse_two_entries_with_threads_and_trailing_data():
     assert set(snap.processes) == {0, OWN_PID}
     idle = snap.processes[0]
     assert idle.name == ''                  # PID 0 没有映像名
-    assert idle.create_time == 0.0          # PID 0/4 按 psutil 口径为 0.0
+    assert idle.create_time == 1_700_000_000.0  # 纯解析保留内核时间，兼容校正在快照器内。
     assert idle.num_threads == 1
 
     s = snap.processes[OWN_PID]
@@ -187,10 +189,63 @@ def test_parse_two_entries_with_threads_and_trailing_data():
     assert snap.context_switches(999) is None
 
 
-def test_system_pid_4_create_time_is_zero():
-    entries = [entry(4, "System", threads=[1], CreateTime=ticks_of(1_700_000_000.0))]
+@pytest.mark.parametrize('pid', [0, 4])
+def test_raw_system_creation_time_is_not_assumed_zero(pid):
+    entries = [entry(pid, "System", threads=[1], CreateTime=ticks_of(1_700_000_000.0))]
     buffer, length = _hand_buffer(entries)
-    assert parse_buffer(buffer, length, build_layout()).processes[4].create_time == 0.0
+    assert parse_buffer(buffer, length, build_layout()).processes[pid].create_time == 1_700_000_000.0
+
+
+@pytest.mark.parametrize('created', [0.0, 1_794_533_275.1563342])
+def test_system_identity_uses_psutil_once_and_keeps_normal_process_time(monkeypatch, created):
+    calls = []
+
+    def process(pid):
+        calls.append(pid)
+        assert pid in (0, 4), '只有特殊系统 PID 需要慢路径身份核对'
+        return SimpleNamespace(create_time=lambda: 0.0 if pid == 0 else created)
+
+    monkeypatch.setattr(ss.psutil, 'Process', process)
+    query = FakeQuery([*DEFAULT_ENTRIES,
+                       entry(4, 'System', threads=[1], CreateTime=ticks_of(1_700_000_000.0))])
+    snapper = NtProcessSnapshotter(query, own_pid=OWN_PID)
+    assert snapper.available()
+    for _ in range(3):
+        snapshot = snapper.snapshot()
+        assert snapshot.processes[0].create_time == 0.0
+        assert snapshot.processes[4].create_time == created
+        assert snapshot.processes[OWN_PID].create_time == 1_794_000_000.5
+    assert calls == [0, 4]
+
+    # 与采集器已有的身份规则相容，不靠放宽 PID 复用检查接受 System。
+    from core.process_collector import ProcessCollector
+    collector = ProcessCollector(4)
+    collector._process = SimpleNamespace(create_time=lambda: created)
+    assert collector._same_process(snapshot.processes[4])
+    assert not collector._same_process(snapshot.processes[4]._replace(create_time=created + 1))
+
+
+@pytest.mark.parametrize('error', [psutil.AccessDenied(4), psutil.NoSuchProcess(4),
+                                  OSError('系统身份接口暂不可用')])
+def test_system_identity_failure_keeps_raw_time_and_snapshot_available(monkeypatch, error):
+    calls = []
+
+    def process(pid):
+        calls.append(pid)
+        if pid == 4:
+            raise error
+        return SimpleNamespace(create_time=lambda: 0.0)
+
+    monkeypatch.setattr(ss.psutil, 'Process', process)
+    raw = 1_700_000_000.0
+    query = FakeQuery([*DEFAULT_ENTRIES,
+                       entry(4, 'System', threads=[1], CreateTime=ticks_of(raw))])
+    snapper = NtProcessSnapshotter(query, own_pid=OWN_PID)
+    assert snapper.available()
+    assert snapper.snapshot().processes[4].create_time == raw
+    assert snapper.snapshot().processes[0].create_time == 0.0
+    assert calls == [0, 4]
+    assert snapper.available()
 
 
 def test_filetime_conversion_matches_psutil_formula():

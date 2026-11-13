@@ -514,10 +514,11 @@ def test_prime_cpu_target_still_missing_after_refresh_leaves_first_point_unavail
 @pytest.mark.skipif(os.name != "nt", reason="仅 Windows")
 @pytest.mark.parametrize("pid", [0, 4])
 def test_system_pids_create_time_agrees_between_psutil_and_snapshot(pid):
-    """psutil 对 PID 0/4 的 create_time() 为 0.0（快照口径同），监控它们不会被误判为 PID 复用"""
+    """系统 PID 创建时间随权限路径变化；快照须同口径，不能误判为 PID 复用。"""
     from core import system_snapshot
-    assert psutil.Process(pid).create_time() == 0.0
+    created = psutil.Process(pid).create_time()
     sample = system_snapshot.snapshot().processes[pid]
+    assert sample.create_time == created
     c = ProcessCollector(pid, hub=SnapshotHub())
     assert c._same_process(sample)
     assert c.collect_metrics([MetricType.NUM_THREADS]) is not None

@@ -29,7 +29,7 @@ python pmctl.py start --plan D:\plans\window-cycle.json
 python pmctl.py verdict --task TASK_ID --vs-reference
 ```
 
-方案可在监控页保存、导入和导出；备注最多 2000 个字符，等待超时支持小数秒，留空表示不限时。`pmctl --json` 的中文与 emoji 使用标准转义，可按 UTF-8 解析。命令行参数与方案示例见 [自动化使用说明](tools/README.md)。
+方案可在监控页保存、导入和导出；备注最多 2000 个字符，等待超时支持小数秒，留空表示不限时。`pmctl` 重定向输出统一使用 UTF-8，`--json` 的中文与 emoji 使用标准转义。命令行参数与方案示例见 [自动化使用说明](tools/README.md)。
 
 
 进程监控助手是一款 Windows 11 Fluent Design 风格的桌面应用，用于持续观察某个进程的运行状态。通过 PID 或从进程列表中选择目标进程后，可从内存、CPU、系统资源、I/O 四大类共 26 个指标中任意勾选，并以 1 秒到 1 小时之间任意整数秒的周期采集数据。所有采集结果会自动落库；在“分析”页可以看到每个指标的判定结论、逐轮增量与趋势图，也可以把最多四次测试放在一起对比，并一键导出报告图片与 CSV。

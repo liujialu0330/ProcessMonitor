@@ -22,6 +22,7 @@ import sys
 import time
 import xml.etree.ElementTree as ET
 from datetime import datetime
+from functools import partial
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from core.ipc import client as ipc
@@ -119,10 +120,65 @@ class UsageError(ClientError):
     exit_code = EXIT_USAGE
 
 
+class _TextOutput:
+    """默认重定向用 UTF-8；终端和注入流保留编码，无法表示的字符可逆转义。
+
+    不重配置调用方的流；冻结程序也不依赖 PYTHONIOENCODING。显式 out/err 的编码
+    决定实际字节，默认 stdout/stderr 的管道与文件输出则始终可按 UTF-8 读取。
+    """
+
+    def __init__(self, stream, *, redirect_utf8=False):
+        self._stream = stream
+        self._buffer = getattr(stream, 'buffer', None) if redirect_utf8 else None
+
+    def write(self, text: str) -> int:
+        size = len(text)
+        if self._buffer is not None:
+            self._stream.flush()
+            self._buffer.write(text.encode('utf-8', errors='backslashreplace'))
+        else:
+            encoding = getattr(self._stream, 'encoding', None)
+            if encoding:
+                text = text.encode(encoding, errors='backslashreplace').decode(encoding)
+            self._stream.write(text)
+        return size
+
+    def flush(self) -> None:
+        self._stream.flush()
+
+
+def _output_stream(stream, default):
+    if isinstance(stream, _TextOutput):
+        return stream
+    if stream is None:
+        return _TextOutput(default, redirect_utf8=not default.isatty())
+    return _TextOutput(stream)
+
+
+class _OutputParser(argparse.ArgumentParser):
+    """帮助与参数错误也使用同一输出约定，并遵循 main 注入的输出流。"""
+
+    def __init__(self, *args, out=None, err=None, **kwargs):
+        self._out = _output_stream(out, sys.stdout)
+        self._err = _output_stream(err, sys.stderr)
+        super().__init__(*args, **kwargs)
+
+    def add_subparsers(self, **kwargs):
+        kwargs.setdefault('parser_class', partial(type(self), out=self._out, err=self._err))
+        return super().add_subparsers(**kwargs)
+
+    def _print_message(self, message, file=None):
+        if message:
+            stream = (self._err if file is sys.stderr else self._out
+                      if file is None or file is sys.stdout else _output_stream(file, file))
+            stream.write(message)
+            stream.flush()
+
+
 # ---------- 参数 ----------
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog=PROG, description=DESCRIPTION, epilog=EPILOG)
+def build_parser(*, out=None, err=None) -> argparse.ArgumentParser:
+    parser = _OutputParser(prog=PROG, description=DESCRIPTION, epilog=EPILOG, out=out, err=err)
     parser.add_argument('--data-dir', help=HELP['data_dir'])
     parser.add_argument('--timeout', type=float, default=DEFAULT_TIMEOUT_S, help=HELP['timeout'])
     parser.add_argument('--json', action='store_true', help=HELP['json'])
@@ -315,7 +371,7 @@ def default_session_factory(args, err=None):
     launch = None if args.no_launch else ipc.launch_command(
         os.path.abspath(args.data_dir) if args.data_dir else None,
         idle_exit_s=getattr(args, 'idle_exit', DEFAULT_IDLE_EXIT_S))
-    stream = err or sys.stderr
+    stream = _output_stream(err, sys.stderr)
 
     def on_waiting(message: str) -> None:
         print(MSG_WAITING.format(message=message), file=stream, flush=True)
@@ -435,8 +491,8 @@ class Cli:
     def __init__(self, args, session_factory: Callable, out=None, err=None):
         self.args = args
         self._factory = session_factory
-        self.out = out or sys.stdout
-        self.err = err or sys.stderr
+        self.out = _output_stream(out, sys.stdout)
+        self.err = _output_stream(err, sys.stderr)
         self.client = None
 
     def emit(self, text: str) -> None:
@@ -787,7 +843,8 @@ class Cli:
 
 def main(argv: Optional[Sequence[str]] = None, *, session_factory: Optional[Callable] = None,
          out=None, err=None) -> int:
-    parser = build_parser()
+    out, err = _output_stream(out, sys.stdout), _output_stream(err, sys.stderr)
+    parser = build_parser(out=out, err=err)
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:
