@@ -2,6 +2,7 @@
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -62,35 +63,47 @@ def test_release_part_and_prerelease(text, release, pre):
     assert version.is_prerelease(text) is pre
 
 
-# ========== 当前版本号（2.0.0-beta.1）在各读取方的表现 ==========
+# ========== 发布版本与预发布版本在各读取方的表现 ==========
 
-def test_app_version_is_beta_prerelease():
-    assert config.APP_VERSION == "2.0.0-beta.1"
-    assert version.is_prerelease(config.APP_VERSION)
+def test_app_version_matches_changelog():
+    changelog = Path(__file__).resolve().parent.parent / 'CHANGELOG.md'
+    section = next(line[4:] for line in changelog.read_text(encoding='utf-8').splitlines()
+                   if line.startswith('### '))
+    if section.startswith('未发布'):
+        assert version.is_prerelease(config.APP_VERSION)
+    else:
+        assert section.split()[0] == f'v{config.APP_VERSION}'
 
 
-def test_beta_reads_and_writes_v5_db():
+@pytest.mark.parametrize('current_version', ['2.0.0-beta.1', '2.0.0'])
+def test_release_line_reads_and_writes_v5_db(current_version):
     """库的最低读取版本是 2.0.0：同一发布线的预发布版不能被判为只读"""
     from data.db import meta
     info = meta.MetaInfo(schema_version=5, min_reader_version=meta.MIN_READER_VERSION)
-    assert meta.reader_blocked(info, config.APP_VERSION) is None
+    assert meta.reader_blocked(info, current_version) is None
 
 
-def test_update_check_with_beta_current_version():
-    """beta 用户能收到正式版与更新的 beta，不会把旧正式版当成更新"""
+@pytest.mark.parametrize('current_version, ga_update, beta_update', [
+    ('2.0.0-beta.1', True, True),
+    ('2.0.0', False, False),
+])
+def test_update_check_respects_release_stage(monkeypatch, current_version,
+                                            ga_update, beta_update):
+    """beta 能升级到正式版；正式版不会提示安装同版本或更早的 beta。"""
     from core.update_checker import parse_release_info
+    monkeypatch.setattr(config, 'APP_VERSION', current_version)
 
     def release(tag):
         return {'tag_name': tag, 'body': '', 'html_url': 'https://github.com/x/y',
                 'assets': []}
 
-    assert parse_release_info(release('v2.0.0'))['has_update'] is True
-    assert parse_release_info(release('v2.0.0-beta.2'))['has_update'] is True
+    assert parse_release_info(release('v2.0.0'))['has_update'] is ga_update
+    assert parse_release_info(release('v2.0.0-beta.2'))['has_update'] is beta_update
     assert parse_release_info(release('v2.0.0-beta.1'))['has_update'] is False
     assert parse_release_info(release('v1.4.1'))['has_update'] is False
 
 
-def test_meta_records_beta_as_writer(tmp_path):
+def test_meta_records_current_version_as_writer(tmp_path):
     from data.database import Database
     from data.db import meta
     path = str(tmp_path / 'monitor.db')
