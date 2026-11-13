@@ -590,8 +590,11 @@ class SettingPage(ScrollArea):
                            ('export', self.export_group), ('data', self.data_group),
                            ('about', self.about_group)):
             group.setMaximumWidth(1000)
-            self.pivot.addItem(key, group.titleLabel.text(),
-                               onClick=lambda g=group: self.verticalScrollBar().setValue(g.y()))
+            # itemClicked 携带选中状态，不能覆盖回调捕获的分组控件。
+            self.pivot.addItem(
+                key, group.titleLabel.text(),
+                onClick=lambda _selected=False, g=group:
+                    self.verticalScrollBar().setValue(g.y()))
         self.pivot.setCurrentItem('appearance')
         self.pivot.setMaximumWidth(1000)
 

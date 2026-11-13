@@ -723,6 +723,42 @@ def test_scroll_to_about_does_not_raise(setting):
     assert setting.verticalScrollBar().value() <= setting.about_group.y()
 
 
+@pytest.mark.parametrize('width', [800, 1280])
+@pytest.mark.parametrize('route, group_name', [
+    ('appearance', 'general_group'),
+    ('monitor', 'monitor_group'),
+    ('shortcuts', 'shortcuts_group'),
+    ('notify', 'notify_group'),
+    ('export', 'export_group'),
+    ('data', 'data_group'),
+    ('about', 'about_group'),
+])
+def test_settings_pivot_mouse_click_scrolls_to_group(setting, monkeypatch,
+                                                   width, route, group_name):
+    """实际点击导航，覆盖首次选择、重复选择和滚动位置被重置后的再次跳转。"""
+    errors = []
+    monkeypatch.setattr(sys, 'excepthook', lambda *error: errors.append(error))
+    setting.resize(width, 600)
+    setting.show()
+    QApplication.processEvents()
+    scrollbar = setting.verticalScrollBar()
+    assert scrollbar.maximum() > 0
+    button = setting.pivot.widget(route)
+    group = getattr(setting, group_name)
+
+    for _ in range(2):
+        scrollbar.setValue(0)
+        QApplication.processEvents()
+        assert button.isVisible() and button.isEnabled()
+        QTest.mouseClick(button, Qt.LeftButton)
+        QApplication.processEvents()
+
+        assert not errors, [str(error[1]) for error in errors]
+        assert setting.pivot.currentRouteKey() == route
+        assert scrollbar.value() == min(group.y(), scrollbar.maximum())
+        assert group.mapTo(setting.viewport(), group.rect().topLeft()).y() >= 0
+
+
 def test_about_group_status_shows_last_check_time(about):
     from ui.pages.about_update import APP_TAGLINE, up_to_date_text
     from qfluentwidgets import PrimaryPushButton
