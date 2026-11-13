@@ -18,8 +18,6 @@ jobs:
       QT_QPA_FONTDIR: C:\Windows\Fonts
       PYTHONIOENCODING: utf-8
       GUI_SMOKE_VISIBLE: '1'
-      GUI_SMOKE_CAPTURE_DIR: ${{ runner.temp }}/gui-smoke
-      PROCESS_MONITOR_DATA_DIR: ${{ runner.temp }}/process-monitor-gui-smoke
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -45,6 +43,9 @@ jobs:
           }
           python -c "from PyQt5.QtWidgets import QApplication,QSystemTrayIcon; app=QApplication([]); print('托盘可用：', QSystemTrayIcon.isSystemTrayAvailable())"
       - name: 完整主线冒烟与阶段截图
+        env:
+          GUI_SMOKE_CAPTURE_DIR: ${{ runner.temp }}/gui-smoke
+          PROCESS_MONITOR_DATA_DIR: ${{ runner.temp }}/process-monitor-gui-smoke
         run: python -m pytest tests/e2e/test_gui_smoke.py -m slow -v -s --junitxml=${{ runner.temp }}/gui-smoke/results.xml
       - name: 保留截图与测试报告
         if: always()
