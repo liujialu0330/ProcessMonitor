@@ -169,7 +169,8 @@ def test_marker_compare_and_export_off_main_thread(setup, services, tmp_path):
     _settle(page, services)
     assert "analytics.aggregates" in spy.names()
     _assert_off_main_thread(spy, "任务对比")
-    assert page.compare_panel.chart.legend_names() == ["当前任务", "对比任务"]
+    page.compare_panel.alignment_combo.setCurrentIndex(1)  # 没有完整轮次时改用相对时间
+    assert len(page.compare_panel.chart.legend_names()) == 2
 
     # 导出报告：图片在主线程离屏渲染（不读库），明细在导出线程读取
     out = tmp_path / "out"

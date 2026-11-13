@@ -6,13 +6,15 @@ IPC 命令白名单与处理器（CommandDispatcher）
 
 门禁顺序：未知命令 → unknown_command；设置里关闭了"允许命令行与脚本控制"→ disabled
 （ping / activate 除外；无窗口模式的 quit 也除外——那是结束它的唯一途径）；程序尚未就绪
-（数据库、管理器还没组装好）→ not_ready；危险命令（start / export / quit / stop）要求客户端
+（数据库、管理器还没组装好）→ not_ready；危险命令（start / start_plan / export / quit / stop）要求客户端
 完整性级别不低于服务端 → forbidden（Windows 上读不到服务端自身的完整性级别时同样拒绝）。
 
 资源上限：每个连接同时最多 MAX_PENDING_PER_CONNECTION 条延迟回复、全局同时最多
 MAX_CONCURRENT_VERDICTS 个 verdict 分析，超出回 busy；秒数参数不超过 MAX_SECONDS（30 天），
 label / note 有长度上限，超出回 invalid_args。处理器中途抛出任何异常时，本次请求已创建的
 延迟回复一律取消（不留下继续发心跳的孤儿）。
+完整测试方案经 start_plan 一次发起，最多 5 个目标；所有等待独立登记，整个批次仅一条
+延迟回复与心跳。连接断开只撤销未完成等待，保留已开始的任务。
 
 | 命令 | 参数 | 结果 |
 |---|---|---|
@@ -49,9 +51,10 @@ import math
 import os
 import re
 import sys
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 from PyQt5.QtCore import QObject, QTimer, pyqtSignal
 
@@ -67,7 +70,8 @@ from core.ipc.protocol import (
 )
 from core.monitor_manager import default_marker_kind
 from core.monitor_task import SYSTEM_CLOCK
-from core.wait_service import WAIT_FAILED_TIMEOUT, WaitMatch, WaitService
+from core.plans import MAX_NOTE_CHARS
+from core.wait_service import WAIT_FAILED_AMBIGUOUS, WAIT_FAILED_TIMEOUT, WaitMatch, WaitService
 from core.workers.base import BackgroundTask, CancelToken
 from data.errors import StorageError
 from data.models import TARGET_KINDS, TARGET_NAME, TARGET_PID, TARGET_TREE
@@ -79,6 +83,7 @@ CMD_PING = 'ping'
 CMD_ACTIVATE = 'activate'
 CMD_STATUS = 'status'
 CMD_START = 'start'
+CMD_START_PLAN = 'start_plan'
 CMD_MARKER = 'marker'
 CMD_PAUSE = 'pause'
 CMD_RESUME = 'resume'
@@ -93,7 +98,7 @@ ALWAYS_ALLOWED = frozenset({CMD_PING, CMD_ACTIVATE})
 # 无窗口模式下关闭自动化后仍可用的命令：quit 是结束无窗口实例的唯一途径
 HEADLESS_ALWAYS_ALLOWED = ALWAYS_ALLOWED | {CMD_QUIT}
 # 要求客户端完整性级别不低于服务端的命令
-DANGEROUS_COMMANDS = frozenset({CMD_START, CMD_EXPORT, CMD_QUIT, CMD_STOP})
+DANGEROUS_COMMANDS = frozenset({CMD_START, CMD_START_PLAN, CMD_EXPORT, CMD_QUIT, CMD_STOP})
 
 # ---------- 取值 ----------
 EXPORT_KIND_CSV = 'csv'
@@ -124,7 +129,6 @@ MAX_PENDING_PER_CONNECTION = 4
 MAX_CONCURRENT_VERDICTS = 2
 # 文本参数的长度上限（字符）
 MAX_LABEL_CHARS = 200
-MAX_NOTE_CHARS = 2000
 # PID 的取值上限（DWORD）
 MAX_PID = 0xFFFFFFFF
 
@@ -604,6 +608,75 @@ class _Pending:
                 logger.error("取消延迟命令失败: %s", self.kind, exc_info=True)
 
 
+class _PlanItem:
+    """批量开始中的一个结果槽。无定时器/连接，心跳与取消由整个批次管理。"""
+
+    def __init__(self, batch, index: int):
+        self.batch = batch
+        self.index = index
+        self.done = False
+        self.on_cancel: List[Callable[[], None]] = []
+
+    def ok(self, result=None):
+        self._complete({'index': self.index, 'ok': True, 'result': result or {}})
+
+    def error(self, code, message, **extra):
+        self._complete({'index': self.index, 'ok': False,
+                        'error': {'code': code, 'message': message, **extra}})
+
+    def _complete(self, result):
+        if self.done or self.batch.pending.done:
+            return
+        self.done = True
+        self._clear_waits()
+        self.batch.results[self.index - 1] = result
+        self.batch.finish_if_ready()
+
+    def cancel(self):
+        if self.done:
+            return
+        self.done = True
+        self._clear_waits()
+
+    def _clear_waits(self):
+        callbacks, self.on_cancel = self.on_cancel, []
+        for callback in callbacks:
+            try:
+                callback()
+            except Exception:
+                logger.exception('取消方案中等待的目标失败')
+
+
+class _StartBatch:
+    """一次请求最多五个目标，一条最终回复；在全部目标发起前不允许提前结束。"""
+
+    def __init__(self, pending: _Pending, plan, group_id):
+        self.pending, self.plan, self.group_id = pending, plan, group_id
+        self.results = [None] * len(plan.targets)
+        self.items = [_PlanItem(self, index + 1) for index in range(len(plan.targets))]
+        self.dispatching = True
+        pending.on_cancel.append(self.cancel)
+
+    def cancel(self):
+        for item in self.items:
+            item.cancel()
+        self._release()
+
+    def _release(self):
+        # 连接可长驻；完成的批次不应被它的关闭回调间接持有整份方案与结果。
+        self.pending.on_cancel = [callback for callback in self.pending.on_cancel
+                                  if callback != self.cancel]
+
+    def finish_if_ready(self):
+        if self.dispatching or self.pending.done or any(item is None for item in self.results):
+            return
+        started = sum(item['ok'] for item in self.results)
+        self._release()
+        self.pending.ok({'name': self.plan.name, 'group_id': self.group_id,
+                         'started': started, 'failed': len(self.results) - started,
+                         'results': self.results})
+
+
 @dataclass
 class _WaitJob:
     pending: _Pending
@@ -621,6 +694,8 @@ class _StartRequest:
     interval: float
     note: str
     plan: Optional[AutomationPlan]
+    identity: dict = field(default_factory=dict)
+    target_kind: str = TARGET_PID
 
 
 # ---------- 导出 ----------
@@ -829,7 +904,7 @@ class CommandDispatcher(QObject):
         self._pending: List[_Pending] = []
         self._wait_jobs: List[_WaitJob] = []
         # 等待进程启动的 start：{等待 ID: (延迟回复, 进程名)}
-        self._start_waits: Dict[str, Tuple[_Pending, str]] = {}
+        self._start_waits: Dict[str, Tuple[Union[_Pending, _PlanItem], str]] = {}
         self._exports: List[ExportRun] = []
         self._stop_reasons: Dict[str, StopReason] = {}
         self._unsaved_plans: Dict[str, AutomationPlan] = {}
@@ -845,6 +920,7 @@ class CommandDispatcher(QObject):
             CMD_ACTIVATE: self._cmd_activate,
             CMD_STATUS: self._cmd_status,
             CMD_START: self._cmd_start,
+            CMD_START_PLAN: self._cmd_start_plan,
             CMD_MARKER: self._cmd_marker,
             CMD_PAUSE: self._cmd_pause,
             CMD_RESUME: self._cmd_resume,
@@ -884,6 +960,9 @@ class CommandDispatcher(QObject):
             wait_id, None))
         manager.task_stopped.connect(self._on_task_stopped)
         manager.data_updated.connect(self._on_data_updated)
+        plan_saved = getattr(manager, 'task_plan_saved', None)
+        if plan_saved is not None:
+            plan_saved.connect(self._on_plan_saved)
         if context.handle_auto_export and context.auto_marker is not None:
             context.auto_marker.export_requested.connect(self._on_auto_export)
 
@@ -1150,6 +1229,60 @@ class CommandDispatcher(QObject):
         return kind
 
     def _cmd_start(self, conn, request):
+        self._parse_identity(request.args)
+        return self._cmd_start_target(conn, request)
+
+    def _cmd_start_plan(self, conn, request):
+        from core.plans import TestPlan
+        try:
+            plan = TestPlan.from_dict(request.args.get('plan'))
+        except (ValueError, TypeError) as exc:
+            raise CommandError(ERR_INVALID_ARGS, f'测试方案不正确：{exc}') from None
+        pending = self._new_pending(conn, request, CMD_START_PLAN)
+        group_id = uuid.uuid4().hex if plan.shared_markers else None
+        batch = _StartBatch(pending, plan, group_id)
+        now = self.context.clock.now()
+        for index, (target, item) in enumerate(zip(plan.targets, batch.items), 1):
+            if pending.done:
+                break
+            try:
+                args = target.start_args(index=index, now=now)
+                if group_id:
+                    args['group_id'] = group_id
+                self._parse_identity(args)
+                result = self._cmd_start_target(
+                    conn, Request(id=request.id, cmd=CMD_START, args=args), pending=item)
+                if result is not None:
+                    item.ok(result)
+            except CommandError as exc:
+                item.error(exc.code, exc.message, **exc.extra)
+            except (StorageError, ValueError, TypeError) as exc:
+                item.error(ERR_INTERNAL, f'目标未能开始：{exc}')
+            except Exception:
+                logger.exception('方案目标 %d 开始失败', index)
+                item.error(ERR_INTERNAL, '目标未能开始，详见日志')
+        batch.dispatching = False
+        batch.finish_if_ready()
+        return None
+
+    @staticmethod
+    def _parse_identity(args):
+        result = {}
+        for key in ('scenario', 'build', 'group_id'):
+            if key in args:
+                result[key] = _string(args, key, max_length=120) or ''
+        return result
+
+    def _apply_identity(self, task_id, identity):
+        if 'scenario' in identity or 'build' in identity:
+            saved = self.context.manager.update_task_identity(
+                task_id, identity.get('scenario', ''), identity.get('build', ''))
+            if saved is False:
+                raise ValueError('无法保存任务的场景与版本')
+        if identity.get('group_id'):
+            self.context.manager.set_task_group([task_id], identity['group_id'])
+
+    def _cmd_start_target(self, conn, request, *, pending=None):
         args = request.args
         target_kind = self._parse_target_kind(args)
         if args.get('launch') is not None:
@@ -1161,7 +1294,8 @@ class CommandDispatcher(QObject):
             if pid is not None or not has_name:
                 raise CommandError(ERR_INVALID_ARGS, MSG_NAME_KIND_NEEDS_NAME)
         elif target_kind == TARGET_TREE:
-            if pid is None or name is not None:
+            if ((pid is None and not (has_name and _boolean(args, 'wait')))
+                    or (pid is not None and name is not None)):
                 raise CommandError(ERR_INVALID_ARGS, MSG_TREE_NEEDS_PID)
         elif (pid is None) == (not has_name):
             raise CommandError(ERR_INVALID_ARGS, MSG_PID_OR_NAME)
@@ -1178,7 +1312,8 @@ class CommandDispatcher(QObject):
         lookup = self.context.process_lookup
 
         if target_kind == TARGET_NAME:
-            return self._start_name_group(name.strip(), metrics, interval, note, plan, wait)
+            return self._start_name_group(name.strip(), metrics, interval, note, plan, wait,
+                                          identity=self._parse_identity(args))
 
         if pid is not None:
             identity = lookup.identity_of(pid)
@@ -1186,16 +1321,18 @@ class CommandDispatcher(QObject):
                 raise CommandError(ERR_NOT_FOUND, MSG_PROCESS_NOT_FOUND.format(pid=pid))
             process_name, create_time = identity
             return self._create(pid, process_name, create_time, metrics, interval, note, plan,
-                                target_kind=target_kind)
+                                target_kind=target_kind, identity=self._parse_identity(args))
 
         name = name.strip()
         found = self._find_by_name(name)
         if found is not None:
-            return self._create(*found, metrics, interval, note, plan)
+            return self._create(*found, metrics, interval, note, plan, target_kind=target_kind,
+                                identity=self._parse_identity(args))
         if not wait:
             raise CommandError(ERR_NOT_FOUND, MSG_NAME_NOT_FOUND.format(name=name))
-        start = _StartRequest(name, metrics, interval, note, plan)
-        pending = self._new_pending(conn, request, CMD_START)
+        start = _StartRequest(name, metrics, interval, note, plan,
+                              self._parse_identity(args), target_kind)
+        pending = pending if pending is not None else self._new_pending(conn, request, CMD_START)
         wait_id = self.wait_service.add(start, starter=lambda wid, match: self._start_waited(
             pending, match), timeout_s=wait_timeout)
         self._start_waits[wait_id] = (pending, name)
@@ -1204,7 +1341,7 @@ class CommandDispatcher(QObject):
         return None
 
     def _start_name_group(self, name: str, metrics: Sequence[str], interval: float, note: str,
-                          plan: Optional[AutomationPlan], wait: bool) -> Dict[str, Any]:
+                          plan: Optional[AutomationPlan], wait: bool, *, identity=None) -> Dict[str, Any]:
         """start target_kind=name：监控全部同名进程。不要求唯一（与按名选单个进程不同，这里
         同名多个正是目标），不能是本程序自身的进程名。当前一个也没有时：wait=true 照样立即
         开始（成员出现后自动纳入，归零不结束任务），否则回 not_found。"""
@@ -1219,7 +1356,7 @@ class CommandDispatcher(QObject):
             # 没找到时用带扩展名的写法：Windows 的进程映像名几乎都以 .exe 结尾
             chosen = candidates[-1]
         return self._create(0, chosen, None, metrics, interval, note, plan,
-                            target_kind=TARGET_NAME)
+                            target_kind=TARGET_NAME, identity=identity)
 
     def _reject_self_name(self, names: Sequence[str]) -> None:
         own = {os.path.basename(sys.executable).lower()}
@@ -1277,7 +1414,8 @@ class CommandDispatcher(QObject):
         if not result.ok:
             raise CommandError(ERR_INVALID_STATE, MSG_LAUNCH_FAILED.format(detail=result.error))
         reply = self._create(result.pid, result.name or spec.name, result.create_time,
-                             metrics, interval, note, plan, target_kind=target_kind)
+                             metrics, interval, note, plan, target_kind=target_kind,
+                             identity=self._parse_identity(args))
         if close_on_stop:
             self._close_on_stop[reply['task_id']] = (result.pid, result.create_time)
         reply['launched'] = True
@@ -1316,7 +1454,7 @@ class CommandDispatcher(QObject):
     def _create(self, pid: int, name: str, create_time: Optional[float],
                 metrics: Sequence[str], interval: float, note: str,
                 plan: Optional[AutomationPlan], *,
-                target_kind: str = TARGET_PID) -> Dict[str, Any]:
+                target_kind: str = TARGET_PID, identity=None) -> Dict[str, Any]:
         manager = self.context.manager
         if manager.is_maintenance_running():
             raise CommandError(ERR_BUSY, MSG_MAINTENANCE)
@@ -1328,12 +1466,15 @@ class CommandDispatcher(QObject):
         if not task_id:
             raise CommandError(ERR_BUSY, MSG_START_FAILED.format(reason="数据库维护中或任务数已满"))
         try:
+            self._apply_identity(task_id, identity or {})
             if plan is not None:
+                manager.seed_restart_policy(task_id, plan.resume_on_restart, plan.restart_limit)
                 self._unsaved_plans[task_id] = plan
                 self._save_plan(task_id)
                 if self.context.auto_marker is not None:
                     self.context.auto_marker.attach(task_id, plan)
-            manager.start_task(task_id)
+            if manager.start_task(task_id) is False:
+                raise ValueError('任务未能启动')
         except Exception as exc:
             # 挂接方案或启动失败：回滚，不留下一个没人启动、也没人知道的任务
             logger.error("命令行开始监控失败，已回滚任务: task_id=%s", task_id, exc_info=True)
@@ -1343,7 +1484,7 @@ class CommandDispatcher(QObject):
         logger.info("命令行开始监控: task_id=%s pid=%s name=%s target=%s", task_id, pid, name,
                     target_kind)
         return {'task_id': task_id, 'pid': pid, 'name': name, 'metrics': list(metrics),
-                'interval': interval, 'target_kind': target_kind}
+                'interval': interval, 'target_kind': target_kind, **(identity or {})}
 
     def _rollback_task(self, task_id: str) -> None:
         self._unsaved_plans.pop(task_id, None)
@@ -1358,7 +1499,7 @@ class CommandDispatcher(QObject):
             except Exception:
                 logger.error("回滚任务失败: task_id=%s", task_id, exc_info=True)
 
-    def _start_waited(self, pending: _Pending, match: WaitMatch) -> Optional[str]:
+    def _start_waited(self, pending: Union[_Pending, _PlanItem], match: WaitMatch) -> Optional[str]:
         """等待的进程出现：与 start name=… 同一套按名解析规则（同名多个回 invalid_args 并
         列出 PID、不能是本程序自身），再建任务。"""
         request = match.request
@@ -1368,7 +1509,8 @@ class CommandDispatcher(QObject):
                 found = (match.pid, match.name, match.create_time)
             pid, name, create_time = found
             result = self._create(pid, name, create_time, request.metrics,
-                                  request.interval, request.note, request.plan)
+                                  request.interval, request.note, request.plan,
+                                  target_kind=request.target_kind, identity=request.identity)
         except CommandError as exc:
             pending.error(exc.code, exc.message, **exc.extra)
             return None
@@ -1389,6 +1531,9 @@ class CommandDispatcher(QObject):
         pending, name = entry
         if reason == WAIT_FAILED_TIMEOUT:
             pending.error(ERR_TIMEOUT, MSG_WAIT_START_TIMEOUT.format(name=name))
+        elif reason.startswith(WAIT_FAILED_AMBIGUOUS + ':'):
+            pending.error(ERR_INVALID_ARGS, reason.split(':', 1)[1],
+                          pids=self.wait_service.failure_pids(wait_id))
         else:
             pending.error(ERR_INTERNAL, MSG_START_FAILED.format(reason=reason))
         self._sync_timer()
@@ -1399,10 +1544,16 @@ class CommandDispatcher(QObject):
         if plan is None or store is None:
             return
         try:
-            if store.save_plan(task_id, plan.to_json()):
+            save = getattr(self.context.manager, 'save_task_plan', store.save_plan)
+            if save(task_id, plan.to_json()):
                 self._unsaved_plans.pop(task_id, None)
+                if not hasattr(self.context.manager, 'save_task_plan'):
+                    self.context.manager.release_restart_policy_seed(task_id)
         except StorageError:
             logger.error("保存自动化方案失败: task_id=%s", task_id, exc_info=True)
+
+    def _on_plan_saved(self, task_id: str) -> None:
+        self._unsaved_plans.pop(task_id, None)
 
     # ---------- 命令：打点、暂停、恢复、停止 ----------
 
@@ -1418,7 +1569,16 @@ class CommandDispatcher(QObject):
         label = _string(args, 'label', max_length=MAX_LABEL_CHARS)
         self._reject_if_read_only()
         manager = self.context.manager
-        if task_id == MARKER_ALL:
+        group_id = _string(args, 'group_id', max_length=120)
+        if group_id:
+            if task_id != MARKER_ALL:
+                raise CommandError(ERR_INVALID_ARGS, 'group_id 与具体任务不能同时指定')
+            ids = [info.task_id for info in manager.list_task_infos()
+                   if manager.is_task_active(info.task_id)
+                   and manager.task_group(info.task_id) == group_id]
+            if not ids:
+                raise CommandError(ERR_INVALID_STATE, '该方案组没有运行中的任务')
+        elif task_id == MARKER_ALL:
             ids = [info.task_id for info in manager.list_task_infos()
                    if manager.is_task_active(info.task_id)]
             if not ids:
@@ -1457,6 +1617,9 @@ class CommandDispatcher(QObject):
         if not self.context.manager.resume_task(task_id):
             raise CommandError(ERR_INVALID_STATE, MSG_RESUME_FAILED.format(task_id=task_id))
         self._process_auto(task_id)
+        if self.context.manager.is_task_paused(task_id):
+            raise CommandError(ERR_INVALID_STATE, f'任务 {task_id} 未恢复，当前仍处于暂停状态',
+                               task_id=task_id, paused=True)
         return {'task_id': task_id, 'paused': False}
 
     def _process_auto(self, task_id: str) -> None:
@@ -1643,6 +1806,7 @@ class CommandDispatcher(QObject):
     # ---------- 命令：判定 ----------
 
     def _cmd_verdict(self, conn, request):
+        vs_reference = _boolean(request.args, 'vs_reference')
         task_id = _task_id(request.args)
         task = self.context.db.get_task(task_id)
         if task is None:
@@ -1660,16 +1824,21 @@ class CommandDispatcher(QObject):
         exit_code = getattr(task, 'exit_code', None) if task is not None else None
         pending = self._new_pending(conn, request, CMD_VERDICT)
         factory = self.context.analysis_worker_factory or TaskAnalysisWorker
-        worker = factory(self.context.db, task_id, metrics, analysis=False)
+        worker = factory(self.context.db, task_id, metrics, analysis=vs_reference)
 
         def done(analysis) -> None:
+            if pending.done:
+                return
             try:
                 result = compute_verdict(analysis, reason,
                                          stopped_before_condition=before_condition)
                 if exit_code is not None and result.get('target_exit') is not None:
                     result['target_exit'].update(_exit_fields(exit_code))
                 result['task_id'] = task_id
-                pending.ok(result)
+                if vs_reference:
+                    self._finish_reference_verdict(pending, task_id, analysis, result)
+                else:
+                    pending.ok(result)
             except CommandError as exc:
                 pending.error(exc.code, exc.message)
             except Exception as exc:
@@ -1685,6 +1854,20 @@ class CommandDispatcher(QObject):
                                            cancel=worker.cancel, timeout_ms=THREAD_TIMEOUT_MS)
         worker.start()
         return None
+
+    def _finish_reference_verdict(self, pending, task_id, analysis, result):
+        from core.reference import ReferenceWorker
+        worker = ReferenceWorker(self.context.db, task_id, analysis, parent=self)
+        pending.on_cancel.append(worker.cancel)
+        worker.result.connect(lambda comparison: pending.ok(
+            {**result, 'reference': comparison.to_dict()}))
+        worker.failed.connect(lambda error: pending.error(ERR_INTERNAL, error))
+        if self.context.registry is not None:
+            self.context.registry.register(worker, name='参考基线比较', cancel=worker.cancel,
+                                           timeout_ms=THREAD_TIMEOUT_MS)
+        else:
+            worker.finished.connect(worker.deleteLater)
+        worker.start()
 
     def _exited_before_condition(self, task_id: str, task, reason) -> bool:
         """被测进程是否在方案的停止条件达成之前退出（停止原因不是退出类时为假）。

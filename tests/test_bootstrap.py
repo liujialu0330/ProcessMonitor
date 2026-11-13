@@ -1,4 +1,5 @@
 """组合根：build_context 的组装顺序与迁移/校正，run() 的固定启动顺序（全部替身，不建真实窗口）"""
+import copy
 import os
 from datetime import datetime
 
@@ -601,17 +602,33 @@ class _FakeDispatcher:
 
     def set_settings(self, settings):
         self.events.append('dispatcher.settings')
+        self.settings = settings
 
     def set_context(self, context):
         self.events.append('dispatcher.context')
         self.context = context
 
 
+class _RuntimeSettings:
+    def __init__(self, **values):
+        self.values = dict(automation_enabled=True, last_metrics=['memory_private'],
+                           default_interval=1, retention_days=0,
+                           keep_awake_while_monitoring=False)
+        self.values.update(values)
+
+    def get(self, name):
+        return copy.deepcopy(self.values[name])
+
+    def snapshot(self):
+        return {'Monitor': {'DefaultInterval': self.values['default_interval']},
+                'QFluentWidgets': {'ThemeMode': 'Dark'}}
+
+
 @pytest.fixture
 def bg_env(run_env, monkeypatch):
     """run_env 之上：守卫接受 activate 参数并带命令处理器，无窗口路径的各步换成替身"""
     import app.single_instance as single_instance
-    import app_config
+    import settings_store
     import core.headless as headless_module
     from utils import crash_handler
     events, state, exits, paths = run_env
@@ -635,8 +652,14 @@ def bg_env(run_env, monkeypatch):
         return guard
 
     monkeypatch.setattr(single_instance, 'SingleInstanceGuard', make_guard)
-    monkeypatch.setattr(app_config, 'load_app_config',
-                        lambda paths=None: events.append('load_config'))
+    state['runtime_settings'] = _RuntimeSettings()
+
+    def load_settings(config_path, prefs_path):
+        events.append('load_config')
+        assert (config_path, prefs_path) == (paths.config_path, paths.prefs_path)
+        return state['runtime_settings']
+
+    monkeypatch.setattr(settings_store, 'load_settings', load_settings)
 
     class Runner:
         def migrate(self):
@@ -648,8 +671,9 @@ def bg_env(run_env, monkeypatch):
     class FakeServices:
         clock = 'clock'
 
-    def fake_build_context(paths, *, report=None, legacy_importer=None):
+    def fake_build_context(paths, *, report=None, legacy_importer=None, runtime_settings=None):
         events.append('build_context')
+        state['context_settings'] = runtime_settings
         return AppContext(paths=paths, db=_FakeDb(events), manager='manager',
                           services=FakeServices(), registry='registry', maintenance=None,
                           reconcile=ReconcileResult(0, 0, 0))
@@ -683,7 +707,7 @@ def test_run_background_order(bg_env):
     assert code == 3
     assert events == [
         ('logging', paths.log_dir), 'excepthook', 'qapplication', ('single_instance', False),
-        'listen', 'load_config', 'headless_migrate', 'build_context',
+        'load_config', 'listen', 'headless_migrate', 'build_context',
         ('runtime', 'manager', 'registry', 7.0), 'dispatcher.settings', 'dispatcher.context',
         'runtime.start', 'exec', ('exit', 3),
     ]
@@ -697,10 +721,12 @@ def test_run_background_order(bg_env):
     runtime = state['runtime']
     assert context.auto_marker == 'auto_marker' and context.handle_auto_export is True
     assert context.quit == runtime.quit and context.clock == 'clock'
-    assert context.report_renderer is bootstrap.render_report_image_for_ipc
+    assert state['context_settings'] is state['runtime_settings']
+    assert context.report_renderer.__self__ is runtime.stage_renderer.__self__
+    assert isinstance(context.report_renderer.__self__, bootstrap._HeadlessReportRenderer)
     assert runtime.busy == state['guard'].dispatcher.has_pending
     # 无窗口模式也写阶段快照：报告图片的渲染函数由组合根注入
-    assert runtime.stage_renderer is bootstrap.render_stage_snapshot_image
+    assert runtime.stage_renderer.__func__ is bootstrap._HeadlessReportRenderer.stage
 
 
 def test_run_background_starts_storage_guard_and_stops_it_on_quit(bg_env, monkeypatch):
@@ -719,8 +745,9 @@ def test_run_background_starts_storage_guard_and_stops_it_on_quit(bg_env, monkey
     guard = Guard()
     fake_build = bootstrap.build_context
 
-    def build(paths, *, report=None, legacy_importer=None):
-        ctx = fake_build(paths, report=report, legacy_importer=legacy_importer)
+    def build(paths, *, report=None, legacy_importer=None, runtime_settings=None):
+        ctx = fake_build(paths, report=report, legacy_importer=legacy_importer,
+                         runtime_settings=runtime_settings)
         ctx.storage_guard = guard
         return ctx
 
@@ -965,13 +992,14 @@ def test_run_gui_keeps_crash_message_box(bg_env, monkeypatch):
 def test_run_background_exits_zero_when_automation_disabled(bg_env, monkeypatch, caplog):
     import logging
     events, state, exits, paths = bg_env
-    monkeypatch.setattr(bootstrap, '_automation_enabled', lambda: False)
+    state['runtime_settings'].values['automation_enabled'] = False
     with caplog.at_level(logging.WARNING):
         code = bootstrap.run(['prog', '--background'], exit_process=exits.append)
     assert code == bootstrap.EXIT_AUTOMATION_DISABLED == 0
     # 读完配置就退出：不升级数据库、不组装、不进事件循环
     assert events[-1] == 'load_config'
     assert 'headless_migrate' not in events and 'build_context' not in events
+    assert 'listen' not in events
     assert 'exec' not in events and exits == []
     assert "允许命令行与脚本控制" in caplog.text
 
@@ -992,3 +1020,85 @@ def test_automation_enabled_reads_setting_and_fails_open(monkeypatch):
     assert bootstrap._automation_enabled() is True
     monkeypatch.setattr(bootstrap, 'command_settings', lambda: Settings(RuntimeError("坏")))
     assert bootstrap._automation_enabled() is True
+
+
+def test_build_context_runtime_settings_use_only_runtime_services(qapp, paths, monkeypatch):
+    from core.runtime_services import RuntimeServices
+    import ui.services
+    seen = []
+
+    def unexpected_ui_services(*_args):
+        raise AssertionError('后台不应组装界面服务')
+
+    monkeypatch.setattr(ui.services, 'production_services', unexpected_ui_services)
+    monkeypatch.setattr(MaintenanceService, 'startup_reconcile',
+                        lambda self, days, **kw: seen.append(days) or ReconcileResult(0, 0, 0))
+    ctx = build_context(paths, runtime_settings=_RuntimeSettings(retention_days=30))
+    try:
+        assert seen == [30]
+        assert isinstance(ctx.services, RuntimeServices)
+        assert ctx.services.launcher is not None
+        assert ctx.services.clock.now() is not None
+        assert callable(ctx.services.log_path)
+        assert not hasattr(ctx.services, 'dialogs')
+        assert not hasattr(ctx.services, 'notifier')
+        assert not ctx.power_guard.is_enabled()
+    finally:
+        bootstrap.release_session_lock(ctx)
+        _close(ctx)
+
+
+def test_command_settings_runtime_reads_provider_live():
+    provider = _RuntimeSettings()
+    settings = bootstrap.command_settings(provider)
+    provider.values['automation_enabled'] = False
+    provider.values['default_interval'] = 7
+    provider.values['last_metrics'] = ['num_handles']
+    assert settings.automation_enabled() is False
+    assert settings.default_interval() == 7.0
+    assert settings.default_metrics() == ['num_handles']
+    assert settings.interval_range() == (1.0, 3600.0)
+    metrics = settings.default_metrics()
+    metrics.append('memory_private')
+    assert settings.default_metrics() == ['num_handles']
+
+
+def test_headless_image_adapter_is_lazy_and_shared_by_report_and_stage(monkeypatch, paths):
+    import app_config
+    events = []
+    settings = _RuntimeSettings(default_interval=7)
+    snapshot = settings.snapshot()
+    monkeypatch.setattr(app_config, 'apply_runtime_snapshot',
+                        lambda data, path: events.append(('config', data, path)))
+    monkeypatch.setattr(bootstrap, 'render_report_image_for_ipc',
+                        lambda *args: events.append(('report', args)) or 'report-image')
+    monkeypatch.setattr(bootstrap, 'render_stage_snapshot_image',
+                        lambda *args: events.append(('stage', args)) or 'stage-image')
+    renderer = bootstrap._HeadlessReportRenderer(settings, paths.config_path)
+    assert events == []
+    settings.values['default_interval'] = 99
+    assert renderer.report('task', 'analysis', 'now') == 'report-image'
+    assert renderer.stage('task', 'analysis', 'now', 'range') == 'stage-image'
+    assert events == [
+        ('config', snapshot, paths.config_path),
+        ('report', ('task', 'analysis', 'now')),
+        ('stage', ('task', 'analysis', 'now', 'range')),
+    ]
+
+
+def test_headless_image_adapter_retries_configuration_after_failure(monkeypatch, paths):
+    import app_config
+    attempts = []
+
+    def prepare(*_args):
+        attempts.append('prepare')
+        if len(attempts) == 1:
+            raise RuntimeError('配置适配失败')
+
+    monkeypatch.setattr(app_config, 'apply_runtime_snapshot', prepare)
+    monkeypatch.setattr(bootstrap, 'render_report_image_for_ipc', lambda *_args: 'image')
+    renderer = bootstrap._HeadlessReportRenderer(_RuntimeSettings(), paths.config_path)
+    with pytest.raises(RuntimeError, match='配置适配失败'):
+        renderer.report('task', 'analysis', 'now')
+    assert renderer.report('task', 'analysis', 'now') == 'image'
+    assert attempts == ['prepare', 'prepare']

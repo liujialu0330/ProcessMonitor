@@ -24,7 +24,7 @@ from data.models import DataPoint, MonitorTask
 from tests.doubles import FakeClock, FakeTaskStatus
 from tests.factories import make_services
 from tests.helpers import (
-    ManualDefer, ManualHistoryRunner, SyncHistoryRunner, poll_until,
+    ManualDefer, ManualHistoryRunner, SyncHistoryRunner, poll_until, process_events_until,
 )
 from tests.history_dataset import _seed_query_dataset
 from ui.viewmodels import (
@@ -536,11 +536,13 @@ def test_delete_goes_through_manager_and_reloads(vm_rec, db, manager, monkeypatc
     vm.reload_tasks()
     assert vm.can_delete and vm.delete_hint == ""
     deleted = []
-    real = manager.delete_task_data
-    monkeypatch.setattr(manager, 'delete_task_data', lambda tid: deleted.append(tid) or real(tid))
+    real = manager.start_single_task_deletion
+    monkeypatch.setattr(manager, 'start_single_task_deletion',
+                        lambda tid, *args, **kwargs: deleted.append(tid) or real(tid, *args, **kwargs))
     rec.clear()
 
     assert vm.delete_current() is True
+    assert process_events_until(lambda: not vm.delete_pending)
     assert deleted == [task.task_id] and db.get_task(task.task_id) is None
     assert vm.current_task_id is None and vm.tasks == []
     assert rec.of('tasks_changed')[0][0] == []
@@ -554,6 +556,7 @@ def test_delete_explicit_selection_falls_to_select_state(vm_rec, db):
     vm.select_task(older.task_id)
     rec.clear()
     assert vm.delete_current() is True
+    assert process_events_until(lambda: not vm.delete_pending)
     assert vm.current_task_id is None and len(vm.tasks) == 1
     assert rec.of('empty_state') == [("请选择监控任务", "选定任务和指标后即可查看历史数据")]
 
@@ -565,7 +568,8 @@ def test_delete_refused_while_running(vm_rec, db, manager, status, monkeypatch, 
     if by == "task_status":
         status.set_running(task.task_id)
     vm.reload_tasks()
-    monkeypatch.setattr(manager, 'delete_task_data', lambda tid: pytest.fail("运行中不应删除"))
+    monkeypatch.setattr(manager, 'start_single_task_deletion',
+                        lambda *args, **kwargs: pytest.fail("运行中不应删除"))
 
     assert vm.can_delete is False
     assert vm.delete_hint == "任务正在运行中，请先停止任务再删除"
@@ -578,14 +582,17 @@ def test_delete_failure_keeps_selection(vm_rec, db, manager, monkeypatch, runner
     task = _make_task(db, "a.exe", BASE)
     vm.reload_tasks()
     count = len(runner.requests)
-    monkeypatch.setattr(manager, 'delete_task_data', lambda tid: False)
+    def fail(*args, **kwargs):
+        raise ValueError('正在导出数据')
+    monkeypatch.setattr(manager, 'start_single_task_deletion', fail)
     assert vm.delete_current() is False
     assert vm.current_task_id == task.task_id and len(runner.requests) == count
 
 
 def test_delete_without_selection(vm_rec, manager, monkeypatch):
     vm, _rec = vm_rec
-    monkeypatch.setattr(manager, 'delete_task_data', lambda tid: pytest.fail("未选中不应删除"))
+    monkeypatch.setattr(manager, 'start_single_task_deletion',
+                        lambda *args, **kwargs: pytest.fail("未选中不应删除"))
     assert vm.delete_current() is False
 
 

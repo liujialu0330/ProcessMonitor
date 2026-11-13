@@ -2,9 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'codex/release-validation-*']
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 jobs:
   test:
@@ -12,6 +13,8 @@ jobs:
     timeout-minutes: 25
     env:
       QT_QPA_PLATFORM: offscreen
+      # 子进程与测试诊断包含中文，英文 Windows 的默认管道编码无法表示这些字符
+      PYTHONIOENCODING: utf-8
       # 防御性设置：与本机已验证的 offscreen 跑法配置对齐，避免字体缺失导致刷屏/报错
       QT_QPA_FONTDIR: C:\Windows\Fonts
 

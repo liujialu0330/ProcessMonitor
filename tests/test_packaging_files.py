@@ -117,12 +117,13 @@ def _release_yml() -> str:
     return _text(PROJECT_ROOT / ".github" / "workflows" / "release.yml")
 
 
-def test_release_workflow_triggers_only_on_tags_and_manual_dispatch():
+def test_release_workflow_allows_tags_manual_and_isolated_validation_branch():
     yaml = pytest.importorskip("yaml")
     data = yaml.safe_load(_release_yml())
     triggers = data.get("on", data.get(True))
     assert set(triggers) == {"push", "workflow_dispatch"}
-    assert triggers["push"] == {"tags": ["v*"]}
+    assert triggers["push"] == {
+        "tags": ["v*"], "branches": ["codex/release-validation-*"]}
 
 
 def test_release_workflow_builds_and_smokes_but_never_publishes():

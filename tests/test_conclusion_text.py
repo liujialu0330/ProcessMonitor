@@ -380,7 +380,7 @@ def test_group_conclusion_lists_members_in_total_view_only(make_page, seesaw_mem
     page.verdict_banner.copy_actions[FORMAT_TEXT].trigger()
     text = copied(services)
     members = text.split("成员结论：")[1].splitlines()[1:]
-    assert members[0] == "- a.exe（1 个实例）：持续上涨（私有字节）"       # 持续上涨的在前
+    assert members[0] == "- a.exe（1 个实例）：持续上涨（私有字节 +7.03 MB/小时）"
     assert [m.split("（")[0].removeprefix("- ") for m in members] == ["a.exe", "app.exe", "b.exe"]
     # 与成员结论折叠区的判定逐行一致
     panel = [(r[0], r[2]) for r in page.member_panel.row_texts()]
@@ -393,7 +393,7 @@ def test_group_conclusion_lists_members_in_total_view_only(make_page, seesaw_mem
     markdown = copied(services)
     header, _align, body = tables_of(markdown)[1]
     assert header == list(ct.MEMBER_HEADERS)
-    assert body[0] == ["a.exe", "1", "持续上涨", "私有字节"]
+    assert body[0] == ["a.exe", "1", "持续上涨", "私有字节 +7.03 MB/小时"]
 
     vm.select_member("a.exe")                                    # 成员视图：不附成员结论
     page.verdict_banner.copy_actions[FORMAT_TEXT].trigger()
@@ -407,7 +407,7 @@ def test_member_lines_from_core_verdicts_alone(seesaw_members, db, make_page):
     page = make_page()
     open_group(page, seesaw_members)
     lines = member_lines(page.vm.last_analysis, {"a.exe": "A 进程"}, {"a.exe": 3})
-    assert lines[0] == MemberLine("A 进程", 3, "持续上涨", ("私有字节",))
+    assert lines[0] == MemberLine("A 进程", 3, "持续上涨", ("私有字节 +7.03 MB/小时",))
     assert [m.name for m in lines] == ["A 进程", "app.exe", "b.exe"]
     assert lines[1].instances is None and lines[1].verdict == "平稳"
 

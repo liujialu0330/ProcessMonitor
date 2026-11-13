@@ -27,7 +27,7 @@ from ui.theme_tokens import ATTENTION, DATA, EVENT_MARKER_COLORS, qcolor
 # 最小跨度规则按指标 kind 定义在 utils.metrics；常量在此再导出，保持原有导入路径可用
 from utils.metrics import (  # noqa: F401
     MIN_SPAN_BYTES_KB, MIN_SPAN_BYTES_RATIO, MIN_SPAN_COUNT, MIN_SPAN_PERCENT,
-    min_span_for, rate_min_span_for
+    min_span_for, rate_min_span_for, format_metric_value
 )
 
 # 固定高度（像素），横向随父布局拉伸
@@ -236,6 +236,7 @@ class SparklineWidget(QWidget):
     def append(self, value: float, timestamp: Optional[datetime] = None) -> None:
         """向当前显示的指标追加一个采集点并触发重绘；timestamp 为采集时间（画打点刻度要用）"""
         self._sampler.append(value, timestamp)
+        self._sync_height()
         self.update()
 
     def append_values(self, values: Mapping[str, float],
@@ -243,6 +244,7 @@ class SparklineWidget(QWidget):
         """一批采集值分别追加到各指标的缓冲区（之后切换显示对象时曲线已是完整的）。"""
         for metric_type, value in values.items():
             self._sampler_for(metric_type).append(value, timestamp)
+        self._sync_height()
         self.update()
 
     def metric_type(self) -> Optional[str]:
@@ -253,12 +255,18 @@ class SparklineWidget(QWidget):
         """切换显示的指标（纵轴最小跨度随之切换）。"""
         self._metric_type = metric_type
         self._sampler = self._sampler_for(metric_type)
+        self._sync_height()
         self.update()
+
+    def _sync_height(self):
+        values = self._sampler.series()
+        self.setFixedHeight(24 if len(values) >= 2 and min(values) == max(values) else FIXED_HEIGHT)
 
     def clear(self) -> None:
         """清空全部缓冲区并触发重绘"""
         for sampler in self._samplers.values():
             sampler.clear()
+        self._sync_height()
         self.update()
 
     def series(self) -> List[float]:
@@ -380,6 +388,15 @@ class SparklineWidget(QWidget):
         # count == 0：不画任何内容
 
         self._paint_ticks(painter, width, height)
+        if count >= 2 and height > 24 and width > 240 and self._metric_type:
+            painter.setPen(qcolor(DATA))
+            font = painter.font()
+            font.setPixelSize(10)
+            painter.setFont(font)
+            painter.drawText(self.rect().adjusted(4, 0, -4, 0), Qt.AlignRight | Qt.AlignTop,
+                             format_metric_value(self._metric_type, max(values)))
+            painter.drawText(self.rect().adjusted(4, 0, -4, 0), Qt.AlignRight | Qt.AlignBottom,
+                             format_metric_value(self._metric_type, min(values)))
         painter.end()
 
     def _paint_ticks(self, painter: QPainter, width: int, height: int) -> None:
@@ -389,8 +406,18 @@ class SparklineWidget(QWidget):
         if not positions:
             return
         ratio = self.devicePixelRatioF()
+        last_label_x = -100
+        number = 0
         for fraction, kind in positions:
             painter.setPen(tick_pen(kind, ratio))
             # 竖线对齐到设备像素中心：逻辑坐标 x 在 150% 缩放下常落在两个设备像素之间
             x = (math.floor(self._tick_x(fraction) * ratio) + 0.5) / ratio
             painter.drawLine(QPointF(x, 0), QPointF(x, height))
+            if kind == 'user':
+                number += 1
+            if kind in ('baseline', 'user') and x - last_label_x >= 32 and x < width - 35:
+                font = painter.font()
+                font.setPixelSize(10)
+                painter.setFont(font)
+                painter.drawText(QPointF(x + 3, 10), '基线' if kind == 'baseline' else str(number))
+                last_label_x = x

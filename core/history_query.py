@@ -35,7 +35,7 @@ from core.analysis.trend import (
 from data.errors import StorageError
 from data.mappers import normalize_ms
 from data.models import DataPoint, Marker
-from data.repos.analytics_repo import Bucket
+from data.repos.analytics_repo import Bucket, MetricAggregates
 from data.repos.point_repo import PointQuery
 from utils.metrics import (
     VALUE_CLASS_LEVEL, VALUE_CLASS_PEAK, VALUE_CLASS_RATE, member_series_key, spec,
@@ -543,7 +543,8 @@ def _query_data(db, request: HistoryRequest, task_info, anchor: Optional[datetim
         first_ts = display_agg.first_ts
         if segment_start is not None and segment_start > first_ts:
             first_ts = segment_start
-        intervals = _intervals(db, task_id, metric, markers, first_ts, display_agg.last_ts)
+        intervals = _intervals(db, task_id, metric, markers, first_ts, display_agg.last_ts,
+                               whole_range=display_agg)
 
     return HistorySnapshot(
         points=points, stats=stats, buckets=buckets, total_count=total_count,
@@ -567,7 +568,8 @@ def _chart_points(db, request: HistoryRequest, total_count: int) -> List[DataPoi
 
 
 def _intervals(db, task_id: str, metric: str, markers: List[Marker],
-               first_ts: datetime, last_ts: datetime) -> List[IntervalStats]:
+               first_ts: datetime, last_ts: datetime, *,
+               whole_range: Optional[MetricAggregates] = None) -> List[IntervalStats]:
     """
     按打点（基线 + 用户打点，暂停/恢复不算）把 [first_ts, last_ts] 切成相邻区间，
     每段用一次聚合查询取起止值、峰值与点数（不把原始点读进内存）。
@@ -595,8 +597,13 @@ def _intervals(db, task_id: str, metric: str, markers: List[Marker],
         start = _bound(left.timestamp)
         end = (_bound(right.timestamp) if i == last_index
                else _bound(right.timestamp) - timedelta(milliseconds=1))
-        agg = (db.analytics.aggregates(task_id, metric, since=start, until=end)
-               if end >= start else None)
+        # 仅复用当前请求同一指标的完整闭区间；重启裁剪、打点分段均须重新查询。
+        if (last_index == 0 and whole_range is not None and whole_range.count
+                and start == whole_range.first_ts and end == whole_range.last_ts):
+            agg = whole_range
+        else:
+            agg = (db.analytics.aggregates(task_id, metric, since=start, until=end)
+                   if end >= start else None)
         duration = (right.timestamp - left.timestamp).total_seconds()
         if agg is not None and agg.count:
             start_value, end_value = agg.first_value, agg.last_value

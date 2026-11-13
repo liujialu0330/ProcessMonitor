@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Callable, Dict, Optional, List, Tuple
 from PyQt5.QtCore import QThread, pyqtSignal
 
 from core.contracts import StopReason, TaskStatus, UnavailableReason
-from core.cycle_stats import CycleStats
+from core.cycle_stats import CycleStats, Histogram, merge_histograms
 from core.exit_forensics import (ExitCodeProbe, NullExitCodeProbe, crash_marker_label,
                                  format_exit_code, is_abnormal_exit, normalize_exit_code,
                                  open_exit_probe)
@@ -162,6 +162,8 @@ class MonitorWorker(QThread):
 
     # 信号定义
     data_updated = pyqtSignal(str, dict)    # 数据更新信号 (task_id, {指标类型: 指标值})
+    # 带采集时刻的实时样本，发送时可能尚未落库；不能当作提交完成通知。
+    sample_updated = pyqtSignal(str, dict, object)
     task_stopped = pyqtSignal(str, object)  # 任务停止信号 (task_id, StopReason)
     error_occurred = pyqtSignal(str, str)   # 错误信号 (task_id, error_message)
     # 指标不可用信号 (task_id, {指标类型: UnavailableReason})：每个指标每个任务只通知一次
@@ -273,7 +275,10 @@ class MonitorWorker(QThread):
         self._probe_unavailable_logged = False
         self._exe_path: Optional[str] = None
         self._restart_finder = restart_finder
+        self._policy_lock = threading.Lock()
         self._policy_override = (resume_on_restart, restart_limit)
+        self._policy_seed: Optional[Tuple[bool, int]] = None
+        self._policy_generation = 0
         self._policy: Tuple[bool, int] = (
             (bool(resume_on_restart), int(restart_limit or 0))
             if resume_on_restart is not None else (False, 0))
@@ -289,6 +294,7 @@ class MonitorWorker(QThread):
         self._paused_before_wait = False
         # 工具重启后续采：库里已有的数据质量，收尾与快照时在它的基础上累加
         self._prior_quality: Optional[QualityStats] = None
+        self._prior_histograms = None
         # 读退出码重试时的等待事件：永不置位，只借时钟的 wait 做可被假时钟推进的睡眠
         self._settle = threading.Event()
         self._recovering = recovering
@@ -540,6 +546,7 @@ class MonitorWorker(QThread):
                     # 的成员序列不进信号（卡片只看合计，成员经 group_members() 取）
                     if values:
                         self.data_updated.emit(self.task_id, self._signal_values(values))
+                        self.sample_updated.emit(self.task_id, self._signal_values(values), timestamp)
 
                     # 本周期新出现的不可用指标，一次性通知 UI（已通知过的不重复）
                     self._notify_unavailable()
@@ -735,29 +742,57 @@ class MonitorWorker(QThread):
 
     def restart_policy(self) -> Tuple[bool, int]:
         """续接策略 (是否续接, 次数上限)；读缓存，可在任意线程调用。"""
-        return self._policy
+        with self._policy_lock:
+            return self._policy
 
     def set_restart_policy(self, enabled: bool, limit: int) -> None:
         """直接设定续接策略（之后不再从库里读）。"""
-        self._policy_override = (bool(enabled), int(limit))
-        self._policy = (bool(enabled), int(limit) if enabled else 0)
+        with self._policy_lock:
+            self._policy_override = (bool(enabled), int(limit))
+            self._policy_seed = None
+            self._policy_generation += 1
+            self._policy = (bool(enabled), int(limit) if enabled else 0)
+
+    def seed_restart_policy(self, enabled: bool, limit: int) -> None:
+        """任务方案尚未落库时先使用已校验的启动策略，不覆盖显式固定策略。"""
+        with self._policy_lock:
+            if self._policy_override[0] is not None:
+                return
+            self._policy_seed = (bool(enabled), int(limit) if enabled else 0)
+            self._policy_generation += 1
+            self._policy = self._policy_seed
+
+    def release_restart_policy_seed(self) -> None:
+        """方案成功落库后恢复数据库策略读取，下一次检查不受刷新间隔限制。"""
+        with self._policy_lock:
+            if self._policy_seed is not None:
+                self._policy_seed = None
+                self._policy_generation += 1
+                self._policy_read_at = None
 
     def _refresh_restart_policy(self, force: bool = False) -> None:
         """从库里重读续接策略（方案在任务启动后才落库，所以周期性重读；注入了固定策略的不读）。"""
-        if self._policy_override[0] is not None:
-            return
         now = self._clock.monotonic()
-        if (not force and self._policy_read_at is not None
-                and now - self._policy_read_at < RESTART_POLICY_REFRESH_S):
-            return
-        self._policy_read_at = now
+        with self._policy_lock:
+            if self._policy_override[0] is not None or self._policy_seed is not None:
+                return
+            if (not force and self._policy_read_at is not None
+                    and now - self._policy_read_at < RESTART_POLICY_REFRESH_S):
+                return
+            self._policy_read_at = now
+            generation = self._policy_generation
         loader = getattr(getattr(self.db, 'tasks', None), 'load_restart_policy', None)
         if loader is None:
             return
         try:
-            self._policy = loader(self.task_id)
+            policy = loader(self.task_id)
         except Exception:
             logger.warning("task_id=%s 读取续接策略失败", self.task_id, exc_info=True)
+            return
+        with self._policy_lock:
+            # 读库期间入口可能刚保存新方案或设置固定策略，旧查询结果不能盖回去。
+            if generation == self._policy_generation:
+                self._policy = policy
 
     def _wants_restart(self) -> bool:
         """被测进程退出后是否进入"等待重启"：pid / tree 任务、策略开启、未达次数上限、
@@ -767,7 +802,7 @@ class MonitorWorker(QThread):
         if self.state not in (WorkerState.RUNNING, WorkerState.PAUSED):
             return False
         self._refresh_restart_policy(force=True)
-        enabled, limit = self._policy
+        enabled, limit = self.restart_policy()
         if not enabled:
             return False
         if self.restart_count >= limit:
@@ -828,9 +863,12 @@ class MonitorWorker(QThread):
             # 唤醒只来自 stop()：事件置位后状态已变，循环条件随即为假
             self._clock.wait(self._wake, RESTART_POLL_INTERVAL_S)
             self._wake.clear()
-        resumed_state = WorkerState.PAUSED if self._paused_before_wait else WorkerState.RUNNING
-        if prepared is None or not self._transition((WorkerState.WAITING_RESTART,),
-                                                    resumed_state):
+        with self._state_lock:
+            adopted = prepared is not None and self._state is WorkerState.WAITING_RESTART
+            if adopted:
+                self._state = (WorkerState.PAUSED if self._paused_before_wait
+                               else WorkerState.RUNNING)
+        if not adopted:
             if prepared is not None:
                 prepared.probe.close()
             self.waiting_restart_changed.emit(self.task_id, False)
@@ -1046,23 +1084,38 @@ class MonitorWorker(QThread):
         self._wake.set()
         return changed
 
-    def pause(self, timestamp: Optional[datetime] = None) -> bool:
-        """暂停监控（仅 RUNNING 可暂停；等待被测进程重启时没有数据可暂停，同样被拒绝；
-        唤醒当前等待，工作线程转入暂停等待）。
+    def pause(self, timestamp: Optional[datetime] = None, *, write_marker: bool = True) -> bool:
+        """暂停监控；等待重启时记住暂停意图，续接后保持暂停。
         切换成功后写一条"暂停"系统打点，时间为 timestamp（缺省取调用时刻）。"""
-        if not self._transition((WorkerState.RUNNING,), WorkerState.PAUSED):
-            return False
+        with self._state_lock:
+            if self._state is WorkerState.WAITING_RESTART:
+                if self._paused_before_wait:
+                    return False
+                self._paused_before_wait = True
+            elif self._state is WorkerState.RUNNING:
+                self._state = WorkerState.PAUSED
+            else:
+                return False
         self._wake.set()
-        self._write_system_marker('pause', timestamp)
+        if write_marker:
+            self._write_system_marker('pause', timestamp)
         return True
 
-    def resume(self, timestamp: Optional[datetime] = None) -> bool:
+    def resume(self, timestamp: Optional[datetime] = None, *, write_marker: bool = True) -> bool:
         """恢复监控（仅 PAUSED 可恢复；唤醒暂停等待，工作线程立即采集一次）。
         切换成功后写一条"恢复"系统打点，时间为 timestamp（缺省取调用时刻）。"""
-        if not self._transition((WorkerState.PAUSED,), WorkerState.RUNNING):
-            return False
+        with self._state_lock:
+            if self._state is WorkerState.WAITING_RESTART:
+                if not self._paused_before_wait:
+                    return False
+                self._paused_before_wait = False
+            elif self._state is WorkerState.PAUSED:
+                self._state = WorkerState.RUNNING
+            else:
+                return False
         self._wake.set()
-        self._write_system_marker('resume', timestamp)
+        if write_marker:
+            self._write_system_marker('resume', timestamp)
         return True
 
     def _write_system_marker(self, kind: str, timestamp: Optional[datetime]) -> None:
@@ -1086,7 +1139,9 @@ class MonitorWorker(QThread):
 
     def is_paused(self) -> bool:
         """任务是否已暂停"""
-        return self.state is WorkerState.PAUSED
+        with self._state_lock:
+            return (self._state is WorkerState.PAUSED
+                    or (self._state is WorkerState.WAITING_RESTART and self._paused_before_wait))
 
     def is_waiting_restart(self) -> bool:
         """被测进程已退出，任务正在等它重新启动"""
@@ -1110,8 +1165,8 @@ class MonitorWorker(QThread):
         return len(self._data_buffer) if self._storage_full_latched else 0
 
     def _with_prior_quality(self, quality: QualityStats) -> QualityStats:
-        """工具重启后续采：把库里已有的数据质量并进来。周期数是累加的；p95 无法相加，取两者
-        较大的（宁可偏悲观）。没有已有值（首次运行、上次没来得及写）时原样返回。"""
+        """工具重启后续采：周期数累加，直方图合并后重新取 p95；历史记录没有分布时
+        保守取已有 p95 与本段的较大值。没有历史质量时原样返回。"""
         prior = self._prior_quality
         if prior is None:
             return quality
@@ -1120,18 +1175,30 @@ class MonitorWorker(QThread):
             values = [v for v in (a, b) if v is not None]
             return max(values) if values else None
 
+        histograms = self._combined_histograms()
+
+        def percentile(name, old, new):
+            return (Histogram.restore(histograms[name]).p95_ms()
+                    if histograms is not None else worst(old, new))
+
         return QualityStats(
             planned_cycles=prior.planned_cycles + quality.planned_cycles,
             done_cycles=prior.done_cycles + quality.done_cycles,
             missed_cycles=prior.missed_cycles + quality.missed_cycles,
-            lag_p95_ms=worst(prior.lag_p95_ms, quality.lag_p95_ms),
-            collect_p95_ms=worst(prior.collect_p95_ms, quality.collect_p95_ms),
-            write_p95_ms=quality.write_p95_ms)
+            lag_p95_ms=percentile('lag', prior.lag_p95_ms, quality.lag_p95_ms),
+            collect_p95_ms=percentile('collect', prior.collect_p95_ms, quality.collect_p95_ms),
+            write_p95_ms=percentile('write', prior.write_p95_ms, quality.write_p95_ms))
+
+    def _combined_histograms(self):
+        if self._prior_quality is not None and self._prior_histograms is None:
+            return None
+        return merge_histograms(self.cycle_stats.histograms(), self._prior_histograms)
 
     def _load_prior_quality(self) -> None:
         """续采启动时读一次库里已有的数据质量（见 _with_prior_quality）；失败只记日志。"""
         try:
             self._prior_quality = self.db.tasks.load_quality(self.task_id)
+            self._prior_histograms = self.db.tasks.load_quality_histograms(self.task_id)
         except Exception:
             logger.warning("task_id=%s 读取已有数据质量失败，本次只记续采之后的", self.task_id,
                            exc_info=True)
@@ -1197,7 +1264,8 @@ class MonitorWorker(QThread):
                 return
             quality = self._with_prior_quality(stats.summary())
             self.task_model.quality = quality
-            self.db.tasks.save_quality(self.task_id, quality)
+            self.db.tasks.save_quality(self.task_id, quality,
+                                       histograms=self._combined_histograms())
             logger.info("task_id=%s 数据质量: 计划 %d 完成 %d 跳过 %d 周期，"
                         "调度延迟 p95 %s ms，采集 p95 %s ms，写库 p95 %s ms",
                         self.task_id, quality.planned_cycles, quality.done_cycles,

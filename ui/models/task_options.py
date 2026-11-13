@@ -12,7 +12,7 @@
 任务带自动化方案（tasks.plan_json）时，选项另带解析好的 plan（"同配置再测"、
 方案模板可直接取用），提示里多一行方案简述；方案损坏或版本过高时 plan 为 None。
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Collection, Dict, List, Mapping, Optional, Sequence
 
@@ -30,6 +30,11 @@ class TaskOption:
     tooltip: str
     running: bool
     plan: Optional[AutomationPlan] = None
+    process_name: str = field(default='', compare=False)
+    scenario: str = field(default='', compare=False)
+    build: str = field(default='', compare=False)
+    starred: bool = field(default=False, compare=False)
+    search_text: str = field(default='', compare=False)
 
 
 @dataclass
@@ -53,12 +58,25 @@ class TaskOptionsModel:
 
     def _make_option(self, task: MonitorTask, running: bool,
                      now: datetime) -> TaskOption:
+        identity = [value for value in (task.scenario, task.build) if value]
+        suffix = (' · ' + ' / '.join(identity)) if identity else ''
+        tooltip = format_task_tooltip(task, running, now)
+        if task.scenario:
+            tooltip += '\n场景：' + task.scenario
+        if task.build:
+            tooltip += '\n版本：' + task.build
+        if task.is_reference:
+            tooltip += '\n该场景的参考任务'
         return TaskOption(
             task_id=task.task_id,
-            text=format_task_option_text(task, running=running, now=now),
-            tooltip=format_task_tooltip(task, running, now),
+            text=('已标星 · ' if task.starred else '') + format_task_option_text(task, running=running, now=now) + suffix,
+            tooltip=tooltip,
             running=running,
             plan=plan_from_json_or_none(task.plan_json),
+            process_name=task.process_name, scenario=task.scenario, build=task.build,
+            starred=task.starred,
+            search_text=' '.join((task.process_name, task.note, task.scenario, task.build,
+                                  str(task.pid), task.task_id)).casefold(),
         )
 
     def rebuild(self, tasks: Sequence[MonitorTask], running_ids: Collection[str],

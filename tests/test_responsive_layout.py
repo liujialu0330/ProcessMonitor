@@ -645,9 +645,16 @@ _SCALED_SCRIPT = textwrap.dedent(r"""
         monitor_overflow = win.monitor_page.horizontalScrollBar().maximum()
         win.switchTo(win.analysis_page)
         print("RESULT", ratio, width, overflow, fits, monitor_overflow, page.breakpoints.tier)
-    manager.stop_all_tasks()
-    manager.join_all(3000)
-    win.hide()
+    # 最后一次切页仍可能发起后台查询，必须像正式入口一样收完登记线程再销毁窗口。
+    shutdown = []
+    real_shutdown = win._run_shutdown
+    win._run_shutdown = lambda: shutdown.append(real_shutdown()) or shutdown[-1]
+    win.request_quit()
+    assert shutdown == [True]
+    assert not services.threads.entries()
+    from tests.helpers import dispose_widget
+    dispose_widget(win)
+    sys.stdout.flush()
 """)
 
 
@@ -657,7 +664,7 @@ def test_high_dpi_smoke(tmp_path, scale):
     code = _SCALED_SCRIPT.format(root=root, db=str(tmp_path / "scaled.db"))
     env = dict(os.environ, QT_SCALE_FACTOR=scale, QT_QPA_PLATFORM="offscreen",
                PYTHONIOENCODING="utf-8", PROCESS_MONITOR_DATA_DIR=str(tmp_path / "appdata"))
-    proc = subprocess.run([sys.executable, "-c", code], cwd=root, env=env, capture_output=True,
+    proc = subprocess.run([sys.executable, "-u", "-X", "faulthandler", "-c", code], cwd=root, env=env, capture_output=True,
                           text=True, encoding="utf-8", timeout=180)
     lines = [line.split() for line in proc.stdout.splitlines() if line.startswith("RESULT")]
     assert proc.returncode == 0 and len(lines) == 2, (

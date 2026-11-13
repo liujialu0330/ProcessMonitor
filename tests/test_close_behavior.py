@@ -809,8 +809,9 @@ def test_navigation_is_monitor_analysis_settings(window):
     assert window.navigationInterface.panel.returnButton.isHidden()
     assert window.navigationInterface.panel.minimumExpandWidth == 1200
     # 只有三个一级页面（旧的历史/导出/关于页都已并入）
-    assert {name for name in vars(window) if name.endswith('_page')} == {
-        'monitor_page', 'analysis_page', 'setting_page'}
+    assert window.stackedWidget.count() == 3
+    assert window._analysis_content is None
+    assert window._setting_content is None
 
 
 def test_analysis_page_is_the_new_page(window):
@@ -914,12 +915,14 @@ def test_real_quit_stops_watchdog_before_shutdown(window, monkeypatch):
     """真退出收尾会阻塞界面线程数秒：先停看门狗，免得把正常收尾当成卡死转储。"""
     order = []
     window.attach_watchdog(_RecordingWatchdog(order))
+    monkeypatch.setattr(window.monitor_page.presenter, 'shutdown_live_stats',
+                        lambda: order.append('live_stats.stop'))
     monkeypatch.setattr(window, '_run_shutdown', lambda: order.append('shutdown'))
     monkeypatch.setattr(QApplication, 'quit', MagicMock())
 
     window.closeEvent(_fake_event())
 
-    assert order == ['watchdog.stop', 'shutdown']
+    assert order == ['watchdog.stop', 'live_stats.stop', 'shutdown']
 
 
 def test_hide_to_tray_keeps_watchdog_running(window, monkeypatch):
@@ -927,6 +930,8 @@ def test_hide_to_tray_keeps_watchdog_running(window, monkeypatch):
     window.tray = _FakeTray()
     order = []
     window.attach_watchdog(_RecordingWatchdog(order))
+    monkeypatch.setattr(window.monitor_page.presenter, 'shutdown_live_stats',
+                        lambda: order.append('live_stats.stop'))
 
     window.closeEvent(_fake_event())
 

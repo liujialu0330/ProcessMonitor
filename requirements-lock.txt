@@ -2,8 +2,8 @@
 # 生成方式：干净 venv 中安装 requirements.txt 的4个运行依赖 + pyinstaller，
 # 再 pip freeze 导出，用于未来在干净环境中复现打包时验证过的确切依赖版本。
 # 不含 pytest（测试依赖不应进入打包环境）。
-# 本机实际打包仍使用全局环境（与 v1.1.0 发布口径一致，全局环境即发布环境）；
-# 本文件仅供需要搭建/复现干净打包环境时使用：
+# 当前 CI 安装包使用 Python 3.11.9 和本文件的干净环境构建；
+# 本机复现同一依赖环境时执行：
 #   pip install -r requirements-lock.txt
 altgraph==0.17.5
 colorama==0.4.6

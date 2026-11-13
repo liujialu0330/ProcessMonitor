@@ -1,0 +1,56 @@
+name: 真实窗口冒烟验证
+
+# 专用验收分支与手动入口验证真实桌面；验收记录见 doc/2.0.0验收记录.md。
+on:
+  push:
+    branches: ['codex/release-validation-*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gui-smoke:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      QT_QPA_PLATFORM: windows
+      QT_QPA_FONTDIR: C:\Windows\Fonts
+      PYTHONIOENCODING: utf-8
+      GUI_SMOKE_VISIBLE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements-lock.txt
+      - name: 安装依赖
+        run: |
+          pip install -r requirements-lock.txt
+          pip install -r requirements-dev.txt
+      - name: 检查真实桌面与托盘
+        shell: pwsh
+        run: |
+          if (Get-Command Set-DisplayResolution -ErrorAction SilentlyContinue) {
+            Set-DisplayResolution -Width 1920 -Height 1080 -Force
+          }
+          Add-Type -AssemblyName System.Windows.Forms
+          $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+          Write-Host "桌面分辨率：$bounds"
+          if ($bounds.Width -lt 1280 -or $bounds.Height -lt 800) {
+            throw '运行器没有足够大的交互桌面，不能视为真实窗口验收通过'
+          }
+          python -c "from PyQt5.QtWidgets import QApplication,QSystemTrayIcon; app=QApplication([]); print('托盘可用：', QSystemTrayIcon.isSystemTrayAvailable())"
+      - name: 完整主线冒烟与阶段截图
+        env:
+          GUI_SMOKE_CAPTURE_DIR: ${{ runner.temp }}/gui-smoke
+          PROCESS_MONITOR_DATA_DIR: ${{ runner.temp }}/process-monitor-gui-smoke
+        run: python -m pytest tests/e2e/test_gui_smoke.py -m slow -v -s --junitxml=${{ runner.temp }}/gui-smoke/results.xml
+      - name: 保留截图与测试报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-window-smoke
+          path: ${{ runner.temp }}/gui-smoke
+          if-no-files-found: warn

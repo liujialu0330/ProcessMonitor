@@ -56,6 +56,8 @@ data/config.json
 logs/
 
 # 测试
+.pytest_cache/
+.ruff_cache/
 test_*.db
 tests/perf/.cache/
 tests/visual/.out/

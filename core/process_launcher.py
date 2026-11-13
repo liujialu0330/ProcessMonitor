@@ -28,6 +28,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+from utils.runtime_env import target_environment
+
 logger = logging.getLogger(__name__)
 
 # 启动后观察多久判断"立即退出"（秒）：缺 DLL、参数不对的程序通常在这段时间内就退出了
@@ -277,7 +279,7 @@ class ProcessLauncher:
         try:
             # 不捕获输出、不改控制台与优先级：被测程序应当像用户自己双击启动的一样
             proc = self._popen(command, cwd=spec.effective_cwd(), creationflags=0,
-                               close_fds=True)
+                               close_fds=True, env=target_environment())
         except OSError as exc:
             logger.warning("启动被测程序失败: %s", spec.command_line(), exc_info=True)
             return LaunchResult(error=_os_error_text(exc, spec))

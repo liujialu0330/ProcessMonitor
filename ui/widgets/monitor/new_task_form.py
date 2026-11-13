@@ -19,6 +19,7 @@ launch_options）+ 开始按钮。
 总数），存储预估按成员数估算；同名进程没有"等待启动"与"启动被测程序"（它本来就随时
 可以开始，且没有单一的被启动进程），进程树两者都可用。
 """
+import math
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
@@ -26,11 +27,12 @@ from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import QGridLayout, QHBoxLayout, QVBoxLayout, QWidget
 from qfluentwidgets import (
     CaptionLabel, CardWidget, CheckBox, FluentIcon, LineEdit, PrimaryPushButton,
-    PushButton, SegmentedWidget, SpinBox, StrongBodyLabel, TransparentToolButton,
+    PushButton, SegmentedWidget, SpinBox, StrongBodyLabel, TransparentToolButton, TransparentPushButton,
 )
 
 from core.automation.plan import AutomationPlan
 from core.process_launcher import LaunchSpec
+from core.plans import MAX_NOTE_CHARS, MAX_WAIT_TIMEOUT_S
 from core.storage_estimate import (
     GROUP_TYPICAL_MEMBERS, estimate, estimate_tooltip, format_estimate,
 )
@@ -46,7 +48,7 @@ from utils.metrics import (
     LEAK_CHECK_PRESET, PROCESS_COUNT, filter_group_metrics, get_metric_display_name,
 )
 
-NOTE_MAX_LENGTH = 100
+NOTE_MAX_LENGTH = MAX_NOTE_CHARS
 START_TEXT = "开始监控"
 WAIT_START_TEXT = "等待并开始"
 LAUNCH_START_TEXT = "启动并监控"
@@ -83,6 +85,8 @@ class TaskRequest:
     # 监控目标类型：pid 单个进程 / tree 以 pid 为根的进程树 / name 全部同名进程
     # （name 时 pid 为 0、name 是要监控的进程名）
     target_kind: str = TARGET_PID
+    scenario: str = ''
+    build: str = ''
 
 
 @dataclass(frozen=True)
@@ -95,6 +99,9 @@ class WaitRequest:
     plan: Optional[AutomationPlan] = None
     # 出现后按哪种目标建任务（pid 或 tree；同名进程不需要等待）
     target_kind: str = TARGET_PID
+    scenario: str = ''
+    build: str = ''
+    timeout_s: Optional[float] = None
 
 
 def metric_summary(metrics: Sequence[str], group: bool = False) -> Tuple[str, str]:
@@ -152,10 +159,14 @@ class NewTaskForm(CardWidget):
         layout.setSpacing(12)
 
         self.title_label = StrongBodyLabel("新建监控任务", self)
-        layout.addWidget(self.title_label)
+        self.title_row = QHBoxLayout()
+        self.title_row.addWidget(self.title_label)
+        self.title_row.addStretch(1)
+        layout.addLayout(self.title_row)
 
         # 第一行：目标类型 | 进程选择 | 展开/收起 | 开始。折叠后只剩这一行
         top_row = QHBoxLayout()
+        self.top_row = top_row
         top_row.setSpacing(8)
         self.kind_segmented = SegmentedWidget(self)
         for key, text, tip in KIND_OPTIONS:
@@ -167,7 +178,7 @@ class NewTaskForm(CardWidget):
         self.picker = ProcessPicker(process_query, self)
         top_row.addWidget(self.picker, 1)
 
-        self.expand_button = TransparentToolButton(FluentIcon.CHEVRON_DOWN_MED, self)
+        self.expand_button = TransparentPushButton('选项', self, FluentIcon.SETTING)
         self.expand_button.setToolTip("展开采集间隔、指标、备注与自动化")
         self.expand_button.clicked.connect(self._toggle_details)
         self.expand_button.hide()
@@ -214,7 +225,9 @@ class NewTaskForm(CardWidget):
         grid.addWidget(CaptionLabel("测试备注", self.details), 1, 0)
         self.note_input = LineEdit(self.details)
         self.note_input.setPlaceholderText("测试备注（可选，如：建模 200 次）；回车开始监控")
-        self.note_input.setMaxLength(NOTE_MAX_LENGTH)
+        # Qt 按 UTF-16 单元限长，预留双倍容量以完整接收非 BMP 字符；提交时按字符数校验。
+        self.note_input.setMaxLength(NOTE_MAX_LENGTH * 2)
+        self.note_input.setToolTip(f'最多 {NOTE_MAX_LENGTH} 个字符')
         self.note_input.setClearButtonEnabled(True)
         self.note_input.returnPressed.connect(self.submit)
         grid.addWidget(self.note_input, 1, 1, 1, 3)
@@ -224,6 +237,22 @@ class NewTaskForm(CardWidget):
         self.wait_checkbox.setToolTip(WAIT_OPTION_TIP)
         self.wait_checkbox.toggled.connect(self._on_wait_toggled)
         grid.addWidget(self.wait_checkbox, 2, 1, 1, 3)
+        self.wait_timeout_box = QWidget(self.details)
+        timeout_row = QHBoxLayout(self.wait_timeout_box)
+        timeout_row.setContentsMargins(0, 0, 0, 0)
+        timeout_row.setSpacing(8)
+        timeout_row.addWidget(CaptionLabel('超时（秒）', self.wait_timeout_box))
+        self.wait_timeout_input = LineEdit(self.wait_timeout_box)
+        self.wait_timeout_input.setPlaceholderText('不限')
+        self.wait_timeout_input.setMaximumWidth(130)
+        self.wait_timeout_input.setMaxLength(32)
+        self.wait_timeout_input.setEnabled(False)
+        self.wait_timeout_input.setToolTip('留空表示持续等待；可填写 1 秒到 30 天，支持小数秒')
+        self.wait_timeout_input.returnPressed.connect(self.submit)
+        timeout_row.addWidget(self.wait_timeout_input)
+        timeout_row.addStretch(1)
+        self.wait_timeout_box.hide()
+        grid.addWidget(self.wait_timeout_box, 3, 1, 1, 3)
 
         # 自动化：定时 / 日志触发打点、停止条件、停止后导出（默认折叠）
         self.automation = AutomationOptions(self.details)
@@ -231,14 +260,24 @@ class NewTaskForm(CardWidget):
         self.automation.browse_export_dir_requested.connect(self.browse_export_dir_requested)
         self.automation.browse_snapshot_dir_requested.connect(
             self.browse_snapshot_dir_requested)
-        grid.addWidget(self.automation, 3, 0, 1, 4)
+        grid.addWidget(self.automation, 4, 0, 1, 4)
 
         # 启动被测程序：先启动再监控（默认折叠）
         self.launch_options = LaunchOptions(self.details)
         self.launch_options.browse_exe_requested.connect(self.browse_exe_requested)
         self.launch_options.browse_cwd_requested.connect(self.browse_cwd_requested)
         self.launch_options.changed.connect(self._on_launch_changed)
-        grid.addWidget(self.launch_options, 4, 0, 1, 4)
+        grid.addWidget(self.launch_options, 5, 0, 1, 4)
+        self.scenario_edit = LineEdit(self.details)
+        self.scenario_edit.setMaxLength(120)
+        self.scenario_edit.setPlaceholderText('测试场景（用于参考基线与方案）')
+        self.build_edit = LineEdit(self.details)
+        self.build_edit.setMaxLength(120)
+        self.build_edit.setPlaceholderText('被测版本（留空自动读取文件版本）')
+        grid.addWidget(CaptionLabel('场景', self.details), 6, 0)
+        grid.addWidget(self.scenario_edit, 6, 1)
+        grid.addWidget(CaptionLabel('版本', self.details), 6, 2)
+        grid.addWidget(self.build_edit, 6, 3)
         layout.addWidget(self.details)
 
         self.interval_spinbox.valueChanged.connect(self._refresh_storage_estimate)
@@ -249,7 +288,9 @@ class NewTaskForm(CardWidget):
         """Tab 顺序：进程 → 间隔 → 指标 → 备注 → 等待选项 → 开始 → 展开按钮 → 自动化区 →
         启动区。开始按钮紧跟常用字段（填完回车/Tab 即到），两个折叠区按显示顺序放在最后。"""
         chain = [self.picker.combo.line_edit, self.interval_spinbox, self.metric_button,
-                 self.note_input, self.wait_checkbox, self.start_button, self.expand_button,
+                 self.note_input, self.scenario_edit, self.build_edit,
+                 self.wait_checkbox, self.wait_timeout_input, self.start_button,
+                 self.expand_button,
                  *self.automation.focus_chain(), *self.launch_options.focus_chain()]
         for first, second in zip(chain, chain[1:]):
             QWidget.setTabOrder(first, second)
@@ -349,6 +390,22 @@ class NewTaskForm(CardWidget):
     def set_wait_enabled(self, enabled: bool) -> None:
         self.wait_checkbox.setChecked(enabled)
 
+    def wait_timeout_s(self) -> Optional[float]:
+        """保留方案的小数秒精度；隐藏时可记住输入，只有等待启动才使用它。"""
+        text = self.wait_timeout_input.text().strip()
+        if not text:
+            return None
+        try:
+            seconds = float(text)
+        except ValueError:
+            seconds = float('nan')
+        if not math.isfinite(seconds) or not 1 <= seconds <= MAX_WAIT_TIMEOUT_S:
+            raise ValueError('等待超时应为 1 秒到 30 天之间的数字；留空表示不限')
+        return seconds
+
+    def set_wait_timeout_s(self, seconds: Optional[float]) -> None:
+        self.wait_timeout_input.setText('' if seconds is None else str(seconds))
+
     def _on_wait_toggled(self, checked: bool) -> None:
         self._sync_start_mode()
 
@@ -366,6 +423,8 @@ class NewTaskForm(CardWidget):
         self.launch_options.setEnabled(not name_kind)
         self.launch_options.setToolTip(LAUNCH_NAME_KIND_TIP if name_kind else "")
         waiting = self.wait_enabled() and not launching
+        self.wait_timeout_box.setVisible(waiting and not name_kind)
+        self.wait_timeout_input.setEnabled(waiting and not name_kind)
         # 等待中的进程本来就不在列表里、启动的程序还没运行、同名进程允许输入此刻不存在的
         # 进程名：都不提示"未找到"
         self.picker.set_no_match_hint_enabled(not waiting and not launching and not name_kind)
@@ -468,6 +527,10 @@ class NewTaskForm(CardWidget):
 
     def _checked_plan(self) -> Tuple[bool, Optional[AutomationPlan]]:
         """(是否可以提交, 方案)：方案有误时就近显示错误并返回 (False, None)。"""
+        if len(self.note()) > NOTE_MAX_LENGTH:
+            self.show_error(f'测试备注不能超过 {NOTE_MAX_LENGTH} 个字符')
+            self.note_input.setFocus()
+            return False, None
         plan = self.automation_plan()
         if plan is None:
             return True, None
@@ -512,9 +575,17 @@ class NewTaskForm(CardWidget):
             ok, plan = self._checked_plan()
             if not ok:
                 return
+            try:
+                timeout_s = self.wait_timeout_s()
+            except ValueError as exc:
+                self.show_error(str(exc))
+                self.wait_timeout_input.setFocus()
+                return
             self.wait_requested.emit(WaitRequest(
                 name=name, metrics=tuple(self.metrics()), interval=self.interval(),
-                note=self.note(), plan=plan, target_kind=self._kind))
+                note=self.note(), plan=plan, target_kind=self._kind,
+                scenario=self.scenario_edit.text().strip(), build=self.build_edit.text().strip(),
+                timeout_s=timeout_s))
             return
         target = self.picker.resolve()
         if isinstance(target, ResolveError):
@@ -526,7 +597,8 @@ class NewTaskForm(CardWidget):
         self.start_requested.emit(TaskRequest(
             pid=target.pid, name=target.name, create_time=target.create_time,
             metrics=tuple(self.metrics()), interval=self.interval(), note=self.note(),
-            plan=plan, target_kind=self._kind))
+            plan=plan, target_kind=self._kind,
+            scenario=self.scenario_edit.text().strip(), build=self.build_edit.text().strip()))
 
     def _submit_by_name(self) -> None:
         """同名进程：只要进程名（选中的进程取其名，也可手输），进程不必此刻在运行。"""
@@ -539,7 +611,8 @@ class NewTaskForm(CardWidget):
             return
         self.start_requested.emit(TaskRequest(
             pid=0, name=name, create_time=None, metrics=tuple(self.metrics()),
-            interval=self.interval(), note=self.note(), plan=plan, target_kind=TARGET_NAME))
+            interval=self.interval(), note=self.note(), plan=plan, target_kind=TARGET_NAME,
+            scenario=self.scenario_edit.text().strip(), build=self.build_edit.text().strip()))
 
     def _submit_launch(self) -> None:
         spec, error = self.launch_options.spec()
@@ -554,7 +627,8 @@ class NewTaskForm(CardWidget):
             pid=0, name=spec.name, create_time=None,
             metrics=tuple(self.metrics()), interval=self.interval(), note=self.note(),
             plan=plan, launch=spec, close_on_stop=self.launch_options.close_on_stop(),
-            target_kind=self._kind))
+            target_kind=self._kind, scenario=self.scenario_edit.text().strip(),
+            build=self.build_edit.text().strip()))
 
     def show_error(self, text: str) -> None:
         self.picker.set_error(text)

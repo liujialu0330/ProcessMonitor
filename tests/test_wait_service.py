@@ -93,12 +93,16 @@ def test_process_appears_and_default_starter_creates_task(env):
     assert len(manager.created) == 1
 
 
-def test_newest_same_name_process_wins(env):
+def test_ambiguous_same_name_never_starts_arbitrary_process(env):
     service, clock, query, manager, events = env
     query.processes['app.exe'] = [(1, 5.0), (2, 50.0), (3, 20.0)]
-    service.add(Req('app.exe'))
+    wait_id = service.add(Req('app.exe'))
     service.poll()
-    assert manager.created[0][0] == 2
+    assert manager.created == []
+    assert not service.has_waits()
+    assert events['failed'][0][0] == wait_id
+    assert events['failed'][0][1].startswith('ambiguous:')
+    assert '1, 2, 3' in events['failed'][0][1]
 
 
 def test_missing_extension_tries_exe(env):

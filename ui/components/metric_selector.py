@@ -11,7 +11,7 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
                              QScrollArea)
 from qfluentwidgets import (
-    MessageBoxBase, SubtitleLabel, CheckBox, PushButton, CaptionLabel, FluentIcon
+    MessageBoxBase, SubtitleLabel, CheckBox, PushButton, CaptionLabel, FluentIcon, ComboBox, LineEdit
 )
 
 from utils.metrics import (
@@ -87,6 +87,20 @@ class MetricSelectorDialog(MessageBoxBase):
         preset_row.addWidget(CaptionLabel("鼠标悬停在指标上可查看含义"))
         preset_row.addStretch()
         self.viewLayout.addLayout(preset_row)
+        from ui.metric_presets import metric_presets
+        self.preset_combo = ComboBox(self)
+        self.preset_combo.addItems(list(metric_presets()))
+        self.preset_combo.currentTextChanged.connect(
+            lambda name: self.select_metrics(metric_presets().get(name, [])))
+        self.preset_name = LineEdit(self)
+        self.preset_name.setPlaceholderText('自定义预设名称')
+        self.preset_name.setMaximumWidth(180)
+        self.save_preset_button = PushButton('存为预设', self)
+        self.save_preset_button.clicked.connect(self._save_preset)
+        saved_row = QHBoxLayout()
+        for widget in (self.preset_combo, self.preset_name, self.save_preset_button):
+            saved_row.addWidget(widget)
+        self.viewLayout.addLayout(saved_row)
         self.group_hint_label = None
         if self.group_mode:
             self.group_hint_label = CaptionLabel(GROUP_HINT, self)
@@ -179,6 +193,20 @@ class MetricSelectorDialog(MessageBoxBase):
     def select_leak_check_preset(self) -> None:
         """一键勾选"泄漏排查"预设（覆盖当前勾选）。"""
         self.select_metrics(LEAK_CHECK_PRESET)
+
+    def _save_preset(self):
+        from ui.metric_presets import metric_presets, save_metric_preset
+        try:
+            save_metric_preset(self.preset_name.text(), self.get_selected())
+        except ValueError as exc:
+            self.preset_name.setToolTip(str(exc))
+            self.preset_name.setFocus()
+            return
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+        self.preset_combo.addItems(list(metric_presets()))
+        self.preset_combo.setCurrentText(f'自定义：{self.preset_name.text().strip()}')
+        self.preset_combo.blockSignals(False)
 
     def _on_category_clicked(self, category: str):
         """

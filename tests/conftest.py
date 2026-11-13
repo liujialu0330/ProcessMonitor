@@ -23,6 +23,10 @@ if PROJECT_ROOT not in sys.path:
 # offscreen 平台不弹出任何窗口；若外部已设置 QT_QPA_PLATFORM 则尊重外部设置
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
+# 与正式入口一致：必须早于图表依赖，避免测试进程使用另一套数学库线程默认值。
+from utils.runtime_env import configure_math_threads  # noqa: E402
+configure_math_threads()
+
 import config  # noqa: E402
 from app.paths import AppPaths  # noqa: E402
 from data.database import Database  # noqa: E402

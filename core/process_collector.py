@@ -299,8 +299,8 @@ _FALLBACK = object()
 
 
 def _monotonic() -> float:
-    """回退路径的差分时钟，与快照的 TakenAt.monotonic 同一时钟（time.monotonic）。"""
-    return time.monotonic()
+    """CPU 差分用高精度单调时钟，与快照的 TakenAt.monotonic 同源。"""
+    return time.perf_counter()
 
 
 class _NoCpuBaseline(Exception):

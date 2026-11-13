@@ -22,7 +22,7 @@ from core.target_info import TargetInfo, target_info_from_json_or_none
 from core.verdict import (VERDICT_INSUFFICIENT, VERDICT_RISING, VERDICT_STABLE, member_overall,
                           member_verdicts, segments_summary)
 from data.models import TARGET_NAME, TARGET_TREE
-from utils.metrics import get_metric_display_name
+from utils.metrics import get_metric_display_name, format_metric_rate, member_series_key
 
 FORMAT_TEXT = 'text'
 FORMAT_MARKDOWN = 'markdown'
@@ -175,13 +175,23 @@ def member_lines(analysis, names: Optional[Mapping[str, str]] = None,
     verdicts = member_verdicts(analysis)
     lines = []
     for member, overall in member_overall(analysis).items():
-        rising = tuple(get_metric_display_name(metric)
+        rising = tuple(_member_metric_text(analysis, member, metric)
                        for metric, verdict in verdicts.get(member, {}).items()
                        if verdict == VERDICT_RISING)
         lines.append(MemberLine(names.get(member, member), instances.get(member),
                                 MEMBER_VERDICT_TEXTS.get(overall, overall), rising))
     lines.sort(key=lambda m: (m.verdict != MEMBER_VERDICT_TEXTS[VERDICT_RISING], m.name.casefold()))
     return lines
+
+
+def _member_metric_text(analysis, member: str, metric: str) -> str:
+    from core.verdict import member_snapshots_of
+    snapshot = member_snapshots_of(analysis).get(member_series_key(metric, member))
+    stats = getattr(snapshot, 'stats', None) or {}
+    rate = stats.get('slope_per_hour')
+    text = format_metric_rate(metric, rate)
+    name = get_metric_display_name(metric)
+    return name if text in ('--', '—', '') else f'{name} {text}'
 
 
 # ---------------------------------------------------------------- 组装

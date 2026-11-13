@@ -36,6 +36,7 @@ from ui import theme_tokens as tokens
 from ui.layout_breakpoints import COMPACT, REGULAR, WIDE
 from ui.typography import TypeScale, data_font
 from ui.widgets.history.common import CARD_PADDING_H
+from utils.metrics import format_metric_delta, split_member_key
 
 ROW_HEIGHT = 36
 # 单元格左右内边距（库默认 16 px）
@@ -121,6 +122,7 @@ class SummaryTable(CardWidget):
         省出一行高度；依据文本仍记在 basis() 里。"""
         super().__init__(parent)
         self._rows: List[SummaryRow] = []
+        self._reference = None
         self._font = data_font(TypeScale.BODY)
         self._tier = REGULAR
         self._user_columns: Tuple[str, ...] = ()
@@ -133,6 +135,10 @@ class SummaryTable(CardWidget):
         self.table = TableWidget(self)
         self.table.setColumnCount(len(SUMMARY_COLUMNS))
         self.table.setHorizontalHeaderLabels([SUMMARY_HEADERS[c] for c in SUMMARY_COLUMNS])
+        for column in range(self.table.columnCount()):
+            self.table.horizontalHeaderItem(column).setTextAlignment(
+                Qt.AlignVCenter | (Qt.AlignLeft if column == 0 else
+                                  Qt.AlignCenter if column == VERDICT_COLUMN else Qt.AlignRight))
         header = self.table.horizontalHeader()
         # 不拉伸最后一列（上限占比）：其它列撑满后它会被压窄而截断。
         # 第 0 列的模式由 _apply_column_policy 按可用宽度在 Stretch / Interactive 间切换
@@ -163,7 +169,8 @@ class SummaryTable(CardWidget):
         cell_qss = (f"QTableView::item{{padding-left: {CELL_PADDING_H}px;"
                     f"padding-right: {CELL_PADDING_H}px;}}")
         setCustomStyleSheet(self.table, cell_qss, cell_qss)
-        self.table.cellClicked.connect(self._on_cell_clicked)
+        self.table.currentCellChanged.connect(
+            lambda row, column, _old_row, _old_column: self._on_cell_clicked(row, column))
 
         self.title_label = StrongBodyLabel("判定摘要", self)
         title_row = QHBoxLayout()
@@ -192,6 +199,7 @@ class SummaryTable(CardWidget):
         self.basis_label.setText(f"依据：{basis}" if basis else "")
         table = self.table
         table.setUpdatesEnabled(False)
+        table.blockSignals(True)
         try:
             table.clearContents()
             table.setRowCount(len(self._rows))
@@ -208,13 +216,51 @@ class SummaryTable(CardWidget):
                 pill.setAlignment(Qt.AlignCenter)
                 table.setCellWidget(r, VERDICT_COLUMN, pill)
             self._fill_cells()
+            self._fill_reference()
             self._apply_theme_colors()
             self._apply_plan()
         finally:
+            table.blockSignals(False)
             table.setUpdatesEnabled(True)
         self._fit_height()
         self.select_metric(focus)
         self._apply_column_policy()
+
+    def set_reference(self, comparison) -> None:
+        self._reference = comparison
+        self._fill_reference()
+        self._apply_column_policy()
+
+    def _fill_reference(self) -> None:
+        comparison = self._reference
+        column = len(SUMMARY_COLUMNS)
+        if comparison is None or not comparison.rows:
+            if self.table.columnCount() > column:
+                self.table.setColumnHidden(column, True)
+            return
+        if self.table.columnCount() == column:
+            self.table.setColumnCount(column + 1)
+            header = QTableWidgetItem('较参考')
+            header.setTextAlignment(Qt.AlignVCenter | Qt.AlignRight)
+            self.table.setHorizontalHeaderItem(column, header)
+            self.table.horizontalHeader().setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        self.table.setColumnHidden(column, False)
+        by_metric = {r.metric: r for r in comparison.rows}
+        for index, row in enumerate(self._rows):
+            result = by_metric.get(split_member_key(row.metric)[0])
+            text, tip = '—', '参考任务未采集该指标'
+            if result is not None:
+                tip = result.reason
+                if result.delta is not None:
+                    text = format_metric_delta(result.metric, result.delta) + '/轮'
+                    text += ' · 回归' if result.status == 'regression' else ' · 未见回归'
+                    if result.current and result.reference:
+                        tip += (f'\n当前 95% 区间：{result.current.low:g}～{result.current.high:g}'
+                                f'\n参考 95% 区间：{result.reference.low:g}～{result.reference.high:g}')
+            item = QTableWidgetItem(text)
+            item.setToolTip(tip)
+            item.setTextAlignment(Qt.AlignVCenter | Qt.AlignRight)
+            self.table.setItem(index, column, item)
 
     # ---------- 列：档位、用户勾选与表头菜单 ----------
 
@@ -418,7 +464,7 @@ class SummaryTable(CardWidget):
         header = self.table.horizontalHeader()
         others = sum(max(self.table.sizeHintForColumn(c), header.sectionSizeHint(c),
                          header.minimumSectionSize())
-                     for c in range(1, len(SUMMARY_COLUMNS))
+                     for c in range(1, self.table.columnCount())
                      if not self.table.isColumnHidden(c))
         return self.metric_column_floor() + others
 

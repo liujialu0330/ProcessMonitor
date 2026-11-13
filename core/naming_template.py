@@ -7,7 +7,7 @@
 字段：
 - process：进程名，去掉 .exe；
 - build：被测程序的文件版本（任务的 build 列优先，其次是被测目标元数据里的文件版本）；
-- scenario：场景，暂无来源，恒为空（留给参考基线库）；
+- scenario：任务的测试场景（scenario 列）；
 - note：任务备注，截断到 NOTE_MAX_CHARS 字；
 - date：导出时刻 YYYYMMDD_HHMMSS（不是任务开始时间：同一任务按不同范围多次导出时不会每次
   撞名弹覆盖确认，也和 1.x 的命名习惯一致）；

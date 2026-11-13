@@ -7,7 +7,7 @@
 
 - add(request, starter=None, timeout_s=None) -> wait_id：request 只需有 name 属性（其余字段
   原样交给启动函数）；进程名没写扩展名时也试一下加 .exe；
-- 同名进程有多个时取最新启动的那个；
+- 同名进程有多个时报告歧义，避免自动监控错误的目标；
 - starter(wait_id, match) -> Optional[task_id]：建任务；返回 None 表示没建成（只读库、
   任务数已满等），随后发 failed(wait_id, 'start_failed')；缺省用构造时给的启动函数；
 - timeout_s 到点仍未出现 → failed(wait_id, 'timeout')（时间经注入的时钟，只用 now()）；
@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 WAIT_FAILED_TIMEOUT = 'timeout'
 WAIT_FAILED_START = 'start_failed'
+WAIT_FAILED_AMBIGUOUS = 'ambiguous'
 WAIT_ID_PREFIX = 'wait-'
 
 
@@ -40,6 +41,15 @@ class WaitMatch:
 
 
 Starter = Callable[[str, WaitMatch], Optional[str]]
+
+
+class AmbiguousProcessError(ValueError):
+    """同名目标不唯一，必须选择 PID 或改为同名进程组。"""
+
+    def __init__(self, name: str, pids):
+        self.pids = tuple(sorted(set(pids)))
+        super().__init__(f"找到多个 {name}（PID：{', '.join(map(str, self.pids))}），"
+                         "请选择具体 PID，或改用同名进程组")
 
 
 def candidate_names(name: str) -> List[str]:
@@ -88,6 +98,7 @@ class WaitService(QObject):
         self._prefix = id_prefix
         self._ids = itertools.count(1)
         self._waits: Dict[str, _Wait] = {}
+        self._ambiguity = None
 
     # ---------- 登记 ----------
 
@@ -112,14 +123,20 @@ class WaitService(QObject):
     def has_waits(self) -> bool:
         return bool(self._waits)
 
+    def failure_pids(self, wait_id: str) -> List[int]:
+        failure = self._ambiguity
+        return list(failure[1].pids) if failure and failure[0] == wait_id else []
+
     # ---------- 轮询 ----------
 
     def find(self, name: str) -> Optional[Tuple[int, str, Optional[float]]]:
-        """按名查找一次：返回 (pid, 实际匹配的名称, 创建时间)，同名多个取最新启动的。"""
+        """按名查找唯一实例；同名多个抛 AmbiguousProcessError。"""
         for candidate in candidate_names(name):
             matches = self._query.find_pids_by_name(candidate)
             if matches:
-                pid, create_time = max(matches, key=lambda m: m[1] or 0.0)
+                if len({m[0] for m in matches}) > 1:
+                    raise AmbiguousProcessError(candidate, (m[0] for m in matches))
+                pid, create_time = matches[0]
                 return pid, candidate, create_time
         return None
 
@@ -131,6 +148,14 @@ class WaitService(QObject):
                 continue
             try:
                 found = self.find(entry.request.name)
+            except AmbiguousProcessError as exc:
+                self._waits.pop(wait_id, None)
+                self._ambiguity = (wait_id, exc)
+                try:
+                    self.failed.emit(wait_id, f'{WAIT_FAILED_AMBIGUOUS}:{exc}')
+                finally:
+                    self._ambiguity = None
+                continue
             except Exception:
                 logger.error("按名查找进程失败: %s", entry.request.name, exc_info=True)
                 found = None

@@ -64,7 +64,8 @@ class ConfigPreferences:
 
     def last_metrics(self) -> List[str]:
         """上次选择的指标（副本）。"""
-        return list(cfg.get(cfg.last_metrics))
+        from ui.metric_presets import default_metrics
+        return default_metrics(cfg.get(cfg.last_metrics))
 
     def remember_last_metrics(self, metrics: Iterable[str]) -> None:
         """记住指标选择：委托 app_config.remember_last_metrics（归一化、按需落盘）。"""

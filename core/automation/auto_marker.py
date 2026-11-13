@@ -34,7 +34,7 @@ from typing import Callable, Dict, Optional, Set
 
 from PyQt5.QtCore import QObject, pyqtSignal
 
-from core.automation.log_watcher import LogWatcher
+from core.automation.log_watcher import LogWatcher, make_log_watcher
 from core.automation.plan import AutomationPlan
 from core.automation.stop_conditions import StopState, should_stop
 from core.monitor_manager import default_marker_kind
@@ -83,6 +83,7 @@ class AutoMarkerService(QObject):
     auto_stopped = pyqtSignal(str, str)
     export_requested = pyqtSignal(str, str)
     stage_snapshot_due = pyqtSignal(str, str, int)
+    marker_added = pyqtSignal(str, object)
 
     def __init__(self, manager, clock, parent: Optional[QObject] = None, *,
                  watcher_factory: Optional[Callable[..., LogWatcher]] = None):
@@ -97,7 +98,7 @@ class AutoMarkerService(QObject):
         super().__init__(parent)
         self._manager = manager
         self._clock = clock
-        self._watcher_factory = watcher_factory or LogWatcher
+        self._watcher_factory = watcher_factory or make_log_watcher
         self._tracked: Dict[str, _Tracked] = {}
         # 处理出错已记过 ERROR 的任务（同一任务只记一次，解除跟踪时清除）
         self._failed: Set[str] = set()
@@ -124,8 +125,8 @@ class AutoMarkerService(QObject):
         Returns:
             bool: 是否开始跟踪（方案没有任何自动化内容时不跟踪，返回 False）
         """
+        self.detach(task_id)
         if plan is None or not plan.needs_service():
-            self._tracked.pop(task_id, None)
             return False
         now = self._clock.now()
         tracked = _Tracked(plan=plan, started_at=started_at or now,
@@ -147,7 +148,11 @@ class AutoMarkerService(QObject):
     def detach(self, task_id: str) -> None:
         """停止跟踪任务（不存在时忽略）。"""
         self._failed.discard(task_id)
-        if self._tracked.pop(task_id, None) is not None:
+        tracked = self._tracked.pop(task_id, None)
+        if tracked is not None:
+            close = getattr(tracked.watcher, 'close', None)
+            if close is not None:
+                close()
             logger.info("自动化方案已解除: task_id=%s", task_id)
 
     def is_attached(self, task_id: str) -> bool:
@@ -229,6 +234,9 @@ class AutoMarkerService(QObject):
         if paused == tracked.paused:
             return
         tracked.paused = paused
+        set_paused = getattr(tracked.watcher, 'set_paused', None)
+        if set_paused is not None:
+            set_paused(paused)
         if paused:
             # 暂停：剩余的等待时间作废（暂停期间不累计）
             tracked.next_due = None
@@ -288,6 +296,7 @@ class AutoMarkerService(QObject):
             logger.error("自动打点失败（%s）: task_id=%s label=%s", source, task_id, label)
         else:
             logger.info("自动打点（%s）: task_id=%s label=%s", source, task_id, label)
+            self.marker_added.emit(task_id, marker)
 
     # ========== 内部：轮数与停止 ==========
 

@@ -35,15 +35,18 @@
 **安装后目录结构**：
 ```
 用户选择的安装目录\
-├── 进程监控助手.exe        # 主程序（引导exe）
+├── 进程监控助手.exe        # 主程序
+├── pmctl.exe               # 命令行控制端
 ├── _internal\               # PyInstaller onedir 依赖目录（Qt/Python运行时等）
 ├── app_green_icon.ico       # 应用图标
+├── unins000.exe / .dat      # Inno Setup 卸载器及卸载记录
 └── （数据目录不在安装目录内，见下方"数据存储位置"）
 ```
 
-**数据存储位置**：数据目录固定在 `%LOCALAPPDATA%\进程监控助手\data\monitor.db`
-（与安装目录无关，覆盖安装/卸载重装不影响该目录，详见 `app/paths.py` 的
-`AppPaths.resolve()`）。
+**数据存储位置**：安装版默认数据库为 `%LOCALAPPDATA%\进程监控助手\data\monitor.db`。
+路径优先级是 `--data-dir` → `PROCESS_MONITOR_DATA_DIR` → `portable.flag` → 默认位置；
+便携标志位于程序基础目录时使用其 `data\`，源码默认使用项目 `data\`。
+指定数据目录时日志随数据放在其 `logs\` 下，便于隔离测试；详见 `app/paths.py` 的 `AppPaths.resolve()`。
 
 ---
 
@@ -53,7 +56,7 @@
 
 | 软件 | 用途 | 下载地址 |
 |------|------|---------|
-| **Python 3.8+** | 开发环境 | https://www.python.org/downloads/ |
+| **Python 3.11** | 锁定依赖与CI构建环境；已验证3.11.9 | https://www.python.org/downloads/ |
 | **PyInstaller** | 打包exe（本机实测 6.21.0，注意下方 PATH 提示） | `pip install pyinstaller` |
 | **Inno Setup 6** | 制作安装包 | https://jrsoftware.org/isdl.php |
 
@@ -102,7 +105,34 @@ build.bat
 完成后：
 - onedir 产物位于 `dist\进程监控助手\`
 - 安装包位于 `dist\installer\Windows_v{版本}_Setup.exe`
-- 终端末尾会提示 onedir / 安装包体积是否超过规划门槛（onedir 105 MB、安装包 36 MB，只提示、不拦截）
+- 终端末尾按完整字节数检查体积：安装包 ≤ 100 MB、程序目录 ≤ 350 MB（MB = 1,000,000 字节）；超过目标会中止构建交付
+
+自动化终端若使用 UTF-8 代码页，而批处理文件仍按项目约定保存为 GBK，请从项目根显式运行：
+
+```bat
+cmd /d /c "chcp 936 >nul && call build\build.bat"
+```
+
+否则中文路径判断可能把已生成的程序误报为不存在。无需修改批处理文件编码。
+
+### 当前CI构建与本机验收（2026-11-13）
+
+当前交付包来自 [1fd5279的CI构建](https://github.com/liujialu0330/ProcessMonitor/actions/runs/43350082062)，
+使用Python 3.11.9和 `requirements-lock.txt`，安装包为 **47.88 MB**（47,879,533字节）。
+本机实际安装目录包含卸载器共 **158.98 MB**（158,980,327字节，356文件）；
+其中程序文件154,481,452字节、354文件。两项体积目标均通过。
+
+打包和安装后的11步自检、旧版覆盖升级等21项安装检查、模拟更新7项、实际安装回退A/B均通过；
+最终包又完成本机安装、自检、体积复核与卸载，正式数据未变。
+同一验收提交功能CI连续3次成功，本地完整集4990通过，性能套件10项通过，预算未修改。
+原本机全局环境的81.11 MB构建已退为历史记录，不能与当前CI包的摘要或目录大小混用。
+
+安装包 SHA-256：`ea863e33deee68803e6c89cd89e31b69c0f670e7de548ae73f1f7d0f6f4bb0f2`。
+完整来源、跳过项和复核边界见 [2.0.0验收记录](../doc/2.0.0验收记录.md)。
+2026-11-13决定：其余24小时长测、真机专项与多人内测本次不执行，不作为源码提交门槛；没有把这些项目记录为通过。
+
+本机保留的验收下载包位于 `dist/ci-1fd5279/`，用于回退证据的前一包位于 `dist/ci-15fa596/`。
+它们是CI产物的本地副本；重新运行 `build.bat` 仍会清空整个 `dist/` 并生成标准输出目录，需保留的证据应另行归档。
 
 ### 手动分步执行（调试用）
 
@@ -290,7 +320,7 @@ exe 版本信息4元组），供 spec 的 `version=` 参数引用；每次打包
 
 Inno Setup安装脚本，主要功能：
 - 设置应用信息（名称、版本、发布者）——版本号由外部命令行 `/DMyAppVersion`
-  传入，`#ifndef` 提供兜底值
+  传入，未传时 `#ifndef` 分支报错并停止编译
 - 配置安装目录和权限
 - 创建快捷方式
 - 配置卸载逻辑（保留用户数据选项）
@@ -306,7 +336,7 @@ Inno Setup安装脚本，主要功能：
 5. 清空 `dist\`（旧的 onedir 与历史安装包一并删除）与 PyInstaller 临时目录
 6. 执行 `python -m PyInstaller` 打包（onedir）
 7. 验证打包结果（体积/文件数），运行打包自检（`run_self_test.py` → `进程监控助手.exe --self-test`）
-8. 探测 ISCC 并编译安装包（文件名直接是 `Windows_v{版本}_Setup.exe`），提示体积是否超门槛
+8. 探测 ISCC 并编译安装包（文件名直接是 `Windows_v{版本}_Setup.exe`），按精确字节数校验体积目标，超限中止
 
 ---
 
@@ -436,7 +466,7 @@ powershell -File build\installer_smoke.ps1 -OldInstaller D:\old\Windows_v1.4.1_S
 9. 静默卸载：程序文件与 `_internal` 被删，数据目录（`monitor.db` 与 `.bak_v1`）保留
 
 每一步输出 `[通过]` 行，失败时输出原因、保留工作目录并以退出码 1 结束。`.github/workflows/release.yml`
-（tag `v*` 推送或手动触发）依次运行 `build.bat`、本脚本并把安装包留作 artifact，**不创建也不修改
+（tag `v*`、`codex/release-validation-*` 分支推送或手动触发）依次运行 `build.bat`、本脚本并把安装包留作 artifact，**不创建也不修改
 GitHub Release**；Release 仍由人手动创建，随后用 `verify_release.py` 复核。
 
 ### 其余发布前检查
@@ -578,7 +608,7 @@ build.bat
 ### 发布阶段
 1. 准备发布说明（正文 ≤ 60 行，正式版含“升级须知”）
 2. 建草稿 Release，只上传 `Windows_v{版本}_Setup.exe`
-3. `python builderify_release.py --tag v{版本} --allow-draft --local-setup ...` 全部通过后发布
+3. `python build\verify_release.py --tag v{版本} --allow-draft --local-setup ...` 全部通过后发布
 4. 发布后不带 `--allow-draft` 复核一次；正式版 1 小时内用真实 1.4.1 走一遍自动更新（见“发布校验”）
 
 ---
@@ -592,6 +622,6 @@ build.bat
 
 ---
 
-**文档版本**：v1.1
-**最后更新**：2026-07-12
-**适用版本**：进程监控助手 v1.3.0
+**文档版本**：v2.0
+**最后更新**：2026-11-13
+**适用版本**：进程监控助手 v2.0.0-beta.1

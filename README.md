@@ -17,7 +17,24 @@ English | [简体中文](./README.zh-CN.md)
 
 </div>
 
-ProcessMonitor is a Windows 11 Fluent Design desktop app for keeping an eye on any running process. Pick a process by PID or from a live list, choose from 26 metrics across memory, CPU, system and I/O categories, and watch the numbers update on a configurable sampling interval — from every second up to once an hour. Every sample is persisted locally; the Analysis page gives each metric a verdict, round-by-round increases and trend charts, lets you compare two test runs, and exports a report image plus CSV files in one click.
+## 2.0 development build
+
+The source version is `2.0.0-beta.1`. It adds process trees and same-name process groups, automatic markers and stop conditions, crash evidence and restart recovery, evidence bundles, reusable multi-target plans, comparison of up to four tasks, and scenario references. Monitoring offers card and list views; the task library supports search, stars, and batch deletion.
+
+The first launch upgrades older databases to schema v5 and keeps a `.bak_v1` backup. Large databases may take time to migrate; the default data directory stays the same. Keep enough free disk space and read the [upgrade and rollback notes](CHANGELOG.md).
+
+As of November 13, 2026, the 2.0 implementation, functional regression, remote CI, performance, installation/uninstallation, and both rollback paths have been validated. The project owner has excluded the remaining 24-hour soak, device-specific checks, and multi-user trial from the requirements for this source submission. Those checks were not run and are not counted as passes. The source remains a beta; a formal Release and its live automatic-update channel have not been published and verified. See the [acceptance record](doc/2.0.0验收记录.md) for results, installer hashes, and scope.
+
+```bat
+python main.py
+python pmctl.py start --plan D:\plans\window-cycle.json
+python pmctl.py verdict --task TASK_ID --vs-reference
+```
+
+Save, import, or export plans from the monitoring page. Notes allow up to 2,000 characters; wait timeouts accept fractional seconds, with an empty field meaning no timeout. Redirected `pmctl` output uses UTF-8; `--json` uses standard Unicode escapes for Chinese text and emoji. See the [automation guide](tools/README.md) for commands and JSON examples.
+
+
+ProcessMonitor is a Windows 11 Fluent Design desktop app for keeping an eye on any running process. Pick a process by PID or from a live list, choose from 26 metrics across memory, CPU, system and I/O categories, and watch the numbers update on a configurable sampling interval — from every second up to once an hour. Every sample is persisted locally; the Analysis page gives each metric a verdict, round-by-round increases and trend charts, lets you compare up to four test runs, and exports a report image plus CSV files in one click.
 
 ## ✨ Features
 
@@ -32,7 +49,7 @@ ProcessMonitor is a Windows 11 Fluent Design desktop app for keeping an eye on a
 ### 🔍 Monitoring
 - **26 metrics, 4 categories** — memory (working set, private bytes, page faults, USS, ...), CPU (usage, user/kernel time, base priority), system (threads, handles, GDI/USER objects, voluntary context switches) and I/O (read/write bytes and counts); names follow Task Manager and every metric has a one-line description, shown as a tooltip in the metric picker
 - **Private bytes as the leak indicator** — the former "virtual memory", "commit size" and "private working set" metrics were identical on Windows and are merged into "private bytes", the primary metric for spotting memory leaks
-- **Honest gaps instead of fake zeros** — when a metric cannot be read, the task card shows "unavailable" with the reason and nothing is recorded for it. Without administrator rights only USS of higher-privilege processes is unreadable; GDI/USER objects of processes in other sessions (e.g. system services) show "not supported"
+- **Honest gaps instead of fake zeros** — when a metric cannot be read, the task card shows "unavailable" with the reason and nothing is recorded for it. Availability depends on process permissions, session, and system interfaces, even when running as administrator; GDI/USER objects of processes in other sessions (e.g. system services) show "not supported"
 - **Cards you can read at a glance** — a status pill (Running / Paused / Ended / Ended abnormally) and elapsed time; each metric shows its change since baseline (median of the 5 samples after the baseline marker) or since start; the sparkline covers "task start until now" with marker ticks
 - **Markers without breaking your flow** — the card's "Marker" button, the tray menu and a global hotkey (Ctrl+Alt+M by default, configurable in Settings), all numbered "Baseline / Round N" automatically; pausing and resuming add system markers
 - **Wait for the process to launch** — start waiting before the target runs; monitoring begins with your chosen settings the moment it appears, so you can watch start-up too
@@ -67,7 +84,7 @@ ProcessMonitor is a Windows 11 Fluent Design desktop app for keeping an eye on a
 - **Crash-resilient storage** — SQLite with WAL mode, automatic retry on failed writes, crash/error logging (5MB x 5 rotation), and automatic recovery of orphaned "running" tasks after an unclean shutdown
 - **Safe database upgrades** — upgrades run in an explicit transaction and roll back on failure, restoring from the automatic backup so old data is never lost
 - **Never freezes on stop** — stopping a task or exiting the app does not block the UI, and all collected data is flushed to disk before exit
-- **Automated test suite** — 1,700+ test cases covering the data layer, migration, collection and scheduling, verdicts and interval statistics, report export, the global hotkey (with a fake backend), update verification, page flows and UI contracts, plus an offscreen smoke test of the whole "start → baseline → two rounds → analysis → export report → close" path; tests use a temporary data directory and never touch real data
+- **Automated test suite** — 4,700+ test cases covering the data layer, migration, collection and scheduling, verdicts and interval statistics, report export, the global hotkey (with a fake backend), update verification, page flows and UI contracts, plus an offscreen smoke test of the whole "start → baseline → two rounds → analysis → export report → close" path; tests use a temporary data directory and never touch real data
 - **Measured performance** — opening a 770k-row history task takes ~1.4s (down from 3.4s pre-v1.2.0; measured on the maintainer's dev machine)
 
 ## 📸 Screenshots
@@ -101,7 +118,7 @@ python main.py
 
 ### Notes
 
-- **System requirements**: Windows 10/11 (64-bit); Python 3.8+ to run from source (CI and release builds use 3.11)
+- **System requirements**: Windows 10/11 (64-bit); use Python 3.11 for source runs and locked dependencies (CI verified on 3.11.9)
 - **Data storage**: `%LOCALAPPDATA%\进程监控助手\data\monitor.db` (SQLite, WAL mode); logs live under `%LOCALAPPDATA%\进程监控助手\logs\`
 - **Auto-update**: checks GitHub Releases on startup and from Settings → About & updates; you can download and run the installer without leaving the app
 
@@ -143,14 +160,14 @@ python -m pytest tests/
 ```
 
 - List the test cases with `pytest --collect-only -q`; tests use a temporary data directory by default, and the runtime data directory can be overridden with the `PROCESS_MONITOR_DATA_DIR` environment variable (logs then go to its `logs\` subfolder)
-- CI runs the test suite on every push and pull request (see the CI badge above)
+- Functional CI runs on pushes to `main` or `codex/release-validation-*`, pull requests targeting `main`, and manual dispatch (see the CI badge above)
 - To build a Windows installer, see [build/README_打包说明.md](build/README_打包说明.md)
 
 ## 🗺 Roadmap
 
 - [ ] Export data to Excel format
-- [ ] Compare three or more tasks at once
-- [ ] Alerts when a metric crosses a threshold
+- [x] Compare up to four tasks (2.0 development build)
+- Threshold alerts are outside the current scope.
 
 See [CHANGELOG.md](./CHANGELOG.md) or [GitHub Releases](https://github.com/liujialu0330/ProcessMonitor/releases) for the full release history.
 

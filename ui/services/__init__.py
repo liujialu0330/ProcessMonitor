@@ -5,11 +5,10 @@
 生产环境由 production_services(manager, registry) 一次性组装，主窗口向下分发给各页面；
 测试用 tests/doubles.py 中的替身组装（见 tests/factories.py 的 make_services）。
 """
-import logging
-import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
+from core.runtime_services import APP_LOG_FILENAME, current_log_path
 from ui.services.clock import Clock, SystemClock
 from ui.services.dialogs import (
     CLOSE_ACTION_CANCEL, CLOSE_ACTION_QUIT, CLOSE_ACTION_TRAY, CLOSE_ACTIONS,
@@ -57,10 +56,6 @@ class UiServices:
     window_memory: Any = None
 
 
-# 应用日志文件名（与 utils.logger.setup_logging 一致）
-APP_LOG_FILENAME = 'app.log'
-
-
 def primary_screen_dpi_scale() -> Optional[float]:
     """主屏的设备像素比（启用了高 DPI 缩放，PassThrough 舍入下即系统缩放倍数）；
     没有 QGuiApplication 或主屏时为 None。只能在界面线程调用。"""
@@ -70,16 +65,6 @@ def primary_screen_dpi_scale() -> Optional[float]:
     if screen is None:
         return None
     return float(screen.devicePixelRatio()) or None
-
-
-def current_log_path() -> Optional[str]:
-    """root logger 上 app.log 文件处理器的实际路径：日志目录由组合根按数据目录推导，
-    从处理器上取避免在这里重复那套规则。没有配置文件日志时为 None。"""
-    for handler in logging.getLogger().handlers:
-        filename = getattr(handler, 'baseFilename', None)
-        if filename and os.path.basename(filename) == APP_LOG_FILENAME:
-            return filename
-    return None
 
 
 def production_services(manager: "MonitorManager",

@@ -7,7 +7,8 @@
 """
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QHBoxLayout, QScrollArea, QVBoxLayout, QWidget
-from qfluentwidgets import CaptionLabel
+from qfluentwidgets import CaptionLabel, qconfig
+from ui.theme_tokens import WINDOW, TERTIARY, pick
 
 from ui.layout_breakpoints import LayoutBreakpoints
 from ui.typography import PageTitleLabel
@@ -43,6 +44,8 @@ class PageScaffold(QScrollArea):
         # 去掉边框与底色，透出主窗口的 Fluent 背景
         self.setStyleSheet("QScrollArea{background: transparent; border: none}")
         self.viewport().setStyleSheet("background: transparent")
+        self._apply_scroll_theme()
+        qconfig.themeChanged.connect(self._apply_scroll_theme)
 
         self.container = QWidget()
         self.container.setStyleSheet("background: transparent")
@@ -72,6 +75,16 @@ class PageScaffold(QScrollArea):
         self.header_layout.addLayout(self.command_layout)
         self.header_layout.setAlignment(self.command_layout, Qt.AlignTop)
         self.content_layout.addLayout(self.header_layout)
+
+    def _apply_scroll_theme(self, *_args):
+        """原生 QScrollArea 的滚动条不会跟随 Fluent 主题，显式同步轨道和滑块。"""
+        background, handle = pick(WINDOW), pick(TERTIARY)
+        self.verticalScrollBar().setStyleSheet(
+            'QScrollBar:vertical {background: ' + background + '; width: 10px; margin: 2px 0;}'
+            'QScrollBar::handle:vertical {background: ' + handle + '; border-radius: 3px;'
+            ' min-height: 24px; margin: 0 2px;}'
+            'QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {height: 0;}'
+            'QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {background: transparent;}')
 
     def set_title(self, text: str) -> None:
         self.title_label.setText(text)

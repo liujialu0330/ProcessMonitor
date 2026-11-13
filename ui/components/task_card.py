@@ -21,18 +21,19 @@ from datetime import datetime
 from typing import Dict, Iterable, List, Optional, Set
 
 from PyQt5.QtCore import QRectF, Qt, pyqtSignal
-from PyQt5.QtGui import QColor, QIcon, QPainter
+from PyQt5.QtGui import QColor, QIcon, QPainter, QFont, QFontMetrics, QPen, QPalette
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                              QGridLayout, QSizePolicy)
 from qfluentwidgets import (
-    PushButton, CardWidget, FluentIcon, CaptionLabel, StrongBodyLabel, Theme,
-    TransparentToolButton, isDarkTheme
+    PushButton, PrimaryPushButton, CardWidget, FluentIcon, CaptionLabel, StrongBodyLabel, Theme,
+    TransparentToolButton, isDarkTheme, CheckBox, setCustomStyleSheet
 )
 from qfluentwidgets.common.icon import FluentIconBase, SvgIconEngine, drawSvgIcon
 
 from core.contracts import StopReason, UnavailableReason
 from ui import theme_tokens as tokens
 from ui.components.sparkline import SparklineWidget
+from ui.live_stats import LiveStats
 from data.models import TARGET_NAME, TARGET_PID
 from ui.formatting import (
     MEMBERS_TRUNCATED_TEXT, is_abnormal_stop, members_summary_text, members_tooltip,
@@ -175,6 +176,29 @@ class CardBaseline:
     values: Dict[str, float] = field(default_factory=dict)
 
 
+class MetricReadingLabel(MetricValueLabel):
+    """保留完整文本与无障碍名称，数值主字号、单位次字号绘制。"""
+    def paintEvent(self, event):
+        text = self.text()
+        if ' ' not in text or text.startswith('不可用'):
+            return super().paintEvent(event)
+        value, unit = text.rsplit(' ', 1)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.TextAntialiasing)
+        main = self.font()
+        fm = QFontMetrics(main)
+        baseline = (self.height() - fm.height()) / 2 + fm.ascent()
+        painter.setFont(main)
+        painter.setPen(self.palette().color(QPalette.WindowText))
+        painter.drawText(0, int(baseline), value)
+        secondary = QFont(main)
+        secondary.setPixelSize(12)
+        secondary.setWeight(QFont.Normal)
+        painter.setFont(secondary)
+        painter.setPen(tokens.qcolor(tokens.TERTIARY))
+        painter.drawText(fm.horizontalAdvance(value) + 5, int(baseline), unit)
+
+
 class MetricCell(QWidget):
     """指标格：名 / 值（20px Semibold）/ 较基线变化。点击即把迷你趋势图切到该指标。"""
 
@@ -187,6 +211,7 @@ class MetricCell(QWidget):
         self._hover = False
         self.setCursor(Qt.PointingHandCursor)
         self.setAttribute(Qt.WA_Hover, True)
+        self.setFocusPolicy(Qt.StrongFocus)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 4, 8, 4)
@@ -200,7 +225,7 @@ class MetricCell(QWidget):
         self.name_label = CaptionLabel(display_name, self)
         self.name_label.setMinimumWidth(1)
         self.name_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        self.value_label = MetricValueLabel("--", self)
+        self.value_label = MetricReadingLabel("--", self)
         self.value_label.setMinimumWidth(1)
         self.value_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.delta_label = DataCaptionLabel("", self)
@@ -233,8 +258,23 @@ class MetricCell(QWidget):
         if event.button() == Qt.LeftButton and self.rect().contains(event.pos()):
             self.clicked.emit(self.metric_type)
 
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
+            self.clicked.emit(self.metric_type)
+            event.accept()
+        else:
+            super().keyPressEvent(event)
+
+    def focusInEvent(self, event):
+        super().focusInEvent(event)
+        self.update()
+
+    def focusOutEvent(self, event):
+        super().focusOutEvent(event)
+        self.update()
+
     def paintEvent(self, event):
-        if not (self._selected or self._hover):
+        if not (self._selected or self._hover or self.hasFocus()):
             return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
@@ -245,6 +285,12 @@ class MetricCell(QWidget):
             # 选中态：左缘强调色竖条（强调色只用于选中态与主按钮；对底色不足 3:1 时自动加深）
             painter.setBrush(tokens.selection_bar_color())
             painter.drawRoundedRect(QRectF(0, 6, 3, max(0, self.height() - 12)), 1.5, 1.5)
+        if self.hasFocus():
+            painter.setBrush(Qt.NoBrush)
+            pen = QPen(tokens.selection_bar_color(), 1)
+            pen.setCosmetic(True)
+            painter.setPen(pen)
+            painter.drawRoundedRect(QRectF(self.rect()).adjusted(1, 1, -1, -1), 4, 4)
         painter.end()
 
 
@@ -328,6 +374,8 @@ class TaskCard(CardWidget):
         # 采集次数：UI 内存计数，卡片创建时置 0，每次收到 data_updated 加 1，
         # 不查库（当前没有"重启后恢复运行中任务"的路径）
         self.count = 0
+        self.round_count = 0
+        self.live_stats = LiveStats()
 
         # 暂停/结束状态；卡片创建时任务必为运行态
         self.is_paused = False
@@ -363,7 +411,12 @@ class TaskCard(CardWidget):
         # 顶部一行：身份（进程名 ●状态 · PID · 每 N 秒 · 已运行 · 备注）与操作按钮；
         # 结束后这一行就是整张卡片（· 结束原因 · 结束时间 · 已记录 N 次）
         header_layout = QHBoxLayout()
+        self.header_layout = header_layout
         header_layout.setSpacing(8)
+        self.selection_checkbox = CheckBox(self)
+        self.selection_checkbox.setToolTip('选择此已结束任务用于批量导出或关闭')
+        self.selection_checkbox.hide()
+        header_layout.addWidget(self.selection_checkbox)
 
         self.title_label = StrongBodyLabel(self.process_name)
         self.title_label.setToolTip(self.process_name)
@@ -373,9 +426,10 @@ class TaskCard(CardWidget):
         header_layout.addWidget(self.title_label)
 
         self.status_label = CaptionLabel("")
+        self.status_label.setContentsMargins(6, 2, 6, 2)
         header_layout.addWidget(self.status_label)
 
-        self.meta_label = DataCaptionLabel("")
+        self.meta_label = CaptionLabel("")
         self.meta_label.setMinimumWidth(1)
         header_layout.addWidget(self.meta_label)
 
@@ -402,7 +456,7 @@ class TaskCard(CardWidget):
         running_layout.setContentsMargins(0, 0, 0, 0)
         running_layout.setSpacing(8)
 
-        self.marker_button = PushButton("打点", self, FluentIcon.TAG)
+        self.marker_button = PrimaryPushButton("打点", self, FluentIcon.TAG)
         self.marker_button.setToolTip(MARKER_TOOLTIP)
         self.marker_button.clicked.connect(
             lambda: self.marker_requested.emit(self.task_id))
@@ -457,6 +511,11 @@ class TaskCard(CardWidget):
         self.finished_actions.setVisible(False)
         header_layout.addWidget(self.finished_actions, 0, Qt.AlignRight | Qt.AlignVCenter)
         layout.addLayout(header_layout)
+        self.secondary_identity = QWidget(self)
+        self.secondary_identity_layout = QHBoxLayout(self.secondary_identity)
+        self.secondary_identity_layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.secondary_identity)
+        self.secondary_identity.hide()
 
         # 进程组任务：身份行下的成员摘要（pid 任务不显示）；结束后收成一行时一并隐藏
         self.members_box = QWidget(self)
@@ -531,7 +590,7 @@ class TaskCard(CardWidget):
             self.values_layout.setColumnStretch(column, 1 if column < columns else 0)
         self._columns = columns
         # 列数跨过 6 列时变化量文案要在长短两种之间切换
-        if self._compact_deltas() != was_compact:
+        if self._compact_deltas() != was_compact and hasattr(self, 'trend_delta_label'):
             self._refresh_deltas()
 
     def value_columns(self) -> int:
@@ -541,6 +600,17 @@ class TaskCard(CardWidget):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._relayout_cells(value_columns_for(event.size().width(), len(self.metric_types)))
+        narrow = event.size().width() < 1050 and not self.is_finished
+        target = self.secondary_identity_layout if narrow else self.header_layout
+        if self.meta_label.parentWidget() is not (self.secondary_identity if narrow else self):
+            target.insertWidget(0 if narrow else 2, self.meta_label)
+        self.secondary_identity.setVisible(narrow)
+        self.title_label.setMaximumWidth(140 if narrow else 260)
+        for button, text in ((self.analysis_button, '分析'), (self.stop_button, '停止')):
+            button.setText('' if narrow else text)
+            button.setFixedWidth(36 if narrow else 88)
+        if hasattr(self, 'trend_delta_label'):
+            self._refresh_deltas()
 
     # ========== 进程组成员 ==========
 
@@ -650,7 +720,8 @@ class TaskCard(CardWidget):
 
     def _compact_deltas(self) -> bool:
         """指标格排到最多列时格子最窄，"比开始时（N 分钟前）"放不下，改用短文案。"""
-        return self._columns >= MAX_VALUE_COLUMNS
+        cell_width = (self.width() - 2 * CARD_PADDING) / max(1, self._columns)
+        return self._columns >= MAX_VALUE_COLUMNS or (self.isVisible() and cell_width < 240)
 
     def _refresh_deltas(self) -> None:
         tooltip = self._delta_tooltip()
@@ -685,6 +756,8 @@ class TaskCard(CardWidget):
             footer.append(interval_text)
         footer.append(f"{self.count} 次采集")
         self.count_label.setText(" · ".join(footer))
+        if self.round_count:
+            self.meta_label.setText(self.meta_label.text() + f' · 第 {self.round_count} 轮')
 
         if self.is_finished:
             self._refresh_finished_detail()
@@ -714,8 +787,16 @@ class TaskCard(CardWidget):
             text = f"{text}（{self.pause_reason}）"
         if status == STATUS_WAITING_RESTART:
             text = waiting_restart_text(self.restart_count, self.restart_limit)
+            if self.is_paused:
+                text += ' · 续接后保持暂停'
         self.status_label.setText(f"● {text}")
         self.status_label.setTextColor(light, dark)
+        tone = ('caution' if status in (STATUS_PAUSED, STATUS_WAITING_RESTART) else
+                'critical' if status == STATUS_ABNORMAL else 'neutral' if status == STATUS_FINISHED
+                else 'success')
+        setCustomStyleSheet(self.status_label,
+                            f'CaptionLabel {{ background: {tokens.pill_background(tone, False)}; border-radius: 10px; }}',
+                            f'CaptionLabel {{ background: {tokens.pill_background(tone, True)}; border-radius: 10px; }}')
         self.status_label.setToolTip(self._status_tooltip(status))
 
     def _status_tooltip(self, status: str) -> str:
@@ -735,7 +816,7 @@ class TaskCard(CardWidget):
 
         Args:
             values: 指标值字典 {指标类型: 指标值}
-            now: 收到这批数据的时刻（Presenter 经注入时钟取得）；首次收到时同时作为
+            now: 这批数据实际采集的时刻；首次收到时同时作为
                 "开始时"与（未另行设置时的）开始运行时刻。缺省时不更新时间相关文案
         """
         if now is not None:
@@ -752,6 +833,7 @@ class TaskCard(CardWidget):
             own[metric_type] = value
             self.start_values.setdefault(metric_type, value)
             self.last_values[metric_type] = value
+            self.live_stats.add(metric_type, value, now)
             self._unavailable.discard(metric_type)
 
             formatted_value = format_metric_value(metric_type, value)
@@ -812,6 +894,8 @@ class TaskCard(CardWidget):
                      values: Optional[Dict[str, float]] = None) -> None:
         """进入"较基线"模式。values 为已算好的基线值；缺的指标显示"基线采样中"，
         等 set_baseline_value 补上。"""
+        if self.baseline is None or self.baseline.timestamp != timestamp:
+            self.live_stats.invalidate(timestamp)
         self.baseline = CardBaseline(timestamp, dict(values or {}))
         self._refresh_deltas()
 
@@ -825,12 +909,41 @@ class TaskCard(CardWidget):
     def clear_baseline(self) -> None:
         """基线被删除：回到"比开始时"模式。"""
         self.baseline = None
+        self.live_stats.invalidate()
         self._refresh_deltas()
+
+    def invalidate_live_stats(self, since=None) -> None:
+        self.live_stats.invalidate(since)
+
+    def restore_live_stats(self, aggregates, since=None) -> bool:
+        return self.live_stats.restore(aggregates, since)
 
     def set_markers(self, markers: Iterable) -> None:
         """在迷你趋势图上画打点刻度。markers 为带 timestamp / kind / label 属性的打点对象
         （刻度据此提供悬停文字与右键菜单）。"""
-        self.sparkline.set_markers(list(markers))
+        markers = list(markers)
+        self.round_count = sum(m.kind == 'user' for m in markers)
+        self.sparkline.set_markers(markers)
+        self._refresh_running_texts()
+
+    def set_round_deltas(self, means, latest):
+        for metric, cell in self.cells.items():
+            lines = [get_metric_description(metric)]
+            if metric in means:
+                lines.append(f'每轮均增 {format_metric_delta(metric, means[metric])}')
+            if metric in latest:
+                lines.append(f'最近一轮 {format_metric_delta(metric, latest[metric])}')
+            cell.setToolTip('\n'.join(lines))
+
+    def live_verdict(self):
+        verdicts = [self.live_stats.verdict(m, self.interval) for m in self.metric_types]
+        if 'rising' in verdicts:
+            return '持续上涨'
+        if 'fluctuating' in verdicts:
+            return '波动'
+        if 'stable' in verdicts:
+            return '平稳'
+        return '数据不足'
 
     # ========== 状态切换 ==========
 
@@ -886,7 +999,8 @@ class TaskCard(CardWidget):
             self.pause_button.setText("暂停")
             self.pause_button.setIcon(FluentIcon.PAUSE)
             self.pause_button.setToolTip(PAUSE_TOOLTIP)
-        self._apply_status(STATUS_PAUSED if is_paused else STATUS_RUNNING)
+        self._apply_status(STATUS_WAITING_RESTART if self.waiting_restart else
+                           STATUS_PAUSED if is_paused else STATUS_RUNNING)
 
     def _resume_tooltip(self) -> str:
         if self.pause_reason:
@@ -929,11 +1043,11 @@ class TaskCard(CardWidget):
             self.waiting_restart = False
             return
         self.waiting_restart = waiting
-        if not waiting and paused is not None and bool(paused) != self.is_paused:
+        if paused is not None and bool(paused) != self.is_paused:
             self.set_paused(bool(paused))
-        self.pause_button.setEnabled(not waiting)
+        self.pause_button.setEnabled(True)
         if waiting:
-            self.pause_button.setToolTip(WAITING_PAUSE_TOOLTIP)
+            self.pause_button.setToolTip('设置被测进程重启后的采集状态：暂停或继续记录')
             self._apply_status(STATUS_WAITING_RESTART)
             return
         self.pause_button.setToolTip(
@@ -943,6 +1057,7 @@ class TaskCard(CardWidget):
     def set_pid(self, pid: int) -> None:
         """被测进程重启后同一任务续接到新进程：身份行换成新 PID。"""
         self.pid = pid
+        self.live_stats.clear()
         self._refresh_running_texts()
 
     def set_stopping(self) -> None:
@@ -966,6 +1081,8 @@ class TaskCard(CardWidget):
                 已结束行（"异常退出：访问冲突 0xC0000005"）
         """
         self.is_finished = True
+        self.header_layout.insertWidget(3, self.meta_label)
+        self.secondary_identity.hide()
         self.waiting_restart = False
         if exit_code is not None:
             self.exit_code = exit_code

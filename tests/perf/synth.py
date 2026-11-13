@@ -22,10 +22,11 @@ from datetime import datetime, timedelta
 from typing import List
 
 from data.database import Database
+from data.mappers import to_ms
 from data.models import DataPoint, TaskRecord
 
 # 生成逻辑（数值模型、时间戳规则、打点位置）变化时加一，使旧缓存失效
-SYNTH_VERSION = 2   # v5 汇总表加入后缓存作废
+SYNTH_VERSION = 3   # 本地日期转 UTC 的时区语义纳入缓存身份
 
 # 泄漏排查预设的 5 项指标
 LEAK_METRICS = ('memory_private', 'num_handles', 'num_gdi_objects',
@@ -34,6 +35,22 @@ LEAK_METRICS = ('memory_private', 'num_handles', 'num_gdi_objects',
 T0 = datetime(2026, 11, 1, 9, 0, 0, 123456)
 # 每批写入的周期数（× 指标数 = 每次 append 的行数）
 BATCH_CYCLES = 10_000
+
+
+def time_identity(duration_s: float) -> dict:
+    """缓存中的整数时间戳由本地日期转换而来，换时区后不能沿用旧 UTC 样本。
+
+    同时记录起止时刻和每个覆盖日期的 UTC 映射，覆盖跨夏令时的场景；不修改系统时区。
+    """
+    days = max(0, int(duration_s // 86400))
+    dates = [T0 + timedelta(days=day) for day in range(days + 1)]
+    return {
+        'local_start': T0.isoformat(),
+        'utc_start_ms': to_ms(T0),
+        'utc_end_ms': to_ms(T0 + timedelta(seconds=duration_s)),
+        'daily_utc_ms': [to_ms(day) for day in dates],
+        'timezone_names': list(time.tzname),
+    }
 
 
 @dataclass(frozen=True)
@@ -60,7 +77,8 @@ class TaskSpec:
         return f"perf-{self.name}"
 
     def params(self) -> dict:
-        return {**asdict(self), 'synth_version': SYNTH_VERSION}
+        return {**asdict(self), 'synth_version': SYNTH_VERSION,
+                'time_identity': time_identity(self.duration_s)}
 
     def digest(self) -> str:
         raw = json.dumps(self.params(), sort_keys=True, ensure_ascii=False)
@@ -150,6 +168,7 @@ def build_task_db(path: str, spec: TaskSpec) -> dict:
         'rows': written,
         'holes': expected_holes(spec),
         'seconds': round(time.perf_counter() - started, 2),
+        'time_identity': time_identity(spec.duration_s),
     }
 
 
@@ -171,7 +190,10 @@ class LegacySpec:
                       'num_threads')
 
     def params(self) -> dict:
-        return {**asdict(self), 'synth_version': SYNTH_VERSION, 'schema_version': 1}
+        per_task = self.rows // self.tasks // len(self.metrics)
+        span = max(0, self.tasks - 1) * 86400 + per_task
+        return {**asdict(self), 'synth_version': SYNTH_VERSION, 'schema_version': 1,
+                'time_identity': time_identity(span)}
 
     def digest(self) -> str:
         raw = json.dumps(self.params(), sort_keys=True, ensure_ascii=False)
@@ -236,4 +258,5 @@ def build_v1_db(path: str, spec: LegacySpec) -> dict:
     finally:
         conn.close()
     return {'rows': written, 'tasks': spec.tasks,
-            'seconds': round(time.perf_counter() - started, 2)}
+            'seconds': round(time.perf_counter() - started, 2),
+            'time_identity': spec.params()['time_identity']}

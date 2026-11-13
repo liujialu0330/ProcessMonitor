@@ -70,13 +70,27 @@ class ConnectionFactory:
         self._holder_lock = threading.Lock()
         # 本工厂是否已把库切到 WAL（持久属性，设一次即可；并发首次打开时重复设置无害）
         self._wal_ready = False
+        self._write_options = threading.local()
 
     def _prepare(self, conn: sqlite3.Connection) -> None:
         """新连接的 PRAGMA：WAL 只在本工厂首次打开可写连接时设置"""
         set_wal = not self.read_only and not self._wal_ready
         _apply_pragmas(conn, self.read_only, set_wal=set_wal)
+        timeout_ms = getattr(self._write_options, 'timeout_ms', None)
+        if timeout_ms is not None:
+            conn.execute(f'PRAGMA busy_timeout={timeout_ms}')
         if set_wal:
             self._wal_ready = True
+
+    @contextmanager
+    def write_timeout(self, timeout_ms: int):
+        """只限制当前线程、当前作用域新建连接的锁等待，不影响采集线程。"""
+        previous = getattr(self._write_options, 'timeout_ms', None)
+        self._write_options.timeout_ms = max(0, int(timeout_ms))
+        try:
+            yield
+        finally:
+            self._write_options.timeout_ms = previous
 
     # ========== 连接上下文 ==========
 

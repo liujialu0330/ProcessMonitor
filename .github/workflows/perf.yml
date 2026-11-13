@@ -1,8 +1,10 @@
 name: Perf
 
-# 性能基准（tests/perf/，说明见 tests/perf/README.md）：每周一次 + 手动触发。
+# 性能基准（tests/perf/，说明见 tests/perf/README.md）：每周、手动与专用验收分支触发。
 # 预算按本机校准值换算，CI 机器与基线机器的差异由系数吸收；结果以 artifact 留档。
 on:
+  push:
+    branches: ['codex/release-validation-*']
   schedule:
     - cron: '0 18 * * 0'   # 每周一 02:00（北京时间）
   workflow_dispatch:
@@ -41,6 +43,9 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: perf-last-run
-          path: tests/perf/.cache/last_run.json
+          name: perf-results
+          path: |
+            tests/perf/.cache/last_run.json
+            tests/perf/.cache/runs/*/result.json
+          include-hidden-files: true
           if-no-files-found: warn

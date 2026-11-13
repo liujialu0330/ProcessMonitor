@@ -11,10 +11,11 @@
 """
 from typing import List
 
-from PyQt5.QtCore import QEvent, Qt, pyqtSignal
+from PyQt5.QtCore import QEvent, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QKeySequence
 from PyQt5.QtWidgets import QShortcut
-from qfluentwidgets import CaptionLabel, FluentIcon, PushButton
+from qfluentwidgets import CaptionLabel, FluentIcon, TransparentToolButton, SegmentedWidget, TeachingTip
+from app_config import cfg, update_values
 
 from core.monitor_manager import MonitorManager
 from ui.presenters.monitor_presenter import MonitorPresenter
@@ -57,21 +58,40 @@ class MonitorPage(PageScaffold):
         self.summary_label = CaptionLabel("", self.container)
         self.add_header_widget(self.summary_label)
         self.command_layout.setAlignment(self.summary_label, Qt.AlignVCenter)
-        self.refresh_button = PushButton(REFRESH_TEXT, self.container, FluentIcon.SYNC)
+        self.refresh_button = TransparentToolButton(FluentIcon.SYNC, self.container)
         self.refresh_button.setToolTip("重新读取进程列表（F5）")
-        self.add_header_widget(self.refresh_button)
 
         self.form = NewTaskForm(services.process_query, services.preferences, self.container)
+        self.refresh_button.setText('')
+        self.refresh_button.setFixedWidth(36)
+        self.form.top_row.insertWidget(2, self.refresh_button)
         self.add_section(self.form)
         self.board = TaskBoard(self.container, hotkey_text=hotkey_text)
         self.add_section(self.board)
         self.content_layout.addStretch(1)
+        self.view_switch = SegmentedWidget(self)
+        self.view_switch.addItem('cards', '卡片')
+        self.view_switch.addItem('list', '列表')
+        self.view_switch.setCurrentItem(cfg.get(cfg.monitor_view))
+        self.view_switch.currentItemChanged.connect(self._set_view_mode)
+        self.add_header_widget(self.view_switch)
+        self.board.set_view_mode(cfg.get(cfg.monitor_view))
 
         self.board.summary_changed.connect(self.summary_label.setText)
         self.refresh_button.clicked.connect(self.refresh_processes)
 
         self.presenter = MonitorPresenter(manager, services, self.form, self.board, self, self)
         self.presenter.history_requested.connect(self.history_requested)
+        from ui.presenters.plan_flow import PlanFlow
+        self.plan_flow = PlanFlow(db, self.presenter, self.form, services, self)
+        self.board.export_selected_requested.connect(self.export_selected)
+        self.board.close_selected_requested.connect(self.close_selected)
+        manager.task_started.connect(self._guide_started)
+        manager.markers_changed.connect(self._guide_baseline)
+        self._guide_request = None
+        self._guide_timer = QTimer(self)
+        self._guide_timer.setSingleShot(True)
+        self._guide_timer.timeout.connect(self._show_pending_guide)
         self.summary_label.setText(self.board.summary())
 
         self._shortcuts: List[QShortcut] = []
@@ -84,6 +104,53 @@ class MonitorPage(PageScaffold):
         self.form.picker.loading_changed.connect(self._on_process_list_loading)
         # 启动时发起一次读取（不默认选中任何进程）；直接输入 PID 不必等列表
         self.form.picker.refresh()
+
+    def _set_view_mode(self, mode):
+        self.board.set_view_mode(mode)
+        update_values([(cfg.monitor_view, mode)])
+
+    def export_selected(self):
+        ids = self.board.selected_finished_ids()
+        if not ids:
+            self.services.notifier.info(self, '请选择任务', '勾选已结束任务后再批量导出')
+            return
+        directory = self.services.dialogs.ask_directory(
+            self, '导出选中任务的明细 CSV', cfg.get(cfg.default_export_dir))
+        if directory:
+            for task_id in ids:
+                self.presenter.on_export_requested(task_id, directory)
+
+    def close_selected(self):
+        for task_id in self.board.selected_finished_ids():
+            self.presenter.on_close(task_id)
+
+    def _guide_started(self, task_id):
+        self._guide_request = task_id, False
+        self._guide_timer.start(0)
+
+    def _guide_baseline(self, task_id):
+        if not cfg.get(cfg.guide_baseline) and self.manager.get_baseline(task_id) is not None:
+            self._guide_request = task_id, True
+            self._guide_timer.start(0)
+
+    def _show_pending_guide(self):
+        if self._guide_request is not None:
+            request, self._guide_request = self._guide_request, None
+            self._show_guide(*request)
+
+    def _show_guide(self, task_id, baseline):
+        item = cfg.guide_baseline if baseline else cfg.guide_started
+        card = self.board.card(task_id)
+        if cfg.get(item) or not self.isVisible() or card is None or card.is_finished:
+            return
+        target = card.analysis_button if baseline else card.marker_button
+        if not target.isVisible():
+            target = self.view_switch
+        TeachingTip.create(target, '基线已记录' if baseline else '开始记录了',
+                           '每完成一轮操作再打一个点，到分析页查看每轮变化。' if baseline else
+                           '让被测程序预热至稳定，再点“打点”记录基线。',
+                           icon=FluentIcon.INFO, duration=6000, parent=self)
+        update_values([(item, True)])
 
     # ========== 进程列表 ==========
 

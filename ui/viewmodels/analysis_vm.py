@@ -10,7 +10,8 @@
 - 自定义范围：概览条刷选 → set_custom_range(start, end)，范围键为 "custom"；换任务时
   自动回到"全部"（自定义起止是某个任务的绝对时刻）；
 - 视图模式：小倍数 / 叠加 Δ%，绝对 / 相对时间（纯显示状态，不查库）；
-- 任务对比：选第二个任务后按焦点指标查它的快照（同样异步），与当前任务的快照配对；
+- 任务对比：最多增加三个任务，按各任务指标并集整批后台读取，全部返回后发布；
+  焦点指标画曲线，矩阵显示全部指标；批次门丢弃切任务/范围前的迟到结果；
 - 导出：报告/CSV/图片在 ReportWorker 线程里写文件，登记到线程登记表，并与清理数据库
   互斥（manager.begin_export / end_export）；
 - 打点编辑：右键菜单的"在此处打点 / 设为基线 / 重命名 / 删除"经 manager 执行，
@@ -34,6 +35,8 @@ from typing import Callable, Dict, List, Optional, Tuple
 from PyQt5.QtCore import QObject, pyqtSignal, pyqtSlot
 
 from core.report_worker import ReportJob, ReportResult, ReportWorker
+from core.comparison import CompareEntry, MAX_COMPARE_TASKS
+from core.workers.comparison_worker import ComparisonQueryWorker
 from core.history_query import (
     BASELINE_RANGE_KEY, CUSTOM_RANGE_KEY, DEFAULT_RANGE_KEY, RANGE_KEYS,
     HistorySnapshot, SegmentAnalysis, TaskAnalysis, build_request, build_segment)
@@ -206,6 +209,19 @@ class CompareResult:
     other_task: object
     other: Optional[HistorySnapshot] = None
     message: str = ""
+    entries: Tuple[CompareEntry, ...] = ()
+    metrics: Tuple[str, ...] = ()
+
+
+@dataclass
+class _CompareBatch:
+    seq: int
+    metric: str
+    primary: HistorySnapshot
+    tasks: list
+    metrics: tuple
+    snapshots: dict
+    pending: set
 
 
 @dataclass
@@ -259,6 +275,7 @@ class AnalysisViewModel(HistoryViewModel):
     view_mode_changed = pyqtSignal(str)
     time_mode_changed = pyqtSignal(str)
     compare_ready = pyqtSignal(object)
+    reference_ready = pyqtSignal(object)
     export_busy = pyqtSignal(bool)
     export_progress = pyqtSignal(int)
     export_finished = pyqtSignal(object)
@@ -286,6 +303,12 @@ class AnalysisViewModel(HistoryViewModel):
         self.custom_range: Optional[Tuple[datetime, datetime]] = None
         self.last_analysis: Optional[TaskAnalysis] = None
         self.compare_task_id: Optional[str] = None
+        self.compare_task_ids: Tuple[str, ...] = ()
+        self._compare_injected = injected
+        self._comparison_workers = set()
+        self._reference_gate = LatestRequestGate()
+        self._reference_workers = set()
+        self.last_reference = None
         self.last_compare: Optional[CompareResult] = None
         # 执行器按请求序号区分在途请求：各指标的子请求用独立递增的序号，批次另有序号
         self._part_seq = itertools.count(1)
@@ -293,7 +316,7 @@ class AnalysisViewModel(HistoryViewModel):
         self._pending_analysis: Optional[TaskAnalysis] = None
         self._member_parts: Dict[int, _Batch] = {}
         self._compare_gate = LatestRequestGate()
-        self._compare_parts: Dict[int, Tuple[int, object]] = {}
+        self._compare_parts: Dict[int, _CompareBatch] = {}
         self._report_worker: Optional[ReportWorker] = None
 
     # ========== 只读属性 ==========
@@ -387,19 +410,30 @@ class AnalysisViewModel(HistoryViewModel):
             self.range_key = DEFAULT_RANGE_KEY
             self.custom_range_changed.emit(None, None)
             self.range_reset.emit(DEFAULT_RANGE_KEY)
-        if task.task_id != self.current_task_id and self.compare_task_id == task.task_id:
-            self.set_compare_task(None)
+        if task.task_id != self.current_task_id:
+            self._compare_gate.invalidate()
+            self._compare_parts.clear()
+            self.compare_task_ids = tuple(t for t in self.compare_task_ids if t != task.task_id)
+            self.compare_task_id = next(iter(self.compare_task_ids), None)
+            self.last_compare = None
+            self.compare_ready.emit(None)
         if task.task_id != self.current_task_id:
             self._reset_members()
         super()._apply_selection(task, preferred_metric)
 
     def _clear_selection(self) -> None:
+        self.set_compare_tasks([])
         self._reset_members()
         super()._clear_selection()
 
     # ========== 多指标查询 ==========
 
     def _start_query(self, auto_refresh: bool, forced: bool = False) -> None:
+        self._reference_gate.invalidate()
+        self._compare_gate.invalidate()
+        self._compare_parts.clear()
+        for worker in tuple(self._comparison_workers):
+            worker.cancel()
         task_id = self.current_task_id
         metrics = self.metrics or [self.current_metric]
         group = self.is_group_task
@@ -701,59 +735,152 @@ class AnalysisViewModel(HistoryViewModel):
         return [t for t in self.tasks if t.task_id != self.current_task_id]
 
     def set_compare_task(self, task_id: Optional[str]) -> None:
-        """选择对比任务（None 关闭对比）。"""
-        if task_id == self.current_task_id:
-            task_id = None
-        self.compare_task_id = task_id
+        """双任务兼容入口；多任务使用 set_compare_tasks。"""
+        self.set_compare_tasks([task_id] if task_id else [])
+
+    def set_compare_tasks(self, task_ids) -> None:
+        ids = tuple(dict.fromkeys(t for t in task_ids if t and t != self.current_task_id))
+        if len(ids) > MAX_COMPARE_TASKS - 1:
+            raise ValueError('最多同时对比 4 个任务（含当前任务）')
+        self.compare_task_ids = ids
+        self.compare_task_id = next(iter(ids), None)
         self._compare_gate.invalidate()
-        if task_id is None:
-            self.last_compare = None
-            self.compare_ready.emit(None)
-            return
-        self._refresh_compare(requery=True)
+        self._compare_parts.clear()
+        for worker in tuple(self._comparison_workers):
+            worker.cancel()
+        self.last_compare = None
+        self.compare_ready.emit(None)
+        if ids:
+            self._refresh_compare(requery=True)
 
     def _refresh_compare(self, requery: bool = True) -> None:
         primary = self.last_snapshot
-        if self.compare_task_id is None or primary is None:
+        if not self.compare_task_ids or primary is None or self.current_task is None:
             return
-        other_task = self._find_task(self.compare_task_id)
-        if other_task is None:
-            self.set_compare_task(None)
+        others = [self._find_task(t) for t in self.compare_task_ids]
+        others = [t for t in others if t is not None]
+        if not others:
+            self.set_compare_tasks([])
             return
+        self.compare_task_ids = tuple(t.task_id for t in others)
+        self.compare_task_id = others[0].task_id
         metric = primary.request.metric
         last = self.last_compare
         if (not requery and last is not None and last.metric == metric
-                and last.other_task is not None
-                and last.other_task.task_id == other_task.task_id):
-            self._emit_compare(replace(last, primary=primary))
+                and tuple(e.task.task_id for e in last.entries[1:]) == self.compare_task_ids
+                and not any(t.task_id in self.running_ids for t in others)):
+            entries = (CompareEntry(self.current_task, dict(self.last_analysis.snapshots)),
+                       *last.entries[1:])
+            self._emit_compare(replace(last, primary=primary, entries=entries))
             return
-        if metric not in other_task.metric_types:
-            self._emit_compare(CompareResult(metric, primary, other_task,
-                                             message=COMPARE_MISSING_METRIC))
-            return
+        self._compare_parts.clear()
+        for worker in tuple(self._comparison_workers):
+            worker.cancel()
+        self.last_compare = None
+        self.compare_ready.emit(None)
+        seq = self._compare_gate.next_seq()
+        metrics = tuple(dict.fromkeys([*self.metrics,
+                                       *(m for task in others for m in task.metric_types), metric]))
+        tasks = [self.current_task, *others]
+        snapshots = {self.current_task_id: dict(self.last_analysis.snapshots)
+                     if self.last_analysis else {metric: primary}}
+        snapshots.update({t.task_id: {} for t in others})
+        batch = _CompareBatch(seq, metric, primary, tasks, metrics, snapshots, set())
+        requests = []
         range_key = self.range_key if self.range_key in RANGE_KEYS else DEFAULT_RANGE_KEY
-        request = build_request(
-            other_task.task_id, metric, range_key, table_limit=self._table_limit,
-            max_buckets=self._max_buckets, seq=next(self._part_seq), analysis=True)
-        self._compare_parts[request.request_seq] = (self._compare_gate.next_seq(), other_task)
-        self._runner(request, self._on_compare_part)
+        for task in others:
+            for key in metrics:
+                if key not in task.metric_types:
+                    continue
+                request = build_request(task.task_id, key, range_key,
+                                        table_limit=self._table_limit,
+                                        max_buckets=self._max_buckets,
+                                        seq=next(self._part_seq), analysis=True)
+                batch.pending.add(request.request_seq)
+                self._compare_parts[request.request_seq] = batch
+                requests.append(request)
+        if not requests:
+            self._finish_compare_batch(batch)
+        elif self._compare_injected:
+            for request in requests:
+                self._runner(request, self._on_compare_part)
+        else:
+            worker = ComparisonQueryWorker(self._db, requests)
+            self._comparison_workers.add(worker)
+            worker.result.connect(self._on_compare_results)
+            worker.failed.connect(lambda message, rs=requests: self._compare_failed(rs, message))
+            worker.finished.connect(lambda w=worker: self._comparison_workers.discard(w))
+            self._services.threads.register(worker, name='任务对比查询', cancel=worker.cancel,
+                                            timeout_ms=3000)
+            worker.start()
+
+    def _on_compare_results(self, snapshots) -> None:
+        for snapshot in snapshots:
+            self._on_compare_part(snapshot)
+
+    def _compare_failed(self, requests, message) -> None:
+        for request in requests:
+            self._on_compare_part(HistorySnapshot(request=request, error=message))
 
     @pyqtSlot(object)
     def _on_compare_part(self, snapshot: HistorySnapshot) -> None:
-        entry = self._compare_parts.pop(snapshot.request.request_seq, None)
-        if entry is None or not self._compare_gate.is_current(entry[0]):
+        batch = self._compare_parts.pop(snapshot.request.request_seq, None)
+        if batch is None or not self._compare_gate.is_current(batch.seq):
             return
-        primary = self.last_snapshot
-        if primary is None:
+        if batch.primary.request.task_id != self.current_task_id:
             return
-        message = "" if snapshot.ok else (snapshot.error or "对比任务读取失败")
-        self._emit_compare(CompareResult(
-            snapshot.request.metric, primary, entry[1],
-            snapshot if snapshot.ok else None, message))
+        batch.pending.discard(snapshot.request.request_seq)
+        batch.snapshots[snapshot.request.task_id][snapshot.request.metric] = snapshot
+        if not batch.pending:
+            self._finish_compare_batch(batch)
+
+    def _finish_compare_batch(self, batch) -> None:
+        if not self._compare_gate.is_current(batch.seq):
+            return
+        entries = tuple(CompareEntry(t, batch.snapshots[t.task_id]) for t in batch.tasks)
+        other_task = batch.tasks[1]
+        other = batch.snapshots[other_task.task_id].get(batch.metric)
+        message = (COMPARE_MISSING_METRIC if other is None else
+                   '' if other.ok else other.error or '对比任务读取失败')
+        self._emit_compare(CompareResult(batch.metric, batch.primary, other_task,
+                                         other if other is not None and other.ok else None,
+                                         message, entries, batch.metrics))
 
     def _emit_compare(self, result: CompareResult) -> None:
         self.last_compare = result
         self.compare_ready.emit(result)
+
+    def refresh_reference(self, analysis=None):
+        from core.reference import ReferenceComparison, ReferenceWorker, load_reference_comparison
+        seq = self._reference_gate.next_seq()
+        for worker in tuple(self._reference_workers):
+            worker.cancel()
+        task = self.current_task
+        if task is None:
+            self.last_reference = None
+            self.reference_ready.emit(None)
+            return
+        if not getattr(task, 'scenario', ''):
+            self._on_reference(seq, ReferenceComparison(task.task_id, None, '',
+                                                        reason='请先填写测试场景'))
+            return
+        if self._compare_injected:
+            self._on_reference(seq, load_reference_comparison(self._db, task.task_id, analysis))
+            return
+        worker = ReferenceWorker(self._db, task.task_id, analysis)
+        self._reference_workers.add(worker)
+        worker.result.connect(lambda result, s=seq: self._on_reference(s, result))
+        worker.failed.connect(lambda message, s=seq, t=task: self._on_reference(
+            s, ReferenceComparison(t.task_id, None, t.scenario, reason='参考比较失败：' + message)))
+        worker.finished.connect(lambda w=worker: self._reference_workers.discard(w))
+        self._services.threads.register(worker, name='参考基线比较', cancel=worker.cancel,
+                                        timeout_ms=3000)
+        worker.start()
+
+    def _on_reference(self, seq, result):
+        if self._reference_gate.is_current(seq) and result.task_id == self.current_task_id:
+            self.last_reference = result
+            self.reference_ready.emit(result)
 
     # ========== 打点编辑 ==========
 

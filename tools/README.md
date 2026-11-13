@@ -1,11 +1,13 @@
 # 命令行与脚本控制
 
 进程监控助手 2.0 起可以被命令行与脚本驱动：开始监控、打点、停止、等待、导出报告、取泄漏判定。
-设置页「允许命令行与脚本控制」关闭后，除 `ping` / `activate` 外的命令一律回 `disabled`。
+设置页「允许命令行与脚本控制」关闭后，除 `ping` / `activate` 外的命令一律回 `disabled`；无窗口实例另允许 `quit`，以便结束后台程序。危险命令仍需通过客户端身份与完整性级别校验。
 
 ## pmctl
 
 打包后与主程序同目录的 `pmctl.exe`（控制台程序）；源码运行时用 `python pmctl.py`。
+
+标准输出与错误输出重定向到管道或文件时统一使用 UTF-8，包括普通文本、帮助和错误；脚本应按 UTF-8 解码。直接显示到终端时遵循终端编码，无法表示的字符使用 Unicode 转义。`--json` 始终使用标准 Unicode 转义，中文和 emoji 不丢失。
 
 - 程序在运行（有窗口或无窗口）：直接连接它；
 - 程序不在：自动以 `--background` 拉起一个**无窗口实例**（没有主窗口和托盘，用 `pmctl quit` 结束；
@@ -37,7 +39,7 @@ pmctl run --name MyApp.exe --wait --rounds-every 60 --rounds 20 --out D:\out --j
 ```bat
 pmctl start --tree --pid 1234
 pmctl start --group-name chrome.exe --metrics memory_private,num_handles
-pmctl run --tree --launch D:pp\App.exe --stop-after 3600 --out D:\out
+pmctl run --tree --launch D:/app/App.exe --stop-after 3600 --out D:\out
 ```
 
 协议里对应 `start` 的 `target_kind` 参数（`pid` 缺省 / `tree` / `name`）；`status` 的每个任务带
@@ -99,16 +101,55 @@ python tools\pmclient.py marker "{\"task_id\":\"all\"}"
 
 回答“监控工具自己有没有在泄漏”：用独立探针记录本工具的资源曲线，再用与分析页同一套趋势判定
 （`core.analysis.trend.judge`）判这次浸泡过没过。完整步骤、中途操作与要留的产物见
-`doc小时浸泡手册.md`。
+`doc/24小时浸泡手册.md`。
 
 | 文件 | 作用 |
 |---|---|
 | `tools\soak_run.ps1` | 一条命令拉起：负载 → 本工具（缺省 `-Exe` 不给 = 源码无窗口；给 = 启动安装版）→ 用 `pmctl` 建 26 指标任务 → 探针；`-Stop -OutDir 目录` 收尾（各任务 `verdict`、导出证据包、停负载与探针、跑判定）；`-Wait` 等探针结束后自动收尾 |
 | `tools\soak_probe.py` | 独立探针（标准库 + psutil，IPC 只用 `core.ipc.client`）：每 10 秒记本工具的私有字节 / 工作集 / 句柄 / GDI / USER / 线程 / CPU，并经 `status` 记各任务的 `planned_cycles` / `done_cycles` / `missed_cycles`；输出目录里的 `soak_probe.csv`、`soak_tasks.csv`、`soak_events.csv`（事件：`probe_start` / `target_found` / `target_exited` / `target_not_found` / `ipc_lost` / `ipc_ok` / `probe_stop`）；每行即时 flush、已有文件时追加；本工具退出后默认继续等它重新出现（`--on-exit exit` 则一并退出）；目录里出现 `STOP` 文件、到 `--hours` 或 Ctrl+C 正常收尾。找目标：`--pid` / `--name`（缺省 `进程监控助手.exe`）/ `--by-ipc`（经 ping 取 PID，需 `--data-dir`） |
 | `tools\soak_verdict.py` | 读探针 CSV 判定：窗口 `--hours`（缺省 20）内私有字节增长 ≤ `--max-growth-mb`（30）且判定非“持续上涨”；句柄 / GDI / USER / 线程非“持续上涨”（小容差内只提示）；每个任务采样完成率 ≥ `--min-completion`（0.995）；工具未退出；记录覆盖。退出码 0 通过 / 1 未通过 / 2 输入错误；`--json` 机读 |
-| `testsixtures\soak_target.py` | 被测负载：`--mode leak`（泄漏内存与句柄，速率可配）/ `stable`（锯齿不涨）/ `restart`（定时退出，`--exit-code 0xC0000005` 模拟崩溃，`--supervise` 由监督进程重新拉起，使本工具能按“重启”续接） |
+| `tests\fixtures\soak_target.py` | 被测负载：`--mode leak`（泄漏内存与句柄，速率可配）/ `stable`（锯齿不涨）/ `restart`（定时退出，`--exit-code 0xC0000005` 模拟崩溃，`--supervise` 由监督进程重新拉起，使本工具能按“重启”续接） |
 
 ```bat
-python tools\soak_probe.py --out-dir D:\soakun1 --by-ipc --data-dir D:\soakun1\data --hours 24
-python tools\soak_verdict.py D:\soakun1 --hours 20
+python tools\soak_probe.py --out-dir D:\soak\run1 --by-ipc --data-dir D:\soak\run1\data --hours 24
+python tools\soak_verdict.py D:\soak\run1 --hours 20
 ```
+
+## 完整测试方案与参考比较
+
+监控页可将当前配置保存为方案，也可导入/导出 JSON。文件存于当前数据目录的 `plans` 子目录；完整方案最多包含 5 个目标。旧版只包含自动打点、停止条件的自动化 JSON 仍可配合显式目标使用。
+
+```json
+{
+  "schema_version": 1,
+  "name": "窗口反复开关",
+  "shared_markers": true,
+  "targets": [
+    {
+      "name": "App.exe",
+      "target_kind": "pid",
+      "wait": true,
+      "wait_timeout_s": 120,
+      "metrics": ["memory_private", "num_handles"],
+      "interval": 1,
+      "scenario": "反复打开窗口",
+      "build": "2.0",
+      "note": "{scenario} 第{index}组 {date}",
+      "automation": {"timed_marker_seconds": 60, "stop_after_rounds": 10}
+    }
+  ]
+}
+```
+
+```bat
+pmctl start --plan D:\plans\window-cycle.json
+pmctl marker --group GROUP_ID
+pmctl start --pid 1234 --scenario "反复打开窗口" --build "2.0"
+pmctl verdict --task TASK_ID --vs-reference
+```
+
+完整方案一次登记整批目标，各自独立等待，某个目标尚未出现不会挡住其他目标。最终按方案顺序报告每项成功或失败，已成功的任务不会因其他项失败被停止；断开连接只取消尚在等待的目标。共享打点组 ID 随结果给出，`marker --group` 仅对该组的活动任务打点。
+
+方案中的目标、周期等配置不能再由同一次命令的 `--pid` / `--name` / `--args` 等参数覆盖，避免部分参数被悄悄忽略。文件上限 1 MB；未知字段记录日志并忽略，过高版本和不合法目标会被拒绝。
+
+参考任务在分析页按场景设置，同场景至多一个，必须是已结束且有数据的任务。`--vs-reference` 比较至少三轮完整操作的每轮增量置信区间：退出码 10 为较参考回归，0 为未发现较参考回归，20 为不可比；被测异常退出仍优先返回 30。每个指标的不可比原因保留在 JSON 的 `reference.rows` 中，不能把缺数据当作平稳。

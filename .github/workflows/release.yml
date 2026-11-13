@@ -1,10 +1,12 @@
 name: Release
 
-# 发版构建与安装包冒烟：tag（v*）推送或手动触发。只构建、验证并把安装包留作 artifact，
+# 构建与安装包冒烟：tag（v*）、专用验收分支推送或手动触发。只构建、验证并把安装包留作 artifact，
 # 不创建、不修改任何 GitHub Release：Release 的创建与上传由人在冒烟通过后手动完成，
 # 随后用 build/verify_release.py 复核（步骤见 build/README_打包说明.md）。
 on:
   push:
+    branches:
+      - 'codex/release-validation-*'
     tags:
       - 'v*'
   workflow_dispatch:

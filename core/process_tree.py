@@ -353,7 +353,7 @@ class SnapshotTreeSource:
                                           create_time)
         root_alive, root_ct, pids = self._resolve(procs, spec, root_create_time)
         wanted = [m for m in metrics if m in SAMPLERS and m != MetricType.CPU_PERCENT]
-        taken = time.monotonic()
+        taken = time.perf_counter()
         readings: List[InstanceReading] = []
         for pid in pids:
             proc = procs[pid]

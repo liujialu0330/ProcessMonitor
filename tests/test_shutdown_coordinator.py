@@ -140,17 +140,38 @@ def test_budget_exhausted_still_runs_steps_logs_and_returns_false(clock, caplog)
     assert any("预算" in r.getMessage() for r in caplog.records)
 
 
-def test_join_timeout_returns_false_but_continues(clock):
+def test_join_timeout_still_drains_registry_without_closing_active_database(clock):
     log = []
     coordinator = ShutdownCoordinator(_FakeManager(log, join_ok=False),
                                       _FakeRegistry(log), db=_FakeDb(log))
     assert coordinator.run() is False
-    assert log[-2:] == ["shutdown_all", "db.close"]
+    assert log[-1] == "shutdown_all"
+    assert "db.close" not in log
 
 
 def test_registry_timeout_returns_false(clock):
     log = []
     assert ShutdownCoordinator(_FakeManager(log), _FakeRegistry(log, ok=False)).run() is False
+
+
+@pytest.mark.parametrize('join_ok,registry_ok', [(False, True), (True, False)])
+def test_unfinished_writer_skips_final_flush_and_database_close(clock, join_ok, registry_ok):
+    log = []
+    manager = _FakeManager(log, join_ok=join_ok)
+    manager.begin_shutdown = lambda: log.append('begin_shutdown')
+    manager.flush_pending_task_writes = lambda **_: log.append('flush')
+    coordinator = ShutdownCoordinator(manager, _FakeRegistry(log, ok=registry_ok), db=_FakeDb(log))
+    assert not coordinator.run()
+    assert log[0] == 'begin_shutdown'
+    assert 'flush' not in log and 'db.close' not in log
+
+
+def test_expired_deadline_skips_pending_write_attempt_and_close(clock):
+    log = []
+    manager = _FakeManager(log, clock=clock, stop_ms=30001)
+    manager.flush_pending_task_writes = lambda **_: log.append('flush')
+    assert not ShutdownCoordinator(manager, _FakeRegistry(log), db=_FakeDb(log)).run()
+    assert 'flush' not in log and 'db.close' not in log
 
 
 @pytest.mark.parametrize("broken", ["stop", "join", "registry", "db"])
@@ -165,8 +186,10 @@ def test_step_errors_never_raise_and_later_steps_still_run(clock, caplog, broken
     with caplog.at_level(logging.ERROR, logger="core.shutdown"):
         assert ShutdownCoordinator(manager, registry, db=db).run() is False
 
-    assert log == ["stop_all_tasks", "cancel_all", ("join_all", 3000), "shutdown_all",
-                   "db.close"]
+    expected = ["stop_all_tasks", "cancel_all", ("join_all", 3000), "shutdown_all"]
+    if broken not in ('join', 'registry'):
+        expected.append('db.close')
+    assert log == expected
     assert any(r.exc_info for r in caplog.records)
 
 
@@ -243,7 +266,7 @@ class _StuckThread(QThread):
 def test_total_budget_bounds_every_wait(qapp, db):
     """5 个永不结束的任务 + 3 个永不结束的登记表线程：单项超时（3s/5s）累加远超
     预算，但总耗时不超过 0.6 秒预算加少量余量；登记表线程在等待任务之前就已统一取消；
-    进度文案顺序不变，仍关闭数据库"""
+    先取消再等待，仍有写库线程时不关闭数据库"""
     log, progress = [], []
     manager = MonitorManager(db=db)
     manager._tasks = {f"t{i}": _StuckTask(log, f"t{i}") for i in range(5)}
@@ -263,12 +286,11 @@ def test_total_budget_bounds_every_wait(qapp, db):
         elapsed = time.monotonic() - t0
 
         assert elapsed <= 0.6 + 0.5
-        assert progress == [PROGRESS_STOPPING_TASKS, PROGRESS_STOPPING_THREADS,
-                            PROGRESS_SAVING]
+        assert progress == [PROGRESS_STOPPING_TASKS, PROGRESS_STOPPING_THREADS]
         cancels = [entry for entry in log if entry[0] == "cancel"]
         assert cancels == [("cancel", "线程0"), ("cancel", "线程1"), ("cancel", "线程2")]
         assert log[:3] == cancels           # 取消先于任何等待发出，且只发一次
-        assert log[-1] == "db.close"
+        assert "db.close" not in log
     finally:
         manager._tasks = {}
         for thread in threads:

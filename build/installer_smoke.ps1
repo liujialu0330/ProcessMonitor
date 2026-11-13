@@ -317,7 +317,7 @@ try {
     # ---- 8 启动、迁移
     Step '启动新版，等待数据库迁移完成'
     $logPath = Join-Path $dataDir 'logs\app.log'
-    $app = Start-Process -FilePath $installedExe -ArgumentList @('--data-dir', "`"$dataDir`"") -PassThru
+    $app = Start-Process -FilePath $installedExe -ArgumentList @('--data-dir', "`"$dataDir`"") -PassThru -WindowStyle Hidden
     Info "已启动，PID $($app.Id)"
     Wait-LogPattern $logPath '数据库迁移完成' $MigrationTimeoutSec $app '等待迁移'
     Ok '日志出现「数据库迁移完成」'

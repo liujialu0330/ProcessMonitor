@@ -307,14 +307,14 @@ def test_static_fields_equal(snapshotter, target):
 
 
 def test_system_process_identity(snapshotter):
-    """PID 4（System）：create_time 按 psutil 口径为 0.0，名称为 System，父 PID 为 0。"""
+    """PID 4（System）的创建时间与本机 psutil 一致，不预设是否使用权限回退。"""
     sample = snapshotter.snapshot().processes[4]
     try:
         p = psutil.Process(4)
         ps_create, ps_name, ps_ppid = p.create_time(), p.name(), p.ppid()
     except psutil.AccessDenied:
         pytest.skip('无权读取 System 进程信息')
-    assert sample.create_time == ps_create == 0.0
+    assert sample.create_time == ps_create
     assert sample.name == ps_name == 'System'
     assert sample.parent_pid == ps_ppid
 
