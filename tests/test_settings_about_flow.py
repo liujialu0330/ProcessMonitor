@@ -96,6 +96,74 @@ def test_close_to_tray_switch_uses_chinese_text(setting, tmp_path):
     assert card.switchButton.text == "开"
 
 
+def test_keep_awake_switch_roundtrips_config(setting, tmp_path):
+    """"监控期间阻止电脑睡眠"开关：默认开，点击写配置并落盘，配置变化反映到开关"""
+    from ui.pages.setting_page import KEEP_AWAKE_CONTENT, KEEP_AWAKE_TITLE
+
+    config_path = tmp_path / "keep_awake_config.json"
+    qconfig.load(str(config_path), cfg)
+    item = cfg.keep_awake_while_monitoring
+    try:
+        card = setting.keep_awake_card
+        assert card.titleLabel.text() == KEEP_AWAKE_TITLE
+        assert card.contentLabel.text() == KEEP_AWAKE_CONTENT
+        assert card.isChecked() is True and card.switchButton.text == "开"
+
+        card.switchButton.toggleChecked()          # 用户点击
+        assert cfg.get(item) is False
+        assert card.switchButton.text == "关"
+        assert '"KeepAwakeWhileMonitoring": false' in config_path.read_text(encoding='utf-8')
+
+        qconfig.set(item, True, save=False)        # 配置变化回显到开关
+        assert card.isChecked() is True
+    finally:
+        item.value = item.defaultValue
+
+
+def test_automation_switch_roundtrips_config(setting, tmp_path):
+    """"允许命令行与脚本控制"开关：默认开，点击写配置并落盘（命令处理器每条请求现读）"""
+    from ui.pages.setting_page import AUTOMATION_CONTENT, AUTOMATION_TITLE
+
+    config_path = tmp_path / "automation_config.json"
+    qconfig.load(str(config_path), cfg)
+    item = cfg.automation_enabled
+    try:
+        card = setting.automation_card
+        assert card.titleLabel.text() == AUTOMATION_TITLE
+        assert card.contentLabel.text() == AUTOMATION_CONTENT
+        assert card.isChecked() is True
+
+        card.switchButton.toggleChecked()
+        assert cfg.get(item) is False
+        assert '"Enabled": false' in config_path.read_text(encoding='utf-8')
+    finally:
+        item.value = item.defaultValue
+
+
+def test_notification_group_has_the_background_bubble_switch(setting, tmp_path):
+    """"通知"分组："窗口不在前台时用系统通知提醒"开关，默认开，点击写配置并落盘；
+    偏好服务现读该项（Notifier 每次发提示时判断）"""
+    from ui.pages.setting_page import NOTIFY_BACKGROUND_CONTENT, NOTIFY_BACKGROUND_TITLE
+    from ui.services import ConfigPreferences
+
+    config_path = tmp_path / "notify_config.json"
+    qconfig.load(str(config_path), cfg)
+    item = cfg.notify_in_background
+    try:
+        assert setting.notify_group.titleLabel.text() == "通知"
+        card = setting.notify_background_card
+        assert card.parent() is setting.notify_group
+        assert card.titleLabel.text() == NOTIFY_BACKGROUND_TITLE == "窗口不在前台时用系统通知提醒"
+        assert card.contentLabel.text() == NOTIFY_BACKGROUND_CONTENT
+        assert card.isChecked() is True and ConfigPreferences().notify_in_background() is True
+
+        card.switchButton.toggleChecked()
+        assert cfg.get(item) is False and ConfigPreferences().notify_in_background() is False
+        assert '"BackgroundBubble": false' in config_path.read_text(encoding='utf-8')
+    finally:
+        item.value = item.defaultValue
+
+
 # ---------- 数据目录 ----------
 
 def test_open_data_dir_goes_through_dialogs(setting, dialogs, notifier):
@@ -167,7 +235,7 @@ def test_busy_started_during_confirm_refused_before_thread(setting, manager, not
     setting._on_cleanup_clicked()
 
     assert setting._cleanup_worker is None
-    assert setting.services.threads.entries() == []
+    assert not [e for e in setting.services.threads.entries() if e.name == '清理数据库']
     assert manager.is_maintenance_running() is False
     assert notifier.levels() == ["warning"]
     notice = notifier.last("warning")
@@ -321,7 +389,7 @@ def test_cleanup_worker_registered_and_released(setting, dialogs):
 
     setting._on_cleanup_clicked()
     worker = setting._cleanup_worker
-    entries = setting.services.threads.entries()
+    entries = [e for e in setting.services.threads.entries() if e.name == '清理数据库']
     assert [(e.name, e.thread, e.cancel, e.timeout_ms) for e in entries] == [
         ("清理数据库", worker, None, 5000)]
 
@@ -619,11 +687,11 @@ def test_update_downloader_registered_with_cancel(about, monkeypatch):
 
 # ---------- 分组与文案（常规 / 数据 / 关于与更新） ----------
 
-def test_three_groups_in_order(setting):
+def test_settings_groups_follow_workflow(setting):
     from qfluentwidgets import SettingCardGroup
     groups = [w for w in setting.scroll_widget.children() if isinstance(w, SettingCardGroup)]
-    assert [g.titleLabel.text() for g in groups] == ["常规", "数据", "关于与更新"]
-    assert setting.about_group is groups[2]
+    assert [g.titleLabel.text() for g in groups] == ["外观", "监控默认值", "打点与快捷键", "通知", "数据", "导出", "关于与更新"]
+    assert setting.about_group is groups[-1]
     general = [setting.theme_card, setting.default_interval_card,
                setting.close_to_tray_card, setting.hotkey_card]
     assert all(card.parent() is not None for card in general)
@@ -686,3 +754,102 @@ def test_install_confirm_defaults_to_later(qapp):
         dialog.close()
     finally:
         host.close()
+
+
+# ---------- 诊断信息 ----------
+
+def _pumped(value):
+    """先处理事件（后台线程的结果经排队信号回到界面线程）再取值。"""
+    QApplication.processEvents()
+    return value() if callable(value) else value
+
+
+def test_copy_diagnostics_puts_text_on_clipboard_and_says_copied(setting, dialogs, notifier):
+    setting.copy_diagnostics_button.click()
+
+    copied = dialogs.calls_of("copy_text")
+    assert len(copied) == 1
+    # 诊断文本至少含版本与数据库两节（本页没有 provider 时只用 db 与 manager）
+    assert "【" in copied[0]["text"] and "数据库" in copied[0]["text"]
+    assert notifier.last().level == "success"
+    assert notifier.last().title == "已复制"
+
+
+def test_copy_diagnostics_uses_injected_provider(qapp, db, manager, notifier, dialogs):
+    """组合根经 MainWindow 注入的 provider 决定诊断部件（如自身监控、看门狗）。"""
+    from ui.pages.setting_page import SettingPage
+
+    asked = []
+
+    def provider():
+        asked.append(True)
+        return SimpleNamespace(db=db, manager=manager)
+
+    services = make_services(notifier=notifier, dialogs=dialogs,
+                             task_status=ManagerTaskStatus(manager))
+    page = SettingPage(db, manager, services, diagnostics_provider=provider)
+    try:
+        text = page.copy_diagnostics()
+    finally:
+        _close_setting_page(page)
+
+    assert asked == [True]
+    assert text is not None and dialogs.last_call("copy_text")["text"] == text
+
+
+def test_copy_diagnostics_failure_shows_error(setting, dialogs, notifier):
+    dialogs.push("copy_text", RuntimeError("剪贴板被占用"))
+
+    assert setting.copy_diagnostics() is None
+
+    assert notifier.last().level == "error"
+    assert "剪贴板被占用" in notifier.last().content
+
+
+def test_export_diagnostics_cancelled_starts_nothing(setting, dialogs, notifier):
+    dialogs.push("ask_directory", None)
+
+    assert setting.export_diagnostics() is None
+    assert notifier.notices == []
+
+
+def test_export_diagnostics_writes_zip_in_background_and_offers_open_folder(
+        setting, dialogs, notifier, tmp_path):
+    import zipfile
+    dialogs.push("ask_directory", str(tmp_path))
+
+    worker = setting.export_diagnostics()
+    assert worker is not None
+    # 导出中按钮不可再点，避免同时打两个包
+    assert not setting.export_diagnostics_button.isEnabled()
+    assert setting.export_diagnostics() is None
+    assert poll_until(lambda: _pumped(notifier.notices), timeout=10)
+
+    notice = notifier.last()
+    assert notice.level == "success"
+    assert notice.title == "诊断包已导出"
+    assert notice.content.endswith(".zip")
+    with zipfile.ZipFile(notice.content) as zf:
+        assert "diagnostics.txt" in zf.namelist()
+    assert poll_until(lambda: _pumped(setting.export_diagnostics_button.isEnabled), timeout=5)
+
+    # 完成提示带"打开文件夹"：点了才打开（不自动打开）
+    assert dialogs.calls_of("open_folder") == []
+    [button] = notice.bar.widgets
+    assert button.text() == "打开文件夹"
+    button.click()
+    assert dialogs.calls_of("open_folder") == [{"path": str(tmp_path)}]
+
+
+def test_export_diagnostics_failure_shows_error(setting, dialogs, notifier, tmp_path):
+    # 选中的"目录"其实是个文件：打包必然失败
+    blocker = tmp_path / "不是目录"
+    blocker.write_text("x", encoding="utf-8")
+    dialogs.push("ask_directory", str(blocker))
+
+    assert setting.export_diagnostics() is not None
+    assert poll_until(lambda: _pumped(notifier.notices), timeout=10)
+
+    assert notifier.last().level == "error"
+    assert notifier.last().title == "导出诊断包失败"
+    assert poll_until(lambda: _pumped(setting.export_diagnostics_button.isEnabled), timeout=5)

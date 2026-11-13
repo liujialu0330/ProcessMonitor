@@ -4,11 +4,15 @@
 
 - 空洞（相邻采样间隔 > 2.5 × 周期）：曲线在空洞处断开（pyqtgraph connect 数组），
   空洞区间画灰色阴影并标注"无数据 12分钟"；
-- 打点：用户打点画注意色虚线、顶部横排编号徽标 ①②③，基线画注意色实线、徽标"基"，
-  标签放在 tooltip 与悬停读数里；暂停/恢复是系统打点，画在底部的浅色短竖线、不编号；
+- 打点：用户打点画注意色虚线、顶部横排编号徽标 ①②③，基线画注意色实线、徽标"基线"，
+  标签放在 tooltip 与悬停读数里；屏幕上挨得太近的徽标错开高度（badge_positions），
+  缩放/平移/改变窗口大小后重新排；暂停/恢复是系统打点，画在底部的浅色短竖线、不编号；
+- 系统事件打点（被测进程异常退出 crash / 重启续接 restart / 工具重启后续采 recover）：贯穿整个
+  高度的点划线，红 / 绿 / 蓝三色（颜色取自 ui.theme_tokens）、底部带短文字标签、悬停提示写明事件与
+  时刻；不编号，也不能在右键菜单里改名或删除；
 - 累计类指标由调用方传入每秒速率序列（rate=True），纵轴标题为"每秒 X"。
 
-分析页用到的扩展点：标题（小倍数各图的指标名）、隐藏保存/复制
+分析页用到的扩展点：标题（小倍数各图的指标名）、小图模式（compact，不显示轴标题）、隐藏保存/复制
 图标、可调最小高度、min/max 带（set_band，按时间分桶，空洞处断开）、相对时间横轴
 （set_relative_origin）、跨图联动十字线（hover_moved / set_crosshair）、右键菜单请求
 （enable_context_menu 后发 context_menu_requested(x, 附近打点或 None, 屏幕坐标)）。
@@ -23,14 +27,15 @@ from typing import Callable, List, Optional, Sequence, Tuple
 import numpy as np
 import pyqtgraph as pg
 from pyqtgraph import exporters
-from PyQt5.QtCore import QEvent, Qt, pyqtSignal
-from PyQt5.QtGui import QColor, QPixmap
+from PyQt5.QtCore import QEvent, QPointF, Qt, pyqtSignal
+from PyQt5.QtGui import QColor, QPainter, QPixmap
 from PyQt5.QtWidgets import QHBoxLayout, QSizePolicy, QVBoxLayout
 from qfluentwidgets import (CardWidget, FluentIcon, StrongBodyLabel, TransparentToolButton,
                             qconfig)
 
 from core.analysis.series import connect_mask
-from ui.chart_theme import BAND_ALPHA, chart_colors
+from ui.chart_theme import (BAND_ALPHA, GAP_SHADE_ALPHA, GRID_ALPHA, chart_colors,
+                             is_transparent, make_transparent)
 from ui.components.chart_axes import ContextDateAxisItem, MetricAxisItem
 from ui.components.sparkline import compute_y_range
 from ui.formatting import (
@@ -40,7 +45,7 @@ from ui.typography import DataCaptionLabel, TypeScale, data_font, ui_font
 from ui.widgets.history.common import CARD_PADDING_H, DETAIL_TIME_FORMAT
 from utils.metrics import (
     VALUE_CLASS_RATE, format_metric_value, get_metric_display_name,
-    get_metric_display_unit, is_integer_metric)
+    get_metric_display_unit, is_integer_metric, split_member_key)
 
 # 保留约 360px 的有效读图高度，同时允许高窗口自动拉伸
 CHART_MIN_HEIGHT = 340
@@ -65,14 +70,33 @@ MARKER_USER = 'user'
 MARKER_BASELINE = 'baseline'
 SYSTEM_MARKER_KINDS = ('pause', 'resume')
 SYSTEM_MARKER_TEXTS = {'pause': '暂停', 'resume': '恢复'}
+# 系统事件打点：线上的短标签、悬停提示里的事件名，以及图表配色表（ui.chart_theme）里的键
+EVENT_MARKER_KINDS = ('crash', 'restart', 'recover')
+EVENT_MARKER_LABELS = {'crash': '异常退出', 'restart': '重启', 'recover': '续采'}
+EVENT_MARKER_TEXTS = {'crash': '被测进程异常退出', 'restart': '被测进程重启并续接',
+                      'recover': '工具重启后继续监控'}
+EVENT_MARKER_COLOR_KEYS = {'crash': 'crash_marker', 'restart': 'restart_marker',
+                           'recover': 'recover_marker'}
+# 事件标签在竖线上的纵向位置（0 底、1 顶）：贴近底部，避开顶部的编号徽标。相邻事件（崩溃后
+# 几十秒就重启）的标签在屏幕上不足 EVENT_LABEL_MIN_GAP_PX 像素时依次上移 EVENT_LABEL_STEP 错开，
+# 最多 EVENT_LABEL_ROWS 层
+EVENT_LABEL_POSITION = 0.10
+EVENT_LABEL_TOP = 0.25
+EVENT_LABEL_STEP = 0.075
+EVENT_LABEL_ROWS = 3
+EVENT_LABEL_MIN_GAP_PX = 64
+# 右键与悬停读数都不把这些打点当作可编辑的"轮次边界"
+NON_EDITABLE_MARKER_KINDS = SYSTEM_MARKER_KINDS + EVENT_MARKER_KINDS
 # 徽标在竖线上的纵向位置（0 底、1 顶）；系统打点短竖线占绘图区高度的比例
 BADGE_POSITION = 0.94
 SYSTEM_MARKER_SPAN = 0.08
-# 空洞阴影的不透明度（0–255）与说明文字的纵向位置
-GAP_SHADE_ALPHA = 36
+# 相邻徽标横向相距不足 BADGE_MIN_GAP_PX 像素（约一个徽标宽）时视为挤在一起，
+# 依次下移 BADGE_STEP 错开，最多 BADGE_ROWS 层后回到顶层
+BADGE_MIN_GAP_PX = 22
+BADGE_STEP = 0.07
+BADGE_ROWS = 3
+# 空洞说明文字的纵向位置（阴影不透明度见 ui.chart_theme.GAP_SHADE_ALPHA）
 GAP_LABEL_POSITION = 0.85
-# 系统打点短竖线的不透明度
-SYSTEM_MARKER_ALPHA = 140
 
 
 def value_axis_title(metric_type: Optional[str], display_unit: str,
@@ -80,7 +104,8 @@ def value_axis_title(metric_type: Optional[str], display_unit: str,
     """纵轴标题：指标名（显示单位）；速率序列为"每秒指标名（单位）"；无指标时为 "值"。"""
     if not metric_type:
         return DEFAULT_VALUE_AXIS_TITLE
-    name = get_metric_display_name(metric_type)
+    # 成员序列（指标@成员键）的轴标题只写指标名：成员名放在图的标题里，轴上写不下
+    name = get_metric_display_name(split_member_key(metric_type)[0])
     if rate:
         name = f"每秒{name}"
     return f"{name}（{display_unit}）" if display_unit else name
@@ -100,20 +125,44 @@ def gap_label_text(start: datetime, end: datetime) -> str:
 
 
 def marker_badges(markers: Sequence) -> List[Optional[str]]:
-    """与 markers 等长的徽标：用户打点按时间顺序编号 ①②③，基线为"基"，
-    系统打点（暂停/恢复）为 None。markers 须按时间升序。"""
+    """与 markers 等长的徽标：用户打点按时间顺序编号 ①②③，基线为"基线"，
+    系统打点（暂停/恢复）与系统事件（异常退出/重启/续采）为 None。markers 须按时间升序。"""
     badges: List[Optional[str]] = []
     number = 0
     for marker in markers:
         kind = getattr(marker, 'kind', MARKER_USER)
         if kind == MARKER_BASELINE:
             badges.append(BADGE_BASELINE)
-        elif kind in SYSTEM_MARKER_KINDS:
+        elif kind in NON_EDITABLE_MARKER_KINDS:
             badges.append(None)
         else:
             number += 1
             badges.append(marker_badge(number))
     return badges
+
+
+def event_marker_tooltip(kind: str, label: str, time_text: str) -> str:
+    """系统事件竖线的悬停提示："被测进程异常退出：异常退出 0xC0000005（访问冲突） · 11-07 10:30:00"。
+    打点名称里已经带事件名（如"异常退出 …"）时不重复写。"""
+    text = EVENT_MARKER_TEXTS.get(kind, kind)
+    if label and label.startswith(EVENT_MARKER_LABELS.get(kind, text)):
+        return f"{label} · {time_text}"
+    return f"{text}：{label} · {time_text}" if label else f"{text} · {time_text}"
+
+
+def badge_positions(pixel_xs: Sequence[float], min_gap_px: float, top: float,
+                    step: float, rows: int) -> List[float]:
+    """各徽标的纵向位置（0 底、1 顶）。pixel_xs 为按时间升序的屏幕 x 像素；
+    相邻两个相距 < min_gap_px 归入同一簇，簇内第 k 个位于 top - (k % rows) * step，
+    簇间互不影响（每簇都从 top 开始）。"""
+    positions: List[float] = []
+    k = 0
+    previous: Optional[float] = None
+    for x in pixel_xs:
+        k = k + 1 if previous is not None and abs(x - previous) < min_gap_px else 0
+        positions.append(top - (k % rows) * step)
+        previous = x
+    return positions
 
 
 def nearest_index(x_array: Sequence[float], x: float) -> int:
@@ -142,8 +191,11 @@ class ChartView(CardWidget):
     # 右键：(x epoch 秒, 附近的打点或 None, 屏幕坐标 QPoint)；需先 enable_context_menu
     context_menu_requested = pyqtSignal(float, object, object)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, compact: bool = False):
+        """compact=True 为小倍数里的小图：不显示纵轴、横轴标题（单位由调用方写进卡片标题），
+        省出的空间留给曲线；其余行为与大图相同。"""
         super().__init__(parent)
+        self._compact = compact
         # min/max 带 [(epoch 秒, 下沿, 上沿)]，与空洞一起决定分段
         self._band: List[Tuple[float, float, float]] = []
         self._band_items: list = []
@@ -180,9 +232,9 @@ class ChartView(CardWidget):
             'left': self.value_axis,
             'bottom': self.time_axis,
         })
-        self.chart_widget.showGrid(x=False, y=True, alpha=0.18)
-        self.chart_widget.setLabel('left', DEFAULT_VALUE_AXIS_TITLE)
-        self.chart_widget.setLabel('bottom', TIME_AXIS_TITLE)
+        self.chart_widget.showGrid(x=False, y=True, alpha=GRID_ALPHA)
+        self._set_axis_label('left', DEFAULT_VALUE_AXIS_TITLE)
+        self._set_axis_label('bottom', TIME_AXIS_TITLE)
         for axis in (self.value_axis, self.time_axis):
             axis.setTickFont(data_font(TypeScale.CHART_TICK))
             axis.setStyle(maxTickLevel=0, tickTextOffset=6)
@@ -195,6 +247,11 @@ class ChartView(CardWidget):
         # 两者都能正确处理 connect 数组（空洞断开）
         self.chart_widget.setDownsampling(auto=True, mode='peak')
         self.chart_widget.setClipToView(True)
+        # 徽标错开取决于屏幕上的像素距离：缩放、平移、改变大小后重新排。
+        # chart_widget.clear() 不会替换 ViewBox，连一次即可
+        view_box = self.chart_widget.getPlotItem().vb
+        view_box.sigXRangeChanged.connect(self._layout_badges)
+        view_box.sigResized.connect(self._layout_badges)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(
@@ -270,6 +327,16 @@ class ChartView(CardWidget):
         """本次绘制的打点竖线：[(kind, 徽标或 None, InfiniteLine)]，按时间升序。"""
         return list(self._marker_items)
 
+    def event_label_layout(self) -> List[float]:
+        """系统事件短标签当前的纵向位置（0 底、1 顶），按时间升序（紧凑图没有标签，不计）。"""
+        return [line.label.orthoPos for kind, _badge, line in self._marker_items
+                if kind in EVENT_MARKER_KINDS and getattr(line, 'label', None) is not None]
+
+    def badge_layout(self) -> List[float]:
+        """带徽标竖线的标签当前纵向位置（0 底、1 顶），按时间升序（系统打点不计）。"""
+        return [line.label.orthoPos for _kind, badge, line in self._marker_items
+                if badge is not None]
+
     def gap_items(self) -> list:
         """本次绘制的空洞阴影：[(LinearRegionItem, 说明文本)]。"""
         return list(self._gap_items)
@@ -341,9 +408,8 @@ class ChartView(CardWidget):
             integer_only=bool(metric_type) and not rate and is_integer_metric(metric_type))
 
         self._redraw()
-        self.chart_widget.setLabel(
-            'left', value_axis_title(metric_type, self._display_unit, rate))
-        self.chart_widget.setLabel('bottom', TIME_AXIS_TITLE)
+        self._set_axis_label('left', value_axis_title(metric_type, self._display_unit, rate))
+        self._set_axis_label('bottom', TIME_AXIS_TITLE)
 
         if not keep_view:
             self.reset_view()
@@ -376,8 +442,23 @@ class ChartView(CardWidget):
         """横轴改为相对 origin（epoch 秒）的 T+mm:ss；None 恢复绝对时间。"""
         self._relative_origin = origin
         self.time_axis.set_relative_origin(origin)
-        self.chart_widget.setLabel(
+        self._set_axis_label(
             'bottom', TIME_AXIS_TITLE if origin is None else RELATIVE_TIME_AXIS_TITLE)
+
+    @property
+    def compact(self) -> bool:
+        """是否为不显示轴标题的小图。"""
+        return self._compact
+
+    def axis_label_visible(self, name: str) -> bool:
+        """name（'left' / 'bottom'）轴的标题是否显示。"""
+        return self.chart_widget.getPlotItem().getAxis(name).label.isVisible()
+
+    def _set_axis_label(self, name: str, text: str) -> None:
+        # pyqtgraph 的 setLabel 会顺带把标题显示出来；小图记下文本（axis_title 仍可读）后再藏起
+        self.chart_widget.setLabel(name, text)
+        if self._compact:
+            self.chart_widget.getPlotItem().getAxis(name).showLabel(False)
 
     def enable_context_menu(self) -> None:
         """改用自己的右键菜单：关掉 pyqtgraph 自带菜单，右键时发 context_menu_requested。"""
@@ -392,7 +473,7 @@ class ChartView(CardWidget):
         pixel = self.chart_widget.getPlotItem().vb.viewPixelSize()[0] or 0.0
         best, best_dist = None, None
         for marker in self._markers:
-            if getattr(marker, 'kind', MARKER_USER) in SYSTEM_MARKER_KINDS:
+            if getattr(marker, 'kind', MARKER_USER) in NON_EDITABLE_MARKER_KINDS:
                 continue
             dist = abs(marker.timestamp.timestamp() - x)
             if dist <= tolerance_px * pixel and (best_dist is None or dist < best_dist):
@@ -429,9 +510,13 @@ class ChartView(CardWidget):
         self.value_axis.set_display_unit('')
         self._redraw()
 
-    def reset_view(self) -> None:
-        """重新自适应范围；数据几乎是平线时把纵向跨度扩到下限。"""
-        self.chart_widget.enableAutoRange()
+    def reset_view(self, follow_x: bool = False) -> None:
+        """重新自适应范围；数据几乎是平线时把纵向跨度扩到下限。follow_x 为真时横轴不自适应
+        （由外部同步，如小倍数图跟随焦点大图），只自适应纵轴。"""
+        if follow_x:
+            self.chart_widget.enableAutoRange(axis='y')
+        else:
+            self.chart_widget.enableAutoRange()
         self._apply_min_y_span()
 
     def _apply_min_y_span(self) -> None:
@@ -466,7 +551,7 @@ class ChartView(CardWidget):
 
     def _draw_gaps(self, colors: dict) -> None:
         """空洞：灰色阴影 + "无数据 N" 说明；ignoreBounds 不参与自动范围。"""
-        shade = QColor(colors['axis'])
+        shade = QColor(colors['gap_shade'])
         shade.setAlpha(GAP_SHADE_ALPHA)
         for start, end in self._gaps:
             region = pg.LinearRegionItem(
@@ -477,6 +562,8 @@ class ChartView(CardWidget):
             label = pg.InfLineLabel(
                 region.lines[0], text=text, position=GAP_LABEL_POSITION,
                 anchors=[(0, 0.5), (0, 0.5)], color=colors['text'])
+            # pyqtgraph 默认字号比刻度大一号，与刻度同为说明文字
+            label.setFont(ui_font(TypeScale.CAPTION))
             label.setToolTip(text)
             region.setToolTip(text)
             self.chart_widget.addItem(region, ignoreBounds=True)
@@ -520,18 +607,30 @@ class ChartView(CardWidget):
         return low, high
 
     def _draw_markers(self, colors: dict) -> None:
-        """打点竖线：用户打点虚线 + 编号徽标，基线实线 + "基"，暂停/恢复底部浅色短线。"""
+        """打点竖线：用户打点虚线 + 编号徽标，基线实线 + "基线"，暂停/恢复底部浅色短线，
+        系统事件（异常退出/重启/续采）彩色点划线 + 底部短标签。"""
         marker_color = colors['marker']
         user_pen = pg.mkPen(color=marker_color, width=1, style=Qt.DashLine)
         baseline_pen = pg.mkPen(color=marker_color, width=2)
-        system_color = QColor(colors['crosshair'])
-        system_color.setAlpha(SYSTEM_MARKER_ALPHA)
-        system_pen = pg.mkPen(color=system_color, width=2)
+        system_pen = pg.mkPen(color=colors['system_marker'], width=2)
         for marker, badge in zip(self._markers, marker_badges(self._markers)):
             kind = getattr(marker, 'kind', MARKER_USER)
             pos = marker.timestamp.timestamp()
             time_text = marker.timestamp.strftime(DETAIL_TIME_FORMAT)
-            if badge is None:
+            if kind in EVENT_MARKER_KINDS:
+                color = colors[EVENT_MARKER_COLOR_KEYS[kind]]
+                tooltip = event_marker_tooltip(kind, marker.label, time_text)
+                opts = {'position': EVENT_LABEL_POSITION, 'color': color, 'movable': False,
+                        'anchors': [(0, 1), (0, 1)]}
+                line = pg.InfiniteLine(
+                    pos=pos, angle=90, movable=False,
+                    pen=pg.mkPen(color=color, width=2, style=Qt.DashDotLine),
+                    label=None if self._compact else EVENT_MARKER_LABELS[kind], labelOpts=opts)
+                tag = getattr(line, 'label', None)
+                if tag is not None:
+                    tag.setFont(ui_font(TypeScale.CAPTION))
+                    tag.setToolTip(tooltip)
+            elif badge is None:
                 tooltip = f"{SYSTEM_MARKER_TEXTS.get(kind, kind)} · {time_text}"
                 line = pg.InfiniteLine(pos=pos, angle=90, movable=False, pen=system_pen,
                                        span=(0, SYSTEM_MARKER_SPAN))
@@ -548,6 +647,31 @@ class ChartView(CardWidget):
             line.setToolTip(tooltip)
             self.chart_widget.addItem(line, ignoreBounds=True)
             self._marker_items.append((kind, badge, line))
+        self._layout_badges()
+
+    def _layout_badges(self, *_args) -> None:
+        """按徽标在屏幕上的横向距离错开高度，避免相隔几秒的打点徽标重叠；系统事件的短标签
+        同理（各自一组，互不影响）。只改标签位置，不改视图范围，不会反过来触发 sigXRangeChanged。"""
+        badge_lines = [line for _kind, badge, line in self._marker_items if badge is not None]
+        event_lines = [line for kind, _badge, line in self._marker_items
+                       if kind in EVENT_MARKER_KINDS and getattr(line, 'label', None) is not None]
+        self._stagger(badge_lines, BADGE_MIN_GAP_PX, BADGE_POSITION, BADGE_STEP, BADGE_ROWS)
+        self._stagger(event_lines, EVENT_LABEL_MIN_GAP_PX, EVENT_LABEL_TOP, EVENT_LABEL_STEP,
+                      EVENT_LABEL_ROWS)
+
+    def _stagger(self, lines: list, min_gap_px: float, top: float, step: float,
+                 rows: int) -> None:
+        if not lines:
+            return
+        view_box = self.chart_widget.getPlotItem().vb
+        pixel_xs = [view_box.mapViewToScene(QPointF(line.value(), 0)).x() for line in lines]
+        if not all(np.isfinite(pixel_xs)):
+            # 视图尚未布局（尺寸为零等）时映射无意义，先放回顶层，sigResized 后再排
+            positions = [top] * len(lines)
+        else:
+            positions = badge_positions(pixel_xs, min_gap_px, top, step, rows)
+        for line, position in zip(lines, positions):
+            line.label.setPosition(position)
 
     # ---------- 悬停十字线 ----------
 
@@ -654,10 +778,31 @@ class ChartView(CardWidget):
 
     # ---------- 主题 ----------
 
+    def renders_offscreen(self) -> bool:
+        """是否在离屏窗口里渲染（报告图片：WA_DontShowOnScreen 下 show 一次再 grab）。
+        这时没有主窗口的底色可透，卡片的半透明底会叠在 Qt 默认的浅灰窗口色上。"""
+        return self.window().testAttribute(Qt.WA_DontShowOnScreen)
+
+    def paintEvent(self, event) -> None:
+        # 离屏导出时先垫一层当前主题的窗口底色（卡片的半透明底叠上去正好是屏幕上的卡片色），
+        # 深色报告里的图表与标题才不会是浅底浅字
+        if self.renders_offscreen():
+            painter = QPainter(self)
+            try:
+                painter.fillRect(self.rect(), QColor(chart_colors()['window']))
+            finally:
+                painter.end()
+        super().paintEvent(event)
+
+    def is_background_transparent(self) -> bool:
+        """绘图区背景是否透明（由卡片提供底色）。"""
+        return is_transparent(self.chart_widget)
+
     def apply_theme(self) -> None:
-        """按 chart_colors() 设置背景、坐标轴、十字线配色，并用缓存数据重绘曲线。"""
+        """按 chart_colors() 设置坐标轴、十字线配色，并用缓存数据重绘曲线。
+        绘图区背景透明，由卡片提供底色（写死的底色在 Mica 与悬停下会露出色差矩形）。"""
         colors = chart_colors()
-        self.chart_widget.setBackground(colors['background'])
+        make_transparent(self.chart_widget)
         axis_pen = pg.mkPen(color=colors['axis'])
         text_pen = pg.mkPen(color=colors['text'])
         for axis_name in ('bottom', 'left'):
@@ -668,16 +813,35 @@ class ChartView(CardWidget):
         self._redraw()
 
     def _on_theme_changed(self, _theme) -> None:
-        self.apply_theme()
+        # 无父对象的 ChartView（测试里常见）可能已被 Python 端回收了 pyqtgraph 的场景，
+        # 而控件本身还在：此时重新取色会碰到已删除的 C++ 对象。遇到就退订，不再跟随主题
+        try:
+            self.apply_theme()
+        except RuntimeError:
+            try:
+                qconfig.themeChanged.disconnect(self._on_theme_changed)
+            except TypeError:
+                pass
 
     # ---------- 导出 ----------
 
     def export_png(self, path: str, width: int = EXPORT_WIDTH) -> None:
-        """把绘图区导出为 PNG；失败时异常原样抛出，由调用方提示。"""
+        """把绘图区导出为 PNG；失败时异常原样抛出，由调用方提示。
+        屏幕上背景透明，导出时垫当前主题的卡片底色，图片离开卡片后文字仍可读。"""
         exporter = exporters.ImageExporter(self.chart_widget.getPlotItem())
         exporter.parameters()['width'] = width
+        exporter.parameters()['background'] = QColor(chart_colors()['background'])
         exporter.export(path)
 
     def grab_pixmap(self) -> QPixmap:
-        """绘图区截图（复制到剪贴板用）。"""
-        return self.chart_widget.grab()
+        """绘图区截图（复制到剪贴板用），垫当前主题的卡片底色（同 export_png）。"""
+        ratio = self.chart_widget.devicePixelRatioF()
+        pixmap = QPixmap(self.chart_widget.size() * ratio)
+        pixmap.setDevicePixelRatio(ratio)
+        pixmap.fill(QColor(chart_colors()['background']))
+        painter = QPainter(pixmap)
+        try:
+            self.chart_widget.render(painter)
+        finally:
+            painter.end()
+        return pixmap

@@ -2,11 +2,10 @@
 ; 进程监控助手安装程序配置
 
 #define MyAppName "进程监控助手"
-; 版本号优先由外部命令行传入 /DMyAppVersion=x.y.z（build.bat 已实现，读取
-; config.APP_VERSION 单源）；此处 #ifndef 仅作直接用 Inno Setup IDE 打开
-; 编译时的兜底，避免忘传参数时编译出错误版本号的安装包
+; 版本号只能由外部命令行传入 /DMyAppVersion=x.y.z（build.bat 读取 config.APP_VERSION
+; 单源后传入）；没有传入时直接报错，不再用写死的兜底版本号——那会编译出版本号错误的安装包
 #ifndef MyAppVersion
-#define MyAppVersion "1.3.0"
+  #error 版本号必须由 build.bat 传入（/DMyAppVersion=x.y.z）
 #endif
 #define MyAppPublisher "软件测试工程师"
 #define MyAppExeName "进程监控助手.exe"
@@ -25,7 +24,9 @@ DefaultGroupName={#MyAppName}
 
 ; 输出配置
 OutputDir=..\dist\installer
-OutputBaseFilename=进程监控助手_v{#MyAppVersion}_Setup
+; 文件名固定为 ASCII 的 Windows_v{版本}_Setup：Release 资产命名是对已安装版本更新器的契约
+; （1.4.1 取第一个文件名含 setup 的 .exe），不另存中文名副本
+OutputBaseFilename=Windows_v{#MyAppVersion}_Setup
 ; 应用图标（在build目录下）
 SetupIconFile=app_green_icon.ico
 
@@ -48,6 +49,15 @@ ShowLanguageDialog=no
 ; 许可协议（可选）
 ; LicenseFile=
 
+; 程序运行中时拦截安装/卸载：Setup 与 Uninstall 启动时按名称检查这些互斥量，任一存在
+; 即提示先关闭程序。主程序成为主实例后持有固定名互斥量 ProcessMonitor.Running（见
+; app/single_instance.py 的 INSTALLER_MUTEX_NAME，两处必须一致，名称区分大小写），
+; 会话局部名与 Global\ 各建一个。Inno Setup 6 文档（[Setup]: AppMutex）只说明按所列
+; 名称（逗号分隔）逐个检查，未说明会自动补查 Global\，故按文档示例
+; "AppMutex=MyProgramsMutexName,Global\MyProgramsMutexName" 把两个名称都列出：不带前缀
+; 的名称落在当前会话命名空间（即程序创建的 Local\ 名），Global\ 名覆盖其他会话里运行的实例
+AppMutex=ProcessMonitor.Running,Global\ProcessMonitor.Running
+
 ; 其他配置
 UninstallDisplayIcon={app}\{#MyAppExeName}
 UninstallDisplayName={#MyAppName}
@@ -60,6 +70,11 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加图标:"
+
+[InstallDelete]
+; 覆盖安装前先清掉旧版本的运行库目录：新版本的 _internal 里文件名可能已变（少了的 DLL、
+; 改名的 Qt 插件），只靠 [Files] 覆盖会留下旧文件，与新文件混用或白占体积
+Type: filesandordirs; Name: "{app}\_internal"
 
 [Files]
 ; onedir 打包产物（主exe + _internal依赖目录），整体复制到安装目录

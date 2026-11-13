@@ -1,4 +1,4 @@
-"""MaintenanceService：启动校正顺序、清理压缩时维护锁的持有/释放（一段式与两段式）、
+"""MaintenanceService：启动校正顺序、清理压缩与重建汇总时维护锁的持有/释放（一段式与两段式）、
 忙碌原因与失败上抛"""
 from datetime import datetime, timedelta
 
@@ -10,7 +10,7 @@ from core.maintenance_service import (
     MaintenanceService, ReconcileResult,
 )
 from data.errors import StorageError
-from data.models import MonitorTask
+from data.models import DataPoint, MonitorTask
 
 
 class FakeManager:
@@ -49,6 +49,18 @@ class RecordingDb:
     def __init__(self):
         self.calls = []
 
+    def touch_writer(self, version):
+        self.calls.append('touch')
+        return True
+
+    def import_legacy_points(self):
+        self.calls.append('import')
+        return 5
+
+    def purge_orphan_series(self):
+        self.calls.append('purge')
+        return 6
+
     def reconcile_orphan_tasks(self):
         self.calls.append('orphans')
         return 2
@@ -76,16 +88,26 @@ def _old_stopped_task(db, days_ago=40):
 def test_startup_reconcile_order_and_result():
     db = RecordingDb()
     result = MaintenanceService(db, FakeManager()).startup_reconcile(30)
-    assert db.calls == ['orphans', 'recount', ('cleanup', 30)]
-    assert result == ReconcileResult(orphans=2, recounted=3, cleaned=4)
+    # v5 起先记写入版本、导回 1.4.1 写的 data_points、清孤儿序列，再走原有三步
+    assert db.calls == ['touch', 'import', 'purge', 'orphans', 'recount', ('cleanup', 30)]
+    assert result == ReconcileResult(orphans=2, recounted=3, cleaned=4, imported=5, purged=6)
 
 
 @pytest.mark.parametrize("days", [0, -1])
 def test_startup_reconcile_skips_cleanup_when_disabled(days):
     db = RecordingDb()
     result = MaintenanceService(db, FakeManager()).startup_reconcile(days)
-    assert db.calls == ['orphans', 'recount']
+    assert db.calls == ['touch', 'import', 'purge', 'orphans', 'recount']
     assert result.cleaned == 0
+
+
+def test_startup_reconcile_skipped_for_read_only_db():
+    """只读打开的库（由更高版本写入）不做任何校正：每一步都要写库"""
+    db = RecordingDb()
+    db.read_only = True
+    result = MaintenanceService(db, FakeManager()).startup_reconcile(30)
+    assert db.calls == []
+    assert result == ReconcileResult(orphans=0, recounted=0, cleaned=0)
 
 
 def test_startup_reconcile_on_real_db(db):
@@ -102,6 +124,32 @@ def test_startup_reconcile_on_real_db(db):
     assert result.cleaned == 1
     assert db.get_task("orphan").status == "stopped"
     assert db.get_task("old-40") is None
+
+
+def test_startup_reconcile_purges_markers_of_deleted_tasks(db):
+    """任务已不存在的打点（1.4.1 删任务只删它认识的表）由启动校正清掉，仍存在任务的打点不动；
+    再校正一次无事可做"""
+    now = datetime.now()
+    for task_id in ("keep", "gone"):
+        db.save_task(MonitorTask(task_id=task_id, pid=1, process_name="a.exe",
+                                 metric_types=["memory_rss"], interval=1.0, start_time=now,
+                                 end_time=now + timedelta(minutes=1), status="stopped"))
+        db.markers.add(task_id, now, f"{task_id}-基线", kind='baseline')
+        db.markers.add(task_id, now + timedelta(seconds=30), f"{task_id}-打点")
+    with db._factory.connect() as conn:
+        conn.execute("DELETE FROM tasks WHERE task_id = 'gone'")   # 1.4.1 的删除：附属表留下孤儿行
+        assert conn.execute("SELECT COUNT(*) FROM task_markers WHERE task_id = 'gone'"
+                            ).fetchone()[0] == 2
+
+    MaintenanceService(db, FakeManager()).startup_reconcile(0)
+
+    assert db.markers.list("gone") == []
+    assert [m.label for m in db.markers.list("keep")] == ["keep-基线", "keep-打点"]
+    with db._factory.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM task_markers").fetchone()[0] == 2
+    # 再校正一次：没有新的孤儿，保留的打点原样
+    MaintenanceService(db, FakeManager()).startup_reconcile(0)
+    assert len(db.markers.list("keep")) == 2
 
 
 # ========== cleanup_and_vacuum ==========
@@ -280,3 +328,64 @@ def test_cleanup_worker_passes_already_locked(db, qapp, already_locked):
     assert worker.wait(5000)
     assert service.calls == [(7, already_locked)]
     assert results == [CleanupResult(0, 1, 1)]
+
+
+# ========== rebuild_rollups ==========
+
+def _seed_rollups(db):
+    db.save_task(MonitorTask(task_id='r', pid=1, process_name='a.exe', metric_types=['m'],
+                             interval=1.0, start_time=datetime(2026, 3, 1, 9),
+                             end_time=None, status='stopped'))
+    db.save_data_points([DataPoint('r', datetime(2026, 3, 1, 9) + timedelta(seconds=s), 1.0, 'm')
+                         for s in range(0, 300, 2)])
+
+
+def test_rebuild_rollups_holds_and_releases_lock(db):
+    from core.maintenance_service import RebuildRollupsResult
+    manager = FakeManager()
+    seen = []
+    original = db.maintenance.rebuild_rollups
+
+    def rebuild():
+        seen.append(manager.is_maintenance_running())
+        return original()
+
+    db.maintenance.rebuild_rollups = rebuild
+    _seed_rollups(db)
+    result = MaintenanceService(db, manager).rebuild_rollups()
+    assert result == RebuildRollupsResult(series=1)
+    assert seen == [True]
+    assert manager.calls == ['begin', 'end']
+
+
+@pytest.mark.parametrize("tasks, exports, reason", [
+    (True, False, BUSY_TASKS_RUNNING),
+    (False, True, BUSY_EXPORT_RUNNING),
+])
+def test_rebuild_rollups_rejected_when_busy(db, tasks, exports, reason):
+    manager = FakeManager(tasks_running=tasks, exports_running=exports)
+    with pytest.raises(MaintenanceBusy) as info:
+        MaintenanceService(db, manager).rebuild_rollups()
+    assert info.value.reason == reason
+    assert manager.calls == ['begin']
+
+
+def test_rebuild_rollups_already_locked_and_failure(db):
+    manager = FakeManager()
+    service = MaintenanceService(db, manager)
+    service.begin()
+    assert service.rebuild_rollups(already_locked=True).series == 0
+    assert manager.calls == ['begin'] and manager.is_maintenance_running()
+
+    def boom():
+        raise StorageError("重建失败")
+
+    db.maintenance.rebuild_rollups = boom
+    with pytest.raises(StorageError):
+        service.rebuild_rollups(already_locked=True)
+    assert manager.is_maintenance_running()       # 已占锁时失败也不释放，交给调用方 end()
+    service.end()
+    with pytest.raises(StorageError):
+        service.rebuild_rollups()
+    assert manager.calls[-2:] == ['begin', 'end']
+    assert manager.is_maintenance_running() is False

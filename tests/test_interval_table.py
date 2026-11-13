@@ -62,7 +62,7 @@ def test_activate_row_emits_interval_bounds(table, db):
     table.interval_activated.connect(lambda s, e: got.append((s, e)))
     table.activate_row(2)
     assert got == [(BASE + timedelta(seconds=40), BASE + timedelta(seconds=70))]
-    table.table.cellClicked.emit(0, 3)
+    table.table.setCurrentCell(0, 3)
     assert got[-1][0] == BASE
     table.activate_row(99)                          # 越界忽略
     assert len(got) == 2
@@ -90,6 +90,24 @@ def test_lower_views_switch(qapp):
     assert seen[-1] == VIEW_SAMPLES
     views.clear()
     views.close()
+
+
+def test_interval_page_sized_to_rows_not_to_sample_table(qapp, db):
+    """焦点区里区间表高度贴合行数：堆叠不按更高的采集明细页留空白，切到明细再按明细。"""
+    from ui.widgets.analysis.interval_table import HEADER_HEIGHT, ROW_HEIGHT
+    views = LowerViews()
+    try:
+        snapshot, markers = _snapshot(db)
+        views.interval_table.set_intervals(HANDLES, snapshot.intervals, markers)
+        assert views.interval_table.table.height() == HEADER_HEIGHT + 4 * ROW_HEIGHT + 4
+        short = views.stack.sizeHint().height()
+        assert short < views.sample_table.sizeHint().height()
+        views.set_view(VIEW_SAMPLES)
+        assert views.stack.sizeHint().height() >= views.sample_table.sizeHint().height()
+        views.set_view(VIEW_INTERVALS)
+        assert views.stack.sizeHint().height() == short
+    finally:
+        views.close()
 
 
 def test_format_relative():

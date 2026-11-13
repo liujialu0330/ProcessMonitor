@@ -14,8 +14,9 @@ import uuid
 from datetime import datetime, timedelta
 
 import pytest
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import QEvent, Qt
 from PyQt5.QtTest import QTest
+from PyQt5.QtWidgets import QApplication
 
 from core.history_query import CUSTOM_RANGE_KEY
 from core.monitor_manager import MonitorManager
@@ -26,12 +27,14 @@ from tests.factories import make_analysis_page, make_services
 from tests.helpers import (
     ManualDefer, ManualHistoryRunner, SyncHistoryRunner, process_events_until)
 from ui.pages.analysis_page import TASK_HAS_NO_DATA
+from ui.formatting import SUMMARY_COLUMNS
 from ui.services import QtDialogs
 from ui.viewmodels.analysis_vm import TIME_RELATIVE, VIEW_OVERLAY, VIEW_SMALL
 from ui.widgets.analysis.export_flow import MAINTENANCE, NO_DATA
 from ui.widgets.analysis.interval_table import VIEW_SAMPLES
 from ui.widgets.analysis.marker_menu import ADD_TEXT, BASELINE_TEXT, DELETE_TEXT, RENAME_TEXT
 from ui.widgets.analysis.toolbar import EXPORT_COPY, EXPORT_CSV, EXPORT_REPORT
+from ui.widgets.history.chart_view import ChartView
 from utils.metrics import MetricType
 
 BASE = datetime(2026, 7, 16, 16, 0, 0)
@@ -115,11 +118,18 @@ def test_loads_summary_small_multiples_and_intervals(loaded):
     assert len(page.summary_table.row_texts()) == 4
     assert page.summary_table.selected_metric() == MEM
     assert page.summary_table.basis().startswith("依据：")
+    assert page.verdict_banner.basis() == page.summary_table.basis()   # 依据显示在结论条
+    # 夹具跨度不足 10 分钟、全部数据不足：只画焦点大图，其余折叠为一行；全部展开后才是
+    # 原来"每个指标一张小倍数图、两列"的样子
+    charts = page.trend_panel.charts()
+    assert list(charts) == [MEM]
+    assert page.trend_panel.folded_metrics() == [HANDLES, GDI, IO]
+    page.trend_panel.expand_all()
     charts = page.trend_panel.charts()
     assert list(charts) == METRICS
     assert all(chart.has_data() for chart in charts.values())
     assert charts[MEM].band_items()                     # min/max 带
-    assert page.trend_panel.columns() == 2
+    assert page.trend_panel.columns() == min(3, len(charts) - 1)   # wide 档 3 列；小图不足一行不留空列
     assert [r[0] for r in page.interval_table.row_texts()] == [
         "开始 → 基线", "基线 → 第 1 轮", "第 1 轮 → 第 2 轮", "第 2 轮 → 结束"]
     assert page.trend_panel.overview.has_data()
@@ -129,7 +139,7 @@ def test_loads_summary_small_multiples_and_intervals(loaded):
 def test_focus_switch_reuses_batch(loaded, runner):
     page, _task = loaded
     queries = len(runner.requests)
-    page.summary_table.table.cellClicked.emit(1, 0)
+    page.summary_table.table.setCurrentCell(1, 0)
     assert page.current_metric == HANDLES
     assert len(runner.requests) == queries            # 复用已取回的快照，不重查
     assert "句柄数" in page.interval_table.title_label.text()
@@ -149,6 +159,127 @@ def test_empty_state_and_task_without_data(make_page, db, services):
     page.select_task(empty.task_id)
     assert services.notifier.last('info').title == TASK_HAS_NO_DATA[0]
     assert page.current_task_id is None
+
+
+# ---------------------------------------------------------------- 结论优先：结论条、排序、折叠
+
+
+def _chart_views(page):
+    """页面里的趋势图实例（不含叠加图 / 对比图这类 ChartView 子类）。"""
+    QApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+    return [c for c in page.findChildren(ChartView) if type(c) is ChartView]
+
+
+@pytest.fixture
+def leaking(make_page, db, manager):
+    """跨度 20 分钟：私有字节、句柄数持续上涨，GDI 恒定（平稳），I/O 是累计量（不判定）。
+    任务指标顺序故意把平稳的 GDI 排在前面。"""
+    task = _seed(db, manager, metrics=[GDI, IO, HANDLES, MEM], samples=1200,
+                 markers=((400, "第 1 轮"), (700, "第 2 轮"), (1000, "第 3 轮")))
+    page = make_page()
+    page.show()
+    page.select_task(task.task_id)
+    page.vm.select_metric(MEM)
+    return page, task
+
+
+def test_layout_order_puts_conclusions_and_intervals_first(loaded):
+    page, _task = loaded
+    layout = page.body.layout()
+    order = [layout.itemAt(i).widget() for i in range(layout.count())]
+    assert order == [page.verdict_banner, page.summary_table, page.member_panel,
+                     page.compare_panel, page.lower_views, page.trend_panel]
+    # pid 任务没有成员结论与成员下拉
+    assert not page.member_panel.isVisible()
+    assert not page.toolbar.members_visible()
+    # 焦点区：区间 | 采集明细页签在焦点大图之上
+    trend = page.trend_panel
+    assert trend.layout().indexOf(trend.focus_chart) < trend.layout().indexOf(trend.overview)
+    assert page.lower_views.segmented.currentRouteKey() == 'intervals'
+    assert not page.summary_table.title_label.isVisible()
+
+
+def test_summary_sorted_by_verdict_and_banner_names_rising(leaking):
+    page, _task = leaking
+    assert page.summary_table.metrics() == [MEM, HANDLES, GDI, IO]
+    texts = dict(zip(page.summary_table.metrics(), page.summary_table.row_texts()))
+    columns = list(SUMMARY_COLUMNS)
+    gdi = texts[GDI]
+    assert gdi[columns.index("verdict")] == "平稳"
+    assert gdi[columns.index("rate")] == "—" and gdi[columns.index("per_round")] == "—"
+    assert gdi[columns.index("usage")] == "3%"
+    assert texts[MEM][columns.index("rate")].startswith("+")
+    banner = page.verdict_banner
+    assert banner.verdict() == "持续上涨"
+    assert banner.sentence().startswith("2 / 4 项持续上涨：私有字节 +")
+    assert "句柄数 +" in banner.sentence()
+    assert banner.basis().startswith("依据：基线")
+    assert banner.refresh_status() == ""                 # 已结束任务不显示自动刷新
+
+
+def test_only_anomalous_metrics_get_charts_and_folded_rows_expand(leaking, runner):
+    page, _task = leaking
+    trend = page.trend_panel
+    # 持续上涨 2 项：焦点大图（私有字节）+ 句柄数小图；平稳与累计量只是一行迷你图
+    assert len(_chart_views(page)) == 2
+    assert list(trend.charts()) == [MEM, HANDLES]
+    assert trend.folded_metrics() == [GDI, IO]
+    small = trend.small_charts()[HANDLES]
+    assert small.compact and not small.axis_label_visible('left')
+    assert not small.axis_label_visible('bottom')
+    assert small.title_label.text() == "句柄数（个）"
+    assert trend.focus_chart.axis_label_visible('left')
+    row = trend.folded_rows()[GDI]
+    assert row.verdict() == "平稳" and row.value_label.text() == "300 个"
+    assert row.sparkline.series()
+
+    queries = len(runner.requests)
+    row.click()                                          # 点折叠行：设为焦点、在大图展开
+    assert page.current_metric == GDI and trend.focus_metric() == GDI
+    assert len(runner.requests) == queries
+    assert trend.focus_chart.metric_type == GDI
+    assert trend.folded_metrics() == [IO]
+    assert list(trend.charts()) == [GDI, MEM, HANDLES]
+    assert len(_chart_views(page)) == 3
+    assert "GDI对象数" in page.interval_table.title_label.text()
+
+    trend.folded_panel.expand_button.click()             # 全部展开
+    assert trend.expanded() and trend.folded_metrics() == []
+    assert len(_chart_views(page)) == 4
+    assert trend.folded_panel.isVisible()                # 留着"收起"
+    trend.folded_panel.expand_button.click()
+    assert trend.folded_metrics() == [IO] and len(_chart_views(page)) == 3
+
+
+def test_running_task_banner_shows_auto_refresh_age(make_page, db, manager, services):
+    task = _seed(db, manager, status="running", metrics=[MEM], samples=60, markers=(),
+                 baseline=None)
+    services.task_status.set_running(task.task_id)
+    page = make_page()
+    page.show()
+    page.select_task(task.task_id)
+    banner = page.verdict_banner
+    assert banner.verdict() == "数据不足"
+    assert banner.sentence() == "数据不足：已采 59秒 / 需 ≥ 10分钟"
+    assert banner.refresh_status() == "自动刷新 · 刚刚"
+    services.clock.advance(timedelta(seconds=15))
+    page.update_refresh_status()
+    assert banner.refresh_status() == "自动刷新 · 15 秒前"
+
+
+def test_overlay_and_compare_legends_sit_outside_plot(loaded, db, manager):
+    page, _task = loaded
+    page.toolbar.view_segmented.setCurrentItem(VIEW_OVERLAY)
+    trend = page.trend_panel
+    assert trend.overlay_legend.names() == trend.overlay_chart.legend_names()
+    assert not trend.overlay_chart.legend.isVisible()
+    old = _seed(db, manager, name="old.exe", start=BASE - timedelta(days=1), slope=4.0)
+    page.vm.reload_tasks()
+    page.toolbar.compare_button.setChecked(True)
+    page.compare_panel.task_selected.emit(old.task_id)
+    assert len(page.compare_panel.legend.names()) == 2
+    assert "demo.exe" in page.compare_panel.legend.names()[0]
+    assert not page.compare_panel.chart.legend.isVisible()
 
 
 # ---------------------------------------------------------------- 视图与范围
@@ -245,6 +376,8 @@ def test_delete_task_data(loaded, db, services):
     page, task = loaded
     services.dialogs.push('confirm', True)
     page.toolbar.delete_clicked.emit()
+    assert process_events_until(lambda: not page.vm.delete_pending
+                                and not services.threads.entries())
     assert services.notifier.last('success').title == "删除成功"
     assert db.get_task(task.task_id) is None
     assert page.content_stack.currentWidget() is page.empty_state_card
@@ -316,11 +449,12 @@ def test_compare_panel_overlays_two_tasks(loaded, db, manager):
     assert page.compare_panel.isVisible()
     page.compare_panel.task_selected.emit(old.task_id)
     assert page.vm.compare_task_id == old.task_id
-    assert page.compare_panel.chart.legend_names() == ["当前任务", "对比任务"]
+    assert len(page.compare_panel.chart.legend_names()) == 2
+    assert "demo.exe" in page.compare_panel.chart.legend_names()[0]
     assert page.compare_panel.primary_rounds.texts()
     assert page.compare_panel.other_rounds.texts()
 
-    page.summary_table.table.cellClicked.emit(1, 0)     # 切焦点：对比跟随
+    page.summary_table.table.setCurrentCell(1, 0)     # 切焦点：对比跟随
     assert "句柄数" in page.compare_panel.message_label.text()
 
     page.compare_panel.close_requested.emit()
@@ -560,12 +694,14 @@ def test_delete_confirm_texts_and_goes_through_manager(loaded, db, manager, serv
                                                        monkeypatch):
     page, task = loaded
     deleted = []
-    real = manager.delete_task_data
-    monkeypatch.setattr(manager, 'delete_task_data',
-                        lambda tid: deleted.append(tid) or real(tid))
+    real = manager.start_single_task_deletion
+    monkeypatch.setattr(manager, 'start_single_task_deletion',
+                        lambda tid, *args, **kw: deleted.append(tid) or real(tid, *args, **kw))
     services.dialogs.push('confirm', True)
 
     page.toolbar.delete_action.trigger()
+    assert process_events_until(lambda: not page.vm.delete_pending
+                                and not services.threads.entries())
 
     confirm = services.dialogs.last_call('confirm')
     assert confirm['parent'] is page.window()
@@ -578,17 +714,47 @@ def test_delete_confirm_texts_and_goes_through_manager(loaded, db, manager, serv
 def test_delete_cancelled_or_failed_keeps_task(loaded, db, manager, services, monkeypatch):
     page, task = loaded
     services.dialogs.push('confirm', False)
-    monkeypatch.setattr(manager, 'delete_task_data', lambda tid: pytest.fail("取消后不应删除"))
+    monkeypatch.setattr(manager, 'start_single_task_deletion',
+                        lambda *_a, **_kw: pytest.fail("取消后不应删除"))
     page.toolbar.delete_action.trigger()
     assert db.get_task(task.task_id) is not None
     assert services.notifier.notices == []
 
     services.dialogs.push('confirm', True)
-    monkeypatch.setattr(manager, 'delete_task_data', lambda tid: False)
+    def fail(*_a, **_kw):
+        raise ValueError('模拟启动删除失败')
+    monkeypatch.setattr(manager, 'start_single_task_deletion', fail)
     page.toolbar.delete_action.trigger()
     error, = services.notifier.messages('error')
     assert error.title == "删除失败" and error.effective_duration == -1
     assert db.get_task(task.task_id) is not None
+
+
+@pytest.mark.parametrize('reference', [False, True])
+def test_delete_confirmation_cannot_follow_a_changed_selection(
+        loaded, db, manager, services, monkeypatch, reference):
+    page, first = loaded
+    second = _seed(db, manager, name='another.exe', metrics=[MEM], samples=10,
+                   markers=(), baseline=None)
+    page.vm.reload_tasks()
+    page.select_task(first.task_id)
+    page.vm.current_task.is_reference = reference
+    calls = []
+
+    def confirm(*args, **kwargs):
+        calls.append(args)
+        if len(calls) == (2 if reference else 1):
+            page.select_task(second.task_id)
+        return True
+
+    monkeypatch.setattr(services.dialogs, 'confirm', confirm)
+    monkeypatch.setattr(manager, 'start_single_task_deletion',
+                        lambda *_a, **_kw: pytest.fail('选择变化后不得删除任何任务'))
+    page._on_delete_clicked()
+    assert len(calls) == (2 if reference else 1)
+    assert db.tasks.get(first.task_id) is not None
+    assert db.tasks.get(second.task_id) is not None
+    assert '变化' in services.notifier.messages('error')[-1].content
 
 
 def test_delete_disabled_for_running_task(make_page, db, manager, services):

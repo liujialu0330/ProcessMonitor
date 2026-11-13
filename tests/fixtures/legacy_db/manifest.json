@@ -1,0 +1,810 @@
+{
+  "description": "真实旧库样本清单；由 generate.py 生成，勿手改。期望值按现有迁移链口径独立推算（v2 去重：同任务同时间戳的三项重复内存指标合并为一行 memory_private；不跨任务合并）。时间戳一律带微秒（与旧版 datetime.now().isoformat() 的形态一致）",
+  "samples": [
+    {
+      "file": "v1.0.6_v0.db.gz",
+      "tag": "v1.0.6",
+      "commit": "127ba80f229917f49702f48dad846d75c18ccbb8",
+      "schema_version": 0,
+      "generated_on": "2026-11-07",
+      "origin": "git archive v1.0.6（config.py, data/__init__.py, data/database.py, data/models.py），子进程 python -I 用该版本 data.database.Database 写库",
+      "write_api": "single",
+      "journal_mode": "delete",
+      "sqlite_version": "3.45.1",
+      "db_bytes": 380928,
+      "gz_bytes": 53066,
+      "scenario": "任务 A：一任务一指标（v1.0.x 用法），同一进程 泄漏复现_客户端.exe 拆成 5 个已结束任务（memory_rss / memory_vms[golden-a] / memory_private / memory_pagefile / num_handles），各 600 个点、时间戳相同；任务 B：running 遗留，memory_pagefile，200 个点；任务 C：已结束空任务（memory_vms）。该版本无备注/打点功能时不写。",
+      "history_task_id": "golden-a",
+      "history_metric": "memory_private",
+      "totals": {
+        "tasks": 7,
+        "running_tasks": 1,
+        "rows_written": 3200,
+        "rows_after": 3200,
+        "duplicate_rows_removed": 0,
+        "markers_after": 0
+      },
+      "tasks": {
+        "golden-a-rss": {
+          "process_name": "泄漏复现_客户端.exe",
+          "status_before": "stopped",
+          "status_after_reconcile": "stopped",
+          "metric_types_before": [
+            "memory_rss"
+          ],
+          "metric_types_after": [
+            "memory_rss"
+          ],
+          "rows_written_by_metric": {
+            "memory_rss": 600
+          },
+          "rows_after_by_metric": {
+            "memory_rss": 600
+          },
+          "value_sum_after_by_metric": {
+            "memory_rss": 36720000.0
+          },
+          "sample_count_after": 600,
+          "last_sample_at": "2025-06-01T09:09:59.250000",
+          "end_time_after_reconcile": "2025-06-01T09:10:00.250000",
+          "note_after": "",
+          "markers_after": 0
+        },
+        "golden-a": {
+          "process_name": "泄漏复现_客户端.exe",
+          "status_before": "stopped",
+          "status_after_reconcile": "stopped",
+          "metric_types_before": [
+            "memory_vms"
+          ],
+          "metric_types_after": [
+            "memory_private"
+          ],
+          "rows_written_by_metric": {
+            "memory_vms": 600
+          },
+          "rows_after_by_metric": {
+            "memory_private": 600
+          },
+          "value_sum_after_by_metric": {
+            "memory_private": 50880585.0
+          },
+          "sample_count_after": 600,
+          "last_sample_at": "2025-06-01T09:09:59.250000",
+          "end_time_after_reconcile": "2025-06-01T09:10:00.250000",
+          "note_after": "",
+          "markers_after": 0
+        },
+        "golden-a-private": {
+          "process_name": "泄漏复现_客户端.exe",
+          "status_before": "stopped",
+          "status_after_reconcile": "stopped",
+          "metric_types_before": [
+            "memory_private"
+          ],
+          "metric_types_after": [
+            "memory_private"
+          ],
+          "rows_written_by_metric": {
+            "memory_private": 600
+          },
+          "rows_after_by_metric": {
+            "memory_private": 600
+          },
+          "value_sum_after_by_metric": {
+            "memory_private": 50880585.0
+          },
+          "sample_count_after": 600,
+          "last_sample_at": "2025-06-01T09:09:59.250000",
+          "end_time_after_reconcile": "2025-06-01T09:10:00.250000",
+          "note_after": "",
+          "markers_after": 0
+        },
+        "golden-a-pagefile": {
+          "process_name": "泄漏复现_客户端.exe",
+          "status_before": "stopped",
+          "status_after_reconcile": "stopped",
+          "metric_types_before": [
+            "memory_pagefile"
+          ],
+          "metric_types_after": [
+            "memory_private"
+          ],
+          "rows_written_by_metric": {
+            "memory_pagefile": 600
+          },
+          "rows_after_by_metric": {
+            "memory_private": 600
+          },
+          "value_sum_after_by_metric": {
+            "memory_private": 50880585.0
+          },
+          "sample_count_after": 600,
+          "last_sample_at": "2025-06-01T09:09:59.250000",
+          "end_time_after_reconcile": "2025-06-01T09:10:00.250000",
+          "note_after": "",
+          "markers_after": 0
+        },
+        "golden-a-handles": {
+          "process_name": "泄漏复现_客户端.exe",
+          "status_before": "stopped",
+          "status_after_reconcile": "stopped",
+          "metric_types_before": [
+            "num_handles"
+          ],
+          "metric_types_after": [
+            "num_handles"
+          ],
+          "rows_written_by_metric": {
+            "num_handles": 600
+          },
+          "rows_after_by_metric": {
+            "num_handles": 600
+          },
+          "value_sum_after_by_metric": {
+            "num_handles": 248700.0
+          },
+          "sample_count_after": 600,
+          "last_sample_at": "2025-06-01T09:09:59.250000",
+          "end_time_after_reconcile": "2025-06-01T09:10:00.250000",
+          "note_after": "",
+          "markers_after": 0
+        },
+        "golden-b": {
+          "process_name": "崩溃遗留_服务.exe",
+          "status_before": "running",
+          "status_after_reconcile": "stopped",
+          "metric_types_before": [
+            "memory_pagefile"
+          ],
+          "metric_types_after": [
+            "memory_private"
+          ],
+          "rows_written_by_metric": {
+            "memory_pagefile": 200
+          },
+          "rows_after_by_metric": {
+            "memory_private": 200
+          },
+          "value_sum_after_by_metric": {
+            "memory_private": 24039800.0
+          },
+          "sample_count_after": 200,
+          "last_sample_at": "2025-06-02T14:33:19.500000",
+          "end_time_after_reconcile": "2025-06-02T14:33:19.500000",
+          "note_after": "",
+          "markers_after": 0
+        },
+        "golden-c": {
+          "process_name": "空任务_工具.exe",
+          "status_before": "stopped",
+          "status_after_reconcile": "stopped",
+          "metric_types_before": [
+            "memory_vms"
+          ],
+          "metric_types_after": [
+            "memory_private"
+          ],
+          "rows_written_by_metric": {},
+          "rows_after_by_metric": {},
+          "value_sum_after_by_metric": {},
+          "sample_count_after": 0,
+          "last_sample_at": null,
+          "end_time_after_reconcile": "2025-06-03T08:00:05.750000",
+          "note_after": "",
+          "markers_after": 0
+        }
+      }
+    },
+    {
+      "file": "v1.1.0_v1.db.gz",
+      "tag": "v1.1.0",
+      "commit": "97d8d32c41f5952f72298a01dfc1bda9211f7109",
+      "schema_version": 1,
+      "generated_on": "2026-11-07",
+      "origin": "git archive v1.1.0（config.py, data/__init__.py, data/database.py, data/models.py），子进程 python -I 用该版本 data.database.Database 写库",
+      "write_api": "multi",
+      "journal_mode": "delete",
+      "sqlite_version": "3.45.1",
+      "db_bytes": 520192,
+      "gz_bytes": 64330,
+      "scenario": "任务 A：已结束，泄漏复现_客户端.exe，5 指标（memory_rss / memory_vms / memory_private / memory_pagefile / num_handles），600 个周期；任务 B：running 遗留，memory_pagefile + num_handles，200 个周期；任务 C：已结束空任务（memory_vms + cpu_percent）。该版本无备注/打点功能时不写。",
+      "history_task_id": "golden-a",
+      "history_metric": "memory_private",
+      "totals": {
+        "tasks": 3,
+        "running_tasks": 1,
+        "rows_written": 3400,
+        "rows_after": 2200,
+        "duplicate_rows_removed": 1200,
+        "markers_after": 0
+      },
+      "tasks": {
+        "golden-a": {
+          "process_name": "泄漏复现_客户端.exe",
+          "status_before": "stopped",
+          "status_after_reconcile": "stopped",
+          "metric_types_before": [
+            "memory_rss",
+            "memory_vms",
+            "memory_private",
+            "memory_pagefile",
+            "num_handles"
+          ],
+          "metric_types_after": [
+            "memory_rss",
+            "memory_private",
+            "num_handles"
+          ],
+          "rows_written_by_metric": {
+            "memory_rss": 600,
+            "memory_vms": 600,
+            "memory_private": 600,
+            "memory_pagefile": 600,
+            "num_handles": 600
+          },
+          "rows_after_by_metric": {
+            "memory_rss": 600,
+            "memory_private": 600,
+            "num_handles": 600
+          },
+          "value_sum_after_by_metric": {
+            "memory_rss": 36720000.0,
+            "memory_private": 50880585.0,
+            "num_handles": 248700.0
+          },
+          "sample_count_after": 600,
+          "last_sample_at": "2025-06-01T09:09:59.250000",
+          "end_time_after_reconcile": "2025-06-01T09:10:00.250000",
+          "note_after": "",
+          "markers_after": 0
+        },
+        "golden-b": {
+          "process_name": "崩溃遗留_服务.exe",
+          "status_before": "running",
+          "status_after_reconcile": "stopped",
+          "metric_types_before": [
+            "memory_pagefile",
+            "num_handles"
+          ],
+          "metric_types_after": [
+            "memory_private",
+            "num_handles"
+          ],
+          "rows_written_by_metric": {
+            "memory_pagefile": 200,
+            "num_handles": 200
+          },
+          "rows_after_by_metric": {
+            "memory_private": 200,
+            "num_handles": 200
+          },
+          "value_sum_after_by_metric": {
+            "memory_private": 24039800.0,
+            "num_handles": 179801.0
+          },
+          "sample_count_after": 200,
+          "last_sample_at": "2025-06-02T14:33:19.500000",
+          "end_time_after_reconcile": "2025-06-02T14:33:19.500000",
+          "note_after": "",
+          "markers_after": 0
+        },
+        "golden-c": {
+          "process_name": "空任务_工具.exe",
+          "status_before": "stopped",
+          "status_after_reconcile": "stopped",
+          "metric_types_before": [
+            "memory_vms",
+            "cpu_percent"
+          ],
+          "metric_types_after": [
+            "memory_private",
+            "cpu_percent"
+          ],
+          "rows_written_by_metric": {},
+          "rows_after_by_metric": {},
+          "value_sum_after_by_metric": {},
+          "sample_count_after": 0,
+          "last_sample_at": null,
+          "end_time_after_reconcile": "2025-06-03T08:00:05.750000",
+          "note_after": "",
+          "markers_after": 0
+        }
+      }
+    },
+    {
+      "file": "v1.2.0_v1.db.gz",
+      "tag": "v1.2.0",
+      "commit": "402c3ec1f912ade43e19be5537015e14b07caccd",
+      "schema_version": 1,
+      "generated_on": "2026-11-07",
+      "origin": "git archive v1.2.0（config.py, data/__init__.py, data/database.py, data/models.py），子进程 python -I 用该版本 data.database.Database 写库",
+      "write_api": "multi",
+      "journal_mode": "wal",
+      "sqlite_version": "3.45.1",
+      "db_bytes": 520192,
+      "gz_bytes": 64329,
+      "scenario": "任务 A：已结束，泄漏复现_客户端.exe，5 指标（memory_rss / memory_vms / memory_private / memory_pagefile / num_handles），600 个周期；任务 B：running 遗留，memory_pagefile + num_handles，200 个周期；任务 C：已结束空任务（memory_vms + cpu_percent）。该版本无备注/打点功能时不写。",
+      "history_task_id": "golden-a",
+      "history_metric": "memory_private",
+      "totals": {
+        "tasks": 3,
+        "running_tasks": 1,
+        "rows_written": 3400,
+        "rows_after": 2200,
+        "duplicate_rows_removed": 1200,
+        "markers_after": 0
+      },
+      "tasks": {
+        "golden-a": {
+          "process_name": "泄漏复现_客户端.exe",
+          "status_before": "stopped",
+          "status_after_reconcile": "stopped",
+          "metric_types_before": [
+            "memory_rss",
+            "memory_vms",
+            "memory_private",
+            "memory_pagefile",
+            "num_handles"
+          ],
+          "metric_types_after": [
+            "memory_rss",
+            "memory_private",
+            "num_handles"
+          ],
+          "rows_written_by_metric": {
+            "memory_rss": 600,
+            "memory_vms": 600,
+            "memory_private": 600,
+            "memory_pagefile": 600,
+            "num_handles": 600
+          },
+          "rows_after_by_metric": {
+            "memory_rss": 600,
+            "memory_private": 600,
+            "num_handles": 600
+          },
+          "value_sum_after_by_metric": {
+            "memory_rss": 36720000.0,
+            "memory_private": 50880585.0,
+            "num_handles": 248700.0
+          },
+          "sample_count_after": 600,
+          "last_sample_at": "2025-06-01T09:09:59.250000",
+          "end_time_after_reconcile": "2025-06-01T09:10:00.250000",
+          "note_after": "",
+          "markers_after": 0
+        },
+        "golden-b": {
+          "process_name": "崩溃遗留_服务.exe",
+          "status_before": "running",
+          "status_after_reconcile": "stopped",
+          "metric_types_before": [
+            "memory_pagefile",
+            "num_handles"
+          ],
+          "metric_types_after": [
+            "memory_private",
+            "num_handles"
+          ],
+          "rows_written_by_metric": {
+            "memory_pagefile": 200,
+            "num_handles": 200
+          },
+          "rows_after_by_metric": {
+            "memory_private": 200,
+            "num_handles": 200
+          },
+          "value_sum_after_by_metric": {
+            "memory_private": 24039800.0,
+            "num_handles": 179801.0
+          },
+          "sample_count_after": 200,
+          "last_sample_at": "2025-06-02T14:33:19.500000",
+          "end_time_after_reconcile": "2025-06-02T14:33:19.500000",
+          "note_after": "",
+          "markers_after": 0
+        },
+        "golden-c": {
+          "process_name": "空任务_工具.exe",
+          "status_before": "stopped",
+          "status_after_reconcile": "stopped",
+          "metric_types_before": [
+            "memory_vms",
+            "cpu_percent"
+          ],
+          "metric_types_after": [
+            "memory_private",
+            "cpu_percent"
+          ],
+          "rows_written_by_metric": {},
+          "rows_after_by_metric": {},
+          "value_sum_after_by_metric": {},
+          "sample_count_after": 0,
+          "last_sample_at": null,
+          "end_time_after_reconcile": "2025-06-03T08:00:05.750000",
+          "note_after": "",
+          "markers_after": 0
+        }
+      }
+    },
+    {
+      "file": "v1.4.1_v1.db.gz",
+      "tag": "v1.4.1",
+      "commit": "ea1dd90e7991502c7ef2f390b6337b0093809c39",
+      "schema_version": 1,
+      "generated_on": "2026-11-07",
+      "origin": "git archive v1.4.1（config.py, data/__init__.py, data/database.py, data/models.py），子进程 python -I 用该版本 data.database.Database 写库",
+      "write_api": "multi",
+      "journal_mode": "wal",
+      "sqlite_version": "3.45.1",
+      "db_bytes": 520192,
+      "gz_bytes": 64329,
+      "scenario": "任务 A：已结束，泄漏复现_客户端.exe，5 指标（memory_rss / memory_vms / memory_private / memory_pagefile / num_handles），600 个周期；任务 B：running 遗留，memory_pagefile + num_handles，200 个周期；任务 C：已结束空任务（memory_vms + cpu_percent）。该版本无备注/打点功能时不写。",
+      "history_task_id": "golden-a",
+      "history_metric": "memory_private",
+      "totals": {
+        "tasks": 3,
+        "running_tasks": 1,
+        "rows_written": 3400,
+        "rows_after": 2200,
+        "duplicate_rows_removed": 1200,
+        "markers_after": 0
+      },
+      "tasks": {
+        "golden-a": {
+          "process_name": "泄漏复现_客户端.exe",
+          "status_before": "stopped",
+          "status_after_reconcile": "stopped",
+          "metric_types_before": [
+            "memory_rss",
+            "memory_vms",
+            "memory_private",
+            "memory_pagefile",
+            "num_handles"
+          ],
+          "metric_types_after": [
+            "memory_rss",
+            "memory_private",
+            "num_handles"
+          ],
+          "rows_written_by_metric": {
+            "memory_rss": 600,
+            "memory_vms": 600,
+            "memory_private": 600,
+            "memory_pagefile": 600,
+            "num_handles": 600
+          },
+          "rows_after_by_metric": {
+            "memory_rss": 600,
+            "memory_private": 600,
+            "num_handles": 600
+          },
+          "value_sum_after_by_metric": {
+            "memory_rss": 36720000.0,
+            "memory_private": 50880585.0,
+            "num_handles": 248700.0
+          },
+          "sample_count_after": 600,
+          "last_sample_at": "2025-06-01T09:09:59.250000",
+          "end_time_after_reconcile": "2025-06-01T09:10:00.250000",
+          "note_after": "",
+          "markers_after": 0
+        },
+        "golden-b": {
+          "process_name": "崩溃遗留_服务.exe",
+          "status_before": "running",
+          "status_after_reconcile": "stopped",
+          "metric_types_before": [
+            "memory_pagefile",
+            "num_handles"
+          ],
+          "metric_types_after": [
+            "memory_private",
+            "num_handles"
+          ],
+          "rows_written_by_metric": {
+            "memory_pagefile": 200,
+            "num_handles": 200
+          },
+          "rows_after_by_metric": {
+            "memory_private": 200,
+            "num_handles": 200
+          },
+          "value_sum_after_by_metric": {
+            "memory_private": 24039800.0,
+            "num_handles": 179801.0
+          },
+          "sample_count_after": 200,
+          "last_sample_at": "2025-06-02T14:33:19.500000",
+          "end_time_after_reconcile": "2025-06-02T14:33:19.500000",
+          "note_after": "",
+          "markers_after": 0
+        },
+        "golden-c": {
+          "process_name": "空任务_工具.exe",
+          "status_before": "stopped",
+          "status_after_reconcile": "stopped",
+          "metric_types_before": [
+            "memory_vms",
+            "cpu_percent"
+          ],
+          "metric_types_after": [
+            "memory_private",
+            "cpu_percent"
+          ],
+          "rows_written_by_metric": {},
+          "rows_after_by_metric": {},
+          "value_sum_after_by_metric": {},
+          "sample_count_after": 0,
+          "last_sample_at": null,
+          "end_time_after_reconcile": "2025-06-03T08:00:05.750000",
+          "note_after": "",
+          "markers_after": 0
+        }
+      }
+    },
+    {
+      "file": "derived_v2_from_v1.4.1.db.gz",
+      "tag": null,
+      "commit": "d29556e84b4f8e1cdcca8a0828cedf7d49e15fbe",
+      "schema_version": 2,
+      "generated_on": "2026-11-07",
+      "origin": "v1.4.1 样本经当前仓库 data/db/migrations 冻结迁移链（v1..v2）截断迁移",
+      "write_api": "derived",
+      "journal_mode": "wal",
+      "sqlite_version": "3.45.1",
+      "db_bytes": 348160,
+      "gz_bytes": 46398,
+      "scenario": "任务 A：已结束，泄漏复现_客户端.exe，5 指标（memory_rss / memory_vms / memory_private / memory_pagefile / num_handles），600 个周期；任务 B：running 遗留，memory_pagefile + num_handles，200 个周期；任务 C：已结束空任务（memory_vms + cpu_percent）。该版本无备注/打点功能时不写。",
+      "history_task_id": "golden-a",
+      "history_metric": "memory_private",
+      "totals": {
+        "tasks": 3,
+        "running_tasks": 1,
+        "rows_written": 3400,
+        "rows_after": 2200,
+        "duplicate_rows_removed": 1200,
+        "markers_after": 0
+      },
+      "tasks": {
+        "golden-a": {
+          "process_name": "泄漏复现_客户端.exe",
+          "status_before": "stopped",
+          "status_after_reconcile": "stopped",
+          "metric_types_before": [
+            "memory_rss",
+            "memory_vms",
+            "memory_private",
+            "memory_pagefile",
+            "num_handles"
+          ],
+          "metric_types_after": [
+            "memory_rss",
+            "memory_private",
+            "num_handles"
+          ],
+          "rows_written_by_metric": {
+            "memory_rss": 600,
+            "memory_vms": 600,
+            "memory_private": 600,
+            "memory_pagefile": 600,
+            "num_handles": 600
+          },
+          "rows_after_by_metric": {
+            "memory_rss": 600,
+            "memory_private": 600,
+            "num_handles": 600
+          },
+          "value_sum_after_by_metric": {
+            "memory_rss": 36720000.0,
+            "memory_private": 50880585.0,
+            "num_handles": 248700.0
+          },
+          "sample_count_after": 600,
+          "last_sample_at": "2025-06-01T09:09:59.250000",
+          "end_time_after_reconcile": "2025-06-01T09:10:00.250000",
+          "note_after": "",
+          "markers_after": 0
+        },
+        "golden-b": {
+          "process_name": "崩溃遗留_服务.exe",
+          "status_before": "running",
+          "status_after_reconcile": "stopped",
+          "metric_types_before": [
+            "memory_pagefile",
+            "num_handles"
+          ],
+          "metric_types_after": [
+            "memory_private",
+            "num_handles"
+          ],
+          "rows_written_by_metric": {
+            "memory_pagefile": 200,
+            "num_handles": 200
+          },
+          "rows_after_by_metric": {
+            "memory_private": 200,
+            "num_handles": 200
+          },
+          "value_sum_after_by_metric": {
+            "memory_private": 24039800.0,
+            "num_handles": 179801.0
+          },
+          "sample_count_after": 200,
+          "last_sample_at": "2025-06-02T14:33:19.500000",
+          "end_time_after_reconcile": "2025-06-02T14:33:19.500000",
+          "note_after": "",
+          "markers_after": 0
+        },
+        "golden-c": {
+          "process_name": "空任务_工具.exe",
+          "status_before": "stopped",
+          "status_after_reconcile": "stopped",
+          "metric_types_before": [
+            "memory_vms",
+            "cpu_percent"
+          ],
+          "metric_types_after": [
+            "memory_private",
+            "cpu_percent"
+          ],
+          "rows_written_by_metric": {},
+          "rows_after_by_metric": {},
+          "value_sum_after_by_metric": {},
+          "sample_count_after": 0,
+          "last_sample_at": null,
+          "end_time_after_reconcile": "2025-06-03T08:00:05.750000",
+          "note_after": "",
+          "markers_after": 0
+        }
+      }
+    },
+    {
+      "file": "derived_v3_from_v1.4.1.db.gz",
+      "tag": null,
+      "commit": "d29556e84b4f8e1cdcca8a0828cedf7d49e15fbe",
+      "schema_version": 3,
+      "generated_on": "2026-11-07",
+      "origin": "v1.4.1 样本经当前仓库 data/db/migrations 冻结迁移链（v1..v3）截断迁移，再按 v3 结构补写备注与打点任务",
+      "write_api": "derived",
+      "journal_mode": "wal",
+      "sqlite_version": "3.45.1",
+      "db_bytes": 319488,
+      "gz_bytes": 35182,
+      "scenario": "任务 A：已结束，泄漏复现_客户端.exe，5 指标（memory_rss / memory_vms / memory_private / memory_pagefile / num_handles），600 个周期；任务 B：running 遗留，memory_pagefile + num_handles，200 个周期；任务 C：已结束空任务（memory_vms + cpu_percent）；v3 补写：任务 A 中文备注；任务 D：打点任务_编辑器.exe，memory_private + num_handles，120 个周期，3 个打点。该版本无备注/打点功能时不写。",
+      "history_task_id": "golden-a",
+      "history_metric": "memory_private",
+      "totals": {
+        "tasks": 4,
+        "running_tasks": 1,
+        "rows_written": 3640,
+        "rows_after": 2440,
+        "duplicate_rows_removed": 1200,
+        "markers_after": 3
+      },
+      "tasks": {
+        "golden-a": {
+          "process_name": "泄漏复现_客户端.exe",
+          "status_before": "stopped",
+          "status_after_reconcile": "stopped",
+          "metric_types_before": [
+            "memory_rss",
+            "memory_vms",
+            "memory_private",
+            "memory_pagefile",
+            "num_handles"
+          ],
+          "metric_types_after": [
+            "memory_rss",
+            "memory_private",
+            "num_handles"
+          ],
+          "rows_written_by_metric": {
+            "memory_rss": 600,
+            "memory_vms": 600,
+            "memory_private": 600,
+            "memory_pagefile": 600,
+            "num_handles": 600
+          },
+          "rows_after_by_metric": {
+            "memory_rss": 600,
+            "memory_private": 600,
+            "num_handles": 600
+          },
+          "value_sum_after_by_metric": {
+            "memory_rss": 36720000.0,
+            "memory_private": 50880585.0,
+            "num_handles": 248700.0
+          },
+          "sample_count_after": 600,
+          "last_sample_at": "2025-06-01T09:09:59.250000",
+          "end_time_after_reconcile": "2025-06-01T09:10:00.250000",
+          "note_after": "第二轮复现：打开 20 个文档后关闭",
+          "markers_after": 0
+        },
+        "golden-b": {
+          "process_name": "崩溃遗留_服务.exe",
+          "status_before": "running",
+          "status_after_reconcile": "stopped",
+          "metric_types_before": [
+            "memory_pagefile",
+            "num_handles"
+          ],
+          "metric_types_after": [
+            "memory_private",
+            "num_handles"
+          ],
+          "rows_written_by_metric": {
+            "memory_pagefile": 200,
+            "num_handles": 200
+          },
+          "rows_after_by_metric": {
+            "memory_private": 200,
+            "num_handles": 200
+          },
+          "value_sum_after_by_metric": {
+            "memory_private": 24039800.0,
+            "num_handles": 179801.0
+          },
+          "sample_count_after": 200,
+          "last_sample_at": "2025-06-02T14:33:19.500000",
+          "end_time_after_reconcile": "2025-06-02T14:33:19.500000",
+          "note_after": "",
+          "markers_after": 0
+        },
+        "golden-c": {
+          "process_name": "空任务_工具.exe",
+          "status_before": "stopped",
+          "status_after_reconcile": "stopped",
+          "metric_types_before": [
+            "memory_vms",
+            "cpu_percent"
+          ],
+          "metric_types_after": [
+            "memory_private",
+            "cpu_percent"
+          ],
+          "rows_written_by_metric": {},
+          "rows_after_by_metric": {},
+          "value_sum_after_by_metric": {},
+          "sample_count_after": 0,
+          "last_sample_at": null,
+          "end_time_after_reconcile": "2025-06-03T08:00:05.750000",
+          "note_after": "",
+          "markers_after": 0
+        },
+        "golden-d": {
+          "process_name": "打点任务_编辑器.exe",
+          "status_before": "stopped",
+          "status_after_reconcile": "stopped",
+          "metric_types_before": [
+            "memory_private",
+            "num_handles"
+          ],
+          "metric_types_after": [
+            "memory_private",
+            "num_handles"
+          ],
+          "rows_written_by_metric": {
+            "memory_private": 120,
+            "num_handles": 120
+          },
+          "rows_after_by_metric": {
+            "memory_private": 120,
+            "num_handles": 120
+          },
+          "value_sum_after_by_metric": {
+            "memory_private": 6057120.0,
+            "num_handles": 36660.0
+          },
+          "sample_count_after": 120,
+          "last_sample_at": "2025-06-04T10:01:59.125000",
+          "end_time_after_reconcile": "2025-06-04T10:02:00.125000",
+          "note_after": "",
+          "markers_after": 3
+        }
+      }
+    }
+  ]
+}

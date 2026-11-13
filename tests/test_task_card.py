@@ -211,6 +211,7 @@ def test_sparkline_ticks_for_baseline_and_user_markers(card):
 # ---------- 按钮与文案 ----------
 
 def test_action_buttons_text(card):
+    card.resize(1100, 300)
     assert [b.text() for b in (card.marker_button, card.analysis_button,
                                card.pause_button, card.stop_button)] == [
         "打点", "分析", "暂停", "停止"]
@@ -278,8 +279,8 @@ def test_six_columns_use_short_delta_text_with_full_tooltip(qapp):
 
         widget.resize(600, 300)
         assert widget.value_columns() < 6
-        assert label.text() == "比开始时（12 分钟前）+85.23 MB"
-        assert "\n" not in label.toolTip()
+        assert label.text() == "较开始 +85.23 MB"
+        assert label.toolTip().startswith("比开始时（12 分钟前）+85.23 MB\n")
 
         widget.resize(1300, 300)
         widget.set_baseline(T0 + timedelta(minutes=1))
@@ -321,3 +322,34 @@ def test_finished_card_is_single_row(card):
 ])
 def test_end_time_format(end, now, expected):
     assert format_end_time(end, now) == expected
+
+
+# ---------------------------------------------------------------- 悬停提示：被测目标摘要
+
+
+def _target_lines():
+    from core.target_info import TargetInfo
+    info = TargetInfo(pid=1234, exe_path=r"C:\Apps\demo.exe", file_version="1.2.3.4",
+                      cmdline=(r"C:\Apps\demo.exe", "--load", "a b.prj"),
+                      os_version="Windows 11 10.0.26200", logical_cores=16,
+                      tool_version="2.0.0-beta.1", tool_is_admin=False)
+    return info.summary_lines()
+
+
+def test_tooltip_appends_target_summary_after_plan(card):
+    lines = _target_lines()
+    assert lines[0] == r"被测程序: C:\Apps\demo.exe（文件版本 1.2.3.4）"
+    card.setToolTip("自动打点：每 10 分钟")
+    card.set_target_summary(lines)
+    assert card.toolTip() == "自动打点：每 10 分钟\n\n" + "\n".join(lines)
+    assert card.target_summary() == lines
+
+
+def test_tooltip_keeps_target_summary_when_plan_arrives_later(card):
+    lines = _target_lines()
+    card.set_target_summary(lines)
+    assert card.toolTip() == "\n".join(lines)
+    card.setToolTip("自动打点：每 10 分钟")
+    assert card.toolTip().startswith("自动打点：每 10 分钟\n\n被测程序: ")
+    card.setToolTip("")
+    assert card.toolTip() == "\n".join(lines)

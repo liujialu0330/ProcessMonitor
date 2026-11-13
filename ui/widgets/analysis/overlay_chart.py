@@ -46,6 +46,7 @@ class OverlayChart(ChartView):
         super().__init__(parent)
         self.set_tools_visible(False)
         self.legend = self.chart_widget.getPlotItem().addLegend(offset=(10, 6))
+        self.legend.setLabelTextColor(chart_colors()['text'])
 
     @property
     def series(self) -> List[OverlaySeries]:
@@ -95,6 +96,10 @@ class OverlayChart(ChartView):
             return
         colors = chart_colors()
         palette = series_colors()
+        # 图例文字默认是 pyqtgraph 的固定灰（浅色卡片上不足 3:1），按主题取色
+        legend = getattr(self, 'legend', None)
+        if legend is not None:
+            legend.setLabelTextColor(colors['text'])
         for i, item in enumerate(self._series):
             gaps = [(a.timestamp(), b.timestamp()) if isinstance(a, datetime) else (a, b)
                     for a, b in item.gaps]

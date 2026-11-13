@@ -2,7 +2,7 @@
 import time
 
 
-def poll_until(condition, timeout: float = 10.0, interval: float = 0.01) -> bool:
+def poll_until(condition, timeout: float = 10.0, interval: float = 0.002) -> bool:
     """轮询等待 condition() 为真，最长 timeout 秒；超时返回最后一次判定结果"""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -45,7 +45,7 @@ def process_events_until(condition, timeout: float = 5.0) -> bool:
         QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
         if condition():
             return True
-        time.sleep(0.01)
+        time.sleep(0.002)
     QCoreApplication.processEvents()
     return bool(condition())
 
@@ -60,8 +60,28 @@ def dispose_widget(widget) -> None:
     from PyQt5.QtCore import QCoreApplication, QEvent
 
     widget.hide()
+    release_plot_menus(widget)
     widget.deleteLater()
     QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+
+
+def release_plot_menus(widget) -> None:
+    """释放控件内全部 pyqtgraph 图表的 PlotItem.ctrlMenu（约 30 个无父 QMenu）。
+
+    pyqtgraph 的 PlotItem 构造时无条件建这个菜单，只在 PlotItem.close() 里释放；控件被删后
+    它们仍作为无父顶层控件留在应用里，全量里积到上千个，拖慢每个用例的 topLevelWidgets()。
+    只做 close() 里释放菜单的那两行（不动 ViewBox 与坐标轴），只在控件即将被删除时调用。
+    """
+    try:
+        import pyqtgraph as pg
+        for plot in widget.findChildren(pg.PlotWidget):
+            item = plot.getPlotItem()
+            menu = getattr(item, 'ctrlMenu', None)
+            if menu is not None:
+                menu.setParent(None)
+                item.ctrlMenu = None
+    except Exception:   # 释放失败只是多留一些菜单，不应让用例收尾失败
+        pass
 
 
 def record_stop_reasons(task) -> list:
@@ -138,27 +158,16 @@ class ConnectionFactoryStub:
         return _cm()
 
 
-def make_v4_db(db_path: str) -> str:
-    """
-    建一个 v4 结构的临时库并返回路径。
-    现在先用 Database(path) 建 v3，再补 v4 的两列；连接工厂/迁移的 v4 就绪后改为直接用 Database。
-    """
-    import sqlite3
+def make_current_db(db_path: str) -> str:
+    """建一个当前结构（data.db.schema.SCHEMA_VERSION）的临时库并返回路径。"""
     from data.database import Database
 
-    Database(db_path)
-    conn = sqlite3.connect(db_path)
-    try:
-        columns = {row[1] for row in conn.execute('PRAGMA table_info(tasks)')}
-        if 'create_time' not in columns:
-            conn.execute('ALTER TABLE tasks ADD COLUMN create_time REAL')
-        columns = {row[1] for row in conn.execute('PRAGMA table_info(task_markers)')}
-        if 'kind' not in columns:
-            conn.execute("ALTER TABLE task_markers ADD COLUMN kind TEXT NOT NULL DEFAULT 'user'")
-        conn.commit()
-    finally:
-        conn.close()
+    Database(db_path).close()
     return db_path
+
+
+# 过时：旧名，库结构已不止 v4；新用例请用 make_current_db
+make_v4_db = make_current_db
 
 
 def make_broken_factories(tmp_dir: str) -> list:
@@ -262,3 +271,39 @@ class ManualDefer:
     def run(self):
         while self.queue:
             self.queue.pop(0)()
+
+
+def qt_quit_pending() -> bool:
+    """本线程是否带着"已请求退出"的残留状态。
+
+    QCoreApplication.quit()/exit() 在没有主事件循环（QCoreApplication.exec）运行时调用，
+    Qt 5 会把线程数据里的 quitNow 置位，且只有下一次 QCoreApplication.exec 才清除；
+    置位期间任何新建 QEventLoop 的 exec_() 都立即返回 -1。pytest-qt 的 waitSignal /
+    waitUntil 都靠这种局部循环等待，于是后台线程发来的信号还没送达就"超时"了。
+    探测用一个 0 毫秒定时器退出的局部循环：正常时返回 0，残留时返回 -1。
+    """
+    from PyQt5.QtCore import QEventLoop, QTimer
+
+    loop = QEventLoop()
+    timer = QTimer()
+    timer.setSingleShot(True)
+    timer.timeout.connect(loop.quit)
+    timer.start(0)
+    rc = loop.exec_()
+    timer.stop()
+    return rc == -1
+
+
+def reset_qt_quit_state() -> bool:
+    """清除 qt_quit_pending 描述的残留退出状态；返回清除前是否有残留。
+
+    跑一轮立即退出的 QCoreApplication.exec_()：Qt 在它开头和结尾都会清掉 quitNow。
+    """
+    from PyQt5.QtCore import QCoreApplication, QTimer
+
+    if not qt_quit_pending():
+        return False
+    app = QCoreApplication.instance()
+    QTimer.singleShot(0, app.quit)
+    app.exec_()
+    return True

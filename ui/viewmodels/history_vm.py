@@ -13,16 +13,20 @@
   任务列表本身（单条 SQL）仍在主线程读取。
 
 打点变化（manager.markers_changed）时静默重查当前任务：基线、编号与统计口径都随打点变。
+
+另有分析页共用的派生口径（纯函数）：ordered_metrics 按判定严重程度排序（持续上涨 → 波动 →
+平稳 → 数据不足 → 不判定，同组按相对增速降序），is_anomalous 决定哪些指标默认画图。
 """
 import logging
-from typing import Callable, Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from PyQt5.QtCore import QObject, QTimer, pyqtSignal, pyqtSlot
 
+from core.analysis.trend import Verdict
 from core.contracts import TaskStatus
 from core.history_query import (
     BASELINE_RANGE_KEY, CHART_MAX_BUCKETS, DEFAULT_RANGE_KEY, RANGE_KEYS,
-    TABLE_POINT_LIMIT, HistoryRequest, HistorySnapshot, build_request,
+    TABLE_POINT_LIMIT, HistoryRequest, HistorySnapshot, TaskAnalysis, build_request,
 )
 from core.history_refresh_worker import HistoryRefreshWorker
 from core.workers.base import LatestRequestGate
@@ -92,6 +96,61 @@ def _defer_to_event_loop(fn: Callable[[], None]) -> None:
     QTimer.singleShot(0, fn)
 
 
+# ---------- 分析页的排序与折叠（纯函数，结论条、摘要表与趋势面板共用同一口径） ----------
+
+# 判定的严重程度：持续上涨 → 波动 → 平稳 → 数据不足；累计量 / 峰值类不做趋势判定，排最后
+VERDICT_RANK = {Verdict.RISING: 0, Verdict.FLUCTUATING: 1, Verdict.STABLE: 2,
+                Verdict.INSUFFICIENT: 3}
+UNJUDGED_RANK = 4
+# 默认展开为图表的判定（其余折叠为一行迷你图）
+ANOMALOUS_VERDICTS = (Verdict.RISING, Verdict.FLUCTUATING)
+
+
+def snapshot_verdict(snapshot: Optional[HistorySnapshot]) -> Optional[Verdict]:
+    """快照的判定；没有统计（所选范围内无数据）按数据不足，不做趋势判定的类别为 None。"""
+    if snapshot is None or not snapshot.stats:
+        return Verdict.INSUFFICIENT
+    judgement = snapshot.judgement
+    return Verdict(judgement.verdict) if judgement is not None else None
+
+
+def relative_rate(snapshot: Optional[HistorySnapshot]) -> float:
+    """同组排序用的增速：拟合斜率相对起点（基线值或统计首值）的比例，取绝对值。
+    各指标单位不同（KB、个），直接比斜率没有意义，比相对增速才能把"涨得最凶"的排前面；
+    起点为 0 时无法相对，记为无穷大（从 0 开始上涨本身就最显眼）；不能拟合时为 0。"""
+    if snapshot is None or not snapshot.stats:
+        return 0.0
+    judgement = snapshot.judgement
+    if judgement is None or judgement.fit is None:
+        return 0.0
+    if snapshot.baseline_in_use:
+        reference = snapshot.baseline.value
+    else:
+        reference = snapshot.stats['first']
+    slope = abs(judgement.fit.slope_per_hour)
+    if not reference:
+        return float('inf') if slope else 0.0
+    return slope / abs(reference)
+
+
+def severity_key(snapshot: Optional[HistorySnapshot]) -> Tuple[int, float]:
+    """排序键（升序即从严重到轻微）：判定严重程度，同组按相对增速绝对值降序。"""
+    verdict = snapshot_verdict(snapshot)
+    rank = VERDICT_RANK[verdict] if verdict is not None else UNJUDGED_RANK
+    return rank, -relative_rate(snapshot)
+
+
+def ordered_metrics(analysis: TaskAnalysis) -> List[str]:
+    """分析结果里的指标按严重程度排序（相同时保持任务的指标顺序）。"""
+    metrics = [m for m in analysis.snapshots if m]
+    return sorted(metrics, key=lambda m: severity_key(analysis.snapshots[m]))
+
+
+def is_anomalous(snapshot: Optional[HistorySnapshot]) -> bool:
+    """是否默认展开为图表：判定为持续上涨或波动。"""
+    return snapshot_verdict(snapshot) in ANOMALOUS_VERDICTS
+
+
 class HistoryViewModel(QObject):
     """历史数据视图模型（分析页视图模型的基类）。
 
@@ -123,6 +182,9 @@ class HistoryViewModel(QObject):
     error = pyqtSignal(str, str)
     baseline_changed = pyqtSignal(bool)
     range_reset = pyqtSignal(str)
+    delete_busy_changed = pyqtSignal(bool)
+    delete_succeeded = pyqtSignal(str)
+    delete_failed = pyqtSignal(str)
 
     def __init__(self, db, manager, services, *,
                  worker_runner: Optional[HistoryRunner] = None,
@@ -160,6 +222,8 @@ class HistoryViewModel(QObject):
         # 自动切过去，而不是一直停在启动时的旧任务上
         self.selection_is_auto: bool = False
         self.is_busy: bool = False
+        self._delete_worker = None
+        self._delete_task_id: Optional[str] = None
         # 最近一次显示出来的快照；空状态下为 None
         self.last_snapshot: Optional[HistorySnapshot] = None
         # 当前任务是否有基线打点（最近一次查询结果）
@@ -183,6 +247,9 @@ class HistoryViewModel(QObject):
         self._refresh_guard: Callable[[], bool] = lambda: False
         # 打点变化触发的静默重查：结果不受"跳过定时刷新"的判断影响
         self._forced_seqs: Set[int] = set()
+        # 启动时从上次状态恢复的任务：下一次载入列表时按用户选过的任务选中；任务已被删除则
+        # 静默退回默认选择（见 restore_selection）
+        self._restore_id: Optional[str] = None
 
         # 打点增删改后重查（manager 尚无该信号时不连接，兼容旧 manager 与测试替身）
         markers_changed = getattr(manager, 'markers_changed', None)
@@ -209,15 +276,24 @@ class HistoryViewModel(QObject):
 
     @property
     def can_delete(self) -> bool:
-        """当前任务可否删除：须已选中且不在运行（运行中删除会与写入竞争）"""
-        return bool(self.current_task_id) and not self._current_is_running()
+        """删除只锁目标任务；维护、导出、健康作业及当前删除期间不可重复发起。"""
+        return bool(self.current_task_id) and not self.delete_hint
 
     @property
     def delete_hint(self) -> str:
-        """删除不可用时给用户的原因（选中了运行中任务）；其余情况为空串"""
+        """删除不可用时给用户的原因。"""
+        if self.delete_pending:
+            return '正在删除任务数据，请稍候'
         if self.current_task_id and self._current_is_running():
             return DELETE_BLOCKED_RUNNING
+        query = getattr(self._manager, 'task_deletion_block_reason', None)
+        if self.current_task_id and query is not None:
+            return query(self.current_task_id)
         return ""
+
+    @property
+    def delete_pending(self) -> bool:
+        return self._delete_worker is not None
 
     @property
     def has_pending_query(self) -> bool:
@@ -248,6 +324,11 @@ class HistoryViewModel(QObject):
         self._running = {t.task_id for t in self.tasks if status.is_running(t.task_id)}
         self.tasks_changed.emit(list(self.tasks), set(self._running), now)
 
+        restore, self._restore_id = self._restore_id, None
+        if restore and not prev_id and self._find_task(restore) is not None:
+            prev_id, prev_metric = restore, None
+            self.selection_is_auto = False
+
         if not self.tasks:
             self.cancel_pending()
             self._clear_selection()
@@ -276,6 +357,11 @@ class HistoryViewModel(QObject):
             self.selection_is_auto = True
             self._apply_selection(self.tasks[0], None)
         self._request_load()
+
+    def restore_selection(self, task_id: str) -> None:
+        """启动时恢复上次选中的任务：只在下一次载入列表时生效，且只当用户此前没有选过别的
+        任务；该任务已被删除（或没有数据）就当没有这回事，走默认的"自动选中最新任务"。"""
+        self._restore_id = task_id or None
 
     def refresh(self) -> None:
         """手动刷新：整体重载任务列表与当前任务数据。"""
@@ -325,20 +411,50 @@ class HistoryViewModel(QObject):
         if self.current_task_id:
             self._request_load()
 
-    def delete_current(self) -> bool:
-        """
-        经 manager 删除当前任务的全部数据，成功后重载列表。确认交互由页面负责。
-
-        Returns:
-            bool: 是否删除成功；未选中或任务运行中时直接返回 False（不调用 manager）
-        """
+    def delete_current(self, *, allow_reference: bool = False,
+                       expected_task_id: Optional[str] = None) -> bool:
+        """启动后台删除；返回是否已启动，最终结果经delete_succeeded/failed报告。"""
         task_id = self.current_task_id
+        if expected_task_id is not None and task_id != expected_task_id:
+            # 模态确认期间仍处理刷新事件，不能让变化后的选择替换已确认目标。
+            self.delete_failed.emit('所选任务已变化，请重新确认后重试')
+            return False
         if not task_id or not self.can_delete:
             return False
-        if not self._manager.delete_task_data(task_id):
+        self._delete_task_id = task_id
+        try:
+            self._delete_worker = self._manager.start_single_task_deletion(
+                task_id, self._services.threads, allow_reference=allow_reference,
+                on_result=self._on_delete_result, on_failed=self._on_delete_failed,
+                on_finished=self._on_delete_finished)
+        except Exception as exc:
+            self._delete_task_id = None
+            self._delete_worker = None
+            logger.error('启动任务删除失败: task_id=%s', task_id, exc_info=True)
+            self.delete_failed.emit(str(exc) or '未能启动后台删除')
             return False
-        self.reload_tasks()
+        self.delete_busy_changed.emit(True)
         return True
+
+    @pyqtSlot(object)
+    def _on_delete_result(self, count) -> None:
+        if not count:
+            self.delete_failed.emit('所选任务已变化，请刷新后重试')
+            return
+        task_id = self._delete_task_id
+        self.reload_tasks()
+        if task_id is not None:
+            self.delete_succeeded.emit(task_id)
+
+    @pyqtSlot(str)
+    def _on_delete_failed(self, message: str) -> None:
+        self.delete_failed.emit(message)
+
+    @pyqtSlot()
+    def _on_delete_finished(self) -> None:
+        self._delete_worker = None
+        self._delete_task_id = None
+        self.delete_busy_changed.emit(False)
 
     def on_tick(self) -> None:
         """

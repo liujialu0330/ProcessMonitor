@@ -34,7 +34,9 @@ from tests.doubles import FakePreferences, RecordingNotifier, ScriptedDialogs
 from tests.factories import make_main_window, make_services
 from tests.helpers import dispose_widget, stop_and_join
 from ui.components.dialogs import CloseActionDialog
-from ui.services import ManagerTaskStatus
+from ui.services import (
+    EVENT_QUICK_MARKER, EVENT_TRAY_HIDDEN, EVENT_UPDATE_AVAILABLE, ManagerTaskStatus,
+)
 from utils.metrics import MetricType
 
 
@@ -241,13 +243,16 @@ def test_close_hides_when_tray_enabled(window, monkeypatch):
     event.ignore.assert_called_once()
     event.accept.assert_not_called()
     assert window._tray_tip_shown is True
-    assert window.tray.messages, "首次隐藏到托盘应弹一次提示气泡"
+    # 首次隐藏到托盘的提示经 Notifier 发出（隐藏后它会改发托盘气泡）
+    tips = [n for n in window.services.notifier.messages() if n.event == EVENT_TRAY_HIDDEN]
+    assert len(tips) == 1
 
     # 首次提示只弹一次：再关闭一次（先还原可见性，模拟用户从托盘还原后再关）
     # 不应重复追加气泡
     window.show()
     window.closeEvent(_fake_event())
-    assert len(window.tray.messages) == 1
+    assert len([n for n in window.services.notifier.messages()
+                if n.event == EVENT_TRAY_HIDDEN]) == 1
 
 
 def test_really_quit_bypasses_tray(window, monkeypatch):
@@ -488,6 +493,35 @@ def test_close_with_running_task_cancel_keeps_everything(window, monkeypatch):
     assert window.isHidden() is False
 
 
+def test_close_confirmation_warns_about_data_held_for_a_full_disk(window, monkeypatch):
+    """磁盘已满、数据只留在内存里时，退出确认明确告诉用户"退出后将丢失"和条数"""
+    _start_running_task(window)
+    monkeypatch.setattr(window.monitor_manager, 'held_point_count', lambda: 1234)
+    _patch_ask(window, 'cancel')
+    window.closeEvent(_fake_event())
+    asked = window.services.dialogs.calls_of('ask_close_action')
+    assert asked[0]["notice"] == "有 1234 条因磁盘已满未写入的数据，退出后将丢失"
+
+
+def test_close_confirmation_has_no_notice_without_held_data(window, monkeypatch):
+    _start_running_task(window)
+    _patch_ask(window, 'cancel')
+    window.closeEvent(_fake_event())
+    assert "notice" not in window.services.dialogs.calls_of('ask_close_action')[0]
+
+
+def test_close_action_dialog_shows_the_notice_label(qapp):
+    from PyQt5.QtWidgets import QWidget
+    host = QWidget()
+    host.resize(800, 600)
+    text = "有 3 条因磁盘已满未写入的数据，退出后将丢失"
+    with_notice = CloseActionDialog(1, can_tray=True, parent=host, notice=text)
+    without = CloseActionDialog(1, can_tray=True, parent=host)
+    assert with_notice.notice_label.text() == text
+    assert not hasattr(without, 'notice_label')
+    host.deleteLater()
+
+
 def test_close_with_running_task_quit_stops_and_quits(window, monkeypatch):
     """选"停止监控并退出"：走完整清理 -> quit 路径，任务被停止"""
     _start_running_task(window)
@@ -637,22 +671,6 @@ def test_close_action_dialog_default_is_never_destructive(qapp, can_tray):
         dispose_widget(host)
 
 
-def test_abnormal_end_bubble_only_when_window_not_in_front(window):
-    """异常结束提醒：无托盘时短路；有托盘且窗口隐藏时弹气泡；窗口在前台不重复提醒"""
-    window._on_task_ended_abnormally("标题", "内容")   # 托盘不可用，不应抛错
-
-    window.tray = _FakeTray()
-    window.hide()
-    window._on_task_ended_abnormally("任务已结束", "demo.exe 进程已终止")
-    assert window.tray.messages == [("任务已结束", "demo.exe 进程已终止")]
-
-    window.tray.messages.clear()
-    window.show()
-    window.isActiveWindow = lambda: True
-    window._on_task_ended_abnormally("任务已结束", "x")
-    assert window.tray.messages == []
-
-
 # ========== 退出时经线程登记表收尾后台线程 ==========
 
 class _SlowThread(QThread):
@@ -735,7 +753,9 @@ def test_silent_update_notice_offers_view_button(window, monkeypatch):
 
     notice = window.services.notifier.last("info")
     assert notice.title == "发现新版本 9.9.9" and notice.duration == 10000
-    notice.bar.widgets[0].click()
+    assert notice.event == EVENT_UPDATE_AVAILABLE
+    assert notice.action.text == "查看"
+    notice.action.callback()
     assert window.stackedWidget.currentWidget() is window.setting_page
     assert window.about_group is window.setting_page.about_group
     assert shown == [info]
@@ -789,8 +809,9 @@ def test_navigation_is_monitor_analysis_settings(window):
     assert window.navigationInterface.panel.returnButton.isHidden()
     assert window.navigationInterface.panel.minimumExpandWidth == 1200
     # 只有三个一级页面（旧的历史/导出/关于页都已并入）
-    assert {name for name in vars(window) if name.endswith('_page')} == {
-        'monitor_page', 'analysis_page', 'setting_page'}
+    assert window.stackedWidget.count() == 3
+    assert window._analysis_content is None
+    assert window._setting_content is None
 
 
 def test_analysis_page_is_the_new_page(window):
@@ -814,18 +835,15 @@ def test_navigation_expands_when_crossing_1200(window):
     assert not panel.isCollapsed()
 
 
-def test_quick_marker_feedback_goes_to_tray_balloon(window):
-    tray = _FakeTray()
-    window.tray = tray
-    window.monitor_page.presenter.quick_marker_feedback.emit('ok', "已打点：第 2 轮 16:41:03", "x")
-    window.monitor_page.presenter.quick_marker_feedback.emit('none', "没有可打点的任务", "y")
-    assert tray.messages == [("已打点：第 2 轮 16:41:03", "x"), ("没有可打点的任务", "y")]
-
-
-def test_quick_marker_feedback_without_tray_uses_notice(window):
-    window.monitor_page.presenter.quick_marker_feedback.emit('ok', "已打点：基线 16:41:03", "x")
-    notice = window.services.notifier.last()
-    assert (notice.level, notice.title) == ("success", "已打点：基线 16:41:03")
+def test_quick_marker_feedback_is_routed_as_a_mergeable_notice(window):
+    """渠道（窗口在前台是提示条，后台是托盘气泡）由 Notifier 选；这里只管级别、事件与合并键"""
+    feedback = window.monitor_page.presenter.quick_marker_feedback
+    feedback.emit('ok', "已打点：基线 16:41:03", "x")
+    feedback.emit('none', "没有可打点的任务", "y")
+    ok, none = window.services.notifier.messages()
+    assert (ok.level, ok.title, ok.event) == ("success", "已打点：基线 16:41:03", EVENT_QUICK_MARKER)
+    assert (none.level, none.title) == ("warning", "没有可打点的任务")
+    assert ok.key == none.key == EVENT_QUICK_MARKER
 
 
 def test_tray_marker_request_marks_through_presenter(window, monkeypatch):
@@ -881,3 +899,152 @@ def test_hotkey_wiring_and_unbind_on_quit(tmp_path, qapp, monkeypatch):
     finally:
         stop_and_join(manager)
         dispose_widget(win)
+
+
+# ---------- 界面看门狗 ----------
+
+class _RecordingWatchdog:
+    def __init__(self, order):
+        self.order = order
+
+    def stop(self):
+        self.order.append('watchdog.stop')
+
+
+def test_real_quit_stops_watchdog_before_shutdown(window, monkeypatch):
+    """真退出收尾会阻塞界面线程数秒：先停看门狗，免得把正常收尾当成卡死转储。"""
+    order = []
+    window.attach_watchdog(_RecordingWatchdog(order))
+    monkeypatch.setattr(window.monitor_page.presenter, 'shutdown_live_stats',
+                        lambda: order.append('live_stats.stop'))
+    monkeypatch.setattr(window, '_run_shutdown', lambda: order.append('shutdown'))
+    monkeypatch.setattr(QApplication, 'quit', MagicMock())
+
+    window.closeEvent(_fake_event())
+
+    assert order == ['watchdog.stop', 'live_stats.stop', 'shutdown']
+
+
+def test_hide_to_tray_keeps_watchdog_running(window, monkeypatch):
+    _enable_close_to_tray(window)
+    window.tray = _FakeTray()
+    order = []
+    window.attach_watchdog(_RecordingWatchdog(order))
+    monkeypatch.setattr(window.monitor_page.presenter, 'shutdown_live_stats',
+                        lambda: order.append('live_stats.stop'))
+
+    window.closeEvent(_fake_event())
+
+    assert order == []
+
+
+# ---------- 磁盘已满时留在内存的数据：托盘退出与更新安装前的确认 ----------
+
+HELD_NOTICE = "有 1234 条因磁盘已满未写入的数据，退出后将丢失"
+
+
+def _hold_data(window, monkeypatch, count=1234):
+    monkeypatch.setattr(window.monitor_manager, 'held_point_count', lambda: count)
+
+
+def test_tray_quit_with_held_data_asks_and_cancel_keeps_running(window, monkeypatch):
+    _hold_data(window, monkeypatch)
+    window.services.dialogs.always('confirm', False)
+    quit_mock = MagicMock()
+    monkeypatch.setattr(QApplication, 'quit', quit_mock)
+
+    window.tray.quit_requested.emit()
+
+    asked = window.services.dialogs.calls_of('confirm')
+    assert len(asked) == 1
+    assert HELD_NOTICE in asked[0]["content"]
+    assert asked[0]["confirm_text"] == "仍然退出"
+    assert window._really_quit is False
+    quit_mock.assert_not_called()
+    assert window._shutdown_started is False
+
+
+def test_tray_quit_with_held_data_confirmed_quits(window, monkeypatch):
+    _hold_data(window, monkeypatch)
+    window.services.dialogs.always('confirm', True)
+    quit_mock = MagicMock()
+    monkeypatch.setattr(QApplication, 'quit', quit_mock)
+
+    window.tray.quit_requested.emit()
+
+    assert window._really_quit is True
+    quit_mock.assert_called_once()
+
+
+def test_tray_quit_without_held_data_does_not_ask(window, monkeypatch):
+    quit_mock = MagicMock()
+    monkeypatch.setattr(QApplication, 'quit', quit_mock)
+    window.tray.quit_requested.emit()          # confirm 未预设：被问到会直接断言失败
+    assert window.services.dialogs.calls_of('confirm') == []
+    quit_mock.assert_called_once()
+
+
+def test_quit_for_install_called_directly_asks_too(window, monkeypatch):
+    _hold_data(window, monkeypatch)
+    window.services.dialogs.always('confirm', False)
+    quit_mock = MagicMock()
+    monkeypatch.setattr(QApplication, 'quit', quit_mock)
+
+    window.quit_for_install()
+
+    assert len(window.services.dialogs.calls_of('confirm')) == 1
+    assert window._really_quit is False
+    quit_mock.assert_not_called()
+
+
+def test_install_flow_asks_before_launching_the_installer(window, monkeypatch):
+    """"安装更新并退出"：确认发生在启动安装程序之前，用户取消则安装程序根本不启动；
+    确认过的不会在 quit_for_install 里重复问"""
+    import ui.pages.about_update as about_module
+    _hold_data(window, monkeypatch)
+    monkeypatch.setattr(about_module.InstallConfirmDialog, 'exec', lambda self: True)
+    quit_mock = MagicMock()
+    monkeypatch.setattr(QApplication, 'quit', quit_mock)
+    group = window.about_group
+    group._pending_info = {'version': '9.9.9'}
+    dialogs = window.services.dialogs
+
+    dialogs.push('confirm', False)
+    group._on_download_finished(r"C:\temp\setup.exe")
+    assert dialogs.methods_called() == ['confirm']          # 没有 open_file
+    assert "已取消安装" in group.status_label.text()
+    quit_mock.assert_not_called()
+
+    dialogs.push('confirm', True)
+    group._on_download_finished(r"C:\temp\setup.exe")
+    assert dialogs.methods_called() == ['confirm', 'confirm', 'open_file']
+    assert window._really_quit is True                      # install_requested → quit_for_install
+    assert len(dialogs.calls_of('confirm')) == 2            # 退出路径里没有第三次确认
+    quit_mock.assert_called_once()
+
+
+def test_session_end_with_held_data_only_logs_a_warning(window, monkeypatch, caplog):
+    import logging
+    _hold_data(window, monkeypatch)
+    quit_mock = MagicMock()
+    monkeypatch.setattr(QApplication, 'quit', quit_mock)
+    with caplog.at_level(logging.WARNING, logger='ui.main_window'):
+        window._on_commit_data_request()
+    assert window.services.dialogs.calls_of('confirm') == []          # 不弹窗
+    assert any(r.levelno == logging.WARNING and HELD_NOTICE in r.getMessage()
+               for r in caplog.records)
+    assert window._really_quit is True
+    quit_mock.assert_called_once()
+
+
+def test_ipc_quit_with_held_data_logs_and_does_not_ask(window, monkeypatch, caplog):
+    """命令行 quit 没有人可以确认：不弹窗，只记 WARNING"""
+    import logging
+    _hold_data(window, monkeypatch)
+    quit_mock = MagicMock()
+    monkeypatch.setattr(QApplication, 'quit', quit_mock)
+    with caplog.at_level(logging.WARNING, logger='ui.main_window'):
+        window.request_quit()
+    assert window.services.dialogs.calls_of('confirm') == []
+    assert any(HELD_NOTICE in r.getMessage() for r in caplog.records)
+    quit_mock.assert_called_once()

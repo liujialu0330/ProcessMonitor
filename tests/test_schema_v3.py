@@ -15,8 +15,9 @@ from data.database import Database
 from data.db.migrations.runner import MigrationOutcome
 from data.db.schema import SCHEMA_VERSION
 from data.models import DataPoint, Marker, MonitorTask
+from data.mappers import normalize_ms
 from tests.test_migration import (
-    _create_v0_db, _get_user_version, patched_migrations, run_migration,
+    _create_v0_db, _get_user_version, patched_migrations, run_inplace,
 )
 from tests.test_migration_v2 import _create_v1_db
 
@@ -81,12 +82,14 @@ def _schema_signature(path: str):
 # ========== schema 一致性 ==========
 
 def test_new_db_has_current_structure(db_path):
+    """新库为 v5：v3/v4 增加的列仍在原位置；data_points 保留（空表）；完整清单见 test_storage_v5"""
     Database(db_path)
     tables, columns, indexes = _schema_signature(db_path)
-    assert _get_user_version(db_path) == SCHEMA_VERSION == 4
-    assert tables == ['data_points', 'task_markers', 'tasks']
+    assert _get_user_version(db_path) == SCHEMA_VERSION == 5
+    assert tables == ['data_points', 'handle_snapshots', 'meta', 'rollup_1m', 'samples',
+                      'series', 'series_gaps', 'task_markers', 'task_members', 'tasks']
     task_cols = [c[0] for c in columns['tasks']]
-    assert task_cols[-4:] == ['note', 'sample_count', 'last_sample_at', 'create_time']
+    assert task_cols[8:12] == ['note', 'sample_count', 'last_sample_at', 'create_time']
     assert [c[0] for c in columns['task_markers']][-1] == 'kind'
     assert indexes == {
         'idx_data_points_task_metric_ts': ('data_points', ['task_id', 'metric_type', 'timestamp']),
@@ -138,12 +141,15 @@ def test_v2_to_v3_cleans_backfills_and_reindexes(db_path):
     assert os.path.exists(db_path + '.bak_v2')
     conn = sqlite3.connect(db_path)
     try:
-        assert conn.execute("SELECT COUNT(*) FROM data_points WHERE task_id='ghost'").fetchone()[0] == 0
+        # 样本在 v5 的 series/samples 里：孤儿丢弃，NULL 指标回填为首指标
+        assert conn.execute("SELECT COUNT(*) FROM series WHERE task_id='ghost'").fetchone()[0] == 0
         assert conn.execute(
-            "SELECT COUNT(*) FROM data_points WHERE metric_type IS NULL").fetchone()[0] == 0
+            "SELECT COUNT(*) FROM series WHERE metric = ''").fetchone()[0] == 0
         assert conn.execute(
-            "SELECT COUNT(*) FROM data_points WHERE task_id='t1' AND metric_type='memory_rss'"
+            "SELECT COUNT(*) FROM samples s JOIN series se ON se.series_id = s.series_id "
+            "WHERE se.task_id='t1' AND se.metric='memory_rss'"
         ).fetchone()[0] == 3
+        assert conn.execute("SELECT COUNT(*) FROM data_points").fetchone()[0] == 0
         t1 = conn.execute(
             "SELECT note, sample_count, last_sample_at FROM tasks WHERE task_id='t1'").fetchone()
         t2 = conn.execute(
@@ -157,7 +163,7 @@ def test_v2_to_v3_cleans_backfills_and_reindexes(db_path):
 
 
 def test_v3_migration_failure_rolls_back_ddl_and_restores(db_path):
-    """v3 步骤失败：整条链回滚并从备份还原，库仍为 v2"""
+    """（冻结的就地迁移链）v3 步骤失败：整条链回滚并从备份还原，库仍为 v2"""
     _create_v2_db(db_path, {'t1': ['memory_rss']},
                   [('t1', '2026-01-01T00:00:01', 1.0, 'memory_rss')])
 
@@ -165,7 +171,7 @@ def test_v3_migration_failure_rolls_back_ddl_and_restores(db_path):
         cursor.execute("ALTER TABLE tasks ADD COLUMN note TEXT NOT NULL DEFAULT ''")
         raise RuntimeError("模拟迁移失败")
 
-    report = run_migration(db_path, patched_migrations(3, _boom))
+    report = run_inplace(db_path, patched_migrations(3, _boom))
 
     assert report.outcome is MigrationOutcome.FAILED_RESTORED
     assert _get_user_version(db_path) == 2
@@ -382,8 +388,9 @@ def test_metric_stats_extended_fields(db):
 
     assert stats['count'] == 5
     assert (stats['min'], stats['max'], stats['avg']) == (100.0, 124.0, 112.0)
-    assert stats['first'] == 100.0 and stats['first_ts'] == base
-    assert stats['last'] == 124.0 and stats['last_ts'] == base + timedelta(hours=2)
+    # 样本时间按毫秒存储：返回的时刻是写入时刻取整到毫秒
+    assert stats['first'] == 100.0 and stats['first_ts'] == normalize_ms(base)
+    assert stats['last'] == 124.0 and         stats['last_ts'] == normalize_ms(base + timedelta(hours=2))
     assert stats['slope_per_hour'] == pytest.approx(12.0, rel=1e-6)
 
 
@@ -409,23 +416,24 @@ def test_metric_stats_slope_none_for_single_point_or_zero_span(db):
     one = db.get_metric_stats(task.task_id, "memory_rss")
     assert one['count'] == 1 and one['slope_per_hour'] is None
 
-    # 同一时间戳两个值：count=2 但时间跨度为 0
+    # 同一时间戳再写一个值：v5 同一序列同一毫秒只留一行（后写覆盖），仍是单点
     db.save_data_points([DataPoint(task.task_id, t0, 3.0, "memory_rss")])
     same = db.get_metric_stats(task.task_id, "memory_rss")
-    assert same['count'] == 2 and same['slope_per_hour'] is None
+    assert same['count'] == 1 and same['slope_per_hour'] is None
+    assert same['last'] == 3.0
 
 
 def test_metric_stats_uses_composite_index(db):
-    """first/last 查询应走复合索引（避免全表扫描/临时排序）"""
+    """first/last 查询应走 samples 主键 (series_id, ts_ms)（避免全表扫描/临时排序）"""
     conn = sqlite3.connect(db.db_path)
     try:
         plan = ' '.join(str(r) for r in conn.execute(
-            "EXPLAIN QUERY PLAN SELECT timestamp, value FROM data_points "
-            "WHERE task_id=? AND metric_type=? ORDER BY timestamp DESC LIMIT 1",
-            ('t', 'memory_rss')))
+            "EXPLAIN QUERY PLAN SELECT ts_ms, value FROM samples "
+            "WHERE series_id=? AND ts_ms BETWEEN ? AND ? ORDER BY ts_ms DESC LIMIT 1",
+            (1, 0, 1)))
     finally:
         conn.close()
-    assert 'idx_data_points_task_metric_ts' in plan
+    assert 'PRIMARY KEY' in plan
     assert 'TEMP B-TREE' not in plan
 
 

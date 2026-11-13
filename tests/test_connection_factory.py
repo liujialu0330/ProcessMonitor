@@ -67,6 +67,24 @@ def test_connect_sets_pragmas(factory):
     assert JOURNAL_SIZE_LIMIT == 8 * 1024 * 1024
 
 
+def test_write_timeout_is_nested_and_thread_local(factory):
+    def current():
+        with factory.connect() as conn:
+            return conn.execute('PRAGMA busy_timeout').fetchone()[0]
+
+    other = []
+    with factory.write_timeout(10):
+        assert current() == 10
+        worker = threading.Thread(target=lambda: other.append(current()))
+        worker.start()
+        worker.join(3)
+        assert not worker.is_alive()
+        with factory.write_timeout(0):
+            assert current() == 0
+        assert current() == 10
+    assert other == [5000] and current() == 5000
+
+
 # ========== transaction() ==========
 
 def test_transaction_commits_on_normal_exit(factory, db_path):
@@ -282,8 +300,8 @@ def test_checkpoint_returns_false_when_busy(db_path, monkeypatch):
     """
     real_apply = connection_module._apply_pragmas
 
-    def _short_timeout(conn):
-        real_apply(conn)
+    def _short_timeout(conn, *args, **kwargs):
+        real_apply(conn, *args, **kwargs)
         conn.execute('PRAGMA busy_timeout=50')
 
     monkeypatch.setattr(connection_module, '_apply_pragmas', _short_timeout)

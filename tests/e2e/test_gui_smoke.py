@@ -16,7 +16,8 @@ GUI 端到端冒烟测试（tests/e2e/，零生产代码改动）
 
 隔离核实：db 注入 tmp 库（不碰项目真实 data\\monitor.db）、不写 logs（MainWindow
 不调用 setup_logging）。服务用生产实现（真实进程查询、时钟、提示条），只把
-对话框换成 ScriptedDialogs（不真弹资源管理器、关窗确认直接给出"退出"），并把
+对话框换成 ScriptedDialogs（不真弹资源管理器、关窗确认直接给出"退出"），通知的窗口状态
+固定为前台以验证提示上的操作按钮（不依赖运行测试时用户实际聚焦哪个窗口），并把
 about_group.check_update 覆写为 no-op 避免真联网。不注册真实全局快捷键（不注入
 MarkerHotkey），快捷键入口直接调用主窗口的 quick_marker（与快捷键 triggered 同一槽）。
 """
@@ -24,22 +25,29 @@ import csv
 import dataclasses
 import os
 import time
+from pathlib import Path
 
+import pytest
+from PyQt5.QtCore import Qt
 from PyQt5.QtTest import QTest
 from qfluentwidgets import Theme, qconfig, isDarkTheme
 
 from app_config import cfg
+from app.bootstrap import _apply_preferences
+from app.paths import AppPaths
 from core.monitor_manager import MonitorManager
 from tests.doubles import ScriptedDialogs
 from ui.main_window import MainWindow
 from core.shutdown import ThreadRegistry
 from ui.services import production_services
+from ui.services.notifier import InfoBarNotifier, STATE_FOREGROUND
 from ui.tray import ALL_TASKS
 from ui.widgets.analysis.toolbar import EXPORT_REPORT
 from utils.metrics import MetricType
 
 # 真窗口观察态开关：GUI_SMOKE_VISIBLE=1 时追加停顿，断言逻辑不变
 VISIBLE = os.environ.get('GUI_SMOKE_VISIBLE') == '1'
+_capture_index = 0
 
 # 轮询上限（秒）
 POLL_TIMEOUT = 15
@@ -49,6 +57,27 @@ def _pause(ms=800):
     """真窗口模式下追加停顿，便于人工观察；offscreen 断言态跳过，不影响断言。"""
     if VISIBLE:
         QTest.qWait(ms)
+        _capture_window()
+
+
+def _capture_window():
+    """真实窗口冒烟可显式保留阶段截图；默认测试不产生图片。"""
+    global _capture_index
+    directory = os.environ.get('GUI_SMOKE_CAPTURE_DIR')
+    if not directory or os.environ.get('QT_QPA_PLATFORM') != 'windows':
+        return
+    from PyQt5.QtCore import QPoint
+    from PyQt5.QtWidgets import QApplication
+    for window in QApplication.topLevelWidgets():
+        if isinstance(window, MainWindow) and window.isVisible():
+            _capture_index += 1
+            root = Path(directory)
+            root.mkdir(parents=True, exist_ok=True)
+            point = window.mapToGlobal(QPoint(0, 0))
+            screen = window.windowHandle().screen()
+            image = screen.grabWindow(0, point.x(), point.y(), window.width(), window.height())
+            assert image.save(str(root / f'step-{_capture_index:02d}.png'))
+            break
 
 
 def _poll_until(condition, timeout=POLL_TIMEOUT, interval_ms=100):
@@ -82,16 +111,23 @@ def _wait_more_samples(card, more=2):
         f"15s 内采集次数未增加到 {target}，实际 count={card.count}"
 
 
+@pytest.mark.slow   # 全链路冒烟约 10 秒；各环节的快速覆盖见架构说明 §8 的 slow 清单
 def test_gui_smoke_full_lifecycle(qapp, e2e_db, tmp_path):
     """主线冒烟：开始 -> 基线 -> 两轮打点 -> 停止 -> 分析页判定与区间 -> 导出报告 -> 关窗收尾"""
-    # 与 main.py 相同的组装方式，只替换对话框：打开文件夹只做记录；关闭确认是模态
+    # 先走真实主题初始化，避免AUTO被直接当作样式资源目录。
+    _apply_preferences(qapp, AppPaths.resolve())
+    # 与 main.py 相同的组装方式；打开文件夹只做记录，前台通知使用生产渲染。
+    # 关闭确认是模态
     # 对话框，用例中途失败时若仍有任务在跑，收尾的 close() 不能被它阻塞
     manager = MonitorManager(db=e2e_db)
     dialogs = ScriptedDialogs(ask_close_action='quit')
     services = dataclasses.replace(
-        production_services(manager, ThreadRegistry()), dialogs=dialogs)
+        production_services(manager, ThreadRegistry()), dialogs=dialogs,
+        notifier=InfoBarNotifier(state_of=lambda _window: STATE_FOREGROUND))
 
     window = MainWindow(e2e_db, manager, services)
+    if VISIBLE:
+        window.setWindowFlag(Qt.WindowStaysOnTopHint, True)
     # 覆写为 no-op：防止 3 秒后 QTimer 触发真实联网检查更新；MainWindow 内部 QTimer
     # lambda 以 silent=True 调用，no-op 必须接受 **kwargs
     window.about_group.check_update = lambda *args, **kwargs: None

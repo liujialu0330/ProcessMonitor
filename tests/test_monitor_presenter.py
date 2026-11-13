@@ -4,8 +4,10 @@
 默认标签序列"基线 / 第 N 轮"、类型推断、失败提示）、卡片基线（5 个样本中位数、换基线、
 删基线）、任务结束（卡片转已结束、表单清掉已退出进程、异常结束提示）、
 指标不可用（管理员提示）、错误去重、上限提示、同配置再测三种情况、关闭卡片与表单折叠、
+自动化方案（落库与补存、挂接自动打点、按方案停止的提示、再测沿用、停止后自动导出）、
 免弹窗打点（托盘 / 全局快捷键）与"清除全部"已结束卡片。
 """
+from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
@@ -13,16 +15,25 @@ import pytest
 from PyQt5.QtCore import QObject, pyqtSignal
 from PyQt5.QtWidgets import QWidget
 
+from core.automation.plan import AutomationPlan
 from core.contracts import StopReason, TaskInfo, TaskStatus, UnavailableReason
-from core.monitor_manager import BASELINE_LABEL, BaselineSamples, round_label
-from data.models import Marker
+from core.monitor_manager import (
+    BASELINE_LABEL, UNDO_EXPIRED, UNDO_FAILED, UNDO_NOTHING, UNDO_OK, BaselineSamples,
+    UndoOutcome, round_label,
+)
+from core.process_launcher import LaunchSpec
+from core.report_worker import ReportResult, ReportWorker
+from data.errors import StorageError
+from data.models import Marker, MonitorTask
 from tests.doubles import DEFAULT_FAKE_NOW, FakePreferences, FakeProcessQuery
 from tests.factories import make_services
 from ui.presenters.monitor_presenter import (
     ABNORMAL_STOP_INFOBAR_MS, QUICK_MARKER_FAILED, QUICK_MARKER_NONE, QUICK_MARKER_OK,
     MonitorPresenter, resolve_error_text,
 )
-from ui.widgets.monitor.new_task_form import TaskRequest
+from ui.formatting import plan_summary
+from ui.services import EVENT_MARKER_ADDED, EVENT_MARKER_UNDONE, EVENT_TASK_ABNORMAL
+from ui.widgets.monitor.new_task_form import TaskRequest, WaitRequest
 from ui.widgets.monitor.process_picker import (
     ERROR_EMPTY, ERROR_NO_MATCH, ERROR_NOT_A_NUMBER, ERROR_NOT_FOUND, ResolveError,
 )
@@ -47,6 +58,9 @@ class FakeManager(QObject):
     metrics_unavailable = pyqtSignal(str, dict)
     task_limit_reached = pyqtSignal()
     markers_changed = pyqtSignal(str)
+    # 与真实 manager 一致：暂停 / 恢复成功后同步发出
+    task_paused = pyqtSignal(str)
+    task_resumed = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
@@ -64,6 +78,20 @@ class FakeManager(QObject):
         self.pause_result = True
         self.resume_result = True
         self.marker_ok = True
+        # 撤销与打点时刻取值：Presenter 只转发，规则由 test_marker_undo 覆盖
+        self.undo_groups: list = []
+        self.samples: Dict[tuple, Dict[str, float]] = {}    # (task_id, 时刻) -> {指标: 值}
+        self.undo_results: list = []
+        self.paused_ids = set()
+        self.maintenance = False
+        self.exports = 0
+        self.restart_seeds = {}
+
+    def seed_restart_policy(self, task_id, enabled, limit):
+        self.restart_seeds[task_id] = (enabled, limit)
+
+    def release_restart_policy_seed(self, task_id):
+        self.restart_seeds.pop(task_id, None)
 
     def create_task(self, pid, name, metrics, interval=None, note='', create_time=None):
         self.created.append((pid, name, list(metrics), interval, note, create_time))
@@ -96,19 +124,39 @@ class FakeManager(QObject):
 
     def pause_task(self, task_id):
         self.commands.append(("pause", task_id))
+        if self.pause_result:
+            self.task_paused.emit(task_id)
         return self.pause_result
 
     def resume_task(self, task_id):
         self.commands.append(("resume", task_id))
+        if self.resume_result:
+            self.task_resumed.emit(task_id)
         return self.resume_result
+
+    def is_task_paused(self, task_id):
+        return task_id in self.paused_ids
+
+    def is_maintenance_running(self):
+        return self.maintenance
+
+    def begin_export(self):
+        if self.maintenance:
+            return False
+        self.exports += 1
+        return True
+
+    def end_export(self):
+        self.exports -= 1
 
     def remove_task(self, task_id):
         self.commands.append(("remove", task_id))
         self.infos.pop(task_id, None)
         return True
 
-    def add_marker(self, task_id, label, timestamp=None, kind='user'):
+    def add_marker(self, task_id, label, timestamp=None, kind='user', undo_group=None):
         self.commands.append(("marker", task_id, label, timestamp, kind))
+        self.undo_groups.append(undo_group)
         if not self.marker_ok:
             return None
         markers = self.markers.setdefault(task_id, [])
@@ -124,6 +172,18 @@ class FakeManager(QObject):
 
     def list_markers(self, task_id):
         return list(self.markers.get(task_id, []))
+
+    def sample_values_at(self, task_id, metrics, when):
+        values = self.samples.get((task_id, when), {})
+        return {m: values[m] for m in metrics if m in values}
+
+    def undo_last_marker(self):
+        self.commands.append(("undo_last",))
+        return self.undo_results.pop(0)
+
+    def undo_marker(self, marker_id):
+        self.commands.append(("undo", marker_id))
+        return self.undo_results.pop(0)
 
     def get_baseline(self, task_id, markers=None):
         markers = self.list_markers(task_id) if markers is None else markers
@@ -159,6 +219,7 @@ class FakeCard:
         self.markers: List[Marker] = []
         self.baseline: Optional[tuple] = None      # (时间, {指标: 值})
         self.baseline_events: List[tuple] = []
+        self.tooltip = ''
 
     def __getattr__(self, name):
         if name in self._RECORDED:
@@ -167,6 +228,9 @@ class FakeCard:
 
     def tick(self, now):
         self.ticks.append(now)
+
+    def setToolTip(self, text):
+        self.tooltip = text
 
     def set_started_at(self, when):
         self.started_at = when
@@ -192,6 +256,7 @@ class FakeBoard(QObject):
     pause_requested = pyqtSignal(str)
     resume_requested = pyqtSignal(str)
     marker_requested = pyqtSignal(str)
+    marker_menu_requested = pyqtSignal(str, object, object)
     history_requested = pyqtSignal(str)
     restart_requested = pyqtSignal(str)
     close_requested = pyqtSignal(str)
@@ -202,6 +267,7 @@ class FakeBoard(QObject):
         super().__init__()
         self.cards: Dict[str, FakeCard] = {}
         self.finished: Dict[str, tuple] = {}
+        self.exit_codes: Dict[str, Optional[int]] = {}
         self.counts = None
         self.waiting: Dict[str, tuple] = {}
 
@@ -222,8 +288,9 @@ class FakeBoard(QObject):
     def card(self, task_id):
         return self.cards.get(task_id)
 
-    def finish_card(self, task_id, reason, end_time):
+    def finish_card(self, task_id, reason, end_time, exit_code=None):
         self.finished[task_id] = (reason, end_time)
+        self.exit_codes[task_id] = exit_code
 
     def set_counts(self, running, limit):
         self.counts = (running, limit)
@@ -234,6 +301,11 @@ class FakeForm(QObject):
     wait_requested = pyqtSignal(object)
     target_invalid = pyqtSignal(object)
     choose_metrics_requested = pyqtSignal()
+    browse_log_requested = pyqtSignal()
+    browse_export_dir_requested = pyqtSignal()
+    browse_snapshot_dir_requested = pyqtSignal()
+    browse_exe_requested = pyqtSignal()
+    browse_cwd_requested = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -243,6 +315,13 @@ class FakeForm(QObject):
         self.filled: List[str] = []
         self.forgotten: List[int] = []
         self.interval_value = 4.0
+        self.automation_plans: List[object] = []
+        self.log_path_value = ''
+        self.export_dir_value = ''
+        self.snapshot_dir_value = ''
+        self.launch_exe_value = ''
+        self.launch_cwd_value = ''
+        self.launch_errors: List[str] = []
 
     def set_metrics_summary(self, metrics):
         self._metrics = list(metrics)
@@ -265,6 +344,42 @@ class FakeForm(QObject):
 
     def set_collapsed(self, collapsed):
         self.collapsed.append(collapsed)
+
+    def set_automation_plan(self, plan):
+        self.automation_plans.append(plan)
+
+    def log_path(self):
+        return self.log_path_value
+
+    def set_log_path(self, path):
+        self.log_path_value = path
+
+    def export_dir(self):
+        return self.export_dir_value
+
+    def set_export_dir(self, path):
+        self.export_dir_value = path
+
+    def snapshot_dir(self):
+        return self.snapshot_dir_value
+
+    def set_snapshot_dir(self, path):
+        self.snapshot_dir_value = path
+
+    def launch_exe(self):
+        return self.launch_exe_value
+
+    def set_launch_exe(self, path):
+        self.launch_exe_value = path
+
+    def launch_cwd(self):
+        return self.launch_cwd_value
+
+    def set_launch_cwd(self, path):
+        self.launch_cwd_value = path
+
+    def show_launch_error(self, text):
+        self.launch_errors.append(text)
 
 
 # ---------------------------------------------------------------- fixtures
@@ -636,7 +751,7 @@ def test_marker_time_is_click_time_not_confirm_time(presenter, manager, board, s
     assert _marker_commands(manager)[-1] == (task_id, "开始第 3 轮", clicked, "baseline")
     assert services.dialogs.last_call("ask_marker_label")["timestamp"] == clicked
     assert services.clock.now() == clicked + timedelta(seconds=12)
-    assert "10:00:00" in services.notifier.last("success").content
+    assert services.notifier.last("success").event == EVENT_MARKER_ADDED
 
 
 # ---------------------------------------------------------------- 卡片基线
@@ -744,30 +859,27 @@ def test_marker_ignored_for_finished_task(presenter, manager, board, services):
 def test_user_stop_finishes_card_removes_task_and_informs(presenter, manager, board,
                                                           services, form):
     task_id = _add_task(manager, pid=1002)
-    received = []
-    presenter.task_ended_abnormally.connect(lambda *args: received.append(args))
 
     manager.task_stopped.emit(task_id, StopReason.USER)
 
     assert board.finished[task_id] == (StopReason.USER, DEFAULT_FAKE_NOW)
     assert ("remove", task_id) in manager.commands
     assert form.forgotten == [1002]
-    assert received == []
     # 用户自己点的停止：卡片转为"已结束"即是结果，不再弹提示
     assert services.notifier.notices == []
 
 
-def test_abnormal_stop_is_prominent_and_signals_main_window(presenter, manager, services, host):
+def test_abnormal_stop_is_prominent_and_routed_as_task_event(presenter, manager, services, host):
+    """异常结束经 Notifier.route 发出：事件名决定窗口在后台时闪任务栏，渠道由 Notifier 选"""
     task_id = _add_task(manager)
-    received = []
-    presenter.task_ended_abnormally.connect(lambda title, content: received.append(content))
 
     manager.task_stopped.emit(task_id, StopReason.PROCESS_EXITED)
 
     last = services.notifier.last()
     assert last.level == "warning" and last.effective_duration == ABNORMAL_STOP_INFOBAR_MS
     assert last.parent is host
-    assert received and "进程已终止" in received[0] and "demo.exe（PID 1001）" in received[0]
+    assert last.event == EVENT_TASK_ABNORMAL and last.key == EVENT_TASK_ABNORMAL
+    assert "进程已终止" in last.content and "demo.exe（PID 1001）" in last.content
 
 
 def test_stop_of_unknown_task_still_removes_it(presenter, manager, services):
@@ -939,13 +1051,17 @@ def test_quick_marker_single_task_uses_default_label_and_now(presenter, manager,
 
     assert [(m.label, m.kind) for m in markers] == [(BASELINE_LABEL, "baseline")]
     assert ("marker", task_id, BASELINE_LABEL, DEFAULT_FAKE_NOW, "baseline") in manager.commands
-    clock = DEFAULT_FAKE_NOW.strftime("%H:%M:%S")
-    assert received == [(QUICK_MARKER_OK, f"已打点：基线 {clock}", "demo.exe · PID 1001")]
+    # 成功的回显不走 quick_marker_feedback，而是带"撤销"的提示
+    assert received == []
+    notice = presenter.services.notifier.last("success")
+    assert (notice.event, notice.title, notice.content) == (
+        EVENT_MARKER_ADDED, "已打点 · demo.exe", BASELINE_LABEL)
+    assert notice.action.text == "撤销"
     # 不弹任何对话框
     assert presenter.services.dialogs.methods_called() == []
 
     presenter.quick_marker()
-    assert received[-1][1] == f"已打点：第 1 轮 {clock}"
+    assert presenter.services.notifier.last("success").content.startswith("第 1 轮")
 
 
 def test_quick_marker_all_tasks_share_one_moment(presenter, manager):
@@ -957,8 +1073,12 @@ def test_quick_marker_all_tasks_share_one_moment(presenter, manager):
 
     assert {m.task_id for m in markers} == {first, second}
     assert {m.timestamp for m in markers} == {DEFAULT_FAKE_NOW}
-    assert received[-1][0] == QUICK_MARKER_OK
-    assert received[-1][1].startswith("已打点：2 个任务")
+    assert received == []
+    notice = presenter.services.notifier.last("success")
+    assert notice.title == "已打点：2 个任务"
+    assert "demo.exe：基线" in notice.content and "beta.exe：基线" in notice.content
+    # 一次操作打的几个点属于同一个撤销组
+    assert len(set(manager.undo_groups)) == 1 and manager.undo_groups[0] is not None
 
 
 def test_quick_marker_one_task_from_tray_submenu(presenter, manager):
@@ -999,3 +1119,701 @@ def test_clear_finished_removes_only_finished(presenter, manager, board, form):
 
     assert list(board.cards) == [alive]
     assert presenter.task_ids() == [alive]
+
+
+# ---------------------------------------------------------------- 自动化方案
+
+
+TIMED_PLAN = AutomationPlan(timed_marker_seconds=10)
+
+
+class FakePlanStore:
+    """TaskRepo 的 plan_json 部分：任务行出现（rows）前 save_plan 返回 False。"""
+
+    def __init__(self):
+        self.rows = set()
+        self.saved: Dict[str, str] = {}
+        self.calls = 0
+        self.error = False
+
+    def save_plan(self, task_id, plan_json):
+        self.calls += 1
+        if self.error:
+            raise StorageError("磁盘已满")
+        if task_id not in self.rows:
+            return False
+        self.saved[task_id] = plan_json
+        return True
+
+
+class FakeDb:
+    def __init__(self):
+        self.tasks = FakePlanStore()
+        self.records: Dict[str, MonitorTask] = {}
+
+    def get_task(self, task_id):
+        return self.records.get(task_id)
+
+
+@pytest.fixture
+def plan_db():
+    return FakeDb()
+
+
+@pytest.fixture
+def auto_presenter(manager, services, form, board, host, plan_db):
+    return MonitorPresenter(manager, services, form, board, host, db=plan_db)
+
+
+def test_start_with_plan_saves_plan_attaches_and_shows_summary(
+        auto_presenter, manager, board, plan_db):
+    task_id = auto_presenter.on_start_requested(replace(_request(), plan=TIMED_PLAN))
+
+    assert manager.commands[-1] == ("start", task_id)
+    assert auto_presenter.plan_of(task_id) == TIMED_PLAN
+    assert auto_presenter.auto_marker.plan_of(task_id) == TIMED_PLAN
+    assert board.cards[task_id].tooltip == plan_summary(TIMED_PLAN) == "自动打点 每 10 秒"
+    # 任务行要等采集线程启动才写入：第一次写不进去，下一个采集周期补存，之后不再写
+    assert plan_db.tasks.saved == {}
+    plan_db.tasks.rows.add(task_id)
+    manager.data_updated.emit(task_id, {METRICS[0]: 1.0})
+    assert AutomationPlan.from_json(plan_db.tasks.saved[task_id]) == TIMED_PLAN
+    calls = plan_db.tasks.calls
+    manager.data_updated.emit(task_id, {METRICS[0]: 2.0})
+    assert plan_db.tasks.calls == calls
+
+
+def test_plan_saved_on_stop_when_no_cycle_ran(auto_presenter, manager, plan_db):
+    task_id = auto_presenter.on_start_requested(replace(_request(), plan=TIMED_PLAN))
+    plan_db.tasks.rows.add(task_id)
+    manager.task_stopped.emit(task_id, StopReason.PROCESS_NOT_FOUND)
+    assert task_id in plan_db.tasks.saved
+
+
+def test_plan_storage_error_is_retried(auto_presenter, manager, plan_db):
+    plan_db.tasks.error = True
+    task_id = auto_presenter.on_start_requested(replace(_request(), plan=TIMED_PLAN))
+    plan_db.tasks.error = False
+    plan_db.tasks.rows.add(task_id)
+    manager.data_updated.emit(task_id, {METRICS[0]: 1.0})
+    assert task_id in plan_db.tasks.saved
+
+
+def test_start_without_plan_writes_nothing(auto_presenter, manager, plan_db, board):
+    task_id = auto_presenter.on_start_requested(_request())
+    plan_db.tasks.rows.add(task_id)
+    manager.data_updated.emit(task_id, {METRICS[0]: 1.0})
+    assert plan_db.tasks.calls == 0
+    assert not auto_presenter.auto_marker.is_attached(task_id)
+    assert board.cards[task_id].tooltip == ''
+
+
+def test_empty_plan_is_treated_as_no_plan(auto_presenter, plan_db):
+    task_id = auto_presenter.on_start_requested(replace(_request(), plan=AutomationPlan()))
+    assert auto_presenter.plan_of(task_id) is None and plan_db.tasks.calls == 0
+
+
+def test_invalid_plan_is_rejected_before_creating(auto_presenter, manager, services):
+    bad = AutomationPlan(timed_marker_seconds=1)
+    assert auto_presenter.on_start_requested(replace(_request(interval=5.0), plan=bad)) is None
+    assert manager.created == []
+    notice = services.notifier.last("warning")
+    assert notice.title == "自动化设置有误" and "不能小于采集间隔" in notice.content
+
+
+def test_presenter_tick_drives_timed_markers(auto_presenter, manager, services):
+    task_id = auto_presenter.on_start_requested(replace(_request(), plan=TIMED_PLAN))
+    services.clock.advance(10)
+    auto_presenter.tick()
+    assert [m.label for m in manager.list_markers(task_id)] == [BASELINE_LABEL]
+    assert _marker_commands(manager)[-1][2] == services.clock.now()
+
+
+def test_resume_restarts_timer_from_resume_moment(auto_presenter, manager, board, services):
+    task_id = auto_presenter.on_start_requested(replace(_request(), plan=TIMED_PLAN))
+    services.clock.advance(4)
+    manager.paused_ids.add(task_id)
+    board.pause_requested.emit(task_id)
+    assert auto_presenter.auto_marker.next_due(task_id) is None
+    services.clock.advance(60)
+    manager.paused_ids.discard(task_id)
+    board.resume_requested.emit(task_id)
+    assert auto_presenter.auto_marker.next_due(task_id) == (
+        services.clock.now() + timedelta(seconds=10))
+
+
+def test_auto_stop_marks_card_stopping_and_informs(auto_presenter, manager, board, services):
+    plan = AutomationPlan(stop_after_seconds=60)
+    task_id = auto_presenter.on_start_requested(replace(_request(), plan=plan))
+    services.clock.advance(60)
+    auto_presenter.tick()
+
+    assert ("stop", task_id) in manager.commands
+    assert ("set_stopping",) in board.cards[task_id].calls
+    notice = services.notifier.last("info")
+    assert notice.title == "已按方案自动停止"
+    assert notice.content == "alpha.exe（PID 1001）：已运行满 1 分钟"
+    # 不能再打点；随后的停止按"用户停止"处理，不弹异常结束提示
+    assert task_id not in auto_presenter.active_task_ids()
+    services.notifier.clear()
+    manager.task_stopped.emit(task_id, StopReason.USER)
+    assert services.notifier.messages("warning") == []
+
+
+def test_restart_reuses_plan(auto_presenter, manager, services):
+    task_id = auto_presenter.on_start_requested(replace(_request(), plan=TIMED_PLAN))
+    manager.task_stopped.emit(task_id, StopReason.PROCESS_EXITED)
+    services.process_query.processes[:] = [(4321, "alpha.exe", 9.0)]
+
+    new_id = auto_presenter.on_restart(task_id)
+
+    assert new_id is not None and new_id != task_id
+    assert auto_presenter.plan_of(new_id) == TIMED_PLAN
+    assert auto_presenter.auto_marker.is_attached(new_id)
+
+
+def test_restart_without_unique_match_fills_plan_into_form(auto_presenter, manager, services,
+                                                           form):
+    task_id = auto_presenter.on_start_requested(replace(_request(), plan=TIMED_PLAN))
+    manager.task_stopped.emit(task_id, StopReason.PROCESS_EXITED)
+    services.process_query.processes[:] = []
+    assert auto_presenter.on_restart(task_id) is None
+    assert form.filled == ["alpha.exe"] and form.automation_plans == [TIMED_PLAN]
+
+
+def test_restart_without_plan_leaves_form_plan_alone(auto_presenter, manager, services, form):
+    task_id = auto_presenter.on_start_requested(_request())
+    manager.task_stopped.emit(task_id, StopReason.PROCESS_EXITED)
+    services.process_query.processes[:] = []
+    auto_presenter.on_restart(task_id)
+    assert form.automation_plans == []
+
+
+def test_wait_request_plan_is_applied_when_process_appears(auto_presenter, manager, services):
+    auto_presenter.on_wait_requested(WaitRequest(
+        name="late.exe", metrics=METRICS, interval=1.0, plan=TIMED_PLAN))
+    services.process_query.processes.append((5555, "late.exe", 5.0))
+    auto_presenter.poll_waits()
+    assert len(manager.created) == 1
+    assert auto_presenter.plan_of("t1") == TIMED_PLAN
+
+
+def test_browse_log_and_export_dir_go_through_dialogs(auto_presenter, services, form):
+    services.dialogs.push('ask_open_file', "D:\\logs\\app.log", None)
+    services.dialogs.push('ask_directory', "D:\\out")
+    form.browse_log_requested.emit()
+    assert form.log_path_value == "D:\\logs\\app.log"
+    form.browse_log_requested.emit()            # 取消：不改
+    assert form.log_path_value == "D:\\logs\\app.log"
+    assert services.dialogs.last_call('ask_open_file')['start_dir'] == "D:\\logs"
+    form.browse_export_dir_requested.emit()
+    assert form.export_dir_value == "D:\\out"
+
+
+# ---------- 停止后自动导出 ----------
+
+
+class FakeExportWorker(QObject):
+    """ReportWorker 替身：start() 同步发出结果（或失败）与 finished。"""
+
+    result = pyqtSignal(object)
+    failed = pyqtSignal(str)
+    finished = pyqtSignal()
+    created: List["FakeExportWorker"] = []
+
+    def __init__(self, db, job, fail=None):
+        super().__init__()
+        self.db, self.job, self.fail = db, job, fail
+        FakeExportWorker.created.append(self)
+
+    def cancel(self):
+        pass
+
+    def isFinished(self):
+        return False
+
+    def start(self):
+        if self.fail:
+            self.failed.emit(self.fail)
+        else:
+            self.result.emit(ReportResult((self.job.csv_path,), 3, 3))
+        self.finished.emit()
+
+
+def _record(task_id, start=DEFAULT_FAKE_NOW):
+    return MonitorTask(task_id=task_id, pid=1001, process_name="alpha.exe",
+                       metric_types=list(METRICS), interval=1.0, start_time=start,
+                       end_time=start + timedelta(minutes=5), status='stopped',
+                       sample_count=3)
+
+
+def _export_presenter(manager, services, form, board, host, plan_db, fail=None):
+    FakeExportWorker.created = []
+    return MonitorPresenter(
+        manager, services, form, board, host, db=plan_db,
+        export_worker_factory=lambda db, job: FakeExportWorker(db, job, fail))
+
+
+def test_task_end_triggers_csv_export(manager, services, form, board, host, plan_db, tmp_path):
+    presenter = _export_presenter(manager, services, form, board, host, plan_db)
+    out = tmp_path / "导出"
+    plan = AutomationPlan(export_on_stop=True, export_dir=str(out))
+    task_id = presenter.on_start_requested(replace(_request(), plan=plan))
+    plan_db.records[task_id] = _record(task_id)
+
+    manager.task_stopped.emit(task_id, StopReason.PROCESS_EXITED)
+
+    [worker] = FakeExportWorker.created
+    job = worker.job
+    assert job.csv_path == str(out / "alpha_1001_20260101_120000.csv")
+    assert job.image_path is None and job.summary_path is None
+    assert any("任务结束后自动导出" in line for line in job.metadata)
+    assert out.is_dir()
+    assert manager.exports == 0                      # begin/end 成对
+    assert services.notifier.last("success").title == "已自动导出"
+
+
+def test_export_does_not_overwrite_existing_file(manager, services, form, board, host,
+                                                 plan_db, tmp_path):
+    presenter = _export_presenter(manager, services, form, board, host, plan_db)
+    (tmp_path / "alpha_1001_20260101_120000.csv").write_text("旧", encoding="utf-8")
+    plan_db.records["x"] = _record("x")
+    assert presenter.on_export_requested("x", str(tmp_path))
+    assert FakeExportWorker.created[0].job.csv_path == str(
+        tmp_path / "alpha_1001_20260101_120000_2.csv")
+
+
+def test_export_refused_during_maintenance(manager, services, form, board, host, plan_db,
+                                           tmp_path):
+    presenter = _export_presenter(manager, services, form, board, host, plan_db)
+    plan_db.records["x"] = _record("x")
+    manager.maintenance = True
+    assert presenter.on_export_requested("x", str(tmp_path)) is False
+    assert FakeExportWorker.created == []
+    assert "正在清理数据库" in services.notifier.last("error").content
+
+
+def test_export_failure_is_reported(manager, services, form, board, host, plan_db, tmp_path):
+    presenter = _export_presenter(manager, services, form, board, host, plan_db,
+                                  fail="导出失败：磁盘已满")
+    plan_db.records["x"] = _record("x")
+    presenter.on_export_requested("x", str(tmp_path))
+    notice = services.notifier.last("error")
+    assert notice.title == "自动导出失败" and "磁盘已满" in notice.content
+    assert manager.exports == 0
+
+
+def test_export_without_task_record_is_reported(manager, services, form, board, host, plan_db,
+                                                tmp_path):
+    presenter = _export_presenter(manager, services, form, board, host, plan_db)
+    assert presenter.on_export_requested("missing", str(tmp_path)) is False
+    assert services.notifier.last("error").title == "自动导出失败"
+
+
+class _InlineReportWorker(ReportWorker):
+    """真实 ReportWorker 的导出逻辑，但在调用线程里同步执行：本用例只验证"写出的文件"，
+    不依赖跨线程信号投递（e2e 冒烟真退出调用过 QApplication.quit() 之后，同一进程里
+    工作线程发往界面线程的排队信号不再送达，真线程版本会在全量运行时超时）。"""
+
+    def start(self):
+        self.run()
+        self.finished.emit()
+
+
+def test_export_writes_real_csv(db, manager, services, form, board, host, tmp_path):
+    """真实 ReportWorker 导出逻辑 + 真实库：文件确实写出，导出线程登记到 services.threads"""
+    from data.models import DataPoint
+    db.save_task(_record("real"))
+    db.save_data_points([DataPoint("real", DEFAULT_FAKE_NOW + timedelta(seconds=i), 1.0 + i,
+                                   METRICS[0]) for i in range(3)])
+    registered = []
+    services.threads.register = lambda worker, **kw: registered.append(kw['name'])
+    presenter = MonitorPresenter(manager, services, form, board, host, db=db,
+                                 export_worker_factory=_InlineReportWorker)
+
+    assert presenter.on_export_requested("real", str(tmp_path))
+    assert registered == ["自动导出"]
+    assert manager.exports == 0
+    assert [n.title for n in services.notifier.messages()] == ["已自动导出"], (
+        services.notifier.messages())
+    text = (tmp_path / "alpha_1001_20260101_120000.csv").read_text(encoding="utf-8-sig")
+    assert "进程: alpha.exe (PID 1001)" in text
+
+
+# ---------------------------------------------------------------- 暂停 / 恢复同步
+
+
+def test_external_pause_and_resume_update_card(presenter, manager, board):
+    """命令行、托盘等别处直接调 manager 暂停 / 恢复：卡片跟着变。"""
+    task_id = _add_task(manager)
+
+    manager.pause_task(task_id)
+    manager.resume_task(task_id)
+
+    assert board.cards[task_id].calls == [("set_paused", True), ("set_paused", False)]
+
+
+def test_resume_rejected_by_storage_guard_keeps_card_paused(presenter, manager, board):
+    task_id = _add_task(manager)
+    # 恢复信号发出前，模拟先连接的守卫把状态重新置为暂停。
+    manager.paused_ids.add(task_id)
+    presenter.on_resume(task_id)
+    assert board.cards[task_id].calls[-1] == ('set_paused', True)
+    manager.resume_task(task_id)
+    assert board.cards[task_id].calls[-1] == ('set_paused', True)
+
+
+def test_external_pause_for_unknown_task_is_ignored(presenter, manager, board):
+    manager.task_paused.emit("unknown")
+    assert board.cards == {}
+
+
+# ---------------------------------------------------------------- 启动被测程序
+
+LAUNCH_SPEC = LaunchSpec(exe=r"D:\app\demo.exe", args=("--mode", "soak"), cwd=r"D:\app")
+
+
+def _launch_request(close_on_stop=False, note=""):
+    return replace(_request(pid=0, name="demo.exe", create_time=None, note=note),
+                   launch=LAUNCH_SPEC, close_on_stop=close_on_stop)
+
+
+def _pump_until(condition, timeout=5.0):
+    from PyQt5.QtWidgets import QApplication
+    from tests.helpers import poll_until
+    return poll_until(lambda: (QApplication.processEvents(), condition())[1], timeout=timeout)
+
+
+def test_launch_success_creates_task_with_launched_identity(presenter, manager, services):
+    task_id = presenter.start_monitoring(_launch_request())
+
+    assert services.launcher.launched == [LAUNCH_SPEC]
+    # 用启动结果（PID 5001、创建时间 5001.5）建任务，而不是表单里的占位 0
+    assert manager.created == [(5001, "demo.exe", list(METRICS), 1.0, "", 5001.5)]
+    assert manager.commands == [("start", task_id)]
+    assert presenter.is_launched(task_id)
+
+
+def test_form_launch_request_goes_through_start_requested(presenter, manager, services, form):
+    form.start_requested.emit(_launch_request())
+
+    assert services.launcher.launched == [LAUNCH_SPEC]
+    assert manager.created[0][0] == 5001
+
+
+def test_launch_failure_creates_no_task_and_shows_error_near_form(
+        presenter, manager, services, form):
+    services.launcher.fail("找不到程序：D:\\app\\demo.exe")
+
+    assert presenter.start_monitoring(_launch_request()) is None
+
+    assert manager.created == []
+    assert form.launch_errors == ["找不到程序：D:\\app\\demo.exe"]
+    # 就近显示，不另弹提示条
+    assert services.notifier.notices == []
+
+
+def test_launch_skips_duplicate_pid_confirmation(presenter, manager, services):
+    manager.running_pids.add(5001)
+    presenter.start_monitoring(_launch_request())
+    assert services.dialogs.calls_of("confirm") == []
+
+
+def test_launch_refused_during_maintenance_launches_nothing(presenter, manager, services):
+    manager.maintenance = True
+
+    assert presenter.start_monitoring(_launch_request()) is None
+
+    assert services.launcher.launched == []
+    assert services.notifier.last().level == "warning"
+
+
+def test_launch_refused_when_task_limit_reached(presenter, manager, services):
+    manager.can_add_task = lambda: False
+
+    assert presenter.start_monitoring(_launch_request()) is None
+
+    assert services.launcher.launched == []
+    assert manager.created == []
+
+
+def test_launched_but_create_failed_warns_program_still_running(presenter, manager, services):
+    manager.create_ok = False
+
+    assert presenter.start_monitoring(_launch_request()) is None
+
+    assert services.notifier.last().level == "warning"
+    assert "5001" in services.notifier.last().content
+
+
+def test_close_on_stop_closes_program_after_user_stop(presenter, manager, services):
+    task_id = presenter.start_monitoring(_launch_request(close_on_stop=True))
+
+    manager.task_stopped.emit(task_id, StopReason.USER)
+
+    assert _pump_until(lambda: services.launcher.terminated)
+    assert services.launcher.terminated == [(5001, 5001.5)]
+
+
+def test_close_on_stop_leaves_program_alone_when_it_exits_by_itself(
+        presenter, manager, services):
+    task_id = presenter.start_monitoring(_launch_request(close_on_stop=True))
+
+    manager.task_stopped.emit(task_id, StopReason.PROCESS_EXITED)
+
+    assert not _pump_until(lambda: services.launcher.terminated, timeout=0.3)
+
+
+def test_without_close_on_stop_user_stop_leaves_program_running(presenter, manager, services):
+    task_id = presenter.start_monitoring(_launch_request(close_on_stop=False))
+
+    manager.task_stopped.emit(task_id, StopReason.USER)
+
+    assert not _pump_until(lambda: services.launcher.terminated, timeout=0.3)
+
+
+def test_restart_of_launched_task_relaunches_program(presenter, manager, board, services):
+    task_id = presenter.start_monitoring(_launch_request(close_on_stop=True, note="第一轮"))
+    manager.task_stopped.emit(task_id, StopReason.PROCESS_EXITED)
+    manager.created.clear()
+
+    new_id = presenter.on_restart(task_id)
+
+    assert services.launcher.launched == [LAUNCH_SPEC, LAUNCH_SPEC]
+    assert manager.created == [(5002, "demo.exe", list(METRICS), 1.0, "第一轮", 5002.5)]
+    assert presenter.is_launched(new_id)
+    # 新任务沿用"停止时关闭"
+    manager.task_stopped.emit(new_id, StopReason.USER)
+    assert _pump_until(lambda: services.launcher.terminated)
+    assert services.launcher.terminated == [(5002, 5002.5)]
+
+
+def test_browse_exe_and_cwd_go_through_dialogs(presenter, services, form):
+    services.dialogs.push('ask_open_file', r"D:\app\demo.exe")
+    services.dialogs.push('ask_directory', r"D:\work", None)
+
+    form.browse_exe_requested.emit()
+    form.browse_cwd_requested.emit()
+    form.browse_cwd_requested.emit()            # 取消：不改
+
+    assert form.launch_exe_value == r"D:\app\demo.exe"
+    assert form.launch_cwd_value == r"D:\work"
+    # 工作目录对话框从程序所在目录开始
+    assert services.dialogs.calls_of('ask_directory')[0]['start_dir'] == r"D:\app"
+
+
+# ---------------------------------------------------------------- 阶段快照
+
+
+class FakeSnapshotWriter(QObject):
+    written = pyqtSignal(str, object)
+    failed = pyqtSignal(str, str)
+
+    def __init__(self):
+        super().__init__()
+        self.writes: List[tuple] = []
+        self.forgotten: List[str] = []
+
+    def write(self, task_id, directory, index):
+        self.writes.append((task_id, directory, index))
+        return True
+
+    def forget(self, task_id):
+        self.forgotten.append(task_id)
+
+
+@pytest.fixture
+def snap_writer():
+    return FakeSnapshotWriter()
+
+
+@pytest.fixture
+def snap_presenter(manager, services, form, board, host, snap_writer):
+    return MonitorPresenter(manager, services, form, board, host, snapshot_writer=snap_writer)
+
+
+def test_stage_snapshot_due_is_written_by_writer(snap_presenter, snap_writer):
+    snap_presenter.auto_marker.stage_snapshot_due.emit("t1", r"D:\snap", 3)
+    assert snap_writer.writes == [("t1", r"D:\snap", 3)]
+
+
+def test_stage_snapshot_failure_warns_with_task_name(snap_presenter, manager, snap_writer,
+                                                     services):
+    task_id = _add_task(manager, name="demo.exe")
+
+    snap_writer.failed.emit(task_id, "磁盘已满")
+
+    notice = services.notifier.last()
+    assert notice.level == "warning"
+    assert "demo.exe" in notice.content and "磁盘已满" in notice.content
+
+
+def test_stage_snapshot_written_is_reported(snap_presenter, manager, snap_writer, services):
+    task_id = _add_task(manager, name="demo.exe")
+
+    snap_writer.written.emit(task_id, [r"D:\snap\stage_01.png", r"D:\snap\stage_01.csv"])
+
+    assert services.notifier.last().level == "info"
+    assert "stage_01.png" in services.notifier.last().content
+
+
+def test_closing_cards_forgets_snapshot_state(snap_presenter, manager, board, snap_writer):
+    first = _add_task(manager)
+    second = _add_task(manager)
+    manager.task_stopped.emit(first, StopReason.USER)
+    manager.task_stopped.emit(second, StopReason.USER)
+
+    board.close_requested.emit(first)
+    board.clear_finished_requested.emit()
+
+    assert snap_writer.forgotten == [first, second]
+
+
+def test_browse_snapshot_dir_goes_through_dialogs(snap_presenter, services, form):
+    services.dialogs.push('ask_directory', r"D:\snap")
+    form.snapshot_dir_value = r"D:\old"
+
+    form.browse_snapshot_dir_requested.emit()
+
+    assert form.snapshot_dir_value == r"D:\snap"
+    assert services.dialogs.last_call('ask_directory')['start_dir'] == r"D:\old"
+
+
+def test_default_snapshot_writer_renders_with_report_sheet(presenter):
+    from ui.widgets.analysis.report_sheet import render_report_for
+    assert presenter.snapshot_writer._renderer is render_report_for
+
+
+# ---------------------------------------------------------------- 打点回显与撤销
+
+T_BASE = DEFAULT_FAKE_NOW
+T_NEXT = T_BASE + timedelta(seconds=60)
+FOUR_METRICS = (MetricType.MEMORY_PRIVATE, MetricType.NUM_GDI_OBJECTS, MetricType.NUM_HANDLES,
+                MetricType.NUM_THREADS)
+
+
+def _mark(presenter, board, manager, services, task_id, label, when, samples=None):
+    """弹窗打点一次：时钟拨到 when，manager 在该时刻的样本为 samples。"""
+    services.clock.set(when)
+    if samples is not None:
+        manager.samples[(task_id, when)] = samples
+    services.dialogs.push("ask_marker_label", label)
+    board.marker_requested.emit(task_id)
+    return services.notifier.last("success")
+
+
+def test_echo_shows_increments_against_the_previous_marker_with_undo(
+        presenter, manager, board, services):
+    task_id = _add_task(manager)
+    first = _mark(presenter, board, manager, services, task_id, "基线", T_BASE, {
+        MetricType.MEMORY_PRIVATE: 100000.0, MetricType.NUM_GDI_OBJECTS: 10})
+    # 第一个打点就是基线：没有参照，只写名称
+    assert first.content == "基线" and first.title == "已打点 · demo.exe"
+
+    second = _mark(presenter, board, manager, services, task_id, "第 1 轮", T_NEXT, {
+        MetricType.MEMORY_PRIVATE: 101229.0, MetricType.NUM_GDI_OBJECTS: 28})
+    assert second.content == "第 1 轮 · 私有字节 +1.2 MB · GDI对象数 +18 个（较基线）"
+    assert (second.event, second.key, second.level) == (
+        EVENT_MARKER_ADDED, EVENT_MARKER_ADDED, "success")
+    assert second.action.text == "撤销"
+
+    third = _mark(presenter, board, manager, services, task_id, "第 2 轮",
+                  T_NEXT + timedelta(seconds=60), {
+                      MetricType.MEMORY_PRIVATE: 101229.0, MetricType.NUM_GDI_OBJECTS: 25})
+    # 参照换成上一轮；没变化写 ±0，减少写负号
+    assert third.content == "第 2 轮 · 私有字节 ±0 · GDI对象数 -3 个（较上轮）"
+
+
+def test_echo_uses_only_the_first_three_metrics_and_skips_missing_values(
+        presenter, manager, board, services):
+    task_id = _add_task(manager, metrics=FOUR_METRICS)
+    _mark(presenter, board, manager, services, task_id, "基线", T_BASE, {
+        MetricType.MEMORY_PRIVATE: 100000.0, MetricType.NUM_HANDLES: 100,
+        MetricType.NUM_THREADS: 10})
+    notice = _mark(presenter, board, manager, services, task_id, "第 1 轮", T_NEXT, {
+        MetricType.MEMORY_PRIVATE: 100000.0, MetricType.NUM_GDI_OBJECTS: 7,
+        MetricType.NUM_HANDLES: 118, MetricType.NUM_THREADS: 99})
+    # GDI 在基线时刻没有值：跳过它；第 4 个指标（线程数）不列
+    assert notice.content == "第 1 轮 · 私有字节 ±0 · 句柄数 +18 个（较基线）"
+
+
+def test_echo_without_any_value_is_just_the_label(presenter, manager, board, services):
+    task_id = _add_task(manager)
+    _mark(presenter, board, manager, services, task_id, "基线", T_BASE)
+    notice = _mark(presenter, board, manager, services, task_id, "第 1 轮", T_NEXT)
+    assert notice.content == "第 1 轮"
+
+
+def test_echo_compares_with_the_nearest_earlier_round_not_the_baseline(
+        presenter, manager, board, services):
+    task_id = _add_task(manager)
+    values = {MetricType.NUM_GDI_OBJECTS: 5}
+    _mark(presenter, board, manager, services, task_id, "基线", T_BASE, values)
+    _mark(presenter, board, manager, services, task_id, "第 1 轮", T_NEXT,
+          {MetricType.NUM_GDI_OBJECTS: 9})
+    notice = _mark(presenter, board, manager, services, task_id, "第 2 轮",
+                   T_NEXT + timedelta(seconds=30), {MetricType.NUM_GDI_OBJECTS: 12})
+    assert notice.content.endswith("GDI对象数 +3 个（较上轮）")
+
+
+def test_echo_undo_button_undoes_the_marker_and_closes_the_notice(
+        presenter, manager, board, services):
+    task_id = _add_task(manager)
+    notice = _mark(presenter, board, manager, services, task_id, "基线", T_BASE)
+    marker_id = manager.list_markers(task_id)[0].id
+    manager.undo_results.append(UndoOutcome(UNDO_OK, tuple(manager.list_markers(task_id))))
+
+    notice.action.callback()
+
+    assert ("undo", marker_id) in manager.commands
+    assert notice.bar.closed
+    undone = services.notifier.last("success")
+    assert (undone.event, undone.title, undone.content) == (
+        EVENT_MARKER_UNDONE, "已撤销打点", "基线（demo.exe）")
+
+
+def test_undo_button_after_the_time_limit_says_so(presenter, manager, board, services):
+    task_id = _add_task(manager)
+    notice = _mark(presenter, board, manager, services, task_id, "基线", T_BASE)
+    manager.undo_results.append(UndoOutcome(UNDO_EXPIRED))
+
+    notice.action.callback()
+
+    warned = services.notifier.last("warning")
+    assert warned.content == "已超过 30 秒，无法撤销" and warned.event == EVENT_MARKER_UNDONE
+    assert notice.bar.closed
+
+
+@pytest.mark.parametrize("outcome, level, text", [
+    (UndoOutcome(UNDO_NOTHING), "info", "只能撤销最近 30 秒内新增的打点"),
+    (UndoOutcome(UNDO_EXPIRED), "warning", "已超过 30 秒，无法撤销"),
+    (UndoOutcome(UNDO_FAILED), "error", "未能撤销打点，请查看日志"),
+])
+def test_undo_last_marker_reports_every_outcome(presenter, manager, services,
+                                                 outcome, level, text):
+    manager.undo_results.append(outcome)
+    presenter.undo_last_marker()
+    assert manager.commands[-1] == ("undo_last",)
+    assert services.notifier.last(level).content == text
+
+
+def test_undo_last_marker_success_names_what_was_undone(presenter, manager, services):
+    task_id = _add_task(manager)
+    marker = Marker(task_id, T_BASE, "第 3 轮", 5, "user")
+    manager.undo_results.append(UndoOutcome(UNDO_OK, (marker,)))
+    presenter.undo_last_marker()
+    assert services.notifier.last("success").content == "第 3 轮（demo.exe）"
+
+
+def test_quick_marker_undo_button_undoes_the_whole_batch(presenter, manager, services):
+    first = _add_task(manager, pid=1001)
+    _add_task(manager, pid=1002, name="beta.exe")
+    presenter.quick_marker()
+    notice = services.notifier.last("success")
+    marker_id = manager.list_markers(first)[0].id
+    manager.undo_results.append(UndoOutcome(UNDO_NOTHING))
+
+    notice.action.callback()
+
+    assert [c for c in manager.commands if c[0] == "undo"] == [("undo", marker_id)]
+    assert len(set(manager.undo_groups)) == 1

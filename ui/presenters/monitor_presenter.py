@@ -4,48 +4,120 @@
 开始 / 等待进程启动 / 停止 / 暂停 / 恢复 / 打点（含托盘与全局快捷键的免弹窗打点）/
 同配置再测 / 分析 / 关闭卡片与清除已结束的业务流程，以及 manager 各信号（任务添加、
 启动、停止、数据更新、打点变化、指标不可用、错误、达到上限）的界面响应。卡片上的"较基线"由这里维护：基线值 = 基线打点之后前 5 个样本的中位数，
-打点/换基线时先从库里取已有样本，不足部分随 data_updated 累积。依赖：
+打点/换基线时先从库里取已有样本，不足部分随 data_updated 累积。
+自动化方案（自动打点与停止条件）：开始监控时把方案存进 tasks.plan_json 并交给
+AutoMarkerService 跟踪（命令行开始的任务由 IPC 命令处理器挂到同一个服务）；
+"同配置再测"沿用上次的方案；按方案自动停止时提示原因，
+带"停止后自动导出"的任务结束后在后台导出明细 CSV；方案到期请求阶段快照时交给
+StageSnapshotWriter 在后台写报告图片与摘要 CSV（失败每个任务只提示一次）。
+启动被测程序：请求带 launch 时先经 launcher 启动程序，用拿到的 PID 与创建时间建任务
+（启动失败在表单启动区就近提示、不建任务）；勾选"停止时关闭"的任务在用户停止后于后台
+关闭该程序；"同配置再测"对这类任务直接重新启动程序再监控。
+进程组任务（进程树 / 同名进程，见 NewTaskForm 的目标类型）：请求带 target_kind，创建时剔除对组
+不适用的指标；卡片的成员摘要由 manager.group_members 提供，在 members_changed 时刷新，之后每秒
+随 tick 再刷新一次（实例数涨落不发信号）。
+被测进程退出后续接：task_waiting_restart 让卡片显示"等待重启（第 N/M 次）"，task_restarted 把卡片
+的 PID 换成新进程并给一条短暂提示；异常退出（CRASHED）结束时已结束行与提示都带退出码说明。
+这两个信号与 members_changed 一样，替身管理器可以没有。
+暂停 / 恢复：卡片状态跟随 manager 的 task_paused / task_resumed（命令行暂停也同步），
+本页按钮发起的那一次由按钮路径更新，信号回声不重复更新。依赖：
 - manager：只用命令与只读快照接口，不接触任务线程对象；
 - services：process_query / dialogs / notifier / clock / preferences；
+- wait_service（可选）：等待进程启动的轮询与建任务（core.wait_service），缺省自建，
+  这里只管占位卡；
 - form：新建任务表单（NewTaskForm 或同接口的替身）；
 - board：任务面板（TaskBoard 或同接口的替身），按 task_id 取卡片更新显示；
-- host：提示挂靠的控件（页面），对话框挂在 host.window() 上。
+- host：提示挂靠的控件（页面），对话框挂在 host.window() 上；
+- db（可选）：保存方案与自动导出用的数据库，缺省取 manager.db；没有时不存方案、不导出；
+- snapshot_writer（可选）：阶段快照写入器，缺省自建（报告图片用 report_sheet 渲染）；
+- launcher（可选）：启动 / 关闭被测程序，缺省取 services.launcher。
 
 中文文案（表单错误、提示）集中在这里；控件只发信号、显示给定内容。
 """
+import logging
 import itertools
-from dataclasses import dataclass, field
+import os
+from dataclasses import dataclass, field, replace
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
-from PyQt5.QtCore import QObject, QTimer, pyqtSignal
+from PyQt5.QtCore import QObject, QTimer, pyqtSignal, pyqtSlot
 from PyQt5.QtWidgets import QWidget
 
 import config
-from core.contracts import StopReason, UnavailableReason
+from core.automation.auto_marker import AutoMarkerService
+from core.automation.plan import AutomationPlan
+from core.automation.stage_snapshot import StageSnapshotWriter
+from core.contracts import StopReason, TaskStatus, UnavailableReason
 from core.monitor_manager import BASELINE_SAMPLE_COUNT, default_marker_kind, median_of
-from ui.formatting import stop_reason_text, truncate_text, unavailable_reason_text
-from ui.services import UiServices
+from core.report import DATA_CSV_SUFFIX, gap_threshold_seconds, metadata_lines, task_basename
+from core.report_worker import ReportJob, ReportWorker
+from core.process_launcher import LaunchSpec, ProcessLauncher
+from core.wait_service import WaitMatch, WaitService
+from core.workers.terminate_worker import close_in_background
+from core.workers.live_stats_worker import LiveStatsRequest, LiveStatsWorker
+from data.errors import StorageError
+from data.mappers import normalize_ms
+from data.models import TARGET_NAME, TARGET_PID, TARGET_TREE
+from ui.formatting import (
+    TARGET_KIND_TEXTS, AUTO_EXPORT_BUSY, AUTO_EXPORT_DONE_TITLE, AUTO_EXPORT_FAILED_TITLE,
+    AUTO_EXPORT_NO_DATABASE, AUTO_EXPORT_NO_TASK, AUTO_EXPORT_RANGE_TEXT, AUTO_STOP_TITLE,
+    PLAN_INVALID_TITLE, READ_ONLY_MARKER_BLOCKED, READ_ONLY_TITLE, RESTARTED_TITLE,
+    STAGE_SNAPSHOT_DONE_TITLE, STAGE_SNAPSHOT_FAILED_TITLE, auto_stop_text, plan_summary,
+    restarted_hint_text, stage_snapshot_failed_text, stop_detail_text, truncate_text,
+    unavailable_reason_text,
+)
+from ui.presenters.marker_feedback import CardMarkerCommands, MarkerFeedback
+from ui.services import EVENT_TASK_ABNORMAL, EVENT_TASK_ERROR, NoticeAction, UiServices
+from ui.storage_notices import SPACE_PAUSE_REASON
+from ui.widgets.analysis.marker_menu import MarkerEditFlow
+from ui.widgets.analysis.report_sheet import render_report_for
 from ui.widgets.monitor.new_task_form import TaskRequest, WaitRequest
 from ui.widgets.monitor.process_picker import (
-    ERROR_EMPTY, ERROR_NO_MATCH, ERROR_NOT_A_NUMBER, ERROR_NOT_FOUND,
+    ERROR_EMPTY, ERROR_GROUP_NEEDS_NAME, ERROR_NO_MATCH, ERROR_NOT_A_NUMBER, ERROR_NOT_FOUND,
     ERROR_WAIT_NEEDS_NAME, ResolveError,
 )
-from utils.metrics import get_metric_display_name
+from utils.metrics import filter_group_metrics, get_metric_display_name
+
+logger = logging.getLogger(__name__)
 
 # 异常结束提示的显示时长（毫秒）：被测进程崩溃是测试里最需要被注意到的事件，
 # 不能像普通提示那样两秒就消失
 ABNORMAL_STOP_INFOBAR_MS = 15000
 UNAVAILABLE_INFOBAR_MS = 10000
 RESTART_HINT_INFOBAR_MS = 5000
+# 被测进程重启并续接成功的提示：只是告知，几秒后消失
+RESTARTED_INFOBAR_MS = 4000
 # 卡片"已运行"与"（N 分钟前）"的刷新间隔（毫秒）
 TICK_INTERVAL_MS = 1000
 # 等待进程启动的轮询间隔（毫秒）
 WAIT_POLL_INTERVAL_MS = 1000
+# 等待采样落库的重建必须有界；暂停后没有新采样，也能等一次在途写入完成。
+LIVE_STATS_RETRY_DELAYS_MS = (250, 1000, 3000, 10000)
 
 STOP_CONFIRM_HINT = "停止后不能继续记录到这个任务；要继续请用“同配置再测”。已采集的数据会保留。"
 
-# 免弹窗打点（托盘菜单 / 全局快捷键）的反馈种类
+AUTO_STOP_INFOBAR_MS = 8000
+AUTO_EXPORT_INFOBAR_MS = 6000
+# 自动导出线程在登记表里的名称与退出时的等待上限
+AUTO_EXPORT_THREAD_NAME = "自动导出"
+AUTO_EXPORT_TIMEOUT_MS = 2000
+BROWSE_LOG_TITLE = "选择日志文件"
+BROWSE_LOG_FILTER = "日志文件 (*.log *.txt);;所有文件 (*)"
+BROWSE_EXPORT_TITLE = "选择自动导出目录"
+BROWSE_SNAPSHOT_TITLE = "选择阶段快照目录"
+BROWSE_EXE_TITLE = "选择要启动的程序"
+BROWSE_EXE_FILTER = "程序 (*.exe);;所有文件 (*)"
+BROWSE_CWD_TITLE = "选择工作目录"
+
+STAGE_SNAPSHOT_FAILED_INFOBAR_MS = 10000
+STAGE_SNAPSHOT_DONE_INFOBAR_MS = 4000
+LAUNCHED_NOT_MONITORED_TITLE = "程序已启动，但没能开始监控"
+LAUNCHED_NOT_MONITORED_TEXT = "{name}（PID {pid}）已启动，监控任务没能创建；程序仍在运行，请稍后在进程列表里选它"
+LAUNCH_MAINTENANCE_TEXT = "正在清理数据库，请稍后再试"
+
+# 免弹窗打点（托盘菜单 / 全局快捷键）的反馈种类。成功不走这个信号：回显带"撤销"按钮，
+# 由 Presenter 直接经 Notifier 发出（见 MarkerFeedback）
 QUICK_MARKER_OK = 'ok'
 QUICK_MARKER_NONE = 'none'          # 没有可打点的任务
 QUICK_MARKER_FAILED = 'failed'      # 写库失败
@@ -66,6 +138,8 @@ def resolve_error_text(error: ResolveError) -> str:
         return "请输入进程名或 PID，或从列表中选择进程"
     if error.kind == ERROR_WAIT_NEEDS_NAME:
         return "等待进程启动需要填写进程名（如 notepad.exe），不能用 PID"
+    if error.kind == ERROR_GROUP_NEEDS_NAME:
+        return "同名进程需要填写进程名（如 chrome.exe），或从列表里选一个进程；不能用 PID"
     raise ValueError(f"未知的进程选择错误：{error.kind!r}")
 
 
@@ -92,37 +166,55 @@ class _TaskEntry:
     # 已发出停止请求、等待收尾：不再接受打点
     stopping: bool = False
     baseline: Optional[_BaselineTracker] = None
+    # 自动化方案（没有为 None）；plan_saved 为 False 表示还没写进 tasks.plan_json
+    # （任务行由采集线程启动时才写入，之后的周期里补存）
+    plan: Optional[AutomationPlan] = None
+    plan_saved: bool = True
+    # 由本页启动的被测程序（"同配置再测"据此重新启动）；不是启动型任务为 None
+    launch: Optional[LaunchSpec] = None
+    close_on_stop: bool = False
+    # 监控目标类型：pid / tree / name（后两者是进程组任务）
+    target_kind: str = TARGET_PID
+    scenario: str = ''
+    build: str = ''
+
+    @property
+    def is_group(self) -> bool:
+        return self.target_kind != TARGET_PID
+
+    @property
+    def pid_text(self) -> str:
+        """"PID 1234"的位置：进程树写根 PID，同名进程没有 PID。"""
+        if self.target_kind == TARGET_TREE:
+            return f"进程树 · 根 PID {self.pid}"
+        if self.target_kind == TARGET_NAME:
+            return TARGET_KIND_TEXTS[TARGET_NAME]
+        return f"PID {self.pid}"
 
     @property
     def display_name(self) -> str:
-        return f"{self.process_name}（PID {self.pid}）"
+        return f"{self.process_name}（{self.pid_text}）"
+
+    @property
+    def marker_pid(self) -> Optional[int]:
+        """打点对话框里显示的 PID：同名进程没有。"""
+        return None if self.target_kind == TARGET_NAME else self.pid
 
     @property
     def active(self) -> bool:
         """还能打点（运行中或已暂停，未结束、未在停止）。"""
         return not self.finished and not self.stopping
 
+    def identity_text(self) -> str:
+        """"demo.exe · PID 1234"（进程组任务把 PID 换成目标类型说明）。"""
+        return f"{self.process_name} · {self.pid_text}"
+
     def target_text(self) -> str:
         """托盘菜单里的任务名："demo.exe · PID 1234 · 备注"。"""
-        text = f"{self.process_name} · PID {self.pid}"
+        text = self.identity_text()
         if self.note:
             text += f" · {truncate_text(self.note, TARGET_NOTE_CHARS)}"
         return text
-
-
-@dataclass
-class _WaitEntry:
-    """一次"等待进程启动后自动开始"：按进程名轮询，出现即按 request 建任务。"""
-    wait_id: str
-    request: WaitRequest
-
-    def candidate_names(self) -> List[str]:
-        """要查找的进程名：没写扩展名时也试一下加 .exe（多数人只记得程序名）。"""
-        name = self.request.name
-        names = [name]
-        if '.' not in name:
-            names.append(f"{name}.exe")
-        return names
 
 
 class MonitorPresenter(QObject):
@@ -130,19 +222,22 @@ class MonitorPresenter(QObject):
 
     信号：
         history_requested(str): 卡片"分析"：请求切到分析页并选中该任务（主窗口处理）
-        task_ended_abnormally(str, str): 被测进程自行结束（不是用户停止）：(标题, 内容)，
-            主窗口不在前台时据此弹托盘气泡
-        quick_marker_feedback(str, str, str): 免弹窗打点的结果 (种类, 标题, 内容)，
-            种类见 QUICK_MARKER_*；主窗口据此弹托盘气泡
+        quick_marker_feedback(str, str, str): 免弹窗打点没打成的结果 (种类, 标题, 内容)，
+            种类见 QUICK_MARKER_*；主窗口据此经 Notifier 提示（窗口在后台时是托盘气泡）。
+            打点成功的回显（带"撤销"）由 Presenter 自己经 Notifier 发
     """
 
     history_requested = pyqtSignal(str)
-    task_ended_abnormally = pyqtSignal(str, str)
     quick_marker_feedback = pyqtSignal(str, str, str)
 
     def __init__(self, manager, services: UiServices, form, board, host: QWidget,
                  parent: Optional[QObject] = None, *,
-                 task_limit: int = config.MAX_MONITOR_TASKS):
+                 task_limit: int = config.MAX_MONITOR_TASKS,
+                 db=None, auto_marker: Optional[AutoMarkerService] = None,
+                 export_worker_factory: Optional[Callable] = None,
+                 wait_service: Optional[WaitService] = None,
+                 snapshot_writer: Optional[StageSnapshotWriter] = None,
+                 launcher=None, live_stats_worker_factory=None):
         super().__init__(parent)
         self.manager = manager
         self.services = services
@@ -150,14 +245,50 @@ class MonitorPresenter(QObject):
         self.board = board
         self.host = host
         self.task_limit = task_limit
+        # 方案落库（tasks.plan_json）与自动导出读库用的数据库；缺省取 manager 持有的实例
+        self._db = db if db is not None else getattr(manager, 'db', None)
+        self._export_worker_factory = export_worker_factory or ReportWorker
+        # 进行中的自动导出线程（持有引用直到线程结束）
+        self._export_workers: List[Any] = []
+        self._live_worker_factory = live_stats_worker_factory or LiveStatsWorker
+        self._live_sequence = itertools.count(1)
+        self._live_generations = {}
+        self._live_workers = {}
+        self._live_boundaries = {}
+        self._live_shutdown = False
+        self._live_retries = {}
+        self._live_retry_attempts = {}
+        self._live_retry_needed = set()
 
         self._tasks: Dict[str, _TaskEntry] = {}
-        # 等待进程启动的请求 {等待 ID: 请求}
-        self._waits: Dict[str, _WaitEntry] = {}
-        self._wait_ids = itertools.count(1)
+        # 启动 / 关闭被测程序；勾选"停止时关闭"的任务 {task_id: (PID, 创建时间)}
+        self.launcher = (launcher if launcher is not None
+                         else getattr(services, 'launcher', None) or ProcessLauncher())
+        self._close_targets: Dict[str, Tuple[int, Optional[float]]] = {}
+        # 本页按钮正在发起暂停 / 恢复的任务：manager 随之发的 task_paused / task_resumed
+        # 是这次操作的回声，按钮路径已更新卡片，不再重复
+        self._commanding: Optional[str] = None
+        # 数据库只读（由更高版本创建）时的原因文案：不能开始监控、不能打点
+        self._read_only_reason: Optional[str] = None
+        # 等待进程启动：按名轮询与建任务交给 WaitService，这里只管占位卡 {等待 ID: 请求}
+        self.wait_service = (wait_service if wait_service is not None
+                             else WaitService(manager, services.process_query,
+                                              services.clock, self))
+        self._waits: Dict[str, WaitRequest] = {}
+        self.wait_service.failed.connect(self._on_wait_failed)
         # 当前显示中的错误提示 {(task_id, 内容): 提示对象}：错误提示不自动消失，
         # 同一任务同一错误重复上报时不再叠加
         self._error_bars: Dict[Tuple[str, str], Any] = {}
+        # 打点回显与撤销；卡片迷你图打点刻度的右键菜单也在这里
+        self._marker_feedback = MarkerFeedback(manager, services, host, self._tasks.get)
+        # 每个任务一个迷你图右键菜单流程：菜单弹出后是非阻塞的，动作触发时流程对象必须还在，
+        # 所以按任务缓存、随卡片一起释放
+        self._marker_flows: Dict[str, MarkerEditFlow] = {}
+        self._cleared_cards = []
+        self._clear_generation = 0
+        self._clear_timer = QTimer(self)
+        self._clear_timer.setSingleShot(True)
+        self._clear_timer.timeout.connect(self._expire_cleared_cards)
 
         # 每秒刷新运行中卡片的"已运行"等时间文案（有运行中卡片时才走）
         self._tick_timer = QTimer(self)
@@ -183,6 +314,7 @@ class MonitorPresenter(QObject):
         self.board.pause_requested.connect(self.on_pause)
         self.board.resume_requested.connect(self.on_resume)
         self.board.marker_requested.connect(self.on_marker)
+        self.board.marker_menu_requested.connect(self.on_marker_menu)
         self.board.history_requested.connect(self.history_requested)
         self.board.restart_requested.connect(self.on_restart)
         self.board.close_requested.connect(self.on_close)
@@ -192,11 +324,58 @@ class MonitorPresenter(QObject):
         manager.task_added.connect(self.on_task_added)
         manager.task_started.connect(self.on_task_started)
         manager.task_stopped.connect(self.on_task_stopped)
-        manager.data_updated.connect(self.on_data_updated)
+        plan_saved = getattr(manager, 'task_plan_saved', None)
+        if plan_saved is not None:
+            plan_saved.connect(self._on_plan_saved)
+        sample_updated = getattr(manager, 'sample_updated', None)
+        if sample_updated is None:
+            manager.data_updated.connect(self.on_data_updated)
+        else:
+            sample_updated.connect(self.on_sample_updated)
         manager.markers_changed.connect(self.on_markers_changed)
         manager.error_occurred.connect(self.on_error)
         manager.metrics_unavailable.connect(self.on_metrics_unavailable)
         manager.task_limit_reached.connect(self.on_limit_reached)
+        manager.task_paused.connect(self.on_task_paused)
+        manager.task_resumed.connect(self.on_task_resumed)
+        # 进程组成员变化；替身管理器可以没有这个信号
+        members_changed = getattr(manager, 'members_changed', None)
+        if members_changed is not None:
+            members_changed.connect(self.on_members_changed)
+        # 被测目标元数据由 manager 在任务启动后后台探测并落库（无窗口模式同样有）；
+        # 这里只把摘要行补进卡片的悬停提示。替身管理器可以没有这个信号
+        target_info_ready = getattr(manager, 'target_info_ready', None)
+        if target_info_ready is not None:
+            target_info_ready.connect(self.on_target_info_ready)
+        # 被测进程退出后等它重启（续接）：进入 / 离开等待、续接成功；替身管理器可以没有这两个信号
+        for signal_name, slot in (('task_waiting_restart', self.on_task_waiting_restart),
+                                  ('task_restarted', self.on_task_restarted)):
+            signal = getattr(manager, signal_name, None)
+            if signal is not None:
+                signal.connect(slot)
+
+        # 自动打点与停止条件：每个采集周期经 data_updated、另由每秒的 tick 兜底驱动
+        self.auto_marker = (auto_marker if auto_marker is not None
+                            else AutoMarkerService(manager, services.clock, self))
+        self.auto_marker.auto_stopped.connect(self.on_auto_stopped)
+        self.auto_marker.marker_added.connect(
+            lambda task_id, marker: self._marker_feedback.announce([(task_id, marker)]))
+        self.auto_marker.export_requested.connect(self.on_export_requested)
+        self.form.browse_log_requested.connect(self.on_browse_log)
+        self.form.browse_export_dir_requested.connect(self.on_browse_export_dir)
+        self.form.browse_snapshot_dir_requested.connect(self.on_browse_snapshot_dir)
+        self.form.browse_exe_requested.connect(self.on_browse_exe)
+        self.form.browse_cwd_requested.connect(self.on_browse_cwd)
+
+        # 阶段快照：方案到期 → 后台写报告图片与摘要 CSV（命令行开始的任务挂在同一个自动
+        # 打点服务上，也经这里写）
+        self.snapshot_writer = (snapshot_writer if snapshot_writer is not None
+                                else StageSnapshotWriter(self._db, manager, services.threads,
+                                                         services.clock, self,
+                                                         renderer=render_report_for))
+        self.auto_marker.stage_snapshot_due.connect(self.on_stage_snapshot_due)
+        self.snapshot_writer.failed.connect(self.on_stage_snapshot_failed)
+        self.snapshot_writer.written.connect(self.on_stage_snapshot_written)
 
     # ========== 查询（供页面与测试） ==========
 
@@ -220,6 +399,24 @@ class MonitorPresenter(QObject):
     def wait_ids(self) -> List[str]:
         """等待中的进程启动请求 ID（按加入顺序）。"""
         return list(self._waits)
+
+    @property
+    def read_only(self) -> bool:
+        """数据库是否只读（只读时拒绝开始监控与打点）"""
+        return self._read_only_reason is not None
+
+    def set_read_only(self, reason: Optional[str]) -> None:
+        """数据库只读（主窗口按 Database.read_only 设置）：禁用开始按钮并在 tooltip 写明原因，
+        之后的开始、等待、同配置再测与打点请求都被拒绝并就近提示。reason 为 None 时恢复。"""
+        self._read_only_reason = reason or None
+        self.form.set_start_blocked(self._read_only_reason)
+
+    def _reject_if_read_only(self) -> bool:
+        """只读时就近提示并返回 True"""
+        if self._read_only_reason is None:
+            return False
+        self._warn(self._read_only_reason, title=READ_ONLY_TITLE)
+        return True
 
     def next_marker_label(self, task_id: str) -> Optional[str]:
         """下一个打点的默认名称（基线 / 第 N 轮）；面板上没有该任务时返回 None。"""
@@ -257,7 +454,8 @@ class MonitorPresenter(QObject):
             self._tick_timer.stop()
 
     def tick(self) -> None:
-        """刷新运行中卡片的时间文案（定时器每秒调用；测试可直接调用）。"""
+        """刷新运行中卡片的时间文案，并驱动自动打点服务（定时器每秒调用；测试可直接调用）。
+        自动打点也随每个采集周期驱动，这里保证长周期与暂停时也能准时打点、按时长停止。"""
         now = self.services.clock.now()
         for task_id, entry in self._tasks.items():
             if entry.finished:
@@ -265,23 +463,41 @@ class MonitorPresenter(QObject):
             card = self.board.card(task_id)
             if card is not None:
                 card.tick(now)
+            if entry.is_group:
+                self._refresh_members(task_id)
+        self.auto_marker.tick()
 
     # ========== 新建任务 ==========
 
     def on_choose_metrics(self) -> None:
         """弹出指标多选对话框；确定后记住本次选择。"""
-        selected = self.services.dialogs.choose_metrics(
-            self._dialog_parent(), self.form.metrics())
+        group = self._form_kind() != TARGET_PID
+        if group:
+            # 进程组任务有自己的一份选择：对组不适用的指标在对话框里置灰，不写进"上次的指标"
+            # （那是单进程任务的默认值）
+            selected = self.services.dialogs.choose_metrics(
+                self._dialog_parent(), self.form.metrics(), group=True)
+        else:
+            selected = self.services.dialogs.choose_metrics(
+                self._dialog_parent(), self.form.metrics())
         if selected is None:
             return
         metrics = list(selected)
-        self.services.preferences.remember_last_metrics(metrics)
+        if not group:
+            self.services.preferences.remember_last_metrics(metrics)
         self.form.set_metrics_summary(metrics)
+
+    def _form_kind(self) -> str:
+        """表单当前的目标类型（替身表单没有目标类型时按单个进程）。"""
+        getter = getattr(self.form, 'target_kind', None)
+        return getter() if getter is not None else TARGET_PID
 
     def on_target_invalid(self, error: ResolveError) -> None:
         self.form.show_error(resolve_error_text(error))
 
     def on_start_requested(self, request: TaskRequest) -> Optional[str]:
+        if self._reject_if_read_only():
+            return None
         if not request.metrics:
             self._warn("请先选择要监控的指标")
             return None
@@ -289,16 +505,308 @@ class MonitorPresenter(QObject):
 
     def start_monitoring(self, request: TaskRequest) -> Optional[str]:
         """创建并启动任务；同一 PID 已有运行中任务时先确认。返回任务 ID，
-        取消或创建失败返回 None。"""
-        if (self.manager.has_running_task_for_pid(request.pid)
-                and not self._confirm_duplicate_pid(request)):
+        取消或创建失败返回 None；数据库只读或自动化方案有误时拒绝并提示。
+
+        带方案时：建任务后记下方案、尝试写入 tasks.plan_json（任务行要等采集线程启动才
+        写入，写不进去就在之后的采集周期里补存）、交给自动打点服务，再启动任务——
+        服务以 task_started 的时刻起算。"""
+        if self._reject_if_read_only():
             return None
+        plan = request.plan
+        if plan is not None and plan.is_empty():
+            plan = None
+        if plan is not None:
+            errors = plan.validate(request.interval)
+            if errors:
+                self._warn("；".join(errors), title=PLAN_INVALID_TITLE)
+                return None
+        if request.launch is not None:
+            # 先启动被测程序：拿到的 PID 是新进程，不会与已有任务重复
+            request = self._launch_target(request)
+            if request is None:
+                return None
+        elif request.target_kind == TARGET_PID:
+            if (self.manager.has_running_task_for_pid(request.pid)
+                    and not self._confirm_duplicate_pid(request)):
+                return None
+        elif self._has_running_group(request) and not self._confirm_duplicate_group(request):
+            return None
+        if request.target_kind == TARGET_PID:
+            metrics, extra = list(request.metrics), {}
+        else:
+            # 对组不适用的指标（峰值类、基本优先级）剔除；进程总数由 manager 补上
+            metrics, extra = filter_group_metrics(request.metrics), {
+                'target_kind': request.target_kind}
         task_id = self.manager.create_task(
-            request.pid, request.name, list(request.metrics), request.interval,
-            note=request.note, create_time=request.create_time)
-        if task_id:
-            self.manager.start_task(task_id)
+            request.pid, request.name, metrics, request.interval,
+            note=request.note, create_time=request.create_time,
+            **({key: value for key, value in (('scenario', request.scenario), ('build', request.build))
+                if value}), **extra)
+        if not task_id:
+            if request.launch is not None:
+                logger.warning("被测程序已启动但没能创建任务: pid=%s", request.pid)
+                self._warn(LAUNCHED_NOT_MONITORED_TEXT.format(name=request.name, pid=request.pid),
+                           title=LAUNCHED_NOT_MONITORED_TITLE, duration=RESTART_HINT_INFOBAR_MS)
+            return task_id
+        if request.launch is not None:
+            self._remember_launch(task_id, request)
+        if plan is not None:
+            self._apply_plan(task_id, plan)
+        self.manager.start_task(task_id)
         return task_id
+
+    # ========== 启动被测程序 ==========
+
+    def _launch_target(self, request: TaskRequest) -> Optional[TaskRequest]:
+        """启动请求里的程序，返回填好 PID / 进程名 / 创建时间的请求；失败就近提示并返回 None。
+        先确认任务建得起来（没满、没在清理数据库），不留下没人监控的程序。"""
+        can_add = getattr(self.manager, 'can_add_task', None)
+        if can_add is not None and not can_add():
+            self.on_limit_reached()
+            return None
+        if self.manager.is_maintenance_running():
+            self._warn(LAUNCH_MAINTENANCE_TEXT)
+            return None
+        result = self.launcher.launch(request.launch)
+        if not result.ok:
+            self.form.show_launch_error(result.error or "")
+            return None
+        return replace(request, pid=result.pid, name=result.name or request.launch.name,
+                       create_time=result.create_time)
+
+    def _remember_launch(self, task_id: str, request: TaskRequest) -> None:
+        entry = self._tasks.get(task_id)
+        if entry is not None:
+            entry.launch = request.launch
+            entry.close_on_stop = request.close_on_stop
+        if request.close_on_stop:
+            self._close_targets[task_id] = (request.pid, request.create_time)
+
+    def is_launched(self, task_id: str) -> bool:
+        """该卡片的任务是否由本页启动了被测程序。"""
+        entry = self._tasks.get(task_id)
+        return entry is not None and entry.launch is not None
+
+    def _close_launched(self, task_id: str, reason: StopReason) -> None:
+        """勾选了"停止时关闭"的启动型任务结束：只有用户停止（含方案的停止条件）才关闭
+        程序；被测进程自己退出、PID 复用等不动。关闭在后台线程进行（先 WM_CLOSE 再等待）。"""
+        target = self._close_targets.pop(task_id, None)
+        if target is None or reason is not StopReason.USER:
+            return
+        pid, create_time = target
+        close_in_background(self.launcher, pid, create_time, self.services.threads)
+
+    def on_browse_exe(self) -> None:
+        """启动区程序路径的"浏览…"。"""
+        current = self.form.launch_exe()
+        path = self.services.dialogs.ask_open_file(
+            self._dialog_parent(), BROWSE_EXE_TITLE,
+            os.path.dirname(current) if current else '', BROWSE_EXE_FILTER)
+        if path:
+            self.form.set_launch_exe(path)
+
+    def on_browse_cwd(self) -> None:
+        """启动区工作目录的"选择…"。"""
+        start = self.form.launch_cwd() or os.path.dirname(self.form.launch_exe())
+        path = self.services.dialogs.ask_directory(
+            self._dialog_parent(), BROWSE_CWD_TITLE, start)
+        if path:
+            self.form.set_launch_cwd(path)
+
+    # ========== 自动化方案 ==========
+
+    def plan_of(self, task_id: str) -> Optional[AutomationPlan]:
+        """卡片对应任务的自动化方案；没有方案或不在面板上返回 None。"""
+        entry = self._tasks.get(task_id)
+        return entry.plan if entry is not None else None
+
+    def _apply_plan(self, task_id: str, plan: AutomationPlan) -> None:
+        self.manager.seed_restart_policy(task_id, plan.resume_on_restart, plan.restart_limit)
+        entry = self._tasks.get(task_id)
+        if entry is not None:
+            entry.plan = plan
+            entry.plan_saved = False
+            card = self.board.card(task_id)
+            if card is not None:
+                # 悬停卡片即可看到这个任务的自动化设置
+                card.setToolTip(plan_summary(plan))
+        self._save_plan(task_id, plan)
+        self.auto_marker.attach(task_id, plan)
+
+    def _save_plan(self, task_id: str, plan: AutomationPlan) -> bool:
+        """把方案写进 tasks.plan_json；任务行尚不存在或写库失败返回 False（稍后再试）。"""
+        store = getattr(self._db, 'tasks', None)
+        entry = self._tasks.get(task_id)
+        if store is None:
+            if entry is not None:
+                entry.plan_saved = True     # 没有可写的数据库（降级或测试），不再重试
+            return False
+        try:
+            save = getattr(self.manager, 'save_task_plan', store.save_plan)
+            saved = bool(save(task_id, plan.to_json()))
+        except StorageError:
+            logger.error("保存自动化方案失败: task_id=%s", task_id, exc_info=True)
+            saved = False
+        if entry is not None:
+            entry.plan_saved = saved
+        if saved and not hasattr(self.manager, 'save_task_plan'):
+            self.manager.release_restart_policy_seed(task_id)
+        return saved
+
+    def _on_plan_saved(self, task_id: str) -> None:
+        entry = self._tasks.get(task_id)
+        if entry is not None:
+            entry.plan_saved = True
+
+    def _retry_save_plan(self, task_id: str) -> None:
+        entry = self._tasks.get(task_id)
+        if entry is not None and entry.plan is not None and not entry.plan_saved:
+            self._save_plan(task_id, entry.plan)
+
+    def on_auto_stopped(self, task_id: str, reason: str) -> None:
+        """按方案自动停止：卡片转"正在停止"并提示原因（任务随后照常经 task_stopped 结束，
+        停止原因是"用户停止"，不按异常结束提示）。"""
+        entry = self._tasks.get(task_id)
+        if entry is None:
+            return
+        entry.stopping = True
+        card = self.board.card(task_id)
+        if card is not None:
+            card.set_stopping()
+        self.services.notifier.info(
+            self.host, AUTO_STOP_TITLE,
+            f"{entry.display_name}：{auto_stop_text(reason, entry.plan)}",
+            AUTO_STOP_INFOBAR_MS)
+
+    def on_browse_log(self) -> None:
+        """自动化区日志文件的"浏览…"。"""
+        path = self.services.dialogs.ask_open_file(
+            self._dialog_parent(), BROWSE_LOG_TITLE,
+            os.path.dirname(self.form.log_path()), BROWSE_LOG_FILTER)
+        if path:
+            self.form.set_log_path(path)
+
+    def on_browse_export_dir(self) -> None:
+        """自动化区导出目录的"选择…"。"""
+        path = self.services.dialogs.ask_directory(
+            self._dialog_parent(), BROWSE_EXPORT_TITLE, self.form.export_dir())
+        if path:
+            self.form.set_export_dir(path)
+
+    def on_browse_snapshot_dir(self) -> None:
+        """自动化区阶段快照目录的"选择…"。"""
+        path = self.services.dialogs.ask_directory(
+            self._dialog_parent(), BROWSE_SNAPSHOT_TITLE, self.form.snapshot_dir())
+        if path:
+            self.form.set_snapshot_dir(path)
+
+    # ========== 阶段快照 ==========
+
+    def on_stage_snapshot_due(self, task_id: str, directory: str, index: int) -> bool:
+        """方案到了写阶段快照的时刻：交给写入器在后台写（上一次没写完时它会跳过本次）。"""
+        return self.snapshot_writer.write(task_id, directory, index)
+
+    def on_stage_snapshot_failed(self, task_id: str, message: str) -> None:
+        """阶段快照没写出来（写入器保证每个任务只来一次）：提示原因，采集不受影响。"""
+        entry = self._tasks.get(task_id)
+        name = entry.display_name if entry is not None else task_id
+        self.services.notifier.warning(
+            self.host, STAGE_SNAPSHOT_FAILED_TITLE, stage_snapshot_failed_text(name, message),
+            STAGE_SNAPSHOT_FAILED_INFOBAR_MS)
+
+    def on_stage_snapshot_written(self, task_id: str, paths) -> None:
+        entry = self._tasks.get(task_id)
+        name = entry.display_name if entry is not None else task_id
+        files = "、".join(os.path.basename(p) for p in (paths or ()))
+        self.services.notifier.info(
+            self.host, STAGE_SNAPSHOT_DONE_TITLE, f"{name}：{files}",
+            STAGE_SNAPSHOT_DONE_INFOBAR_MS)
+
+    # ========== 停止后自动导出 ==========
+
+    def on_export_requested(self, task_id: str, export_dir: str) -> bool:
+        """带"停止后自动导出"的任务已结束（数据已全部落库）：在后台把明细 CSV（含元数据、
+        已运行秒数、打点列与空洞空行）写到方案的导出目录，与清理数据库互斥。
+        返回是否已启动导出。
+
+        报告图片与摘要 CSV 依赖分析页的离屏渲染与分析结果，不在这里生成。"""
+        entry = self._tasks.get(task_id)
+        name = entry.display_name if entry is not None else task_id
+        db = self._db
+        if db is None:
+            self._export_failed(name, AUTO_EXPORT_NO_DATABASE)
+            return False
+        task = db.get_task(task_id)
+        if task is None or task.start_time is None:
+            self._export_failed(name, AUTO_EXPORT_NO_TASK)
+            return False
+        if self.manager.is_maintenance_running() or not self.manager.begin_export():
+            self._export_failed(name, AUTO_EXPORT_BUSY)
+            return False
+        try:
+            os.makedirs(export_dir, exist_ok=True)
+        except OSError as exc:
+            self.manager.end_export()
+            self._export_failed(name, f"无法创建导出目录：{exc}")
+            return False
+        csv_path = _unique_path(os.path.join(export_dir, task_basename(task) + DATA_CSV_SUFFIX))
+        job = ReportJob(
+            task=task, csv_path=csv_path,
+            metadata=tuple(metadata_lines(
+                task, exported_at=self.services.clock.now(), range_text=AUTO_EXPORT_RANGE_TEXT,
+                sample_count=task.sample_count or None,
+                end_time=task.end_time or task.last_sample_at)),
+            gap_seconds=gap_threshold_seconds(task.interval))
+        worker = self._export_worker_factory(db, job)
+        self._export_workers.append(worker)
+        worker.result.connect(lambda result, n=name: self._export_done(n, result))
+        worker.failed.connect(lambda message, n=name: self._export_failed(n, message))
+        # 注销导出挂在 QThread.finished 上：取消（退出时）不发结果/失败，finished 仍会触发
+        worker.finished.connect(lambda w=worker: self._export_thread_finished(w))
+        self.services.threads.register(worker, name=AUTO_EXPORT_THREAD_NAME,
+                                       cancel=worker.cancel, timeout_ms=AUTO_EXPORT_TIMEOUT_MS)
+        worker.start()
+        return True
+
+    def _export_thread_finished(self, worker) -> None:
+        self.manager.end_export()
+        if worker in self._export_workers:
+            self._export_workers.remove(worker)
+
+    def _export_done(self, name: str, result) -> None:
+        paths = getattr(result, 'paths', ()) or ()
+        self.services.notifier.success(
+            self.host, AUTO_EXPORT_DONE_TITLE, f"{name}：{paths[0] if paths else ''}",
+            AUTO_EXPORT_INFOBAR_MS)
+
+    def _export_failed(self, name: str, message: str) -> None:
+        logger.warning("自动导出未完成: %s：%s", name, message)
+        self.services.notifier.error(self.host, AUTO_EXPORT_FAILED_TITLE, f"{name}：{message}")
+
+    def _has_running_group(self, request: TaskRequest) -> bool:
+        """是否已有同一目标的运行中进程组任务：同名进程看进程名，进程树看根 PID。"""
+        list_infos = getattr(self.manager, 'list_task_infos', None)
+        if list_infos is None:
+            return False
+        for info in list_infos():
+            if (info.target_kind != request.target_kind or info.is_stopping
+                    or info.status != TaskStatus.RUNNING):
+                continue
+            if request.target_kind == TARGET_NAME:
+                if info.process_name.casefold() == request.name.casefold():
+                    return True
+            elif info.pid == request.pid:
+                return True
+        return False
+
+    def _confirm_duplicate_group(self, request: TaskRequest) -> bool:
+        if request.target_kind == TARGET_NAME:
+            title, what = "已在监控同名进程", f"全部 {request.name} 进程"
+        else:
+            title, what = "已在监控该进程树", f"{request.name}（PID {request.pid}）的进程树"
+        return self.services.dialogs.confirm(
+            self._dialog_parent(), title,
+            f"{what}已有一个运行中的监控任务。\n仍要再创建一个吗？", "继续创建")
 
     def _confirm_duplicate_pid(self, request: TaskRequest) -> bool:
         return self.services.dialogs.confirm(
@@ -311,13 +819,16 @@ class MonitorPresenter(QObject):
 
     def on_wait_requested(self, request: WaitRequest) -> Optional[str]:
         """登记一次等待：面板放占位卡，立刻查一次（进程已在运行就直接开始），
-        之后每秒查一次。返回等待 ID；没选指标时拒绝并返回 None。"""
+        之后每秒查一次。返回等待 ID；没选指标或数据库只读时拒绝并返回 None。"""
+        if self._reject_if_read_only():
+            return None
         if not request.metrics:
             self._warn("请先选择要监控的指标")
             return None
         had_tasks = self._has_items()
-        wait_id = f"wait-{next(self._wait_ids)}"
-        self._waits[wait_id] = _WaitEntry(wait_id, request)
+        wait_id = self.wait_service.add(request, starter=self._start_waited,
+                                       timeout_s=getattr(request, 'timeout_s', None))
+        self._waits[wait_id] = request
         self.board.add_waiting(wait_id, request.name, request.note)
         self._set_has_tasks(had_tasks)
         self.poll_waits()
@@ -328,7 +839,14 @@ class MonitorPresenter(QObject):
         """占位卡的"取消等待"。"""
         self._drop_wait(wait_id)
 
+    def _on_wait_failed(self, wait_id: str, reason: str) -> None:
+        if wait_id not in self._waits:
+            return
+        self._drop_wait(wait_id)
+        self._warn(reason.split(':', 1)[1] if ':' in reason else '等待进程启动失败，请重新选择目标')
+
     def _drop_wait(self, wait_id: str) -> None:
+        self.wait_service.cancel(wait_id)
         if self._waits.pop(wait_id, None) is None:
             return
         had_tasks = True
@@ -344,23 +862,18 @@ class MonitorPresenter(QObject):
 
     def poll_waits(self) -> None:
         """查一遍各等待中的进程（定时器每秒调用；测试可直接调用）：出现即移除占位卡，
-        按请求参数建任务。同名进程有多个时取最新启动的那个。"""
-        query = self.services.process_query
-        for wait_id, entry in list(self._waits.items()):
-            if wait_id not in self._waits:
-                continue
-            for name in entry.candidate_names():
-                matches = query.find_pids_by_name(name)
-                if matches:
-                    break
-            else:
-                continue
-            pid, create_time = max(matches, key=lambda m: m[1] or 0.0)
-            request = entry.request
-            self._drop_wait(wait_id)
-            self.start_monitoring(TaskRequest(
-                pid=pid, name=name, create_time=create_time, metrics=request.metrics,
-                interval=request.interval, note=request.note))
+        按请求参数建任务；同名多个时提示选择具体 PID（WaitService 负责查找）。"""
+        self.wait_service.poll()
+
+    def _start_waited(self, wait_id: str, match: WaitMatch) -> Optional[str]:
+        """WaitService 等到了进程：先移除占位卡再按请求开始监控（与手动开始走同一流程）。"""
+        request = match.request
+        self._drop_wait(wait_id)
+        return self.start_monitoring(TaskRequest(
+            pid=match.pid, name=match.name, create_time=match.create_time,
+            metrics=request.metrics, interval=request.interval, note=request.note,
+            plan=request.plan, target_kind=getattr(request, 'target_kind', TARGET_PID),
+            scenario=getattr(request, 'scenario', ''), build=getattr(request, 'build', '')))
 
     # ========== manager 信号 ==========
 
@@ -371,51 +884,278 @@ class MonitorPresenter(QObject):
         had_tasks = self._has_items()
         self._tasks[task_id] = _TaskEntry(
             task_id=task_id, pid=info.pid, process_name=info.process_name,
-            metric_types=tuple(info.metric_types), interval=info.interval, note=info.note)
+            metric_types=tuple(info.metric_types), interval=info.interval, note=info.note,
+            target_kind=getattr(info, 'target_kind', TARGET_PID),
+            scenario=getattr(info, 'scenario', ''), build=getattr(info, 'build', ''))
         self.board.create_card(info)
         self._sync_counts()
         self._set_has_tasks(had_tasks)
 
     def on_task_started(self, task_id: str) -> None:
-        """卡片开始计时。不弹"已启动"提示：卡片就在眼前，结果直接可见。"""
+        """卡片开始计时。不弹"已启动"提示：卡片就在眼前，结果直接可见。
+        由命令行（IPC）开始的任务不经本页，方案由命令处理器挂到同一个自动打点服务并负责
+        落库；这里只把方案记到卡片上（悬停提示与"同配置再测"沿用）。"""
         card = self.board.card(task_id)
         if card is not None:
             card.set_started_at(self.services.clock.now())
+        self._adopt_external_plan(task_id)
+        self._request_live_stats(task_id)
         self._sync_counts()
+
+    def _adopt_external_plan(self, task_id: str) -> None:
+        entry = self._tasks.get(task_id)
+        if entry is None or entry.plan is not None:
+            return
+        plan_of = getattr(self.auto_marker, 'plan_of', None)
+        plan = plan_of(task_id) if plan_of is not None else None
+        if plan is None:
+            return
+        entry.plan = plan
+        entry.plan_saved = True
+        card = self.board.card(task_id)
+        if card is not None:
+            card.setToolTip(plan_summary(plan))
+
+    def on_members_changed(self, task_id: str) -> None:
+        """进程组的成员集合变了：刷新卡片的成员摘要。"""
+        self._refresh_members(task_id)
+
+    def _refresh_members(self, task_id: str) -> None:
+        """把 manager 的成员快照与"成员种类超限"标志交给卡片（卡片只在内容变化时重画）。"""
+        entry = self._tasks.get(task_id)
+        card = self.board.card(task_id)
+        reader = getattr(self.manager, 'group_members', None)
+        if entry is None or entry.finished or card is None or reader is None:
+            return
+        info = self.manager.get_task_info(task_id)
+        card.set_members(reader(task_id), bool(info is not None and info.members_truncated))
+
+    def on_task_waiting_restart(self, task_id: str, waiting: bool) -> None:
+        """被测进程退出后进入 / 离开"等待重启"：卡片写"等待重启（第 N/M 次）"，数字取自
+        manager 的任务快照（已续接次数 + 1 与上限）。"""
+        entry = self._tasks.get(task_id)
+        card = self.board.card(task_id)
+        info = self.manager.get_task_info(task_id)
+        if entry is None or entry.finished or card is None or info is None:
+            return
+        # 离开等待时任务可能回到"暂停"（进入等待前就是暂停的）：以任务快照为准刷新暂停按钮与胶囊
+        card.set_waiting_restart(waiting, getattr(info, 'restart_count', 0),
+                                 getattr(info, 'restart_limit', 0),
+                                 getattr(info, 'exit_code', None),
+                                 paused=bool(info.is_paused))
+
+    def on_task_restarted(self, task_id: str, count: int) -> None:
+        """被测进程已重启、任务续接到新进程：卡片 PID 换成新的（取自任务快照）、退出等待，
+        并给一条短暂提示"已续接：第 N 次启动 PID x"。"""
+        entry = self._tasks.get(task_id)
+        card = self.board.card(task_id)
+        info = self.manager.get_task_info(task_id)
+        if entry is None or entry.finished or card is None:
+            return
+        pid = info.pid if info is not None and info.pid else entry.pid
+        if entry.target_kind != TARGET_NAME:
+            entry.pid = pid
+            card.set_pid(pid)
+        extra = {'paused': bool(info.is_paused)} if info is not None else {}
+        card.set_waiting_restart(False, count, getattr(info, 'restart_limit', 0), **extra)
+        self._request_live_stats(task_id)
+        shown_pid = pid if entry.target_kind != TARGET_NAME else None
+        self.services.notifier.info(
+            self.host, RESTARTED_TITLE, f"{entry.process_name}：{restarted_hint_text(count, shown_pid)}",
+            RESTARTED_INFOBAR_MS)
+
+    def on_target_info_ready(self, task_id: str, info) -> None:
+        """被测目标元数据探测完成：卡片悬停提示追加"被测程序 / 命令行 / 环境"摘要行。"""
+        card = self.board.card(task_id)
+        set_summary = getattr(card, 'set_target_summary', None)
+        if set_summary is None or info is None:
+            return
+        try:
+            set_summary(info.summary_lines())
+        except Exception:
+            logger.warning("更新卡片的被测目标摘要失败: task_id=%s", task_id, exc_info=True)
 
     def on_task_stopped(self, task_id: str, reason: StopReason) -> None:
         """卡片保留并转为"已结束"，同时请 manager 移除 core 侧任务。remove_task 不阻塞：
         线程若还没退出，manager 会在它 finished 后再释放对象。"""
         entry = self._tasks.get(task_id)
+        # 异常退出（CRASHED）时卡片与提示要写退出码说明；此时任务还在 manager 里（下面才移除）
+        exit_code = self._exit_code_of(task_id) if reason is StopReason.CRASHED else None
         if entry is not None:
             entry.finished = True
-            self.board.finish_card(task_id, reason, self.services.clock.now())
+            # 任务行此时一定已落库：一个周期都没采到就结束时，方案在这里补存
+            self._retry_save_plan(task_id)
+            self.board.finish_card(task_id, reason, self.services.clock.now(), exit_code)
+            self._request_live_stats(task_id)
             self.form.forget_process_if(entry.pid)
             self._sync_tick_timer()
 
         self.manager.remove_task(task_id)
         self._sync_counts()
+        self._close_launched(task_id, reason)
 
-        reason_text = stop_reason_text(reason)
+        reason_text = stop_detail_text(reason, exit_code)
         if reason is StopReason.USER:
             # 用户自己点的停止：卡片当场转为已结束，不再弹提示
             return
 
-        # 被测进程崩溃/退出等自行结束：提示要显眼且停留更久，并通知主窗口在后台时补托盘气泡
+        # 被测进程崩溃/退出等自行结束：提示要显眼且停留更久；窗口在后台时 Notifier 改发托盘
+        # 气泡并闪任务栏
         name = entry.display_name if entry is not None else task_id
-        title = "监控任务异常结束"
-        content = f"{name}：{reason_text}"
-        self.services.notifier.warning(self.host, title, content, ABNORMAL_STOP_INFOBAR_MS)
-        self.task_ended_abnormally.emit(title, content)
+        self.services.notifier.route(
+            EVENT_TASK_ABNORMAL, 'warning', "监控任务异常结束", f"{name}：{reason_text}",
+            duration=ABNORMAL_STOP_INFOBAR_MS, key=EVENT_TASK_ABNORMAL, anchor=self.host)
+
+    def _exit_code_of(self, task_id: str) -> Optional[int]:
+        """被测进程最近一次退出的退出码（任务快照里取，没有或替身管理器不提供为 None）。"""
+        info = self.manager.get_task_info(task_id)
+        return getattr(info, 'exit_code', None) if info is not None else None
 
     def on_data_updated(self, task_id: str, values: dict) -> None:
         """每采集周期一次：卡片采集次数为内存自增，基线样本在内存里累积，不查库。"""
+        self.on_sample_updated(task_id, values, self.services.clock.now())
+
+    def on_sample_updated(self, task_id: str, values: dict, timestamp) -> None:
+        """采集事件可能早于落库；精确时间用于与后台聚合水位去重合并。"""
         card = self.board.card(task_id)
         if card is None:
             return
-        card.update_values(values, self.services.clock.now())
+        card.update_values(values, timestamp)
         card.increment_count()
         self._feed_baseline(task_id, values)
+        self._retry_save_plan(task_id)
+        stats = getattr(card, 'live_stats', None)
+        if (stats is not None and stats.needs_rebuild
+                and task_id not in self._live_workers and task_id not in self._live_retries):
+            self._request_live_stats(task_id)
+
+    def _cancel_live_stats(self, task_id):
+        self._live_generations.pop(task_id, None)
+        self._live_boundaries.pop(task_id, None)
+        self._live_retry_attempts.pop(task_id, None)
+        self._live_retry_needed.discard(task_id)
+        pending = self._live_retries.pop(task_id, None)
+        if pending is not None:
+            pending[2].stop()
+            pending[2].deleteLater()
+        worker = self._live_workers.pop(task_id, None)
+        if worker is not None:
+            worker.cancel()
+
+    def shutdown_live_stats(self) -> None:
+        """真退出先使所有结果失效，排队中的采集/停止信号也不能再开查询。"""
+        self._live_shutdown = True
+        for task_id in tuple(self._live_generations):
+            self._cancel_live_stats(task_id)
+        self._live_generations.clear()
+        self._live_boundaries.clear()
+
+    def _request_live_stats(self, task_id, markers=None, *, retry_attempt=0):
+        """仅发后台聚合请求；基线、重启、卡片生命周期各自使旧结果过期。"""
+        if self._live_shutdown:
+            return
+        card = self.board.card(task_id)
+        entry = self._tasks.get(task_id)
+        if (entry is None or card is None or self._db is None
+                or not hasattr(self._db, 'analytics')
+                or not hasattr(card, 'restore_live_stats')):
+            return
+        markers = self.manager.list_markers(task_id) if markers is None else markers
+        since = self._live_since(task_id, markers)
+        self._cancel_live_stats(task_id)
+        sequence = next(self._live_sequence)
+        self._live_generations[task_id] = sequence
+        self._live_boundaries[task_id] = since
+        self._live_retry_attempts[task_id] = retry_attempt
+        card.invalidate_live_stats(since)
+        request = LiveStatsRequest(task_id, entry.metric_types, since, sequence)
+        try:
+            worker = self._live_worker_factory(self._db, request)
+            self._live_workers[task_id] = worker
+            worker.result.connect(self._on_live_stats_result)
+            worker.failed.connect(self._on_live_stats_failed)
+            worker.finished.connect(self._on_live_stats_finished)
+            self.services.threads.register(worker, name='卡片趋势重建',
+                                           cancel=worker.cancel, timeout_ms=3000)
+            worker.start()
+        except Exception:
+            self._cancel_live_stats(task_id)
+            logger.exception('启动卡片趋势重建失败: task_id=%s', task_id)
+
+    def _live_since(self, task_id, markers):
+        baseline = self.manager.get_baseline(task_id, markers)
+        boundaries = [m.timestamp for m in markers if m.kind == 'restart']
+        if baseline is not None:
+            boundaries.append(baseline.timestamp)
+        return normalize_ms(max(boundaries)) if boundaries else None
+
+    @pyqtSlot(object)
+    def _on_live_stats_result(self, result):
+        if result is None:
+            return
+        request = result.request
+        worker = self._live_workers.get(request.task_id)
+        if (self._live_shutdown
+                or self._live_generations.get(request.task_id) != request.sequence
+                or worker is None or worker.is_cancelled):
+            return
+        card = self.board.card(request.task_id)
+        if card is not None and request.task_id in self._tasks:
+            if card.restore_live_stats(result.aggregates, request.since):
+                self._live_retry_needed.discard(request.task_id)
+            else:
+                self._live_retry_needed.add(request.task_id)
+
+    @pyqtSlot(str)
+    def _on_live_stats_failed(self, message):
+        worker = self.sender()
+        if worker is not None:
+            logger.warning('卡片趋势重建失败: task_id=%s, %s', worker.request.task_id, message)
+            task_id = worker.request.task_id
+            if (not self._live_shutdown and not worker.is_cancelled
+                    and self._live_workers.get(task_id) is worker
+                    and self._live_generations.get(task_id) == worker.request.sequence):
+                self._live_retry_needed.add(task_id)
+
+    @pyqtSlot()
+    def _on_live_stats_finished(self):
+        worker = self.sender()
+        if worker is not None and self._live_workers.get(worker.request.task_id) is worker:
+            task_id = worker.request.task_id
+            self._live_workers.pop(task_id, None)
+            if task_id in self._live_retry_needed:
+                self._live_retry_needed.discard(task_id)
+                if not worker.is_cancelled:
+                    self._schedule_live_stats_retry(task_id, worker.request.sequence)
+
+    def _schedule_live_stats_retry(self, task_id, sequence):
+        attempt = self._live_retry_attempts.get(task_id, 0)
+        if (self._live_shutdown or self._live_generations.get(task_id) != sequence
+                or task_id not in self._tasks or task_id in self._live_workers
+                or task_id in self._live_retries or attempt >= len(LIVE_STATS_RETRY_DELAYS_MS)):
+            return
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        self._live_retries[task_id] = (sequence, attempt + 1, timer)
+        timer.timeout.connect(self._on_live_stats_retry)
+        timer.start(LIVE_STATS_RETRY_DELAYS_MS[attempt])
+
+    @pyqtSlot()
+    def _on_live_stats_retry(self):
+        timer = self.sender()
+        for task_id, pending in tuple(self._live_retries.items()):
+            sequence, attempt, expected_timer = pending
+            if timer is not expected_timer:
+                continue
+            self._live_retries.pop(task_id, None)
+            timer.stop()
+            timer.deleteLater()
+            card = self.board.card(task_id)
+            if (not self._live_shutdown and self._live_generations.get(task_id) == sequence
+                    and task_id in self._tasks and task_id not in self._live_workers
+                    and card is not None and card.live_stats.needs_rebuild):
+                self._request_live_stats(task_id, retry_attempt=attempt)
+            return
 
     # ========== 基线 ==========
 
@@ -457,15 +1197,35 @@ class MonitorPresenter(QObject):
         markers = self.manager.list_markers(task_id)
         card.set_markers(markers)
 
+        update_rounds = getattr(card, 'set_round_deltas', None)
+        sample_at = getattr(self.manager, 'sample_values_at', None)
+        baseline_marker = self.manager.get_baseline(task_id, markers)
+        if update_rounds is not None and sample_at is not None and baseline_marker is not None:
+            rounds = [m for m in markers if m.kind == 'user' and m.timestamp >= baseline_marker.timestamp]
+            if rounds:
+                end = sample_at(task_id, entry.metric_types, rounds[-1].timestamp)
+                first = sample_at(task_id, entry.metric_types, baseline_marker.timestamp)
+                previous = sample_at(task_id, entry.metric_types,
+                                     rounds[-2].timestamp if len(rounds) > 1 else baseline_marker.timestamp)
+                update_rounds({m: (v - first[m]) / len(rounds) for m, v in end.items() if m in first},
+                              {m: v - previous[m] for m, v in end.items() if m in previous})
+            else:
+                update_rounds({}, {})
+
         baseline = self.manager.get_baseline(task_id, markers)
         if baseline is None:
             if entry.baseline is not None:
                 entry.baseline = None
                 card.clear_baseline()
+                self._request_live_stats(task_id, markers)
+            elif self._live_since(task_id, markers) != self._live_boundaries.get(task_id):
+                self._request_live_stats(task_id, markers)
             return
         current = entry.baseline
         if (current is not None and current.marker_id == baseline.id
                 and current.timestamp == baseline.timestamp):
+            if self._live_since(task_id, markers) != self._live_boundaries.get(task_id):
+                self._request_live_stats(task_id, markers)
             return
 
         seed = self.manager.baseline_samples(task_id, baseline)
@@ -475,6 +1235,7 @@ class MonitorPresenter(QObject):
             tracker.settled = seed.settled or entry.finished
         entry.baseline = tracker
         card.set_baseline(baseline.timestamp, self.baseline_values(task_id))
+        self._request_live_stats(task_id, markers)
 
     def on_metrics_unavailable(self, task_id: str,
                                reasons: Dict[str, UnavailableReason]) -> None:
@@ -499,7 +1260,8 @@ class MonitorPresenter(QObject):
         key = (task_id, error_msg)
         if key in self._error_bars:
             return
-        bar = self.services.notifier.error(self.host, "错误", error_msg)
+        bar = self.services.notifier.route(
+            EVENT_TASK_ERROR, 'error', "错误", error_msg, anchor=self.host)
         if bar is not None:
             self._error_bars[key] = bar
             bar.closedSignal.connect(lambda k=key: self._error_bars.pop(k, None))
@@ -530,16 +1292,46 @@ class MonitorPresenter(QObject):
 
     def on_pause(self, task_id: str) -> None:
         """manager 确认暂停成功后才更新卡片；任务正在停止等导致失败时不做任何事。"""
-        if self.manager.pause_task(task_id):
-            card = self.board.card(task_id)
-            if card is not None:
-                card.set_paused(True)
+        if self._command(self.manager.pause_task, task_id):
+            self._show_paused(task_id, True)
+            # 自动打点立即以此刻为暂停点，不等下一次 tick
+            self.auto_marker.process(task_id)
 
     def on_resume(self, task_id: str) -> None:
-        if self.manager.resume_task(task_id):
-            card = self.board.card(task_id)
-            if card is not None:
-                card.set_paused(False)
+        if self._command(self.manager.resume_task, task_id):
+            # 存储守卫可能在恢复信号中立即重新暂停，最终显示管理器的真实状态。
+            self._show_paused(task_id, self.manager.is_task_paused(task_id))
+            # 定时打点从恢复的这一刻重新计时
+            self.auto_marker.process(task_id)
+
+    def _command(self, command: Callable[[str], bool], task_id: str) -> bool:
+        """执行本页发起的暂停 / 恢复；执行期间 manager 发出的同名信号视为回声。"""
+        self._commanding = task_id
+        try:
+            return bool(command(task_id))
+        finally:
+            self._commanding = None
+
+    def _show_paused(self, task_id: str, paused: bool) -> None:
+        card = self.board.card(task_id)
+        if card is not None:
+            card.set_paused(paused)
+
+    def on_task_paused(self, task_id: str) -> None:
+        """别处（命令行、托盘等）暂停了任务：同步卡片。本页按钮那一次已由按钮路径更新。"""
+        if task_id != self._commanding:
+            self._show_paused(task_id, True)
+
+    def on_task_resumed(self, task_id: str) -> None:
+        if task_id != self._commanding:
+            self._show_paused(task_id, self.manager.is_task_paused(task_id))
+
+    def set_space_paused(self, task_ids) -> None:
+        """存储守卫因磁盘空间不足暂停的任务集合有变化：集合内（且确实在暂停）的卡片标注
+        暂停原因，其余清除标注。"""
+        ids = set(task_ids)
+        for task_id, card in self.board.cards().items():
+            card.set_pause_reason(SPACE_PAUSE_REASON if task_id in ids else None)
 
     def on_marker(self, task_id: str) -> None:
         """打点：弹出名称输入框（默认名称按序列：基线 / 第 N 轮），经 manager 写库，
@@ -547,27 +1339,64 @@ class MonitorPresenter(QObject):
         entry = self._tasks.get(task_id)
         if entry is None or entry.finished:
             return
+        if self._read_only_reason is not None:
+            self._warn(READ_ONLY_MARKER_BLOCKED, title=READ_ONLY_TITLE)
+            return
         # 打点时间取点击按钮的这一刻：输入名称要花好几秒，按确认时刻记录会让
         # 竖线落在事件之后，短周期下甚至把增长归到下一轮
         clicked_at = self.services.clock.now()
         default_label = self.manager.next_marker_label(task_id)
+        group_of = getattr(self.manager, 'task_group', lambda _tid: None)
+        group = group_of(task_id)
+        ids = ([tid for tid in self.active_task_ids() if group_of(tid) == group]
+               if group else [task_id])
+        defaults = {tid: self.manager.next_marker_label(tid) for tid in ids}
         label = self.services.dialogs.ask_marker_label(
             self._dialog_parent(), default_label, clicked_at,
-            process_name=entry.process_name, pid=entry.pid)
+            process_name=entry.process_name, pid=entry.marker_pid)
         if label is None:
             return
         if not label.strip():
             self._warn("打点名称不能为空")
             return
 
-        marker = self.manager.add_marker(
-            task_id, label, clicked_at, kind=default_marker_kind(default_label, label))
-        if marker is None:
+        batch, added = object(), []
+        for tid in ids:
+            marker = self.manager.add_marker(
+                tid, label, clicked_at,
+                kind=default_marker_kind(defaults[tid], label),
+                **({'undo_group': batch} if group else {}))
+            if marker is not None:
+                added.append((tid, marker))
+        if len(added) != len(ids):
             self.services.notifier.error(self.host, "打点失败", "未能保存打点，请查看日志")
+        self._marker_feedback.announce(added)
+
+    def undo_last_marker(self) -> None:
+        """撤销最近一次新增的打点（主窗口的 Ctrl+Z）：30 秒内有效，结果经 Notifier 提示。"""
+        self._marker_feedback.undo_last()
+
+    def marker_flow(self, task_id: str) -> MarkerEditFlow:
+        """卡片迷你图打点刻度的右键菜单逻辑：复用分析页的 MarkerEditFlow（重命名 / 删除 /
+        设为基线），写库命令经 CardMarkerCommands 交给 manager。"""
+        flow = self._marker_flows.get(task_id)
+        if flow is None:
+            card = self.board.card(task_id)
+            flow = self._marker_flows[task_id] = MarkerEditFlow(
+                CardMarkerCommands(self.manager, task_id, self._tasks.get(task_id)),
+                self.services, card if card is not None else self.host, parent=self)
+        return flow
+
+    def _drop_marker_flow(self, task_id: str) -> None:
+        flow = self._marker_flows.pop(task_id, None)
+        if flow is not None:
+            flow.deleteLater()
+
+    def on_marker_menu(self, task_id: str, marker, global_pos) -> None:
+        """迷你图上的用户打点 / 基线刻度右键：弹出菜单（系统打点的刻度发不出这个信号）。"""
+        if self._reject_if_read_only():
             return
-        self.services.notifier.success(
-            self.host, "已打点",
-            f"{marker.label} · {marker.timestamp.strftime('%H:%M:%S')}", 2000)
+        self.marker_flow(task_id).show_menu(0.0, marker, global_pos, include_add=False)
 
     # ========== 免弹窗打点（托盘菜单 / 全局快捷键） ==========
 
@@ -576,11 +1405,20 @@ class MonitorPresenter(QObject):
 
         task_id 给出时只打这个任务（托盘子菜单）；为 None 时打全部运行中/已暂停的
         任务（全局快捷键、只有一个任务时的托盘菜单）——同一轮操作对各被测进程是同一个
-        时刻。结果经 quick_marker_feedback 交给主窗口弹托盘气泡。
+        时刻。成功时回显增量并带"撤销"（窗口在后台时是托盘气泡，没有按钮，Ctrl+Z 回到窗口
+        后仍可撤销）；失败与没有可打点的任务经 quick_marker_feedback 交给主窗口提示。
         """
+        if self._read_only_reason is not None:
+            # 托盘与全局快捷键也不能写只读库（正常情况下只读时本来就没有运行中的任务）
+            self.quick_marker_feedback.emit(
+                QUICK_MARKER_FAILED, READ_ONLY_TITLE, READ_ONLY_MARKER_BLOCKED)
+            return []
         ids = self.active_task_ids()
         if task_id is not None:
-            ids = [task_id] if task_id in ids else []
+            group_of = getattr(self.manager, 'task_group', lambda _tid: None)
+            group = group_of(task_id)
+            ids = ([tid for tid in ids if group_of(tid) == group] if group
+                   else [task_id] if task_id in ids else [])
         if not ids:
             self.quick_marker_feedback.emit(
                 QUICK_MARKER_NONE, "没有可打点的任务", "请先在监控页开始监控")
@@ -589,38 +1427,47 @@ class MonitorPresenter(QObject):
         when = self.services.clock.now()
         added: List[Tuple[_TaskEntry, Any]] = []
         failed: List[_TaskEntry] = []
+        batch = object()    # 这一次操作打的几个点一起撤销
         for tid in ids:
             entry = self._tasks[tid]
             label = self.manager.next_marker_label(tid)
             marker = self.manager.add_marker(
-                tid, label, when, kind=default_marker_kind(label, label))
+                tid, label, when, kind=default_marker_kind(label, label), undo_group=batch)
             if marker is None:
                 failed.append(entry)
             else:
                 added.append((entry, marker))
 
-        clock_text = when.strftime('%H:%M:%S')
         if failed:
             names = "、".join(entry.process_name for entry in failed)
             self.quick_marker_feedback.emit(
                 QUICK_MARKER_FAILED, "打点失败", f"{names}：未能保存打点，请查看日志")
-        if len(added) == 1:
-            entry, marker = added[0]
-            self.quick_marker_feedback.emit(
-                QUICK_MARKER_OK, f"已打点：{marker.label} {clock_text}",
-                f"{entry.process_name} · PID {entry.pid}")
-        elif added:
-            self.quick_marker_feedback.emit(
-                QUICK_MARKER_OK, f"已打点：{len(added)} 个任务 {clock_text}",
-                "；".join(f"{entry.process_name}：{marker.label}" for entry, marker in added))
+        self._marker_feedback.announce([(entry.task_id, marker) for entry, marker in added])
         return [marker for _entry, marker in added]
 
     def on_restart(self, task_id: str) -> Optional[str]:
-        """已结束卡片的"同配置再测"：按进程名找到唯一的运行进程时，以相同指标/间隔/
-        备注新建任务；找不到或有多个时把进程名填入搜索框，由用户自己选。"""
+        """已结束卡片的"同配置再测"：本页启动过被测程序的任务直接重新启动它再监控；
+        其余按进程名找到唯一的运行进程时，以相同指标/间隔/备注新建任务；找不到或有多个时
+        把进程名填入搜索框，由用户自己选。"""
         entry = self._tasks.get(task_id)
         if entry is None:
             return None
+        if entry.launch is not None:
+            # 启动型任务：直接重新启动同一个程序再监控（沿用参数与"停止时关闭"）
+            return self.start_monitoring(TaskRequest(
+                pid=0, name=entry.launch.name, create_time=None,
+                metrics=entry.metric_types,
+                interval=entry.interval or self.form.interval(), note=entry.note,
+                plan=entry.plan, launch=entry.launch, close_on_stop=entry.close_on_stop,
+                target_kind=entry.target_kind, scenario=entry.scenario, build=entry.build))
+
+        if entry.target_kind == TARGET_NAME:
+            # 同名进程不依赖某个具体进程：直接按进程名再开一个
+            return self.start_monitoring(TaskRequest(
+                pid=0, name=entry.process_name, create_time=None,
+                metrics=entry.metric_types,
+                interval=entry.interval or self.form.interval(), note=entry.note,
+                plan=entry.plan, target_kind=TARGET_NAME, scenario=entry.scenario, build=entry.build))
 
         # 精确匹配（不区分大小写）并排除本程序自身：被测的同名进程（如 python.exe）
         # 退出后，不能因为只剩本程序同名而自动监控起自己
@@ -630,9 +1477,19 @@ class MonitorPresenter(QObject):
             return self.start_monitoring(TaskRequest(
                 pid=pid, name=entry.process_name, create_time=create_time,
                 metrics=entry.metric_types,
-                interval=entry.interval or self.form.interval(), note=entry.note))
+                interval=entry.interval or self.form.interval(), note=entry.note,
+                plan=entry.plan, target_kind=entry.target_kind, scenario=entry.scenario, build=entry.build))
 
+        set_kind = getattr(self.form, 'set_target_kind', None)
+        if entry.is_group and set_kind is not None:
+            set_kind(entry.target_kind)   # 进程树：交给用户重新选根进程
         self.form.fill_search(entry.process_name)
+        if hasattr(self.form, 'scenario_edit'):
+            self.form.scenario_edit.setText(entry.scenario)
+            self.form.build_edit.setText(entry.build)
+        if entry.plan is not None:
+            # 交给用户自己选进程时，把上次的自动化方案填回表单，"开始"时一并沿用
+            self.form.set_automation_plan(entry.plan)
         if matches:
             self._warn(
                 f"找到 {len(matches)} 个 {entry.process_name} 进程，"
@@ -647,8 +1504,11 @@ class MonitorPresenter(QObject):
     def on_close(self, task_id: str) -> None:
         """从列表移除卡片（历史数据仍保留）。"""
         had_tasks = self._has_items()
+        self._cancel_live_stats(task_id)
         self._tasks.pop(task_id, None)
+        self._drop_marker_flow(task_id)
         self.board.remove_card(task_id)
+        self.snapshot_writer.forget(task_id)
         self._sync_counts()
         self._set_has_tasks(had_tasks)
 
@@ -657,9 +1517,60 @@ class MonitorPresenter(QObject):
         finished = [task_id for task_id, entry in self._tasks.items() if entry.finished]
         if not finished:
             return
+        self._expire_cleared_cards()
         had_tasks = self._has_items()
         for task_id in finished:
-            self._tasks.pop(task_id, None)
-            self.board.remove_card(task_id)
+            self._cancel_live_stats(task_id)
+            entry = self._tasks.pop(task_id, None)
+            self._drop_marker_flow(task_id)
+            take = getattr(self.board, 'take_card', None)
+            if take is not None:
+                card = take(task_id)
+                if card is not None:
+                    self._cleared_cards.append((entry, card))
+            else:
+                self.board.remove_card(task_id)
+            self.snapshot_writer.forget(task_id)
         self._sync_counts()
         self._set_has_tasks(had_tasks)
+        if self._cleared_cards:
+            self._clear_timer.start(30000)
+            generation = self._clear_generation
+            self.services.notifier.route('tasks.cleared', 'success', '已清除结束的卡片',
+                                         '历史数据仍保留；30 秒内可撤销',
+                                         action=NoticeAction('撤销', lambda: self.undo_clear_finished(generation)),
+                                         anchor=self.host)
+
+    def _expire_cleared_cards(self):
+        self._clear_timer.stop()
+        self._clear_generation += 1
+        for _entry, card in self._cleared_cards:
+            card.deleteLater()
+        self._cleared_cards = []
+
+    def undo_clear_finished(self, generation=None):
+        if generation is not None and generation != self._clear_generation:
+            self.services.notifier.info(self.host, '撤销已过期', '这次清除已超过时限或被后续操作替代')
+            return False
+        saved, self._cleared_cards = self._cleared_cards, []
+        self._clear_timer.stop()
+        self._clear_generation += 1
+        had_tasks = self._has_items()
+        for entry, card in saved:
+            self._tasks[entry.task_id] = entry
+            self.board.add_card(card, reconnect=False)
+            self._request_live_stats(entry.task_id)
+        self._sync_counts()
+        self._set_has_tasks(had_tasks)
+        return bool(saved)
+
+
+def _unique_path(path: str) -> str:
+    """目标已存在时在扩展名前加 _2、_3……：自动导出没人确认覆盖，不能覆盖已有文件。"""
+    if not os.path.exists(path):
+        return path
+    base, ext = os.path.splitext(path)
+    n = 2
+    while os.path.exists(f"{base}_{n}{ext}"):
+        n += 1
+    return f"{base}_{n}{ext}"

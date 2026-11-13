@@ -7,8 +7,10 @@
 """
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QHBoxLayout, QScrollArea, QVBoxLayout, QWidget
-from qfluentwidgets import CaptionLabel
+from qfluentwidgets import CaptionLabel, qconfig
+from ui.theme_tokens import WINDOW, TERTIARY, pick
 
+from ui.layout_breakpoints import LayoutBreakpoints
 from ui.typography import PageTitleLabel
 
 # 页边距与区块间距（4px 网格）
@@ -28,16 +30,22 @@ class PageScaffold(QScrollArea):
         header_layout: 页头整行（标题组 | 伸缩 | 命令区）
         command_layout: 页头右侧命令区，按添加顺序从左到右排列
         content_layout: 页头之下的内容区（纵向，区块间距 SECTION_SPACING）
+        breakpoints: 档位广播器（按页面宽度 = 内容区宽度分 compact / regular / wide），页内控件
+            订阅它的 tier_changed，不必各自在 resizeEvent 里判断宽度
     """
 
     def __init__(self, title: str, subtitle: str = "", parent=None, *,
                  spacing: int = SECTION_SPACING):
         super().__init__(parent)
+        self.breakpoints = LayoutBreakpoints(self)
+        self.breakpoints.track(self)
         self.setWidgetResizable(True)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         # 去掉边框与底色，透出主窗口的 Fluent 背景
         self.setStyleSheet("QScrollArea{background: transparent; border: none}")
         self.viewport().setStyleSheet("background: transparent")
+        self._apply_scroll_theme()
+        qconfig.themeChanged.connect(self._apply_scroll_theme)
 
         self.container = QWidget()
         self.container.setStyleSheet("background: transparent")
@@ -67,6 +75,16 @@ class PageScaffold(QScrollArea):
         self.header_layout.addLayout(self.command_layout)
         self.header_layout.setAlignment(self.command_layout, Qt.AlignTop)
         self.content_layout.addLayout(self.header_layout)
+
+    def _apply_scroll_theme(self, *_args):
+        """原生 QScrollArea 的滚动条不会跟随 Fluent 主题，显式同步轨道和滑块。"""
+        background, handle = pick(WINDOW), pick(TERTIARY)
+        self.verticalScrollBar().setStyleSheet(
+            'QScrollBar:vertical {background: ' + background + '; width: 10px; margin: 2px 0;}'
+            'QScrollBar::handle:vertical {background: ' + handle + '; border-radius: 3px;'
+            ' min-height: 24px; margin: 0 2px;}'
+            'QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {height: 0;}'
+            'QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {background: transparent;}')
 
     def set_title(self, text: str) -> None:
         self.title_label.setText(text)

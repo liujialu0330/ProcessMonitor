@@ -9,14 +9,21 @@
    None/[]/0/False"的，这里捕获 StorageError、记日志后返回原值。
 例外：vacuum() 失败抛 StorageError（设置页据此提示"清理失败"）；iter_data_points 失败
 抛 StorageError（导出必须知道读取是否完整）。
+
+只读模式（read_only=True）：库由更高版本写入、当前版本不能安全修改时使用（判定见
+data.db.meta.reader_blocked）；或升级失败、库仍是旧结构时（schema_mismatch=True，本版本的
+读写都按 v5 结构写成，不能在旧结构上写入）。不跑迁移；所有仓储写入抛 StorageError，门面旧写方法
+按原语义返回 False。
 """
 import logging
 import os
+import threading
 from datetime import datetime
-from typing import Iterator, List, Optional
+from typing import Collection, Iterator, List, Optional
 
 import config
 from data.db.connection import ConnectionFactory
+from data.db.meta import MetaInfo
 from data.db.migrations.runner import MigrationOutcome, MigrationReport, MigrationRunner
 from data.db.schema import SCHEMA_VERSION  # noqa: F401  兼容旧的 from data.database import SCHEMA_VERSION
 from data.errors import StorageError
@@ -46,7 +53,9 @@ class Database:
     """数据库门面：仓储的持有者 + 旧接口的兼容委托"""
 
     def __init__(self, db_path: str = None, migrate: bool = True,
-                 migration_report: Optional[MigrationReport] = None):
+                 migration_report: Optional[MigrationReport] = None,
+                 read_only: bool = False, newer_version: Optional[str] = None,
+                 schema_mismatch: bool = False):
         """
         Args:
             db_path: 数据库文件路径，默认使用 config 中的配置
@@ -54,9 +63,17 @@ class Database:
                 MigrationRunner，再以 False 构造，并把得到的报告传给 migration_report
                 （或之后调用 apply_migration_report）；其余调用方保持默认 True
             migration_report: migrate=False 时由调用方已跑出的迁移报告，用于映射提示标志
+            read_only: 只读打开（见模块说明）；为 True 时不跑迁移
+            newer_version: 只读打开时，写入本库的更高版本号（主窗口提示用；组合根由 meta 给出）
+            schema_mismatch: 库没能升级、仍是旧结构（组合根按迁移报告判定）；为 True 时
+                一律只读打开
         """
         self.db_path = db_path or config.DB_PATH
-        self._factory = ConnectionFactory(self.db_path)
+        self.schema_mismatch = schema_mismatch
+        read_only = read_only or schema_mismatch
+        self.read_only = read_only
+        self.newer_version: Optional[str] = newer_version if read_only else None
+        self._factory = ConnectionFactory(self.db_path, read_only=read_only)
         # 迁移三态标志（互斥，由 migration_report 映射而来，MainWindow 据此提示）：
         # - migration_failed: 迁移失败且未切到新库，本次运行新数据无法保存（通常已还原旧数据；
         #   还原与改名损坏库都失败时则是旧库原样留在原路径，下次启动会重新迁移）
@@ -66,8 +83,15 @@ class Database:
         self.data_reset: bool = False
         self.backup_aborted: bool = False
         self.migration_report: Optional[MigrationReport] = None
+        # 本次启动成功升级了库（MIGRATED）时：起始版本与旧文件的备份路径，主窗口据此提示
+        # 备份位置；其余情况为 None
+        self.migrated_from: Optional[int] = None
+        self.backup_path: Optional[str] = None
         self._save_failures = 0   # save_data_points 连续失败次数（日志节流用）
-        if migrate:
+        # 本线程最近一次 save_data_points 失败的原因（成功为 None）：采集线程据此区分
+        # "磁盘已满"（保留缓冲、暂停等空间）与其他失败（照旧重试），不改变返回值的口径
+        self._save_result = threading.local()
+        if migrate and not read_only:
             self._init_database()
         elif migration_report is not None:
             self.apply_migration_report(migration_report)
@@ -82,6 +106,10 @@ class Database:
     def _get_connection(self):
         """普通连接上下文（commit/rollback/close 语义见 ConnectionFactory.connect）"""
         return self._factory.connect()
+
+    def write_timeout(self, timeout_ms: int):
+        """短事务可选择较短的锁等待；作用域仅影响调用线程。"""
+        return self._factory.write_timeout(timeout_ms)
 
     def _transaction(self):
         """显式事务上下文（BEGIN IMMEDIATE，见 ConnectionFactory.transaction）"""
@@ -99,6 +127,9 @@ class Database:
         self.data_reset = outcome is MigrationOutcome.RESET
         self.migration_failed = outcome in (MigrationOutcome.FAILED_RESTORED,
                                             MigrationOutcome.FAILED_KEPT)
+        migrated = outcome is MigrationOutcome.MIGRATED
+        self.migrated_from = report.from_version if migrated else None
+        self.backup_path = report.backup_path if migrated else None
 
     def close(self) -> None:
         """释放常驻连接（之后仍可继续使用，会按需重新打开）"""
@@ -106,16 +137,61 @@ class Database:
 
     # ========== 启动校正（调用方须在任何新任务启动前显式调用一次） ==========
 
-    def reconcile_orphan_tasks(self) -> int:
-        """遗留的 running 任务校正为 stopped（见 TaskRepo.reconcile_orphans）；失败返回 0"""
+    def reconcile_orphan_tasks(self, *, exclude: Collection[str] = (),
+                               only: Optional[Collection[str]] = None) -> int:
+        """遗留的 running 任务校正为 stopped（见 TaskRepo.reconcile_orphans）；失败返回 0。
+        exclude / only 用于启动时保留待续采的任务、之后再校正用户放弃的那些"""
         try:
-            return self.tasks.reconcile_orphans()
+            return self.tasks.reconcile_orphans(exclude=exclude, only=only)
         except StorageError:
             logger.error("孤儿任务校正失败", exc_info=True)
             return 0
 
+    def import_legacy_points(self, on_progress=None) -> int:
+        """导回回退 1.4.1 期间写入 data_points 的样本（见 Maintenance.import_legacy_points）；
+        返回导回前的行数，失败返回 0"""
+        try:
+            return self.maintenance.import_legacy_points(on_progress=on_progress)
+        except StorageError:
+            logger.error("导回降级期间写入的数据点失败", exc_info=True)
+            return 0
+
+    def legacy_points_pending(self) -> int:
+        """待导回的 data_points 行数（见 Maintenance.legacy_points_pending）；失败返回 0"""
+        try:
+            return self.maintenance.legacy_points_pending()
+        except StorageError:
+            logger.error("检查降级期间写入的数据点失败", exc_info=True)
+            return 0
+
+    def purge_orphan_series(self) -> int:
+        """清理任务已不存在的序列与附属行（见 Maintenance.purge_orphan_series）；
+        返回删除的序列数，失败返回 0"""
+        try:
+            return self.maintenance.purge_orphan_series()
+        except StorageError:
+            logger.error("孤儿序列清理失败", exc_info=True)
+            return 0
+
+    def read_meta(self) -> Optional[MetaInfo]:
+        """读取库的元数据（meta 表）；失败返回 None"""
+        try:
+            return self.maintenance.read_meta()
+        except StorageError:
+            logger.error("读取数据库元数据失败", exc_info=True)
+            return None
+
+    def touch_writer(self, app_version: str) -> bool:
+        """记录本次以可写方式启动的应用版本；返回是否成功（只读模式下为 False）"""
+        try:
+            self.maintenance.touch_writer(app_version)
+            return True
+        except StorageError:
+            logger.error("记录数据库写入版本失败", exc_info=True)
+            return False
+
     def reconcile_sample_counts(self) -> int:
-        """按数据点重算 sample_count=0 的任务（见 PointRepo.recount_all）；失败返回 0"""
+        """按样本重算 sample_count=0 的任务（见 PointRepo.recount_all）；失败返回 0"""
         try:
             return self.points.recount_all()
         except StorageError:
@@ -168,7 +244,7 @@ class Database:
             return False
 
     def delete_task(self, task_id: str) -> bool:
-        """在一个事务内删除任务及其数据点、打点；返回是否执行成功"""
+        """在一个事务内删除任务及其样本、打点等附属行；返回是否执行成功"""
         try:
             self.tasks.delete(task_id)
             return True
@@ -189,11 +265,13 @@ class Database:
 
     def save_data_points(self, data_points: List[DataPoint]) -> bool:
         """批量保存数据点（同一事务内维护采样计数）；返回是否成功，持续失败时日志节流"""
+        self._save_result.failure = None
         try:
             self.points.append(data_points)
             self._save_failures = 0
             return True
-        except StorageError:
+        except StorageError as exc:
+            self._save_result.failure = exc
             # 持续失败（如磁盘满）时每个采集周期都会走到这里：
             # 首次记完整堆栈，之后每 SAVE_FAILURE_LOG_INTERVAL 次记一条累计次数
             self._save_failures += 1
@@ -202,6 +280,12 @@ class Database:
             elif self._save_failures % SAVE_FAILURE_LOG_INTERVAL == 0:
                 logger.error("批量保存数据点持续失败，累计连续失败 %d 次", self._save_failures)
             return False
+
+    @property
+    def last_save_failure(self) -> Optional[StorageError]:
+        """调用线程最近一次 save_data_points 失败的异常（StorageFullError 表示磁盘已满）；
+        上次成功或还没调用过为 None。按线程隔离：各任务线程互不影响。"""
+        return getattr(self._save_result, 'failure', None)
 
     def get_task_data_points(self, task_id: str, metric_type: Optional[str] = None,
                              limit: Optional[int] = None,
@@ -243,7 +327,7 @@ class Database:
     def get_task_data_points_bucketed(self, task_id: str, metric_type: Optional[str] = None,
                                       max_buckets: int = 2000,
                                       since_iso: Optional[str] = None) -> List[DataPoint]:
-        """按行号分桶、每桶取 MIN/MAX 两行的降采样（见 AnalyticsRepo.legacy_buckets）；失败返回 []"""
+        """2.0 起按时间等分 max_buckets 个桶、每桶取最小值点与最大值点的降采样（见 AnalyticsRepo.legacy_buckets）；失败返回 []"""
         try:
             return self.analytics.legacy_buckets(
                 task_id, metric_type, max_buckets, since=_since(since_iso))
@@ -308,6 +392,57 @@ class Database:
     def vacuum(self) -> None:
         """checkpoint 后 VACUUM 压缩数据库；失败抛 StorageError（调用方据此提示失败）"""
         self.maintenance.vacuum()
+
+    # ========== 存储健康（后台作业的底层入口，调度见 core.storage_guard） ==========
+
+    def wal_size_bytes(self) -> int:
+        """-wal 文件的字节数（不存在为 0）；文件系统错误按 0 计并记日志"""
+        from data.db import maintenance as storage_health
+        try:
+            return storage_health.wal_size(self.db_path)
+        except OSError:
+            logger.warning("获取 -wal 文件大小失败: %s", self.db_path, exc_info=True)
+            return 0
+
+    def checkpoint_wal(self):
+        """-wal 兜底 checkpoint（先 TRUNCATE，被挡住退到 PASSIVE）；不抛 sqlite3 异常，
+        失败写进返回的 CheckpointOutcome.error。只读库没有写入、也没有 -wal 可收，不应调用"""
+        from data.db import maintenance as storage_health
+        return storage_health.checkpoint_wal(self._factory)
+
+    def new_quick_check(self):
+        """新建一次 PRAGMA quick_check（只读连接，run() 阻塞、interrupt() 可跨线程中止）"""
+        from data.db import maintenance as storage_health
+        return storage_health.QuickCheck(self.db_path)
+
+    # ========== 进程组成员（tree / name 任务） ==========
+
+    @property
+    def members(self):
+        """成员仓储（task_members 留痕与成员序列发现）；首次访问时按需创建。"""
+        repo = self.__dict__.get('_members_repo')
+        if repo is None:
+            from data.repos.member_repo import MemberRepo
+            repo = self.__dict__['_members_repo'] = MemberRepo(self._factory)
+        return repo
+
+    def save_member_changes(self, appeared=(), last_seen=()) -> bool:
+        """批量写进程组实例的出现与消失（见 MemberRepo.apply）；返回是否成功，
+        失败记日志（采集线程据此保留缓冲、下个周期重试）"""
+        try:
+            self.members.apply(appeared, last_seen)
+            return True
+        except StorageError:
+            logger.error("保存进程组成员留痕失败", exc_info=True)
+            return False
+
+    def list_members(self, task_id: str) -> list:
+        """任务的成员概况（见 MemberRepo.list_members）；失败返回 []"""
+        try:
+            return self.members.list_members(task_id)
+        except StorageError:
+            logger.error("读取进程组成员失败: task_id=%s", task_id, exc_info=True)
+            return []
 
 
 # 单元测试

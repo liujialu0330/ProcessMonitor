@@ -5,6 +5,17 @@ PyInstaller打包配置文件
 用于将进程监控助手打包成单个exe文件
 """
 
+import struct
+
+# 全系统进程快照（core/system_snapshot.py）的结构布局只在 64 位下验证过；32 位 Python
+# 构建出的程序即便在 64 位系统上（WOW64）也会走另一套结构，运行时会禁用快照回退 psutil，
+# 性能预算不再成立。所以发布构建必须用 64 位 Python。
+if struct.calcsize('P') != 8:
+    raise SystemExit(
+        "打包终止：构建用的 Python 不是 64 位（指针宽度 %d 位）。全系统进程快照的结构"
+        "布局只在 64 位下验证过，32 位构建会在运行时禁用快照并回退 psutil 逐进程采集，"
+        "请改用 64 位 Python 重新构建。" % (struct.calcsize('P') * 8))
+
 block_cipher = None
 
 
@@ -15,6 +26,9 @@ a = Analysis(
     datas=[
         # 打包图标文件到exe同目录
         ('app_green_icon.ico', '.'),
+        # 打包自检（--self-test，见 app/self_test.py）用的 golden 旧库：v1.4.1 写出的真实 v1 库，
+        # 约 64 KB，放在 _internal 下的 selftest 目录
+        ('../tests/fixtures/legacy_db/v1.4.1_v1.db.gz', 'selftest'),
     ],
     hiddenimports=[
         # PyQt5核心模块和子模块
@@ -116,11 +130,80 @@ exe = EXE(
     version='version_info.txt',
 )
 
+# pmctl.exe：命令行控制端（2.0 B-2）。只用标准库 + core.ipc 客户端，单独分析以免把
+# PyQt5 / psutil 打进它的 PYZ；console=True 以便在 cmd / CI 里输出文字与退出码。
+# 与主程序共用同一个 COLLECT，产物都在 dist\进程监控助手\ 下（setup.iss 的
+# dist\进程监控助手\* recursesubdirs 规则自动带上 pmctl.exe）。
+pmctl_a = Analysis(
+    ['../pmctl.py'],
+    pathex=[],
+    binaries=[],
+    datas=[],
+    hiddenimports=[
+        'core.ipc.client',
+        'core.ipc.protocol',
+        'utils.instance_name',
+        'app.paths',
+        'config',
+    ],
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=[
+        'PyQt5',
+        'psutil',
+        'qfluentwidgets',
+        'qframelesswindow',
+        'pyqtgraph',
+        'numpy',
+        'ui',
+        'data',
+        'sqlite3',
+        'tkinter',
+        'matplotlib',
+        'PIL',
+        'pytest',
+        '_pytest',
+        'pluggy',
+        'py',
+    ],
+    win_no_prefer_redirects=False,
+    win_private_assemblies=False,
+    cipher=block_cipher,
+    noarchive=False,
+)
+
+pmctl_pyz = PYZ(pmctl_a.pure, pmctl_a.zipped_data, cipher=block_cipher)
+
+pmctl_exe = EXE(
+    pmctl_pyz,
+    pmctl_a.scripts,
+    [],
+    exclude_binaries=True,
+    name='pmctl',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=False,
+    console=True,  # 命令行程序：需要控制台输出与退出码
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+    icon='app_green_icon.ico',
+    version='version_info.txt',
+)
+
 coll = COLLECT(
     exe,
     a.binaries,
     a.zipfiles,
     a.datas,
+    pmctl_exe,
+    pmctl_a.binaries,
+    pmctl_a.zipfiles,
+    pmctl_a.datas,
     strip=False,
     upx=False,
     name='进程监控助手',

@@ -1,0 +1,94 @@
+{
+  "说明": "性能预算（tests/perf/README.md）：budget = 基线机器实测 × slack；运行时按 本机校准值 / calibration_ms 换算",
+  "calibration_ms": 150.44,
+  "slack": 1.5,
+  "updated": "2026-11-07T08:14:12",
+  "platform": "Windows-10-10.0.26200-SP0",
+  "python": "3.11.9",
+  "budgets": {
+    "analysis_1h_3d": {
+      "budget": 143.0,
+      "measured": 95.6,
+      "unit": "ms",
+      "desc": "自动刷新“最近 1 小时”整批 5 指标并行（1282200 行库）"
+    },
+    "analysis_all_3d": {
+      "budget": 386.0,
+      "measured": 257.0,
+      "unit": "ms",
+      "desc": "分析页“全部”整批 5 指标并行（1282200 行）"
+    },
+    "analysis_all_7d": {
+      "budget": 647.0,
+      "measured": 431.0,
+      "unit": "ms",
+      "desc": "分析页“全部”整批 5 指标并行（2991000 行）"
+    },
+    "collect_5_tasks_ms_per_s": {
+      "budget": 15.2,
+      "measured": 10.2,
+      "unit": "ms",
+      "desc": "5 任务 1 秒周期采集开销 = 单次快照 + 5 × 每任务取值"
+    },
+    "collect_leak_preset_snapshot_us": {
+      "budget": 24.6,
+      "measured": 16.4,
+      "unit": "us",
+      "desc": "快照路径 collect_metrics 泄漏预设 5 项（不含取快照，200 次中位数）"
+    },
+    "collect_leak_preset_us": {
+      "budget": 18900.0,
+      "measured": 12600.0,
+      "unit": "us",
+      "desc": "collect_metrics 泄漏预设 5 项（本进程，200 次中位数）"
+    },
+    "import_main_window_cold": {
+      "budget": 915.0,
+      "measured": 610.0,
+      "unit": "ms",
+      "desc": "新进程 import ui.main_window"
+    },
+    "list_processes_cold": {
+      "budget": 28.6,
+      "measured": 19.0,
+      "unit": "ms",
+      "desc": "process_catalog.list_processes 冷（新进程首次，479 个进程）"
+    },
+    "list_processes_cold_snapshot": {
+      "budget": 26.4,
+      "measured": 17.6,
+      "unit": "ms",
+      "desc": "快照路径 list_processes 冷（新进程首次，含自检，479 个进程）"
+    },
+    "list_processes_hot": {
+      "budget": 0.273,
+      "measured": 0.182,
+      "unit": "ms",
+      "desc": "process_catalog.list_processes 热（同进程第二次，479 个进程）"
+    },
+    "migration_v1_1m": {
+      "budget": 7470.0,
+      "measured": 4980.0,
+      "unit": "ms",
+      "desc": "v1 → v5 迁移（1000000 行，含备份）"
+    },
+    "snapshot_once_ms": {
+      "budget": 15.1,
+      "measured": 10.1,
+      "unit": "ms",
+      "desc": "NtQuerySystemInformation 全系统快照（50 次中位数，478 个进程）"
+    },
+    "write_cycle_p50": {
+      "budget": 2.05,
+      "measured": 1.37,
+      "unit": "ms",
+      "desc": "单周期写入 5 指标 p50（100000 行库，200 次）"
+    },
+    "write_cycle_p95": {
+      "budget": 3.26,
+      "measured": 2.18,
+      "unit": "ms",
+      "desc": "单周期写入 5 指标 p95（100000 行库，200 次）"
+    }
+  }
+}

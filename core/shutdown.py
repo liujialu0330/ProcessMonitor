@@ -200,13 +200,12 @@ class ShutdownCoordinator:
        历史刷新）同时发出取消，与任务收尾并行；
     2. manager.join_all(task_timeout_ms, deadline=)：带超时等待任务线程收尾落库；
     3. registry.shutdown_all(deadline=)：带超时等待登记表线程；
-    4. db.close()（给了 db 时）。
+    4. 确认写库线程已结束后补存管理器的待保存内容，再 db.close()（给了 db 时）。
 
     total_budget_ms 是整个流程的时间预算，开始时换算成截止时间传给每一步，落实到
     每一次等待（取单项超时与剩余时间的较小者，已到期的等待直接跳过），所以无论有多少
     卡住的线程，总耗时都不超过预算。预算耗尽后各步仍会执行（只是不再等待），进度文案
-    顺序不变，并仍会关闭数据库。任何一步出错只记日志，绝不抛异常——调用方随后必须
-    照常退出。
+    顺序不变；仍有写库线程存活时不抢先关闭数据库。任何一步出错只记日志，不抛异常。
     """
 
     def __init__(self, manager, registry: ThreadRegistry, *,
@@ -225,9 +224,14 @@ class ShutdownCoordinator:
         """
         deadline = time.monotonic() + self.total_budget_ms / 1000.0
         ok = True
+        tasks_finished = threads_finished = False
+        writes_flushed = True
 
         _report(on_progress, PROGRESS_STOPPING_TASKS)
         try:
+            begin = getattr(self.manager, 'begin_shutdown', None)
+            if begin is not None:
+                begin()
             self.manager.stop_all_tasks()
         except Exception:
             ok = False
@@ -239,7 +243,8 @@ class ShutdownCoordinator:
             logger.error("退出时取消后台线程失败", exc_info=True)
 
         try:
-            if not self.manager.join_all(self.task_timeout_ms, deadline=deadline):
+            tasks_finished = self.manager.join_all(self.task_timeout_ms, deadline=deadline)
+            if not tasks_finished:
                 ok = False
                 logger.error("退出时有监控任务未在期限内结束")
         except Exception:
@@ -250,13 +255,27 @@ class ShutdownCoordinator:
             # 包一层：进度回调出错不应让登记表的收尾中断
             safe_progress = ((lambda text: _report(on_progress, text))
                              if on_progress is not None else None)
-            if not self.registry.shutdown_all(safe_progress, deadline=deadline):
+            threads_finished = self.registry.shutdown_all(safe_progress, deadline=deadline)
+            if not threads_finished:
                 ok = False
         except Exception:
             ok = False
             logger.error("退出时结束后台线程失败", exc_info=True)
 
-        if self.db is not None:
+        if tasks_finished and threads_finished:
+            flush = getattr(self.manager, 'flush_pending_task_writes', None)
+            if flush is not None:
+                try:
+                    if remaining_ms(deadline) <= 0 or not flush(deadline=deadline):
+                        writes_flushed = False
+                        ok = False
+                        logger.error("退出时仍有任务设置未保存")
+                except Exception:
+                    writes_flushed = False
+                    ok = False
+                    logger.error("退出时补存任务设置失败", exc_info=True)
+
+        if self.db is not None and tasks_finished and threads_finished and writes_flushed:
             _report(on_progress, PROGRESS_SAVING)
             try:
                 self.db.close()

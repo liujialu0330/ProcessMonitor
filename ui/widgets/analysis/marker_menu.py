@@ -1,5 +1,5 @@
 """
-趋势图右键菜单：在此处打点 / 设为基线 / 重命名 / 删除
+趋势图右键菜单：在此处打点 / 设为基线 / 重命名 / 删除（监控页卡片迷你图复用同一套，没有"在此处打点"）
 
 右键位置附近（几个像素内）有打点时，后三项作用于该打点；否则只能"在此处打点"。
 输入名称、确认删除经 services.dialogs，写库经视图模型 → manager（成功后 manager 发
@@ -11,13 +11,15 @@ from typing import Callable, List, Optional, Tuple
 from PyQt5.QtCore import QObject
 from qfluentwidgets import Action, FluentIcon, RoundMenu
 
+from ui.widgets.history.chart_view import NON_EDITABLE_MARKER_KINDS
 from ui.widgets.history.common import DETAIL_TIME_FORMAT
 
 ADD_TEXT = "在此处打点"
 BASELINE_TEXT = "设为基线"
 RENAME_TEXT = "重命名"
 DELETE_TEXT = "删除"
-SYSTEM_KINDS = ('pause', 'resume')
+# 暂停 / 恢复与系统事件（异常退出、重启、续采）是系统记录，不能改名、设基线或删除
+SYSTEM_KINDS = NON_EDITABLE_MARKER_KINDS
 
 MenuItem = Tuple[str, Callable[[], bool], bool]
 
@@ -43,11 +45,15 @@ class MarkerEditFlow(QObject):
             (DELETE_TEXT, lambda: self.delete(marker), editable),
         ]
 
-    def show_menu(self, x: float, marker, global_pos) -> RoundMenu:
+    def show_menu(self, x: float, marker, global_pos, *, include_add: bool = True) -> RoundMenu:
+        """弹出菜单；include_add=False 时去掉"在此处打点"（监控页迷你图只编辑已有刻度）。"""
         menu = RoundMenu(parent=self._host)
-        icons = (FluentIcon.PIN, FluentIcon.FLAG, FluentIcon.EDIT, FluentIcon.DELETE)
-        for (text, run, enabled), icon in zip(self.items(x, marker), icons):
-            action = Action(icon, text, menu)
+        icons = {ADD_TEXT: FluentIcon.PIN, BASELINE_TEXT: FluentIcon.FLAG,
+                 RENAME_TEXT: FluentIcon.EDIT, DELETE_TEXT: FluentIcon.DELETE}
+        for text, run, enabled in self.items(x, marker):
+            if text == ADD_TEXT and not include_add:
+                continue
+            action = Action(icons[text], text, menu)
             action.setEnabled(enabled)
             action.triggered.connect(lambda _=False, fn=run: fn())
             menu.addAction(action)

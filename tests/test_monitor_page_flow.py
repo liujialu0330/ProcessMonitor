@@ -7,6 +7,7 @@
 页面依赖全部经 UiServices 注入，manager 用真实 MonitorManager（不启动采集线程）。
 """
 import os
+from datetime import timedelta
 
 import pytest
 from PyQt5.QtCore import Qt
@@ -17,7 +18,7 @@ from core.contracts import StopReason, UnavailableReason
 from core.monitor_manager import MonitorManager
 from tests.doubles import DEFAULT_FAKE_NOW, FakePreferences, FakeProcessQuery
 from tests.factories import make_monitor_page, make_services
-from tests.helpers import stop_and_join
+from tests.helpers import process_events_until, stop_and_join
 from ui.components.metric_selector import MetricSelectorDialog
 from ui.services import InfoBarNotifier
 from utils.metrics import (
@@ -54,8 +55,19 @@ def page(qapp, db, manager, services, started):
     widget = make_monitor_page(db, manager, services)
     widget.resize(900, 700)
     widget.show()
+    # 进程列表在后台线程读取：等首屏那次读取到达
+    _wait_process_list(widget)
     yield widget
+    # 搜索框打字后 qfluentwidgets 用 50 ms 的 singleShot 弹补全菜单；在本用例内把它跑完，
+    # 不让它落到下一个用例的事件循环里去碰已经换掉的补全器
+    QTest.qWait(60)
     widget.close()
+
+
+def _wait_process_list(page):
+    """等后台读取进程列表结束且结果已填入（含合并的补读）"""
+    assert process_events_until(lambda: not page.form.picker.is_loading()
+                                and not page.services.threads.entries())
 
 
 def _add_card(manager, metrics=None, note="", pid=None, name="demo.exe"):
@@ -212,11 +224,16 @@ def test_invalid_target_shows_error_under_field_and_clears_on_edit(
 
 
 def test_page_has_no_separate_pid_box(page):
-    """PID 直接在搜索框输入（P10）：表单里除搜索框外只剩备注一个单行输入框"""
+    """PID 直接在搜索框输入；其余输入框用于备注、等待和方案身份
+    （"自动化"折叠区里的日志路径、匹配规则与导出目录，"启动被测程序"折叠区里的程序路径、
+    参数与工作目录不算）"""
     from qfluentwidgets import EditableComboBox, LineEdit
     edits = [w for w in page.form.findChildren(LineEdit)
-             if not isinstance(w, EditableComboBox)]
-    assert edits == [page.form.note_input]
+             if not isinstance(w, EditableComboBox)
+             and not page.form.automation.isAncestorOf(w)
+             and not page.form.launch_options.isAncestorOf(w)]
+    assert set(edits) == {page.form.note_input, page.form.scenario_edit,
+                          page.form.build_edit, page.form.wait_timeout_input, page.plan_flow.name}
 
 
 # ---------- 卡片按钮连线 ----------
@@ -226,16 +243,17 @@ def test_data_updated_shows_values_delta_and_count(page, manager):
     card = page.board.cards()[task_id]
     private, gdi = MetricType.MEMORY_PRIVATE, MetricType.NUM_GDI_OBJECTS
 
-    manager.data_updated.emit(task_id, {private: 1024.0, gdi: 100.0})
-    manager.data_updated.emit(task_id, {private: 3072.0, gdi: 103.0})
+    manager.sample_updated.emit(task_id, {private: 1024.0, gdi: 100.0},
+                                DEFAULT_FAKE_NOW - timedelta(seconds=1))
+    manager.sample_updated.emit(task_id, {private: 3072.0, gdi: 103.0}, DEFAULT_FAKE_NOW)
 
     assert card.value_labels[private].text() == "3 MB"
-    # 无基线：比开始时（相对时间取注入时钟，替身时钟不走，故为 0 秒前）
-    assert card.delta_labels[private].text() == "比开始时（0 秒前）+2 MB"
-    assert card.delta_labels[gdi].text() == "比开始时（0 秒前）+3 个"
-    assert card.trend_delta_label.text() == "比开始时（0 秒前）+2 MB"
+    # 无基线：比开始时；使用采样时间，两批样本相隔一秒。
+    assert card.delta_labels[private].text() == "比开始时（1 秒前）+2 MB"
+    assert card.delta_labels[gdi].text() == "比开始时（1 秒前）+3 个"
+    assert card.trend_delta_label.text() == "比开始时（1 秒前）+2 MB"
     assert card.count == 2
-    assert card.count_label.text() == "已运行 0 秒 · 每 1 秒 · 2 次采集"
+    assert card.count_label.text() == "已运行 1 秒 · 每 1 秒 · 2 次采集"
 
 
 def test_metrics_unavailable_marks_card(page, manager, services):
@@ -294,9 +312,9 @@ def test_marker_button_writes_marker_via_manager(page, manager, db, services):
     # 卡片进入"较基线"模式，基线值要等基线之后的 5 个样本
     assert card.baseline is not None
     assert card.delta_labels[MetricType.MEMORY_PRIVATE].text() == "基线采样中"
-    for value in (1024.0, 2048.0, 3072.0, 4096.0, 5120.0):
-        manager.data_updated.emit(task_id, {MetricType.MEMORY_PRIVATE: value})
-    manager.data_updated.emit(task_id, {MetricType.MEMORY_PRIVATE: 6144.0})
+    for index, value in enumerate((1024.0, 2048.0, 3072.0, 4096.0, 5120.0, 6144.0)):
+        manager.sample_updated.emit(task_id, {MetricType.MEMORY_PRIVATE: value},
+                                    DEFAULT_FAKE_NOW + timedelta(seconds=index))
     assert card.delta_labels[MetricType.MEMORY_PRIVATE].text() == "较基线 +3 MB"
 
 
@@ -306,8 +324,9 @@ def test_stopped_card_is_kept_in_finished_group(page, manager, monkeypatch):
     task_id = _add_card(manager, note="备注A")
     other_id = _add_card(manager)
     card = page.board.cards()[task_id]
-    manager.data_updated.emit(task_id, {MetricType.MEMORY_PRIVATE: 1024.0})
-    manager.data_updated.emit(task_id, {MetricType.MEMORY_PRIVATE: 2048.0})
+    manager.sample_updated.emit(task_id, {MetricType.MEMORY_PRIVATE: 1024.0},
+                                DEFAULT_FAKE_NOW - timedelta(seconds=1))
+    manager.sample_updated.emit(task_id, {MetricType.MEMORY_PRIVATE: 2048.0}, DEFAULT_FAKE_NOW)
     monkeypatch.setattr(manager, "running_task_count", lambda: 1)
 
     manager.task_stopped.emit(task_id, StopReason.USER)
@@ -327,15 +346,14 @@ def test_stopped_card_is_kept_in_finished_group(page, manager, monkeypatch):
     assert other_id in page.board.cards()
 
 
-def test_abnormal_stop_signals_main_window(page, manager, services):
+def test_abnormal_stop_is_announced_through_the_notifier(page, manager, services):
     task_id = _add_card(manager)
-    received = []
-    page.task_ended_abnormally.connect(lambda title, content: received.append(content))
 
     manager.task_stopped.emit(task_id, StopReason.PROCESS_EXITED)
 
-    assert received and "进程已终止" in received[0] and "demo.exe" in received[0]
-    assert services.notifier.last().parent is page
+    last = services.notifier.last()
+    assert "进程已终止" in last.content and "demo.exe" in last.content
+    assert last.parent is page
     assert "进程已终止" in page.board.cards()[task_id].finished_detail_label.text()
 
 
@@ -407,6 +425,7 @@ def test_exited_process_is_cleared_from_form(page, manager, services):
 
     services.process_query.kill(1002)
     manager.task_stopped.emit(task_id, StopReason.PROCESS_EXITED)
+    _wait_process_list(page)
 
     assert page.form.picker.text() == ""
     assert all(t.pid != 1002 for t in page.form.picker.targets())
@@ -453,10 +472,13 @@ def test_header_title_subtitle_summary_and_refresh(page, services):
     from ui.pages.monitor_page import PAGE_SUBTITLE, PAGE_TITLE, REFRESH_TEXT
     assert (PAGE_TITLE, REFRESH_TEXT) == ("监控", "刷新进程")
     assert PAGE_SUBTITLE == "选择被测进程开始记录；每轮操作后点“打点”即可量化泄漏"
-    assert page.refresh_button.text() == REFRESH_TEXT
+    assert page.refresh_button.text() == ''
+    assert 'F5' in page.refresh_button.toolTip()
+    assert page.form.top_row.indexOf(page.refresh_button) >= 0
     query = services.process_query
     before = sum(1 for name, _ in query.calls if name == 'list_processes')
     page.refresh_button.click()
+    _wait_process_list(page)
     assert sum(1 for name, _ in query.calls if name == 'list_processes') == before + 1
 
 
@@ -476,6 +498,7 @@ def test_shortcuts_only_while_visible(page, services):
     query = services.process_query
     before = sum(1 for name, _ in query.calls if name == 'list_processes')
     page._shortcuts[0].activated.emit()
+    _wait_process_list(page)
     assert sum(1 for name, _ in query.calls if name == 'list_processes') == before + 1
 
 
@@ -501,3 +524,51 @@ def test_card_analysis_button_requests_analysis(page, manager):
     page.history_requested.connect(requested.append)
     page.board.cards()[task_id].analysis_button.click()
     assert requested == [task_id]
+
+
+def test_pause_from_elsewhere_shows_paused_on_card(page, manager, db):
+    """命令行 / 托盘直接调真实 manager 的 pause_task：卡片随 task_paused 显示"已暂停"，
+    resume_task 后回到"运行中"。"""
+    task_id = _add_card(manager)
+    card = page.board.cards()[task_id]
+    from core.monitor_task import WorkerState
+    assert manager.get_task(task_id)._transition((WorkerState.WAITING,), WorkerState.RUNNING)
+
+    assert manager.pause_task(task_id)
+    assert card.is_paused and card.pause_button.text() == "恢复"
+    assert "已暂停" in card.status_label.text()
+
+    assert manager.resume_task(task_id)
+    assert not card.is_paused and card.status_label.text() == "● 运行中"
+    # 外部暂停 / 恢复同样只写一次系统打点
+    assert [m.kind for m in db.get_markers(task_id)] == ["pause", "resume"]
+
+
+def test_launch_section_start_launches_and_monitors(page, manager, services, started):
+    """勾选"开始时先启动程序"：开始按钮先经 launcher 启动，再以启动结果建任务。"""
+    import sys
+    form = page.form
+    form.launch_options.set_expanded(True)
+    form.set_launch_exe(sys.executable)
+    form.launch_options.close_check.setChecked(True)
+    assert form.start_button.text() == "启动并监控"
+
+    form.start_button.click()
+
+    assert [spec.exe for spec in services.launcher.launched] == [sys.executable]
+    [task_id] = page.presenter.task_ids()
+    info = manager.get_task_info(task_id)
+    assert info.pid == 5001 and info.create_time == 5001.5
+    assert started == [task_id]
+
+
+def test_launch_failure_shows_error_under_launch_section(page, manager, services):
+    import sys
+    services.launcher.fail("程序启动后立即退出（退出码 1），请检查参数与工作目录")
+    page.form.set_launch_exe(sys.executable)
+
+    page.form.start_button.click()
+
+    assert page.presenter.task_ids() == []
+    assert "立即退出" in page.form.launch_error_text()
+    assert page.form.launch_options.is_expanded()

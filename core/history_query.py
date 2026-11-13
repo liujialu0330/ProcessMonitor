@@ -24,19 +24,22 @@ HistoryRequest、把结果定型为 HistorySnapshot，由 run_history_query 同�
 import logging
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from core import verdict as verdict_rules
 from core.analysis.intervals import Boundary, IntervalStats, RoundDelta, round_deltas
-from core.analysis.series import count_rises, per_second_rates
+from core.analysis.series import count_rises, merge_gaps, per_second_rates
 from core.analysis.trend import (
     Judgement, RateText, fit_input_from_aggregates, judge, linear_fit,
     rate_display, rate_unit_for_span)
 from data.errors import StorageError
+from data.mappers import normalize_ms
 from data.models import DataPoint, Marker
-from data.repos.analytics_repo import Bucket
+from data.repos.analytics_repo import Bucket, MetricAggregates
 from data.repos.point_repo import PointQuery
 from utils.metrics import (
-    VALUE_CLASS_LEVEL, VALUE_CLASS_PEAK, VALUE_CLASS_RATE, spec, value_class)
+    VALUE_CLASS_LEVEL, VALUE_CLASS_PEAK, VALUE_CLASS_RATE, member_series_key, spec,
+    split_member_key, value_class)
 
 logger = logging.getLogger(__name__)
 
@@ -56,12 +59,11 @@ RANGE_KEYS = (BASELINE_RANGE_KEY, *TIME_RANGE_SECONDS)
 DEFAULT_RANGE_KEY = 'all'
 # "自定义"范围键（分析页刷选）：起止时刻由请求直接给出，不随锚点换算
 CUSTOM_RANGE_KEY = 'custom'
-# 分析页可用的全部范围键（预设 + 自定义）
-ANALYSIS_RANGE_KEYS = (*RANGE_KEYS, CUSTOM_RANGE_KEY)
 
 # 表格取数上限：只取最近 N 条采集，避免大数据量下界面卡顿
 TABLE_POINT_LIMIT = 2000
-# 图表分桶上限：按行号分桶后每桶取 MIN/MAX 两点，故图表最多 2*CHART_MAX_BUCKETS 个点
+# 图表分桶上限：按时间等分为不超过这么多个桶、每桶取 MIN/MAX 两个真实点（见
+# AnalyticsRepo.legacy_buckets），故图表最多 2*CHART_MAX_BUCKETS 个点
 CHART_MAX_BUCKETS = 2000
 # 基线值 = 基线时刻之后这么多个样本的中位数（单个尖峰样本不会带偏基线）
 BASELINE_SAMPLES = 5
@@ -71,6 +73,13 @@ MIN_ROUND_MARKERS = 2
 BAND_MAX_BUCKETS = 800
 
 MARKER_KIND_BASELINE = 'baseline'
+# 被测进程重启续接的系统打点：它把任务切成若干"启动段"；快照的统计与区间只看最后一段，
+# 判定（TaskAnalysis.segments）逐段做
+MARKER_KIND_RESTART = 'restart'
+# 采集因工具重启中断后接上的系统打点：它前后的样本之间有一段没人看着，同重启一样是数据断点
+MARKER_KIND_RECOVER = 'recover'
+# 这两类打点处图表不连线、不算速率（间隔再短也一样）
+BREAK_MARKER_KINDS = (MARKER_KIND_RESTART, MARKER_KIND_RECOVER)
 MARKER_KIND_USER = 'user'
 # 打点区间表补齐的首末段标签
 INTERVAL_FIRST_LABEL = '开始'
@@ -153,6 +162,14 @@ class HistorySnapshot:
     - judgement / rate / fit_unit：水位量的趋势判定、增速显示量与其时间单位后缀；
     - rounds：统计范围内相邻打点（基线 + 用户打点）围出的各轮增量；
     - value_class：指标显示类别（utils.metrics.VALUE_CLASS_*）；
+    - segment_start / segment_number / segment_count：被测进程重启续接过时，快照的统计只用
+      一个启动段的数据（样本在重启前后分属不同的进程，拼成一条线会把"重启后内存回落 /
+      起点不同"误判成趋势）：默认范围看最后一段，自定义范围看终点所在的段。segment_start 是
+      统计所在启动段的起点（没有重启为 None），segment_number 是该段为第几次启动（从 1 起），
+      segment_count 是启动总次数；各段的整体判定在 TaskAnalysis.segments；
+    - baseline_segment_number / baseline_comparable：基线打点落在第几次启动里；它不在统计所在
+      的段时（baseline_comparable 为假）基线值属于另一个进程，不能当本段的起点——"较基线"
+      一类的增量一律不显示，界面 / 报告改写"基线在第 N 段，不可比"（baseline_note）；
     - band / intervals：仅 request.analysis 时有：显示范围的时间分桶（min/max/avg）与
       按打点（基线 + 用户打点）切出的区间统计（左闭右开，最后一段闭区间）。
     """
@@ -181,6 +198,41 @@ class HistorySnapshot:
     interval_seconds: float = 0.0
     band: List[Bucket] = field(default_factory=list)
     intervals: List[IntervalStats] = field(default_factory=list)
+    segment_start: Optional[datetime] = None
+    segment_number: int = 1
+    segment_count: int = 1
+    baseline_segment_number: int = 1
+
+    @property
+    def only_last_segment(self) -> bool:
+        """统计只用了一个启动段的数据（任务发生过重启续接）。"""
+        return self.segment_count > 1
+
+    @property
+    def baseline_comparable(self) -> bool:
+        """基线（若有）与统计落在同一个启动段，基线值可以当作本段的起点。"""
+        return self.baseline is None or self.baseline_segment_number == self.segment_number
+
+    @property
+    def baseline_in_use(self) -> bool:
+        """基线值是统计的起点：有基线值、只统计基线之后，且基线与统计在同一启动段（基线在别的
+        段时它是另一个进程的值，不能当起点）。分析页摘要表、增速排序与叠加参考值共用。"""
+        return (self.baseline is not None and self.baseline.value is not None
+                and self.request.baseline_only and self.baseline_comparable)
+
+    @property
+    def baseline_foreign(self) -> bool:
+        """本该以基线为参照（有基线、只统计基线之后），但基线落在别的启动段：界面的"基线"
+        与"较基线"写 "—"，说明见 baseline_note。"""
+        return (self.baseline is not None and self.request.baseline_only
+                and not self.baseline_comparable)
+
+    @property
+    def baseline_note(self) -> str:
+        """基线与统计不在同一段时的说明："基线在第 N 段，不可比"；可比或没有基线为空串。"""
+        if self.baseline_comparable:
+            return ""
+        return f"基线在第 {self.baseline_segment_number} 段，不可比"
 
     @property
     def ok(self) -> bool:
@@ -272,18 +324,43 @@ def _stats_dict(agg, fit) -> dict:
     }
 
 
+def _restart_times(markers: Sequence[Marker]) -> List[datetime]:
+    return sorted(_bound(m.timestamp) for m in markers if m.kind == MARKER_KIND_RESTART)
+
+
+def segment_of(markers: List[Marker],
+               until: Optional[datetime] = None) -> Tuple[Optional[datetime], int, int]:
+    """按"重启"系统打点切出的启动段：返回 (统计所在段的起点, 该段是第几次启动, 启动总次数)。
+
+    起点取最后一个不晚于 until（没有终点则不限）的重启打点；没有重启返回 (None, 1, 1)。
+    重启打点的时刻是工具发现新进程的时刻，之前的样本都属于上一个进程。"""
+    restarts = _restart_times(markers)
+    count = len(restarts) + 1
+    eligible = [t for t in restarts if until is None or t <= until]
+    return (eligible[-1] if eligible else None), len(eligible) + 1, count
+
+
+def segment_note(snapshot) -> str:
+    """结论 / 依据行里附的提示："仅统计第 N 次启动后的数据"；任务没有重启过为空串。
+    界面、报告与证据包共用这一句，避免各写各的。"""
+    if getattr(snapshot, 'segment_count', 1) <= 1:
+        return ""
+    return f"仅统计第 {snapshot.segment_number} 次启动后的数据"
+
+
 def _baseline_info(db, task_id: str, metric: str, marker: Marker,
                    stats_since: Optional[datetime], stats_count: int) -> BaselineInfo:
     """基线值与参与取值的样本数。统计起点就是基线时刻时样本数可由统计范围点数推出，
-    否则（统计起点晚于基线）只有统计范围点数不足 BASELINE_SAMPLES 时才需要再数一次。"""
+    否则（统计起点晚于基线）只有统计范围点数不足 BASELINE_SAMPLES 时才需要再数一次
+    （point_count 按范围计数，大范围读分钟汇总，不扫样本）。"""
     value = db.analytics.value_near(
         task_id, metric, marker.timestamp, BASELINE_SAMPLES, after_only=True)
     if value is None:
         return BaselineInfo(marker, None, 0)
-    if stats_since == marker.timestamp or stats_count >= BASELINE_SAMPLES:
+    if stats_since == _bound(marker.timestamp) or stats_count >= BASELINE_SAMPLES:
         after = stats_count
     else:
-        after = db.analytics.aggregates(task_id, metric, since=marker.timestamp).count
+        after = db.analytics.point_count(task_id, metric, since=_bound(marker.timestamp))
     return BaselineInfo(marker, value, max(1, min(BASELINE_SAMPLES, after)))
 
 
@@ -293,6 +370,7 @@ def _rounds(db, task_id: str, metric: str, markers: List[Marker],
     """统计范围内（基线 + 用户打点）相邻两两成一轮；用户打点不足 MIN_ROUND_MARKERS 个时不算。
     每个打点处的值与基线同口径：其后 BASELINE_SAMPLES 个样本的中位数。"""
     def in_range(ts: datetime) -> bool:
+        ts = _bound(ts)
         return (stats_since is None or ts >= stats_since) and ts <= last_ts
 
     users = [m for m in markers if m.kind == MARKER_KIND_USER and in_range(m.timestamp)]
@@ -310,6 +388,14 @@ def _rounds(db, task_id: str, metric: str, markers: List[Marker],
         return db.analytics.value_near(task_id, metric, ts, BASELINE_SAMPLES, after_only=True)
 
     return round_deltas(boundaries, value_at)
+
+
+def _bound(ts: datetime) -> datetime:
+    """
+    打点/基线时刻作为样本查询边界：按样本同一规则（data.mappers.to_ms，四舍五入）取整到毫秒，
+    与该时刻同时采集的样本因此总落在打点之后（规则见 data.mappers 模块说明）
+    """
+    return normalize_ms(ts)
 
 
 def _to_points(task_id: str, metric: str, pairs) -> List[DataPoint]:
@@ -347,7 +433,7 @@ def run_history_query(db, request: HistoryRequest) -> HistorySnapshot:
         if request.range_key == BASELINE_RANGE_KEY:
             request = replace(request, since=compute_since(
                 request.range_key, anchor,
-                baseline_marker.timestamp if baseline_marker else None))
+                _bound(baseline_marker.timestamp) if baseline_marker else None))
         return _query_data(db, request, task_info, anchor, markers, baseline_marker)
     except StorageError as exc:
         logger.error("历史数据读取失败: task_id=%s", request.task_id, exc_info=True)
@@ -360,9 +446,16 @@ def _query_data(db, request: HistoryRequest, task_info, anchor: Optional[datetim
     task_id, metric, since, until = (
         request.task_id, request.metric, request.since, request.until)
     interval = float(task_info.interval or 0.0)
+    segment_start, segment_number, segment_count = segment_of(markers, until)
+    baseline_segment = 1
+    if baseline_marker is not None:
+        at = _bound(baseline_marker.timestamp)
+        baseline_segment = 1 + sum(1 for t in _restart_times(markers) if t <= at)
     base = dict(request=request, markers=markers, task_last_at=anchor,
                 interval_seconds=interval,
-                value_class=value_class(metric) if metric else VALUE_CLASS_LEVEL)
+                value_class=value_class(metric) if metric else VALUE_CLASS_LEVEL,
+                segment_start=segment_start, segment_number=segment_number,
+                segment_count=segment_count, baseline_segment_number=baseline_segment)
 
     points = db.points.fetch(PointQuery(
         task_id, metric, since=since, until=until, limit=request.table_limit))
@@ -380,11 +473,14 @@ def _query_data(db, request: HistoryRequest, task_info, anchor: Optional[datetim
 
     stats_since = since
     if request.baseline_only and baseline_marker is not None:
-        stats_since = (baseline_marker.timestamp if since is None
-                       else max(since, baseline_marker.timestamp))
+        stats_since = (_bound(baseline_marker.timestamp) if since is None
+                       else max(since, _bound(baseline_marker.timestamp)))
         # 基线落在自定义范围之后：这段数据没有"基线之后"，统计退回整个显示范围
         if until is not None and stats_since > until:
             stats_since = since
+    # 只统计最后一次启动之后的数据：更早的样本属于另一个进程
+    if segment_start is not None and (stats_since is None or segment_start > stats_since):
+        stats_since = segment_start
 
     agg = db.analytics.aggregates(task_id, metric, since=stats_since, until=until)
     display_agg = (agg if stats_since == since
@@ -411,6 +507,11 @@ def _query_data(db, request: HistoryRequest, task_info, anchor: Optional[datetim
 
     gaps = (db.analytics.gaps(task_id, interval, since=since, until=until, metric=metric)
             if interval > 0 else [])
+    # 重启 / 续采处无论间隔多短都是断点：前后分属不同进程（或中间有一段无人看守），连线
+    # 会画出假的"回落"，速率会把跨边界的差当成一段真实变化
+    break_instants = tuple(m.timestamp for m in markers if m.kind in BREAK_MARKER_KINDS)
+    gaps = merge_gaps(gaps, db.analytics.break_pairs(
+        task_id, break_instants, since=since, until=until, metric=metric))
     buckets = _chart_points(db, request, total_count)
 
     rate_series: List[DataPoint] = []
@@ -426,7 +527,9 @@ def _query_data(db, request: HistoryRequest, task_info, anchor: Optional[datetim
             rate_stats = RateStats(average, max(in_stats) if in_stats else None)
     elif vclass == VALUE_CLASS_PEAK and stats is not None:
         values = [p.value for p in buckets if stats_since is None or p.timestamp >= stats_since]
-        start = baseline.value if (baseline is not None and baseline.value is not None
+        # 基线不在当前启动段时它属于另一个进程，不能当作本段的起点
+        baseline_in_segment = baseline is not None and baseline_segment == segment_number
+        start = baseline.value if (baseline_in_segment and baseline.value is not None
                                    and request.baseline_only) else agg.first_value
         peak_rises = PeakRises(count_rises(values), agg.last_value - start)
 
@@ -435,9 +538,13 @@ def _query_data(db, request: HistoryRequest, task_info, anchor: Optional[datetim
     if request.analysis and display_agg.count:
         band = db.analytics.buckets(
             task_id, metric, min(BAND_MAX_BUCKETS, request.max_buckets),
-            since=since, until=until, interval_seconds=interval if interval > 0 else None)
-        intervals = _intervals(db, task_id, metric, markers,
-                               display_agg.first_ts, display_agg.last_ts)
+            since=since, until=until, interval_seconds=interval if interval > 0 else None,
+            break_instants=break_instants)
+        first_ts = display_agg.first_ts
+        if segment_start is not None and segment_start > first_ts:
+            first_ts = segment_start
+        intervals = _intervals(db, task_id, metric, markers, first_ts, display_agg.last_ts,
+                               whole_range=display_agg)
 
     return HistorySnapshot(
         points=points, stats=stats, buckets=buckets, total_count=total_count,
@@ -461,7 +568,8 @@ def _chart_points(db, request: HistoryRequest, total_count: int) -> List[DataPoi
 
 
 def _intervals(db, task_id: str, metric: str, markers: List[Marker],
-               first_ts: datetime, last_ts: datetime) -> List[IntervalStats]:
+               first_ts: datetime, last_ts: datetime, *,
+               whole_range: Optional[MetricAggregates] = None) -> List[IntervalStats]:
     """
     按打点（基线 + 用户打点，暂停/恢复不算）把 [first_ts, last_ts] 切成相邻区间，
     每段用一次聚合查询取起止值、峰值与点数（不把原始点读进内存）。
@@ -472,10 +580,10 @@ def _intervals(db, task_id: str, metric: str, markers: List[Marker],
     """
     edges = [Boundary(m.timestamp, m.label, m.kind) for m in markers
              if m.kind in (MARKER_KIND_USER, MARKER_KIND_BASELINE)
-             and first_ts <= m.timestamp <= last_ts]
-    if not edges or edges[0].timestamp > first_ts:
+             and first_ts <= _bound(m.timestamp) <= last_ts]
+    if not edges or _bound(edges[0].timestamp) > first_ts:
         edges.insert(0, Boundary(first_ts, INTERVAL_FIRST_LABEL, 'start'))
-    if edges[-1].timestamp < last_ts:
+    if _bound(edges[-1].timestamp) < last_ts:
         edges.append(Boundary(last_ts, INTERVAL_LAST_LABEL, 'end'))
     if len(edges) < 2:
         return []
@@ -485,10 +593,17 @@ def _intervals(db, task_id: str, metric: str, markers: List[Marker],
     last_index = len(edges) - 2
     for i in range(len(edges) - 1):
         left, right = edges[i], edges[i + 1]
-        # 右开：终点退 1 微秒（ISO 串的字典序与时间序一致，无小数位的时刻排在带小数的之前）
-        end = right.timestamp if i == last_index else right.timestamp - timedelta(microseconds=1)
-        agg = (db.analytics.aggregates(task_id, metric, since=left.timestamp, until=end)
-               if end >= left.timestamp else None)
+        # 打点时刻按样本同一规则取整后作查询边界（见 _bound）；右开：终点退 1 毫秒
+        start = _bound(left.timestamp)
+        end = (_bound(right.timestamp) if i == last_index
+               else _bound(right.timestamp) - timedelta(milliseconds=1))
+        # 仅复用当前请求同一指标的完整闭区间；重启裁剪、打点分段均须重新查询。
+        if (last_index == 0 and whole_range is not None and whole_range.count
+                and start == whole_range.first_ts and end == whole_range.last_ts):
+            agg = whole_range
+        else:
+            agg = (db.analytics.aggregates(task_id, metric, since=start, until=end)
+                   if end >= start else None)
         duration = (right.timestamp - left.timestamp).total_seconds()
         if agg is not None and agg.count:
             start_value, end_value = agg.first_value, agg.last_value
@@ -520,10 +635,33 @@ class TaskAnalysis:
     snapshots: Dict[str, HistorySnapshot]
     request_seq: int = 0
     auto_refresh: bool = False
+    # 进程组任务（tree / name）的成员序列快照 {"指标@成员键": 快照}，按成员、指标的建立顺序；
+    # pid 任务为空。判定把它们和合计一起看（见 core.verdict）。用 load_member_snapshots 取
+    member_snapshots: Dict[str, HistorySnapshot] = field(default_factory=dict)
+    # 逐启动段的判定（按段号升序，没有重启时只有一段）；整体判定取最差的一段，见 core.verdict。
+    # 用 load_segments 取；空列表表示没有分段信息（旧结构 / 替身），判定退回只看 snapshots
+    segments: List["SegmentAnalysis"] = field(default_factory=list)
 
     @property
     def metrics(self) -> List[str]:
         return list(self.snapshots)
+
+    @property
+    def member_keys(self) -> List[str]:
+        """有成员序列快照的成员键（去重，保持顺序）。"""
+        keys: List[str] = []
+        for series_key in self.member_snapshots:
+            member = split_member_key(series_key)[1]
+            if member is not None and member not in keys:
+                keys.append(member)
+        return keys
+
+    def member_snapshot(self, metric: Optional[str],
+                        member: Optional[str]) -> Optional[HistorySnapshot]:
+        """某成员某指标的快照；没有为 None。"""
+        if not metric or member is None:
+            return None
+        return self.member_snapshots.get(member_series_key(metric, member))
 
     def snapshot(self, metric: Optional[str]) -> Optional[HistorySnapshot]:
         return self.snapshots.get(metric) if metric else None
@@ -537,6 +675,129 @@ class TaskAnalysis:
     @property
     def has_data(self) -> bool:
         return any(s.points for s in self.snapshots.values())
+
+
+@dataclass(frozen=True)
+class SegmentAnalysis:
+    """一个启动段（被测进程的一次启动）的判定。
+
+    start / end 为段的起止时刻（start 为 None 表示任务开始，end 为 None 表示仍是最后一段）；
+    verdict 为 rising / stable / insufficient（insufficient 即"本段数据不足"，包括段太短、
+    重启后还没有样本）；rising_metrics 是本段持续上涨的序列键（合计指标键或"指标@成员键"）；
+    sample_count 为本段内各序列统计样本数的最大值；metric_verdicts 是本段每个序列的判定。
+    """
+    number: int
+    start: Optional[datetime]
+    end: Optional[datetime]
+    verdict: str
+    rising_metrics: Tuple[str, ...] = ()
+    sample_count: int = 0
+    metric_verdicts: Dict[str, str] = field(default_factory=dict)
+
+
+def segment_spans(markers: Sequence[Marker]
+                  ) -> List[Tuple[int, Optional[datetime], Optional[datetime]]]:
+    """按"重启"打点切出各启动段 [(段号, 起点, 终点)]：第 1 段起点为 None，最后一段终点为 None；
+    非最后一段的终点是下一次重启前 1 毫秒（查询的 until 含端点，重启时刻起的样本属于下一段）。"""
+    restarts = _restart_times(markers)
+    spans = []
+    start: Optional[datetime] = None
+    for number, restart in enumerate(restarts, start=1):
+        spans.append((number, start, restart - timedelta(milliseconds=1)))
+        start = restart
+    spans.append((len(restarts) + 1, start, None))
+    return spans
+
+
+def build_segment(number: int, start: Optional[datetime], end: Optional[datetime],
+                  snapshots: Mapping[str, HistorySnapshot]) -> SegmentAnalysis:
+    """某一段内各序列（合计指标与成员序列）的快照 → 本段判定。"""
+    verdicts = {key: verdict_rules.metric_verdict(s) for key, s in snapshots.items()}
+    counts = [(s.stats or {}).get('count', 0) for s in snapshots.values()]
+    rising = tuple(key for key, v in verdicts.items() if v == verdict_rules.VERDICT_RISING)
+    return SegmentAnalysis(
+        number=number, start=start, end=end,
+        verdict=verdict_rules.segment_verdict(verdicts.values()),
+        rising_metrics=rising, sample_count=max(counts) if counts else 0,
+        metric_verdicts=verdicts)
+
+
+def _segment_snapshots(db, task_id: str, keys: Sequence[str], start: Optional[datetime],
+                       end: Optional[datetime],
+                       is_cancelled: Optional[Callable[[], bool]]
+                       ) -> Optional[Dict[str, HistorySnapshot]]:
+    """某一启动段 [start, end] 内逐序列的快照（自定义范围，口径与整体查询一致）。
+    查询失败抛 StorageError，取消返回 None。"""
+    result: Dict[str, HistorySnapshot] = {}
+    for key in keys:
+        if is_cancelled is not None and is_cancelled():
+            return None
+        request = replace(build_request(task_id, key, DEFAULT_RANGE_KEY),
+                          range_key=CUSTOM_RANGE_KEY, since=start, until=end)
+        snapshot = run_history_query(db, request)
+        if snapshot.error is not None:
+            raise StorageError(snapshot.error)
+        result[key] = snapshot
+    return result
+
+
+def load_segments(db, task_id: str, metrics: Sequence[str],
+                  snapshots: Mapping[str, HistorySnapshot],
+                  member_snapshots: Mapping[str, HistorySnapshot], *,
+                  is_cancelled: Optional[Callable[[], bool]] = None,
+                  reuse_last: bool = True
+                  ) -> Optional[List[SegmentAnalysis]]:
+    """逐启动段判定。snapshots / member_snapshots 是默认范围（统计只用最后一段）的整体查询
+    结果，直接作为最后一段的依据；更早的各段按段的起止时刻（自定义范围）再查一遍。
+    没有重启时只有一段，不多查。is_cancelled 为真时返回 None；查询失败抛 StorageError。
+
+    reuse_last 为假时最后一段也按段的起止时刻再查（snapshots 统计的不是最后一段时用，如分析页
+    的自定义范围落在更早的某一段里）。"""
+    markers = db.markers.list(task_id)
+    spans = segment_spans(markers)
+    last = {**snapshots, **member_snapshots}
+    if len(spans) == 1:
+        return [build_segment(1, None, None, last)]
+    keys = list(metrics) + member_series_keys(db, task_id, metrics)
+    segments: List[SegmentAnalysis] = []
+    for number, start, end in spans[:-1 if reuse_last else None]:
+        found = _segment_snapshots(db, task_id, keys, start, end, is_cancelled)
+        if found is None:
+            return None
+        segments.append(build_segment(number, start, end, found))
+    if reuse_last:
+        number, start, end = spans[-1]
+        segments.append(build_segment(number, start, end, last))
+    return segments
+
+
+def member_series_keys(db, task_id: str, metrics: Sequence[str]) -> List[str]:
+    """进程组任务里已有样本的成员序列键 "指标@成员键"（只含 metrics 里的指标，按序列建立
+    顺序）。pid 任务与没有成员仓储的库返回空列表。"""
+    members = getattr(db, 'members', None)
+    if members is None:
+        return []
+    wanted = set(metrics)
+    return [member_series_key(base, member) for base, member in members.member_series(task_id)
+            if base in wanted]
+
+
+def load_member_snapshots(db, task_id: str, metrics: Sequence[str], range_key: str, *,
+                          analysis: bool = True,
+                          is_cancelled: Optional[Callable[[], bool]] = None,
+                          **request_options) -> Optional[Dict[str, HistorySnapshot]]:
+    """逐成员序列跑 run_history_query（与合计序列同一函数、同一范围，口径一致）。
+
+    返回 {序列键: 快照}；pid 任务为空字典。is_cancelled 为真时返回 None（调用方据此放弃）。
+    存储故障转成快照的 error，由调用方像对合计快照一样处理。request_options 原样交给
+    build_request（自定义范围的 since / until、表格与分桶上限等，与合计查询保持一致）。"""
+    snapshots: Dict[str, HistorySnapshot] = {}
+    for key in member_series_keys(db, task_id, metrics):
+        if is_cancelled is not None and is_cancelled():
+            return None
+        snapshots[key] = run_history_query(
+            db, build_request(task_id, key, range_key, analysis=analysis, **request_options))
+    return snapshots
 
 
 def _known(metric: str) -> bool:

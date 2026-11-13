@@ -2,14 +2,15 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'codex/release-validation-*']
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 jobs:
   test:
     runs-on: windows-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     env:
       QT_QPA_PLATFORM: offscreen
       # 防御性设置：与本机已验证的 offscreen 跑法配置对齐，避免字体缺失导致刷屏/报错
@@ -29,7 +30,11 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements-lock.txt
-          pip install pytest
+          pip install -r requirements-dev.txt
 
+      # 完整集：包含本地默认排除的 slow（真实进程 / 管道 / 全链路冒烟 / 大数据对拍），
+      # 仍排除 perf（perf.yml 每周跑）、soak 与需要真窗口的 gui_real；
+      # 单个用例超过 PM_TEST_TIMEOUT_S（缺省 60 秒，slow 用例 3 倍）由 tests/watchdog.py
+      # 转储全部线程栈并结束进程，作业不会被卡死的用例拖到超时
       - name: Run tests
-        run: pytest tests/ -v
+        run: pytest tests/ -v -m "not perf and not soak and not gui_real" --durations=25

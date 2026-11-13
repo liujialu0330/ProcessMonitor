@@ -1,7 +1,8 @@
 """
 时间序列的显示辅助：空洞切断、累计量的每秒速率、峰值抬升次数
 
-空洞以 (空洞前最后一点, 空洞后第一点) 表示（与 AnalyticsRepo.gaps 一致）。相邻两个绘制点
+空洞以 (空洞前最后一点, 空洞后第一点) 表示（与 AnalyticsRepo.gaps 一致）；重启 / 续采处的
+强制断点同形，用 merge_gaps 并进来。相邻两个绘制点
 之间"跨过"某个空洞，当且仅当该空洞的两端都落在这两点之间（含端点）——绘制点都是真实
 数据点（降采样只挑点不造点），所以这一判断不受降采样影响。时间可以是 datetime，
 也可以是 epoch 秒（同一次调用里与空洞的类型一致即可）。
@@ -11,6 +12,12 @@ from typing import List, Sequence, Tuple, TypeVar
 
 T = TypeVar('T')
 Gap = Tuple[T, T]
+
+
+def merge_gaps(gaps: Sequence[Gap], extra: Sequence[Gap]) -> List[Gap]:
+    """把"强制断点"（重启 / 续采处，见 AnalyticsRepo.break_pairs）并入空洞：按起点升序、
+    去重。两类空洞同形，下游的连线掩码与速率计算无需区分。"""
+    return sorted(set(gaps) | set(extra), key=lambda g: (g[0], g[1]))
 
 
 def crosses_gap(left: T, right: T, gap_starts: Sequence[T], gaps: Sequence[Gap]) -> bool:

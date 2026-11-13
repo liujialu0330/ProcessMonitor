@@ -6,7 +6,10 @@ core 与 ui 之间传递的枚举与只读快照。界面文案不放这里：�
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
+
+if TYPE_CHECKING:
+    from data.models import QualityStats
 
 
 class TaskStatus(str, Enum):
@@ -27,6 +30,7 @@ class StopReason(Enum):
     PROCESS_NOT_FOUND = 'process_not_found'  # 启动时进程就不存在或无法访问
     PID_REUSED = 'pid_reused'                # 启动时发现所选 PID 已被另一个进程占用
     INTERNAL_ERROR = 'internal_error'        # 监控线程内部未预期异常
+    CRASHED = 'crashed'                      # 被测进程异常退出（退出码为 NTSTATUS 异常码等），且未续接或续接次数已用完
 
 
 class UnavailableReason(Enum):
@@ -43,7 +47,8 @@ class TaskInfo:
     """manager 内存中某个任务的只读快照（界面只拿它，不接触任务线程对象）。
 
     status 取自线程实际状态：RUNNING 覆盖暂停中与停止收尾中，is_stopping 为 True
-    表示已请求停止但收尾尚未完成。
+    表示已请求停止但收尾尚未完成。quality 为采集数据质量快照（MonitorWorker.
+    quality_snapshot()，可选；尚未开始调度或调用方未提供时为 None）。
     """
     task_id: str
     pid: int
@@ -57,3 +62,17 @@ class TaskInfo:
     create_time: Optional[float]     # 所选进程的创建时间（epoch 秒），手动输入 PID 时为 None
     is_paused: bool
     is_stopping: bool
+    quality: Optional['QualityStats'] = None
+    # 监控目标类型：'pid' 单个进程（默认）/ 'tree' 根进程及其全部后代 / 'name' 全部同名进程。
+    # tree 的 pid / create_time 是根进程；name 的 pid 为 0、process_name 是要监控的进程名
+    target_kind: str = 'pid'
+    # 进程组是否出现过因成员名超过上限而没建序列的进程（只在合计里；pid 任务恒为 False）
+    members_truncated: bool = False
+    # 被测进程退出后正在等待它重新启动以续接（C-2；线程仍在，status 仍为 RUNNING，与 is_paused 并列）
+    waiting_restart: bool = False
+    # 本任务已续接的次数与上限（上限 0 表示不续接）
+    restart_count: int = 0
+    restart_limit: int = 0
+    # 被测进程最近一次退出的退出码（无符号 32 位）；未退出或没取到为 None。异常退出的任务据此
+    # 在卡片上显示"异常退出：访问冲突 0xC0000005"（文本用 core.exit_forensics.format_exit_code）
+    exit_code: Optional[int] = None

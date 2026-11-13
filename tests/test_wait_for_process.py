@@ -84,12 +84,14 @@ def test_already_running_process_starts_immediately(env, query):
     assert board.waiting == {} and not presenter._wait_timer.isActive()
 
 
-def test_several_instances_pick_newest(env, query):
+def test_several_instances_require_explicit_target(env, query):
     presenter, manager, form, board = env
     presenter.on_wait_requested(_wait())
     query.processes.extend([(2001, "notepad.exe", 50.0), (2002, "Notepad.exe", 90.0)])
     presenter.poll_waits()
-    assert [c[0] for c in manager.created] == [2002]
+    assert manager.created == []
+    assert board.waiting == {} and presenter.wait_ids() == []
+    assert not presenter._wait_timer.isActive()
 
 
 def test_name_without_exe_suffix_also_matches(env, query):
@@ -124,6 +126,31 @@ def test_form_signal_reaches_presenter(env):
     presenter, manager, form, board = env
     form.wait_requested.emit(_wait())
     assert len(board.waiting) == 1
+
+
+def test_presenter_delegates_polling_to_wait_service(env, query):
+    """轮询与建任务在 core.wait_service（命令行 start --wait 共用）；Presenter 只管占位卡"""
+    from core.wait_service import WaitService
+    presenter, manager, form, board = env
+    assert isinstance(presenter.wait_service, WaitService)
+    wait_id = presenter.on_wait_requested(_wait())
+    assert presenter.wait_service.wait_ids() == [wait_id]
+    board.wait_cancel_requested.emit(wait_id)
+    assert presenter.wait_service.has_waits() is False
+
+
+def test_injected_wait_service_is_used(query, host):
+    from core.wait_service import WaitService
+    manager, form, board = FakeManager(), FakeForm(), FakeBoard()
+    services = make_services(process_query=query)
+    service = WaitService(manager, query, services.clock, id_prefix='x-')
+    presenter = MonitorPresenter(manager, services, form, board, host, wait_service=service)
+    wait_id = presenter.on_wait_requested(_wait())
+    assert wait_id.startswith('x-') and service.wait_ids() == [wait_id]
+    query.processes.append((2001, "notepad.exe", 2001.5))
+    presenter.poll_waits()
+    assert [c[0] for c in manager.created] == [2001]
+    assert board.waiting == {}
 
 
 # ---------------------------------------------------------------- 表单与面板

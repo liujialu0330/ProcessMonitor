@@ -17,7 +17,22 @@ English | [简体中文](./README.zh-CN.md)
 
 </div>
 
-ProcessMonitor is a Windows 11 Fluent Design desktop app for keeping an eye on any running process. Pick a process by PID or from a live list, choose from 26 metrics across memory, CPU, system and I/O categories, and watch the numbers update on a configurable sampling interval — from every second up to once an hour. Every sample is persisted locally; the Analysis page gives each metric a verdict, round-by-round increases and trend charts, lets you compare two test runs, and exports a report image plus CSV files in one click.
+## 2.0 development build
+
+The source version is `2.0.0-beta.1`. It adds process trees and same-name process groups, automatic markers and stop conditions, crash evidence and restart recovery, evidence bundles, reusable multi-target plans, comparison of up to four tasks, and scenario references. Monitoring offers card and list views; the task library supports search, stars, and batch deletion.
+
+The first launch upgrades older databases to schema v5 and keeps a `.bak_v1` backup. Large databases may take time to migrate; the default data directory stays the same. Keep enough free disk space and read the [upgrade and rollback notes](CHANGELOG.md). The latest formal local performance run passed all 10 tests in 22.52 seconds on November 13, 2026, with no code or budget changes for this rerun. Earlier fluctuations and all independent run records remain available for continued validation. The real 24-hour soak, external update-channel rehearsal, and final release acceptance are still pending.
+
+```bat
+python main.py
+python pmctl.py start --plan D:\plans\window-cycle.json
+python pmctl.py verdict --task TASK_ID --vs-reference
+```
+
+Save, import, or export plans from the monitoring page. Notes allow up to 2,000 characters; wait timeouts accept fractional seconds, with an empty field meaning no timeout. `pmctl --json` uses standard Unicode escapes and can be decoded as UTF-8 regardless of the console encoding. See the [automation guide](tools/README.md) for commands and JSON examples.
+
+
+ProcessMonitor is a Windows 11 Fluent Design desktop app for keeping an eye on any running process. Pick a process by PID or from a live list, choose from 26 metrics across memory, CPU, system and I/O categories, and watch the numbers update on a configurable sampling interval — from every second up to once an hour. Every sample is persisted locally; the Analysis page gives each metric a verdict, round-by-round increases and trend charts, lets you compare up to four test runs, and exports a report image plus CSV files in one click.
 
 ## ✨ Features
 
@@ -67,20 +82,18 @@ ProcessMonitor is a Windows 11 Fluent Design desktop app for keeping an eye on a
 - **Crash-resilient storage** — SQLite with WAL mode, automatic retry on failed writes, crash/error logging (5MB x 5 rotation), and automatic recovery of orphaned "running" tasks after an unclean shutdown
 - **Safe database upgrades** — upgrades run in an explicit transaction and roll back on failure, restoring from the automatic backup so old data is never lost
 - **Never freezes on stop** — stopping a task or exiting the app does not block the UI, and all collected data is flushed to disk before exit
-- **Automated test suite** — 1,700+ test cases covering the data layer, migration, collection and scheduling, verdicts and interval statistics, report export, the global hotkey (with a fake backend), update verification, page flows and UI contracts, plus an offscreen smoke test of the whole "start → baseline → two rounds → analysis → export report → close" path; tests use a temporary data directory and never touch real data
+- **Automated test suite** — 4,700+ test cases covering the data layer, migration, collection and scheduling, verdicts and interval statistics, report export, the global hotkey (with a fake backend), update verification, page flows and UI contracts, plus an offscreen smoke test of the whole "start → baseline → two rounds → analysis → export report → close" path; tests use a temporary data directory and never touch real data
 - **Measured performance** — opening a 770k-row history task takes ~1.4s (down from 3.4s pre-v1.2.0; measured on the maintainer's dev machine)
 
 ## 📸 Screenshots
 
-> These screenshots show the pre-redesign (v1.4) UI; new shots of the Monitor, Analysis and Settings pages are still to come.
-
-| Monitor | Analysis (old History page) |
+| Monitor | Analysis |
 |---|---|
-| ![Monitor page](screenshots/monitor-page.png) | ![Analysis page](screenshots/history-page.png) |
+| ![Monitor page](screenshots/monitor-page.png) | ![Analysis page](screenshots/analysis-page.png) |
 
-| Report export (old Export page) | Settings (incl. About & updates) |
-|---|---|
-| ![Export page](screenshots/export-page.png) | ![Settings page](screenshots/setting-page.png)<br>![About & updates](screenshots/about-page.png) |
+| Settings (incl. About & updates) |
+|---|
+| ![Settings page](screenshots/setting-page.png) |
 
 ## 🚀 Getting Started
 
@@ -151,8 +164,8 @@ python -m pytest tests/
 ## 🗺 Roadmap
 
 - [ ] Export data to Excel format
-- [ ] Compare three or more tasks at once
-- [ ] Alerts when a metric crosses a threshold
+- [x] Compare up to four tasks (2.0 development build)
+- Threshold alerts are outside the current scope.
 
 See [CHANGELOG.md](./CHANGELOG.md) or [GitHub Releases](https://github.com/liujialu0330/ProcessMonitor/releases) for the full release history.
 

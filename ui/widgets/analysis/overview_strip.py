@@ -15,12 +15,11 @@ from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import QSizePolicy, QVBoxLayout, QWidget
 from qfluentwidgets import CaptionLabel, qconfig
 
-from ui.chart_theme import chart_colors
+from ui.chart_theme import SELECTION_ALPHA, chart_colors, is_transparent, make_transparent
 from ui.components.chart_axes import ContextDateAxisItem
 from ui.typography import TypeScale, data_font
 
 OVERVIEW_HEIGHT = 84
-REGION_ALPHA = 40
 HINT_TEXT = "拖动或拉伸选区即按选区重新统计；点「全部」等范围恢复"
 
 
@@ -122,17 +121,35 @@ class OverviewStrip(QWidget):
     # ---------- 主题 ----------
 
     def _on_theme_changed(self, _theme) -> None:
-        self.apply_theme()
+        # 无父对象的控件可能已被回收了 pyqtgraph 的场景而 Python 对象还在：
+        # 遇到已删除的 C++ 对象就退订，不再跟随主题
+        try:
+            self.apply_theme()
+        except RuntimeError:
+            try:
+                qconfig.themeChanged.disconnect(self._on_theme_changed)
+            except TypeError:
+                pass
+
+    def is_background_transparent(self) -> bool:
+        """绘图区背景是否透明（由窗口底提供底色）。"""
+        return is_transparent(self.plot)
 
     def apply_theme(self) -> None:
+        """背景透明（概览条直接放在页面上，底色来自窗口）；轴线、走势线、选区按主题取色。"""
         colors = chart_colors()
-        self.plot.setBackground(colors['background'])
+        make_transparent(self.plot)
         self.time_axis.setPen(pg.mkPen(color=colors['axis']))
         self.time_axis.setTextPen(pg.mkPen(color=colors['text']))
-        self.curve.setPen(pg.mkPen(color=colors['crosshair'], width=1))
-        fill = QColor(colors['curve'])
-        fill.setAlpha(REGION_ALPHA)
+        self.curve.setPen(pg.mkPen(color=colors['overview_curve'], width=1))
+        fill = QColor(colors['selection'])
+        fill.setAlpha(SELECTION_ALPHA)
         self.region.setBrush(pg.mkBrush(fill))
-        edge = QColor(colors['curve'])
+        # 悬停态也按主题取色（pyqtgraph 默认悬停填充取构造时的蓝色、边线悬停为红色）
+        hover_fill = QColor(colors['selection'])
+        hover_fill.setAlpha(min(255, SELECTION_ALPHA * 2))
+        self.region.setHoverBrush(pg.mkBrush(hover_fill))
+        edge = QColor(colors['selection'])
         for line in self.region.lines:
             line.setPen(pg.mkPen(color=edge, width=2))
+            line.setHoverPen(pg.mkPen(color=edge, width=3))

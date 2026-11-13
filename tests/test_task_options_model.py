@@ -6,6 +6,7 @@ TaskOptionsModel（纯单元，不建任何控件）：
 """
 from datetime import datetime, timedelta
 
+from core.automation.plan import AutomationPlan
 from data.models import MonitorTask
 from ui.formatting import format_task_option_text, format_task_tooltip
 from ui.models.task_options import TaskOption, TaskOptionsModel
@@ -34,28 +35,25 @@ def _tasks():
 
 def test_text_and_tooltip_match_formatting():
     tasks = _tasks()
-    for full_date in (False, True):
-        model = TaskOptionsModel(full_date=full_date)
-        options = model.rebuild(tasks, {"run"}, NOW)
-        for task, option in zip(tasks, options):
-            running = task.task_id == "run"
-            assert option == TaskOption(
-                task_id=task.task_id,
-                text=format_task_option_text(task, running, NOW, full_date=full_date),
-                tooltip=format_task_tooltip(task, running, NOW),
-                running=running)
+    options = TaskOptionsModel().rebuild(tasks, {"run"}, NOW)
+    for task, option in zip(tasks, options):
+        running = task.task_id == "run"
+        assert option == TaskOption(
+            task_id=task.task_id,
+            text=format_task_option_text(task, running, NOW),
+            tooltip=format_task_tooltip(task, running, NOW),
+            running=running)
 
 
 def test_pinned_texts():
-    """两种日期格式的具体文案（与安全网测试同一组数据）。"""
+    """具体文案（与安全网测试同一组数据）：文本不带年份，完整日期在 tooltip。"""
     short = TaskOptionsModel().rebuild(_tasks(), {"run"}, NOW)
-    full = TaskOptionsModel(full_date=True).rebuild(_tasks(), {"run"}, NOW)
     assert [o.text for o in short] == [
         "run.exe · PID 1000 · 07-16 23:00 · 运行中 5分钟",
         "noted.exe · PID 1000 · 07-16 21:00 · 42分钟 · 建模 200 次回归测试，连续运…",
         "plain.exe · PID 1000 · 12-31 23:30 · 2小时15分",
     ]
-    assert full[2].text == "plain.exe · PID 1000 · 2025-12-31 23:30 · 2小时15分"
+    assert "开始：2025-12-31 23:30:00" in short[2].tooltip
     assert "备注：建模 200 次回归测试，连续运行过夜观察内存增长" in short[1].tooltip
 
 
@@ -99,14 +97,14 @@ def test_refresh_running_returns_changed_indices():
 
 
 def test_refresh_after_task_ends_uses_final_duration_and_freezes():
-    model = TaskOptionsModel(full_date=True)
+    model = TaskOptionsModel()
     model.rebuild(_tasks(), {"run"}, NOW)
     ended = _task("run", BASE + timedelta(hours=3), end=BASE + timedelta(hours=3, minutes=40))
 
     changed = model.refresh_running(BASE + timedelta(hours=6), set(), {"run": ended})
     assert changed == [0]
     option = model.options()[0]
-    assert option.text == "run.exe · PID 1000 · 2026-07-16 23:00 · 40分钟"
+    assert option.text == "run.exe · PID 1000 · 07-16 23:00 · 40分钟"
     assert not option.running and "状态：已结束" in option.tooltip
     assert model.task("run") is ended
     assert model.tracked_running_ids() == []
@@ -132,3 +130,39 @@ def test_rebuild_with_no_tasks():
     assert model.rebuild([], (), NOW) == []
     assert len(model) == 0 and model.tracked_running_ids() == []
     assert model.refresh_running(NOW, set(), {}) == []
+
+
+# ---------- 自动化方案 ----------
+
+
+def test_plan_round_trips_through_option():
+    plan = AutomationPlan(timed_marker_seconds=600, stop_after_rounds=10)
+    planned = _task("planned", BASE)
+    planned.plan_json = plan.to_json()
+    model = TaskOptionsModel()
+    options = model.rebuild([planned, _task("plain", BASE)], set(), NOW)
+
+    assert options[0].plan == plan and model.plan("planned") == plan
+    assert options[1].plan is None and model.plan("plain") is None
+    assert model.plan("missing") is None
+    assert "自动化：自动打点 每 10 分钟 · 满 10 轮停止" in options[0].tooltip
+    assert "自动化" not in options[1].tooltip
+    # 与 ui.formatting 逐字一致的约定不因方案而变
+    assert options[0].tooltip == format_task_tooltip(planned, False, NOW)
+
+
+def test_broken_plan_json_is_ignored():
+    broken = _task("broken", BASE)
+    broken.plan_json = '{"schema_version": 99}'
+    [option] = TaskOptionsModel().rebuild([broken], set(), NOW)
+    assert option.plan is None and "自动化" not in option.tooltip
+
+
+def test_refresh_keeps_plan():
+    plan = AutomationPlan(timed_marker_seconds=60)
+    task = _task("run", BASE)
+    task.plan_json = plan.to_json()
+    model = TaskOptionsModel()
+    model.rebuild([task], {"run"}, NOW)
+    model.refresh_running(NOW + timedelta(minutes=5), {"run"}, {})
+    assert model.plan("run") == plan

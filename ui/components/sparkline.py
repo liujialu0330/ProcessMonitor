@@ -8,21 +8,26 @@
 范围始终是"任务开始至今"，各点代表的时间跨度保持一致。
 纵轴按数据 min-max 自适应，但跨度有下限，避免微小抖动被画成满幅波动。
 采集点带时间时还能画打点刻度：基线为注意色实线，普通打点为注意色虚线。
+刻度可悬停（"第 3 轮 · 10:21:05 · 备注"）；用户打点与基线还能右键（发 marker_menu_requested，
+菜单由监控页的 Presenter 弹出），异常退出 / 重启 / 续采这类系统打点只能悬停。
 """
+import math
 from bisect import bisect_right
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
-from PyQt5.QtCore import Qt, QPointF
-from PyQt5.QtGui import QPainter, QPen, QColor, QPolygonF
-from PyQt5.QtWidgets import QWidget, QSizePolicy
+from PyQt5.QtCore import QEvent, Qt, QPointF, pyqtSignal
+from PyQt5.QtGui import QPainter, QPen, QPolygonF
+from PyQt5.QtWidgets import QToolTip, QWidget, QSizePolicy
 
-from qfluentwidgets import isDarkTheme
+from ui.formatting import marker_tick_text
+from ui.theme_tokens import ATTENTION, DATA, EVENT_MARKER_COLORS, qcolor
 
 # 最小跨度规则按指标 kind 定义在 utils.metrics；常量在此再导出，保持原有导入路径可用
 from utils.metrics import (  # noqa: F401
     MIN_SPAN_BYTES_KB, MIN_SPAN_BYTES_RATIO, MIN_SPAN_COUNT, MIN_SPAN_PERCENT,
-    min_span_for, rate_min_span_for
+    min_span_for, rate_min_span_for, format_metric_value
 )
 
 # 固定高度（像素），横向随父布局拉伸
@@ -31,17 +36,21 @@ FIXED_HEIGHT = 36
 # 缓冲区点数上限（必须为偶数，保证成对合并后没有落单点）
 DEFAULT_MAX_POINTS = 240
 
-# 折线取色：在 paintEvent 内动态调用 isDarkTheme()，不连接 qconfig.themeChanged——
-# 任务卡片随监控任务动态创建/销毁，这样实现不必在卡片销毁时手动断开主题信号连接，
-# 零信号残留。颜色自含常量，不依赖分析页的 ui/chart_theme.py。
-_LIGHT_COLOR = QColor("#0A8F8F")
-_DARK_COLOR = QColor("#44D7D1")
-# 打点刻度用注意色（与历史图表的打点竖线同色）
-_MARKER_LIGHT_COLOR = QColor("#C2410C")
-_MARKER_DARK_COLOR = QColor("#FFB454")
+# 取色：在 paintEvent 内按当前主题从 ui.theme_tokens 取，不连接 qconfig.themeChanged——
+# 任务卡片随监控任务动态创建/销毁，这样不必在卡片销毁时手动断开主题信号连接，零信号残留。
+# 背景不画（透明），底色来自所在卡片；折线用数据主色（对卡片底 ≥ 4.5:1），
+# 打点刻度用注意色（与分析页图表的打点竖线同色）。
+LINE_COLOR = DATA
+TICK_COLOR = ATTENTION
 
-# 画在迷你图上的打点类型：暂停/恢复系统打点不画，小图上只留用户关心的轮次边界
-TICK_KINDS = ('baseline', 'user')
+# 画在迷你图上的打点类型：暂停/恢复系统打点不画，小图上只留用户关心的轮次边界与系统事件
+# （被测进程异常退出 / 重启续接 / 工具重启后续采，点划线，颜色与分析页图表一致）
+EVENT_TICK_KINDS = tuple(EVENT_MARKER_COLORS)
+TICK_KINDS = ('baseline', 'user') + EVENT_TICK_KINDS
+# 能右键编辑的刻度类型（系统事件只读）
+EDITABLE_TICK_KINDS = ('baseline', 'user')
+# 鼠标离刻度多少像素以内算指到它
+TICK_HIT_RADIUS = 5.0
 
 
 def merge_pairs(values: Sequence[float]) -> List[float]:
@@ -153,8 +162,49 @@ def compute_y_range(
     return low, high
 
 
+def cosmetic_pen(color, width: float, ratio: float = 1.0) -> QPen:
+    """cosmetic 画笔：笔宽按设备像素计，不随 QPainter 的缩放变换放大。
+    width 是逻辑像素宽，乘设备像素比 ratio 后落在整数 / 半整数设备像素上，
+    125% / 150% 缩放下 1 px 的刻度线不会被缩放糊成两条半透明的线。"""
+    pen = QPen(color)
+    pen.setCosmetic(True)
+    pen.setWidthF(max(1.0, round(width * max(ratio, 1.0) * 2.0) / 2.0))
+    return pen
+
+
+def tick_pen(kind: str, ratio: float = 1.0) -> QPen:
+    """打点刻度的画笔：基线实线，普通打点虚线，系统事件（异常退出 / 重启 / 续采）点划线并取各自
+    语义色，让它们在迷你图上一眼与用户打点区分开。ratio 为控件的设备像素比（devicePixelRatioF）。"""
+    if kind in EVENT_TICK_KINDS:
+        pen = cosmetic_pen(qcolor(EVENT_MARKER_COLORS[kind]), 1.5, ratio)
+        pen.setStyle(Qt.DashDotLine)
+        return pen
+    if kind == 'baseline':
+        return cosmetic_pen(qcolor(TICK_COLOR), 1.5, ratio)
+    pen = cosmetic_pen(qcolor(TICK_COLOR), 1.0, ratio)
+    pen.setStyle(Qt.DashLine)
+    return pen
+
+
+@dataclass(frozen=True)
+class Tick:
+    """迷你图上的一个打点刻度。marker 为原打点对象（只给了时间与类型时为 None）；
+    text 是悬停文字，没有 marker 时为空串。"""
+    when: datetime
+    kind: str
+    marker: Optional[object] = None
+    text: str = ""
+
+
 class SparklineWidget(QWidget):
-    """迷你趋势图：固定高度 36px，横向拉伸；覆盖任务开始至今的走势"""
+    """迷你趋势图：固定高度 36px，横向拉伸；覆盖任务开始至今的走势
+
+    信号：
+        marker_menu_requested(object, QPoint): 在可编辑的刻度（基线 / 用户打点）上右键，
+            参数为打点对象与全局坐标
+    """
+
+    marker_menu_requested = pyqtSignal(object, object)
 
     def __init__(self, max_points: int = DEFAULT_MAX_POINTS,
                  metric_type: Optional[str] = None, parent=None):
@@ -170,9 +220,10 @@ class SparklineWidget(QWidget):
         # 每个指标一条缓冲区（键为指标类型；未指定指标时键为 None）
         self._samplers: Dict[Optional[str], TrendDownsampler] = {}
         self._sampler = self._sampler_for(metric_type)
-        # 打点刻度 [(时间, kind)]，只保留 TICK_KINDS
-        self._markers: List[Tuple[datetime, str]] = []
+        # 打点刻度（按时间升序），只保留 TICK_KINDS
+        self._ticks: List[Tick] = []
 
+        self.setMouseTracking(True)
         self.setFixedHeight(FIXED_HEIGHT)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
@@ -185,6 +236,7 @@ class SparklineWidget(QWidget):
     def append(self, value: float, timestamp: Optional[datetime] = None) -> None:
         """向当前显示的指标追加一个采集点并触发重绘；timestamp 为采集时间（画打点刻度要用）"""
         self._sampler.append(value, timestamp)
+        self._sync_height()
         self.update()
 
     def append_values(self, values: Mapping[str, float],
@@ -192,6 +244,7 @@ class SparklineWidget(QWidget):
         """一批采集值分别追加到各指标的缓冲区（之后切换显示对象时曲线已是完整的）。"""
         for metric_type, value in values.items():
             self._sampler_for(metric_type).append(value, timestamp)
+        self._sync_height()
         self.update()
 
     def metric_type(self) -> Optional[str]:
@@ -202,32 +255,94 @@ class SparklineWidget(QWidget):
         """切换显示的指标（纵轴最小跨度随之切换）。"""
         self._metric_type = metric_type
         self._sampler = self._sampler_for(metric_type)
+        self._sync_height()
         self.update()
+
+    def _sync_height(self):
+        values = self._sampler.series()
+        self.setFixedHeight(24 if len(values) >= 2 and min(values) == max(values) else FIXED_HEIGHT)
 
     def clear(self) -> None:
         """清空全部缓冲区并触发重绘"""
         for sampler in self._samplers.values():
             sampler.clear()
+        self._sync_height()
         self.update()
 
     def series(self) -> List[float]:
         """当前绘制序列（测试与调试用）"""
         return self._sampler.series()
 
-    def set_markers(self, markers: Sequence[Tuple[datetime, str]]) -> None:
-        """设置打点刻度 [(时间, kind)]；非 TICK_KINDS 的打点忽略。"""
-        self._markers = sorted(
-            ((when, kind) for when, kind in markers if kind in TICK_KINDS),
-            key=lambda item: item[0])
+    def set_markers(self, markers: Sequence) -> None:
+        """设置打点刻度；非 TICK_KINDS 的打点忽略。markers 的元素可以是 (时间, kind)，
+        也可以是带 timestamp / kind / label 的打点对象（后者才有悬停文字与右键）。"""
+        pairs = []
+        for item in markers:
+            if isinstance(item, tuple):
+                pairs.append((item[0], item[1], None))
+            else:
+                pairs.append((item.timestamp, item.kind, item))
+        pairs.sort(key=lambda p: (p[0], getattr(p[2], 'id', None) or 0))
+        # 用户打点的序号按时间先后数（与"第 N 轮"的默认命名同一口径）
+        rounds = 0
+        ticks: List[Tick] = []
+        for when, kind, marker in pairs:
+            number = None
+            if kind == 'user':
+                rounds += 1
+                number = rounds
+            if kind in TICK_KINDS:
+                text = marker_tick_text(marker, number) if marker is not None else ""
+                ticks.append(Tick(when, kind, marker, text))
+        self._ticks = ticks
         self.update()
+
+    def _tick_fractions(self) -> List[Tuple[float, Tick]]:
+        times = self._sampler.times()
+        if not times or any(t is None for t in times):
+            return []
+        return [(tick_fraction(times, tick.when), tick) for tick in self._ticks]
 
     def tick_positions(self) -> List[Tuple[float, str]]:
         """各打点刻度的横轴位置 [(0~1 的比例, kind)]。还没有点、或有点缺少时间时
         无法换算，返回空列表（不画刻度）。"""
-        times = self._sampler.times()
-        if not times or any(t is None for t in times):
-            return []
-        return [(tick_fraction(times, when), kind) for when, kind in self._markers]
+        return [(fraction, tick.kind) for fraction, tick in self._tick_fractions()]
+
+    def _tick_x(self, fraction: float) -> float:
+        width = self.width()
+        return min(max(fraction * width, 0.5), max(width - 0.5, 0.5))
+
+    def tick_at(self, x: float) -> Optional[Tick]:
+        """横坐标 x（控件像素）附近的打点刻度，取最近的一个；没有返回 None。"""
+        best: Optional[Tick] = None
+        best_distance = TICK_HIT_RADIUS + 1e-9
+        for fraction, tick in self._tick_fractions():
+            distance = abs(self._tick_x(fraction) - x)
+            if distance <= best_distance:
+                best, best_distance = tick, distance
+        return best
+
+    def event(self, event) -> bool:
+        if event.type() == QEvent.ToolTip:
+            tick = self.tick_at(event.pos().x())
+            if tick is not None and tick.text:
+                QToolTip.showText(event.globalPos(), tick.text, self)
+                return True
+        return super().event(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        tick = self.tick_at(event.pos().x())
+        editable = tick is not None and tick.kind in EDITABLE_TICK_KINDS
+        self.setCursor(Qt.PointingHandCursor if editable else Qt.ArrowCursor)
+        super().mouseMoveEvent(event)
+
+    def contextMenuEvent(self, event) -> None:
+        tick = self.tick_at(event.pos().x())
+        if tick is None or tick.marker is None or tick.kind not in EDITABLE_TICK_KINDS:
+            event.ignore()
+            return
+        event.accept()
+        self.marker_menu_requested.emit(tick.marker, event.globalPos())
 
     def paintEvent(self, event):
         """
@@ -246,16 +361,14 @@ class SparklineWidget(QWidget):
         count = len(values)
         width = self.width()
         height = self.height()
-        color = _DARK_COLOR if isDarkTheme() else _LIGHT_COLOR
+        color = qcolor(LINE_COLOR)
 
         if count == 1:
             painter.setPen(Qt.NoPen)
             painter.setBrush(color)
             painter.drawEllipse(QPointF(width / 2, height / 2), 2.0, 2.0)
         elif count >= 2:
-            pen = QPen(color)
-            pen.setWidthF(1.5)
-            painter.setPen(pen)
+            painter.setPen(cosmetic_pen(color, 1.5, self.devicePixelRatioF()))
 
             low, high = compute_y_range(values, self._metric_type)
             span = high - low
@@ -275,21 +388,36 @@ class SparklineWidget(QWidget):
         # count == 0：不画任何内容
 
         self._paint_ticks(painter, width, height)
+        if count >= 2 and height > 24 and width > 240 and self._metric_type:
+            painter.setPen(qcolor(DATA))
+            font = painter.font()
+            font.setPixelSize(10)
+            painter.setFont(font)
+            painter.drawText(self.rect().adjusted(4, 0, -4, 0), Qt.AlignRight | Qt.AlignTop,
+                             format_metric_value(self._metric_type, max(values)))
+            painter.drawText(self.rect().adjusted(4, 0, -4, 0), Qt.AlignRight | Qt.AlignBottom,
+                             format_metric_value(self._metric_type, min(values)))
         painter.end()
 
     def _paint_ticks(self, painter: QPainter, width: int, height: int) -> None:
-        """打点刻度：基线注意色实线，普通打点注意色虚线，贯穿整个高度。"""
+        """打点刻度：基线注意色实线，普通打点注意色虚线，系统事件各自的语义色点划线，
+        都贯穿整个高度。"""
         positions = self.tick_positions()
         if not positions:
             return
-        color = _MARKER_DARK_COLOR if isDarkTheme() else _MARKER_LIGHT_COLOR
+        ratio = self.devicePixelRatioF()
+        last_label_x = -100
+        number = 0
         for fraction, kind in positions:
-            pen = QPen(color)
-            if kind == 'baseline':
-                pen.setWidthF(1.5)
-            else:
-                pen.setWidthF(1.0)
-                pen.setStyle(Qt.DashLine)
-            painter.setPen(pen)
-            x = min(max(fraction * width, 0.5), max(width - 0.5, 0.5))
+            painter.setPen(tick_pen(kind, ratio))
+            # 竖线对齐到设备像素中心：逻辑坐标 x 在 150% 缩放下常落在两个设备像素之间
+            x = (math.floor(self._tick_x(fraction) * ratio) + 0.5) / ratio
             painter.drawLine(QPointF(x, 0), QPointF(x, height))
+            if kind == 'user':
+                number += 1
+            if kind in ('baseline', 'user') and x - last_label_x >= 32 and x < width - 35:
+                font = painter.font()
+                font.setPixelSize(10)
+                painter.setFont(font)
+                painter.drawText(QPointF(x + 3, 10), '基线' if kind == 'baseline' else str(number))
+                last_label_x = x

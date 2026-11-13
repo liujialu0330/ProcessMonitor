@@ -65,9 +65,16 @@ class _ClickRunner:
     def __call__(self, dialog) -> bool:
         self.ran += 1
         dialog.show()
-        QTest.qWait(300)  # 淡入动画 200ms
+        # 等淡入动画结束（它收尾时撤掉对话框的透明度特效），不能按固定毫秒数猜：淡入没结束就
+        # 点按钮的话，淡出开始后淡入的收尾回调才触发、把淡出的特效一并撤掉，淡出动画随目标
+        # 销毁而停止、永远不发 finished，对话框就留在屏幕上（机器忙时 300 毫秒不一定够）
+        for _ in range(500):
+            if dialog.graphicsEffect() is None:
+                break
+            QTest.qWait(20)
+        assert dialog.graphicsEffect() is None, "对话框淡入没有结束"
         self.action(dialog, self.seen)
-        for _ in range(50):  # 淡出动画 100ms 后才真正 done()
+        for _ in range(500):  # 淡出动画 100ms 后才真正 done()，条件满足即退出
             if not dialog.isVisible():
                 break
             QTest.qWait(20)
@@ -115,8 +122,12 @@ def test_production_services_binds_task_status_to_manager():
 def test_resolve_duration_defaults_and_explicit_values():
     assert resolve_duration("info", None) == 2000
     assert resolve_duration("success", None) == 2000
-    assert resolve_duration("warning", None) == 3000
+    assert resolve_duration("warning", None) == 5000
     assert resolve_duration("error", None) == -1
+    # 带操作按钮：6 秒；错误即使带按钮也常驻
+    assert resolve_duration("success", None, has_action=True) == 6000
+    assert resolve_duration("warning", None, has_action=True) == 6000
+    assert resolve_duration("error", None, has_action=True) == -1
     assert resolve_duration("warning", 10000) == 10000
     with pytest.raises(ValueError):
         resolve_duration("fatal", None)
@@ -133,10 +144,10 @@ def test_infobar_notifier_shows_bars_with_expected_duration(host):
     QApplication.processEvents()
 
     assert {level: bar.duration for level, bar in bars.items()} == {
-        "info": 2000, "success": 2000, "warning": 3000, "error": -1}
+        "info": 2000, "success": 2000, "warning": 5000, "error": -1}
     for level, bar in bars.items():
         assert isinstance(bar, InfoBar)
-        assert bar.position == InfoBarPosition.TOP
+        assert bar.position == InfoBarPosition.BOTTOM_RIGHT
         assert bar.isClosable
         assert bar.parent() is host
     assert bars["warning"].title == "注意"

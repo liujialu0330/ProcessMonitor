@@ -51,7 +51,7 @@ def test_recording_notifier_effective_duration_follows_production_defaults():
     notifier.warning(None, "注意", "b")
     notifier.error(None, "错误", "c")
     notifier.warning(None, "注意", "d", duration=10000)
-    assert [n.effective_duration for n in notifier.messages()] == [2000, 3000, -1, 10000]
+    assert [n.effective_duration for n in notifier.messages()] == [2000, 5000, -1, 10000]
 
 
 def test_recording_notifier_last_without_records_fails_clearly():

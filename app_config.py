@@ -1,40 +1,32 @@
-"""
-应用配置
-基于 qfluentwidgets QConfig 体系的用户偏好持久化（JSON 落盘于 AppPaths.config_path，即数据目录下的 config.json）
+"""GUI 配置适配层：保留 Fluent 设置卡片的 ConfigItem 和主题信号契约。
 
-与 config.py 的关系：config.py 保留作为"缺省值来源"（模块常量，随代码发布固化）；
-本模块在其基础上包装为可持久化、可在设置页实时编辑的 ConfigItem。运行时业务
-代码统一读 cfg.get(...)，config.py 里被本模块接管的常量只在此处被引用一次
-（作为 ConfigItem 的 default 参数），不再是运行时唯一真相来源。
-
-【关键契约，务必遵守，勿在本类重定义 themeMode】
-主题项直接复用 QConfig 基类内置的 themeMode，本类不重新声明同名 ConfigItem。
-原因（已读源码 + 实测核实）：qfluentwidgets.setTheme() 内部固定操作模块级单例
-qconfig 的 qconfig.themeMode（common/style_sheet.py: `qconfig.set(qconfig.
-themeMode, theme, save)`），而 QConfig.set() 内部又用 `is` 身份比较判断
-"这次改的是不是主题项"（common/config.py: `if item is self._cfg.themeMode`）
-来决定要不要联动更新已解析的主题值、要不要发 themeChanged 信号。若本类另外
-声明一个同名 themeMode 属性，会产生两个不同的 ConfigItem 对象：setTheme() 操作
-qfluentwidgets 内置的那个、设置页的 OptionsSettingCard 绑定的是本类重定义的
-那个，二者状态互不联动，会出现"设置页选了深色但没生效""重启后主题又变回默认"
-之类的错乱。不重定义时 AppConfig.themeMode 与 qconfig.themeMode 是同一对象
-（继承自类属性，未被覆盖），已用脚本验证 `AppConfig.themeMode is QConfig.
-themeMode` 为 True。
+字段、校验与迁移定义来自 settings_schema；无窗口入口使用 settings_store，
+不导入本模块。themeMode 沿用 QConfig 基类的同一对象，不得重新声明。
 """
-import json
+import copy
 import logging
 import os
-
+from pathlib import Path
 from typing import TYPE_CHECKING, Iterable, List, Optional, Tuple
 
+from PyQt5.QtCore import Qt
 from qfluentwidgets import (
-    QConfig, ConfigItem, ConfigValidator, OptionsConfigItem, RangeConfigItem,
-    BoolValidator, OptionsValidator, RangeValidator, qconfig,
-    Theme, setTheme
+    QConfig, ConfigItem, OptionsConfigItem, RangeConfigItem, qconfig, Theme, setTheme,
 )
 
 import config
-from utils.metrics import LEAK_CHECK_PRESET, all_metric_types, canonical_metric_type
+import settings_schema as _schema
+from settings_schema import (
+    CONFIG_MIGRATIONS, CONFIG_VERSION_KEY, CURRENT_CONFIG_VERSION, LEGACY_CONFIG_VERSION,
+    DEFAULT_MARKER_HOTKEY, MARKER_HOTKEY_MAX_LENGTH, DEFAULT_EXPORT_NAME_TEMPLATE,
+    EXPORT_NAME_TEMPLATE_MAX_LENGTH, WINDOW_PAGE_KEYS, SHORT_TEXT_MAX_LENGTH,
+    REPORT_SCHEME_LIGHT, REPORT_SCHEME_FOLLOW, REPORT_COLOR_SCHEMES,
+    ConfigValidator, OptionsValidator, RangeValidator, BoolValidator,
+    MetricListValidator, MetricPresetsValidator, DirectoryTextValidator,
+    MarkerHotkeyValidator, ExportNameTemplateValidator, WindowRectValidator,
+    ShortTextValidator, normalize_metrics, config_version_of,
+)
+from settings_store import prepare_config_file, write_json_atomic, import_legacy_preferences
 
 if TYPE_CHECKING:
     from app.paths import AppPaths
@@ -42,86 +34,40 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def normalize_metrics(value) -> List[str]:
-    """把配置里读出的指标列表归一：非列表/未知键丢弃，旧键经
-    canonical_metric_type 归一，去重保序；结果为空则回落到"泄漏排查"预设。"""
-    known = set(all_metric_types())
-    result: List[str] = []
-    if isinstance(value, (list, tuple)):
-        for item in value:
-            if not isinstance(item, str):
-                continue
-            key = canonical_metric_type(item)
-            if key in known and key not in result:
-                result.append(key)
-    return result or list(LEAK_CHECK_PRESET)
-
-
-class MetricListValidator(ConfigValidator):
-    """监控指标列表校验器：加载与赋值时都按 normalize_metrics 纠正，
-    配置文件被手改或指标键随版本变化时不会让监控页拿到非法指标。"""
-
-    def validate(self, value) -> bool:
-        return value == normalize_metrics(value)
-
-    def correct(self, value) -> List[str]:
-        return normalize_metrics(value)
-
-
-# 默认打点快捷键（与 ui/hotkey.DEFAULT_MARKER_HOTKEY 一致；本模块不依赖界面层）
-DEFAULT_MARKER_HOTKEY = "Ctrl+Alt+M"
-MARKER_HOTKEY_MAX_LENGTH = 40
-
-
-class MarkerHotkeyValidator(ConfigValidator):
-    """打点快捷键校验器：非字符串或过长时回落到默认值（写法由界面层再判断）。"""
-
-    def validate(self, value) -> bool:
-        return isinstance(value, str) and len(value) <= MARKER_HOTKEY_MAX_LENGTH
-
-    def correct(self, value) -> str:
-        return value.strip() if self.validate(value) else DEFAULT_MARKER_HOTKEY
+def migrate_config(data: dict):
+    """兼容既有入口；纯迁移算法与后台共用，迁移表仍可独立注入测试。"""
+    return _schema.migrate_config(data, current_version=CURRENT_CONFIG_VERSION,
+                                  migrations=CONFIG_MIGRATIONS)
 
 
 class AppConfig(QConfig):
-    """应用级用户偏好配置"""
+    """GUI 对象身份不变；共享定义只负责构造普通配置项。"""
 
-    # 默认采集周期（秒）：新建监控任务时采集周期输入框的初始值；用户仍可在
-    # 监控页为单次任务临时改动，不影响本配置项
-    default_interval = RangeConfigItem(
-        "Monitor", "DefaultInterval",
-        int(config.DEFAULT_INTERVAL), RangeValidator(1, 3600))
+    def __init__(self):
+        super().__init__()
+        self._newer_raw = {}
 
-    # 历史数据保留天数：0 = 永久保留（不自动清理），>0 时启动清理已停止且超期的
-    # 任务数据（语义与 config.DATA_RETENTION_DAYS 一致，见该常量注释）
-    retention_days = OptionsConfigItem(
-        "Data", "RetentionDays",
-        config.DATA_RETENTION_DAYS, OptionsValidator([0, 7, 30, 90, 180]))
-
-    # 关闭窗口时是否最小化到系统托盘：设置页开关控制，默认关闭（直接退出）
-    close_to_tray = ConfigItem("Behavior", "CloseToTray", False, BoolValidator())
-
-    # 监控页上次选择的指标：新建任务时沿用，默认"泄漏排查"预设
-    last_metrics = ConfigItem(
-        "Monitor", "LastMetrics", list(LEAK_CHECK_PRESET), MetricListValidator())
-
-    # 用户在更新提示里选择"跳过"的版本号（空串 = 未跳过任何版本）；
-    # 旧版单独存于 update_prefs.json，load_app_config 首次运行时导入并删除旧文件
-    skipped_version = ConfigItem("Update", "SkippedVersion", "")
-
-    # 全局打点快捷键（任何程序里按下即为运行中的任务打点，不弹窗）；空串 = 不使用。
-    # 写法是否合法、能否注册由 ui/hotkey 判断，这里只保证是不太长的字符串
-    marker_hotkey = ConfigItem(
-        "Behavior", "MarkerHotkey", DEFAULT_MARKER_HOTKEY, MarkerHotkeyValidator())
+    def toDict(self, serialize=True):
+        items = super().toDict(serialize)
+        if serialize and self._newer_raw:
+            return _schema.merge_serialized(self._newer_raw, items)
+        return items
 
 
-# 全局单例：进程内所有代码统一通过该实例读写配置（不要自行 AppConfig() 构造新实例
-# 用于生产代码路径——自定义 ConfigItem 是类属性，天然全进程共享同一份值，
-# 但只有这一个实例会被 qconfig.load() 接管、参与自动落盘）
+def _config_item(spec):
+    item_class = {'value': ConfigItem, 'options': OptionsConfigItem,
+                  'range': RangeConfigItem}[spec.kind]
+    return item_class(spec.group, spec.key, copy.deepcopy(spec.default), spec.validator)
+
+
+# QConfig 按类属性扫描 ConfigItem；不能换成仅存在于实例上的动态代理。
+for _name, _spec in _schema.SETTINGS.items():
+    setattr(AppConfig, _name, _config_item(_spec))
+
 cfg = AppConfig()
 
+
 def __getattr__(name):
-    """兼容旧的模块常量 CONFIG_PATH：访问时按 AppPaths 现算，不在导入期固化路径"""
     if name == 'CONFIG_PATH':
         from app.paths import AppPaths
         return AppPaths.resolve().config_path
@@ -129,65 +75,78 @@ def __getattr__(name):
 
 
 def _is_loaded() -> bool:
-    """应用配置是否已由 load_app_config() 接管（接管后才允许落盘）"""
-    return getattr(qconfig, "_cfg", None) is cfg
+    return getattr(qconfig, '_cfg', None) is cfg
 
 
 def load_app_config(paths: Optional["AppPaths"] = None) -> None:
-    """加载应用配置
-
-    进程内只应调用一次（app.bootstrap.run，QApplication 创建之后、MainWindow 创建
-    之前）。测试调用时应传入指向临时目录的 AppPaths，或直接调用
-    qconfig.load(临时路径, cfg)。
-
-    首次启动（配置文件尚不存在）时，主题偏好默认"跟随系统"：qconfig.load
-    完成后显式调用 setTheme(Theme.AUTO, save=True) 落盘一次；非首启（配置文件
-    已存在）不做任何主题相关的额外动作，尊重用户上次保存的选择（哪怕用户主动
-    从"跟随系统"改回了固定的浅色/深色）。
-
-    加载后把旧版 update_prefs.json 里"跳过的版本"一次性导入本配置并删除旧文件。
-
-    Args:
-        paths: 应用路径；为 None 时按 AppPaths.resolve() 解析
-    """
+    """GUI 入口：共用文件迁移，再保留原 QConfig 绑定与信号语义。"""
     if paths is None:
         from app.paths import AppPaths
         paths = AppPaths.resolve()
-    config_path = paths.config_path
-    is_first_launch = not os.path.exists(config_path)
-
-    qconfig.load(config_path, cfg)
-
-    if is_first_launch:
-        setTheme(Theme.AUTO, save=True)
-
+    cfg.config_version.value = CURRENT_CONFIG_VERSION
+    raw, first_launch = prepare_config_file(
+        paths.config_path, log=logger, migrate=migrate_config,
+        current_version=CURRENT_CONFIG_VERSION)
+    cfg._newer_raw = raw if config_version_of(raw) > CURRENT_CONFIG_VERSION else {}
+    qconfig.load(paths.config_path, cfg)
+    if first_launch:
+        # 即使当前内存值已为 AUTO，首启也必须创建配置；不能依赖 set() 的值变化分支。
+        setTheme(Theme.AUTO, save=False)
+        write_json_atomic(paths.config_path, cfg.toDict())
     _import_legacy_update_prefs(paths.prefs_path)
 
 
-def _import_legacy_update_prefs(prefs_path: str) -> None:
-    """
-    把旧版 update_prefs.json 的 skipped_version 并入 cfg 后删除旧文件。
+def _migrate_config_file(config_path: str) -> None:
+    """兼容旧入口；文件准备只有一份实现。"""
+    raw, _ = prepare_config_file(config_path, log=logger, migrate=migrate_config,
+                                 current_version=CURRENT_CONFIG_VERSION)
+    cfg._newer_raw = raw if config_version_of(raw) > CURRENT_CONFIG_VERSION else {}
 
-    cfg 里已有值时以 cfg 为准（旧文件只可能是更早版本留下的），旧文件同样删除；
-    旧文件损坏或读不出时按"没有跳过的版本"处理。删除失败只记日志，下次启动再试。
+
+def _import_legacy_update_prefs(prefs_path: str) -> None:
+    def save_imported(value):
+        if not _is_loaded():
+            raise ValueError('应用配置尚未加载，不能导入旧偏好')
+        old = copy.deepcopy(cfg.get(cfg.skipped_version))
+        qconfig.set(cfg.skipped_version, value, save=False)
+        try:
+            write_json_atomic(str(cfg.file), cfg.toDict())
+        except (OSError, TypeError, ValueError):
+            cfg.skipped_version.value = old
+            raise
+
+    import_legacy_preferences(prefs_path, current=get_skipped_version,
+                              save=save_imported, log=logger)
+
+
+def apply_runtime_snapshot(snapshot: dict, config_path: str) -> None:
+    """首次后台图片渲染时内存绑定配置；不重新读盘、迁移、保存或改变用户主题偏好。
+
+    可重复调用：ConfigItem 仅在值变化时发信号，主题转发使用唯一连接，避免多次导出
+    累积回调。普通监控/CSV 路径不需要导入本模块。
     """
-    if not os.path.exists(prefs_path):
-        return
-    legacy = ''
+    if not isinstance(snapshot, dict):
+        raise TypeError('配置快照必须是字典')
+    qconfig._cfg = cfg
+    cfg.file = Path(config_path)
+    cfg._newer_raw = (copy.deepcopy(snapshot)
+                      if config_version_of(snapshot) > CURRENT_CONFIG_VERSION else {})
+    for name, value in _schema.read_values(snapshot).items():
+        getattr(cfg, name).value = value
+    theme = snapshot.get('QFluentWidgets')
+    theme = theme if isinstance(theme, dict) else {}
+    for name, key in (('themeMode', 'ThemeMode'), ('themeColor', 'ThemeColor'),
+                      ('fontFamilies', 'FontFamilies')):
+        item = getattr(cfg, name)
+        try:
+            item.deserializeFrom(copy.deepcopy(theme.get(key, _schema.GUI_DEFAULTS[key])))
+        except (TypeError, ValueError):
+            item.value = copy.deepcopy(item.defaultValue)
     try:
-        with open(prefs_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            legacy = str(data.get('skipped_version') or '')
-    except Exception:
-        logger.warning("读取旧版更新偏好失败，按未跳过版本处理: %s", prefs_path, exc_info=True)
-    if legacy and not get_skipped_version():
-        set_skipped_version(legacy)
-        logger.info("已从旧版更新偏好导入跳过的版本: %s", legacy)
-    try:
-        os.remove(prefs_path)
-    except OSError:
-        logger.warning("删除旧版更新偏好文件失败: %s", prefs_path, exc_info=True)
+        cfg.themeChanged.connect(qconfig.themeChanged, Qt.UniqueConnection)
+    except TypeError:
+        pass  # 已由 GUI 配置加载或前一次报告绑定。
+    qconfig.theme = cfg.get(cfg.themeMode)
 
 
 def get_skipped_version() -> str:
@@ -211,6 +170,33 @@ def get_marker_hotkey() -> str:
 def set_marker_hotkey(text: str) -> None:
     """记录全局打点快捷键；与 set_skipped_version 相同，配置未接管时只改内存值。"""
     qconfig.set(cfg.marker_hotkey, str(text or '').strip(), save=_is_loaded())
+
+
+def get_export_name_template() -> str:
+    """导出文件命名模板（始终非空）"""
+    value = cfg.get(cfg.export_name_template)
+    return value if isinstance(value, str) and value.strip() else DEFAULT_EXPORT_NAME_TEMPLATE
+
+
+def set_export_name_template(text: str) -> None:
+    """记录导出命名模板；与 set_marker_hotkey 相同，配置未接管时只改内存值。"""
+    qconfig.set(cfg.export_name_template, str(text or '').strip(), save=_is_loaded())
+
+
+def update_values(pairs: Iterable[Tuple[ConfigItem, object]]) -> bool:
+    """批量写配置项：只写真的变了的项，且整批只落盘一次（窗口状态一次要写好几项）。
+
+    与 set_skipped_version 相同，配置未被 load_app_config() 接管时只改内存值。
+    返回是否有项目发生变化。
+    """
+    changed = False
+    for item, value in pairs:
+        if cfg.get(item) != value:
+            qconfig.set(item, value, save=False)
+            changed = True
+    if changed and _is_loaded():
+        qconfig.save()
+    return changed
 
 
 def interval_range() -> Tuple[int, int]:

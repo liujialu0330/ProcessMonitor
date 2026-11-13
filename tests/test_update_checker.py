@@ -1,8 +1,11 @@
 """
-core/update_checker.py 纯函数用例
+core/update_checker.py 纯函数用例（compare_version 已移到 utils.version，core 原样导出）
 覆盖 compare_version 全边界与 parse_release_info（mock JSON dict）
 """
-from core.update_checker import compare_version, parse_release_info
+import pytest
+
+from core.update_checker import parse_release_info
+from utils.version import compare_version
 
 
 # ========== compare_version ==========
@@ -31,11 +34,91 @@ def test_compare_version_segment_count_mismatch():
     assert compare_version("2", "1.9.9.9") == 1
 
 
-def test_compare_version_non_numeric_segment_treated_as_zero():
-    """非数字段（预发布尾段等）按 0 处理——已知限制，非真实 semver 预发布优先级"""
-    # "7-beta" 无法转 int，按 0 处理，实际参与比较的是 [1, 0, 0]
-    assert compare_version("1.0.7-beta", "1.0.6") == -1
-    assert compare_version("1.0.7-beta", "1.0.0") == 0
+def test_compare_version_prerelease_of_newer_core_is_newer():
+    """预发布只在主版本相同时才降低优先级：1.0.7-beta 仍高于 1.0.6 与 1.0.0"""
+    assert compare_version("1.0.7-beta", "1.0.6") == 1
+    assert compare_version("1.0.7-beta", "1.0.0") == 1
+    assert compare_version("1.0.7-beta", "1.0.7") == -1
+
+
+# 每组 (较小, 较大)：按 SemVer 2.0 §11 的优先级严格递增
+_STRICTLY_ORDERED = [
+    ("2.0.0-beta.1", "2.0.0-beta.2"),
+    ("2.0.0-beta.2", "2.0.0-rc.1"),
+    ("2.0.0-rc.1", "2.0.0-rc.2"),
+    ("2.0.0-rc.2", "2.0.0"),
+    ("2.0.0", "2.0.1"),
+    ("2.0.0-beta.1", "2.0.0"),          # 修复点：beta 用户必须收到正式版
+    ("2.0.0-beta.9", "2.0.0-beta.10"),  # 数字标识符按数值而非字典序
+    ("2.0.0-beta", "2.0.0-beta.1"),     # 前缀相同时标识符少者小
+    ("2.0.0-alpha", "2.0.0-alpha.1"),
+    ("2.0.0-alpha.1", "2.0.0-alpha.beta"),  # 数字标识符低于字母数字标识符
+    ("2.0.0-alpha.beta", "2.0.0-beta"),
+    ("2.0.0-beta.11", "2.0.0-rc.1"),
+    ("2.0.0-1", "2.0.0-alpha"),          # 纯数字预发布低于字母预发布
+    ("2.0.0-RC.1", "2.0.0-rc.1"),        # 字母数字按 ASCII（大写字母码位更小）
+    ("1.4.1", "2.0.0-beta.1"),           # 旧正式版用户能收到更高主版本的预发布
+    ("1.9.9", "2.0.0-alpha"),
+    ("v2.0.0-beta.2", "V2.0.0-rc.1"),    # v/V 前缀照常容忍
+    ("2.0", "2.0.1-beta.1"),             # 缺段补 0 后再比预发布
+    ("2.0.0-beta.1+build.9", "2.0.0-beta.2+build.1"),  # 构建元数据不参与比较
+]
+
+_EQUAL = [
+    ("2.0.0+build.1", "2.0.0+build.2"),
+    ("2.0.0+abc", "2.0.0"),
+    ("v2.0.0-rc.1", "2.0.0-rc.1"),
+    ("2.0-rc.1", "2.0.0-rc.1"),
+    ("2.0.0-beta.01", "2.0.0-beta.1"),   # 宽容：数字标识符的前导零按数值比较
+    ("2.0.0-", "2.0.0"),                 # 宽容："-" 后为空视为没有预发布
+]
+
+
+@pytest.mark.parametrize("lower, higher", _STRICTLY_ORDERED)
+def test_compare_version_semver_order(lower, higher):
+    assert compare_version(lower, higher) == -1
+    assert compare_version(higher, lower) == 1
+
+
+@pytest.mark.parametrize("a, b", _EQUAL)
+def test_compare_version_semver_equal(a, b):
+    assert compare_version(a, b) == 0
+    assert compare_version(b, a) == 0
+
+
+def test_compare_version_full_chain_is_sorted():
+    """完整发布链按 compare_version 排序后与预期顺序一致"""
+    import functools
+    chain = ["2.0.0-beta.1", "2.0.0-beta.2", "2.0.0-rc.1", "2.0.0", "2.0.1"]
+    shuffled = [chain[3], chain[0], chain[4], chain[2], chain[1]]
+    assert sorted(shuffled, key=functools.cmp_to_key(compare_version)) == chain
+
+
+@pytest.mark.parametrize("bad", [
+    "", "   ", "abc", "v", "-", "+", "1..2", "1.x.3", "1.0.0-beta..1", "1.0.0-+",
+    None, 1, 2.5, "１.０.０",
+])
+def test_compare_version_never_raises_on_bad_input(bad):
+    """非法输入不抛异常，结果仍是 -1/0/1；非数字主版本段按 0 处理"""
+    assert compare_version(bad, "1.0.0") in (-1, 0, 1)
+    assert compare_version("1.0.0", bad) in (-1, 0, 1)
+
+
+def test_compare_version_non_numeric_core_segment_is_zero():
+    """主版本里的非数字段（含全角数字、空段）按 0 处理，沿用旧宽容度"""
+    assert compare_version("1.x.3", "1.0.3") == 0
+    assert compare_version("1..2", "1.0.2") == 0
+    assert compare_version("abc", "0") == 0
+
+
+def test_parse_release_info_beta_user_sees_ga_as_update():
+    """beta 用户检查更新时，正式版必须判定为有更新；正式版用户不被同号 beta 打扰"""
+    assert parse_release_info(_base_release(tag="v2.0.0"),
+                              current_version="2.0.0-beta.1")["has_update"] is True
+    assert parse_release_info(_base_release(tag="v2.0.0-rc.1"),
+                              current_version="2.0.0")["has_update"] is False
+    assert parse_release_info(_base_release(tag="v2.0.0-beta.2"),
+                              current_version="2.0.0-beta.1")["has_update"] is True
 
 
 # ========== parse_release_info ==========

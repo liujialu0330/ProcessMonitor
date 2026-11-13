@@ -8,7 +8,10 @@ import os
 
 # 应用信息
 APP_NAME = "进程监控助手"
-APP_VERSION = "1.4.1"
+# 预发布期间带后缀（2.0.0-beta.N / 2.0.0-rc.N），正式发布时改为 2.0.0。读取方：窗口标题、
+# 关于页、更新检查（按 SemVer 比较，带后缀的低于同号正式版）、库 meta 的写入版本、
+# build\gen_version_info.py（文件版本四元组）与 build.bat（安装包文件名与 /DMyAppVersion）
+APP_VERSION = "2.0.0-beta.1"
 
 # GitHub 仓库信息（自动更新用）
 GITHUB_OWNER = "liujialu0330"
@@ -62,20 +65,17 @@ def get_icon_path():
 
 # 覆盖数据目录的环境变量名
 DATA_DIR_ENV = "PROCESS_MONITOR_DATA_DIR"
+# 指定数据目录的命令行参数（--data-dir <路径> 或 --data-dir=<路径>），优先于环境变量
+DATA_DIR_ARG = "--data-dir"
+# 便携标志文件：基础目录（打包为 exe 所在目录，开发为项目根）下存在它时，
+# 数据与日志放在基础目录内的 data\ 与 logs\
+PORTABLE_FLAG_FILENAME = "portable.flag"
 
-
-def get_data_dir():
-    """
-    获取数据目录（兼容接口，规则见 app.paths.AppPaths.resolve）
-
-    Returns:
-        str: 数据目录路径
-            - 设置了环境变量 PROCESS_MONITOR_DATA_DIR：使用该目录（便于测试/便携运行）
-            - 开发环境：返回项目根目录下的data文件夹
-            - 打包环境：返回用户本地应用数据目录，避免Program Files权限问题
-    """
-    from app.paths import AppPaths
-    return AppPaths.resolve().data_dir
+# 数据目录的来源（AppPaths.source 的取值），按解析优先级从高到低
+DATA_DIR_SOURCE_CLI = "cli"
+DATA_DIR_SOURCE_ENV = "env"
+DATA_DIR_SOURCE_PORTABLE = "portable"
+DATA_DIR_SOURCE_DEFAULT = "default"
 
 
 # 由数据目录派生的兼容路径常量：不在导入期计算（导入本模块不得有创建目录等副作用，
@@ -86,6 +86,8 @@ _DERIVED_PATHS = {
     'DB_PATH': 'db_path',
     'LOG_DIR': 'log_dir',
     'UPDATE_PREFS_PATH': 'prefs_path',
+    # 数据目录来源（DATA_DIR_SOURCE_* 之一），供设置页显示
+    'DATA_DIR_SOURCE': 'source',
 }
 
 
@@ -115,7 +117,8 @@ SAVE_BATCH_SIZE = 1
 DATA_RETENTION_DAYS = 0
 
 # UI配置
-WINDOW_WIDTH = 1000
-WINDOW_HEIGHT = 700
+# 默认窗口大小：屏幕可用区的 90% 放不下时取可用区的 90%（见 ui.window_state）
+WINDOW_WIDTH = 1280
+WINDOW_HEIGHT = 820
 WINDOW_MIN_WIDTH = 800
 WINDOW_MIN_HEIGHT = 600

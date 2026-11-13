@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -18,6 +19,9 @@ from PyQt5.QtCore import pyqtSignal
 
 import config
 from core.workers.base import BackgroundTask, CancelToken, TaskError
+# 版本比较只在工具层定义一份（数据库只读判定也要用，data 层不能依赖 core），这里原样导出，
+# 旧的 from core.update_checker import compare_version 不变
+from utils.version import compare_version
 
 logger = logging.getLogger(__name__)
 
@@ -87,35 +91,6 @@ def _open_download(request, timeout):
     """打开下载连接（带重定向白名单校验；独立成函数便于测试替换网络层）"""
     opener = urllib.request.build_opener(_SafeRedirectHandler())
     return opener.open(request, timeout=timeout)
-
-
-def compare_version(a: str, b: str) -> int:
-    """
-    语义化版本比较，容忍 v/V 前缀，缺段按 0 处理
-
-    Returns:
-        int: a < b 返回 -1，a > b 返回 1，相等返回 0
-    """
-    def parts(v: str):
-        v = str(v).strip().lstrip('vV')
-        result = []
-        for seg in v.split('.'):
-            try:
-                result.append(int(seg))
-            except ValueError:
-                # 非数字段（如 1.0.7-beta 的尾段）按 0 处理
-                result.append(0)
-        return result
-
-    pa, pb = parts(a), parts(b)
-    for i in range(max(len(pa), len(pb))):
-        na = pa[i] if i < len(pa) else 0
-        nb = pb[i] if i < len(pb) else 0
-        if na < nb:
-            return -1
-        if na > nb:
-            return 1
-    return 0
 
 
 def parse_release_info(data: dict, current_version: Optional[str] = None) -> dict:
@@ -211,6 +186,11 @@ class UpdateDownloader(BackgroundTask):
     摘要（digest），下载完成后逐字节校验，不一致视为失败并删除文件；缺少摘要时
     不下载，经 error_occurred 提示用户去发布页手动下载。文件落在 mkdtemp 生成
     的唯一目录内。取消（cancel）后删除下载残留，不发完成/失败信号。
+
+    取消与交付互斥：基类对已取消的任务不发结果信号，所以"读完最后一块之后、结果交给
+    界面之前"到来的取消若不处理，校验通过的安装包就会留在临时目录无人认领。execute
+    末尾在锁内确认未取消才把目录记为待交付，cancel 在锁内删除待交付的目录，
+    handle_result 在锁内确认未取消才交付；交付之后的取消不再删除（安装程序可能已在用它）。
     """
 
     # 下载进度信号（0-100；总大小未知时报 -1）
@@ -236,6 +216,17 @@ class UpdateDownloader(BackgroundTask):
         self.filename = filename
         self.asset_size = asset_size
         self.digest = digest
+        self._delivery_lock = threading.Lock()
+        # 下载并校验完成、尚未交付给界面的临时目录（交付或删除后为 None）
+        self._pending_dir: Optional[str] = None
+
+    def cancel(self) -> None:
+        """请求取消；下载已完成但结果尚未交付时，顺带删除安装包（见类说明）"""
+        with self._delivery_lock:
+            super().cancel()
+            pending, self._pending_dir = self._pending_dir, None
+        if pending:
+            self._cleanup(pending)
 
     def _report_progress(self, percent: int) -> None:
         self.progress.emit(percent)
@@ -292,6 +283,12 @@ class UpdateDownloader(BackgroundTask):
                              sha256.hexdigest(), expected_sha256, self.url)
                 raise TaskError(
                     "安装包校验失败（SHA-256 不一致），已删除下载文件，请重试或从发布页手动下载")
+
+            # 提交点：此后到来的取消由 cancel() 负责删除
+            with self._delivery_lock:
+                if token.is_cancelled:
+                    raise InterruptedError("用户取消下载")
+                self._pending_dir = work_dir
         except BaseException:
             # 失败与取消都删除整个唯一临时目录，再交给基类决定发不发信号
             self._cleanup(work_dir)
@@ -304,6 +301,11 @@ class UpdateDownloader(BackgroundTask):
         return f"下载更新失败：{exc}"
 
     def handle_result(self, value: str) -> None:
+        with self._delivery_lock:
+            if self.is_cancelled:
+                # 基类检查之后才到的取消：安装包已由 cancel() 删除，不再交付
+                return
+            self._pending_dir = None
         super().handle_result(value)
         self.download_finished.emit(value)
 
@@ -330,6 +332,7 @@ if __name__ == "__main__":
     assert compare_version("v1.1.0", "1.0.6") == 1
     assert compare_version("1.0", "1.0.0") == 0
     assert compare_version("0.9.9", "1.0.6") == -1
+    assert compare_version("2.0.0-beta.1", "2.0.0") == -1
     print("版本比较自测通过")
 
     import sys

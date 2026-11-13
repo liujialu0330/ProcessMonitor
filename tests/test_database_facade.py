@@ -195,3 +195,42 @@ def test_save_failure_counter_resets_after_success(db, monkeypatch, caplog):
     with caplog.at_level(logging.ERROR, logger=database_module.logger.name):
         assert db.save_data_points([POINT]) is False
     assert caplog.records[-1].exc_info is not None
+
+
+# ========== 迁移报告映射：升级成功时的备份位置；只读时的更高版本号 ==========
+
+def _report(outcome, backup_path=None):
+    from data.db.migrations.runner import MigrationReport
+    return MigrationReport(outcome, 1, 5 if outcome.value == 'migrated' else 1,
+                           backup_path=backup_path)
+
+
+def test_migrated_report_exposes_backup_path(tmp_path):
+    from data.db.migrations.runner import MigrationOutcome
+    backup = str(tmp_path / 'monitor.db.bak_v1')
+    db = Database(str(tmp_path / 'monitor.db'), migrate=False,
+                  migration_report=_report(MigrationOutcome.MIGRATED, backup))
+    assert (db.migrated_from, db.backup_path) == (1, backup)
+    assert (db.migration_failed, db.data_reset, db.backup_aborted) == (False, False, False)
+
+
+def test_failed_report_has_no_backup_hint(tmp_path):
+    """失败结果即使带了 backup_path 也不给"已升级"提示用的字段"""
+    from data.db.migrations.runner import MigrationOutcome
+    for outcome in MigrationOutcome:
+        if outcome is MigrationOutcome.MIGRATED:
+            continue
+        db = Database(str(tmp_path / 'monitor.db'), migrate=False,
+                      migration_report=_report(outcome, str(tmp_path / 'x.bak')))
+        assert (db.migrated_from, db.backup_path) == (None, None), outcome
+
+
+def test_newer_version_only_kept_when_read_only(tmp_path):
+    path = str(tmp_path / 'monitor.db')
+    Database(path).close()
+    assert Database(path, migrate=False, newer_version='9.1.0').newer_version is None
+    ro = Database(path, read_only=True, newer_version='9.1.0')
+    try:
+        assert ro.read_only and ro.newer_version == '9.1.0'
+    finally:
+        ro.close()

@@ -71,11 +71,25 @@ def _record_state_at_stop(worker) -> list:
     return seen
 
 
+def test_pause_during_restart_is_preserved_without_cancelling_search(make_worker):
+    worker = make_worker()
+    worker._state = WorkerState.WAITING_RESTART
+    assert worker.pause()
+    assert worker.state is WorkerState.WAITING_RESTART and worker.is_paused()
+    assert not worker.pause()
+    assert worker.resume()
+    assert worker.state is WorkerState.WAITING_RESTART and not worker.is_paused()
+    assert worker.stop()
+    assert not worker.resume()
+
+
 # ========== 状态集合与派生查询 ==========
 
 def test_state_sets():
-    assert ACTIVE_STATES == {WorkerState.RUNNING, WorkerState.PAUSED}
-    assert LIVE_STATES == {WorkerState.RUNNING, WorkerState.PAUSED, WorkerState.STOPPING}
+    # 等待重启时线程仍活着、任务仍算进行中，退出收尾与维护互斥都要把它算上
+    assert ACTIVE_STATES == {WorkerState.RUNNING, WorkerState.PAUSED, WorkerState.WAITING_RESTART}
+    assert LIVE_STATES == {WorkerState.RUNNING, WorkerState.PAUSED, WorkerState.WAITING_RESTART,
+                           WorkerState.STOPPING}
 
 
 @pytest.mark.parametrize("state, running, paused", [

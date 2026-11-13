@@ -1,8 +1,8 @@
 """
 模态对话框与系统交互（Dialogs）
 
-确认框、打点标签输入、指标选择、保存路径、关窗三选一，以及打开文件夹/网址、
-复制图片到剪贴板，统一经由注入的 Dialogs：页面测试换成脚本化替身即可预设
+确认框、打点标签输入、指标选择、保存路径、选择文件/文件夹、关窗三选一，以及打开文件夹/网址、
+复制图片与文本到剪贴板，统一经由注入的 Dialogs：页面测试换成脚本化替身即可预设
 "用户的选择"，不会弹出阻塞的模态对话框，也不会真的拉起资源管理器或浏览器。
 
 parent 约定：对话框类方法的 parent 由页面传 self.window()（遮罩覆盖整个主窗口，
@@ -54,9 +54,11 @@ class Dialogs(Protocol):
         空白的名称，取消返回 None。"""
         ...
 
-    def choose_metrics(self, parent: QWidget,
-                       selected: Sequence[str]) -> Optional[List[str]]:
-        """指标选择框（预选 selected）：确定返回所选指标列表（按指标注册表顺序），取消返回 None。"""
+    def choose_metrics(self, parent: QWidget, selected: Sequence[str], *,
+                       group: bool = False) -> Optional[List[str]]:
+        """指标选择框（预选 selected）：确定返回所选指标列表（按指标注册表顺序），取消返回 None。
+        group 为真时是进程组（进程树 / 同名进程）任务的选择：对组不适用的指标置灰，
+        返回值末尾带进程总数。"""
         ...
 
     def ask_save_path(self, parent: QWidget, title: str, default_path: str,
@@ -64,9 +66,19 @@ class Dialogs(Protocol):
         """保存文件对话框：返回规范化后的路径（Windows 反斜杠），取消返回 None。"""
         ...
 
+    def ask_open_file(self, parent: QWidget, title: str, start_dir: str,
+                      name_filter: str) -> Optional[str]:
+        """选择已有文件的对话框：返回规范化后的路径，取消返回 None。"""
+        ...
+
+    def ask_directory(self, parent: QWidget, title: str, start_dir: str) -> Optional[str]:
+        """选择文件夹的对话框：返回规范化后的路径，取消返回 None。"""
+        ...
+
     def ask_close_action(self, parent: QWidget, running_count: int,
-                         can_tray: bool) -> str:
-        """仍有任务在监控时关闭主窗口的三选一：'quit' / 'tray' / 'cancel'。"""
+                         can_tray: bool, notice: str = "") -> str:
+        """仍有任务在监控时关闭主窗口的三选一：'quit' / 'tray' / 'cancel'。
+        notice 非空时作为醒目的一句提示附在对话框里（如退出后会丢失的数据）。"""
         ...
 
     def open_folder(self, path: str) -> None:
@@ -83,6 +95,10 @@ class Dialogs(Protocol):
 
     def copy_pixmap(self, pixmap: QPixmap) -> None:
         """把图片放入系统剪贴板。"""
+        ...
+
+    def copy_text(self, text: str) -> None:
+        """把文本放入系统剪贴板。"""
         ...
 
 
@@ -120,10 +136,10 @@ class QtDialogs:
                               process_name=process_name, pid=pid)
         return self._run_and_dispose(dialog, dialog.get_label, None)
 
-    def choose_metrics(self, parent: QWidget,
-                       selected: Sequence[str]) -> Optional[List[str]]:
+    def choose_metrics(self, parent: QWidget, selected: Sequence[str], *,
+                       group: bool = False) -> Optional[List[str]]:
         """指标选择框（MetricSelectorDialog）。"""
-        dialog = MetricSelectorDialog(list(selected), parent)
+        dialog = MetricSelectorDialog(list(selected), parent, group_mode=group)
         return self._run_and_dispose(dialog, dialog.get_selected, None)
 
     def ask_save_path(self, parent: QWidget, title: str, default_path: str,
@@ -134,10 +150,22 @@ class QtDialogs:
         # Qt 返回正斜杠路径：规范化后再显示/写入，与资源管理器里看到的一致
         return os.path.normpath(file_path) if file_path else None
 
+    def ask_open_file(self, parent: QWidget, title: str, start_dir: str,
+                      name_filter: str) -> Optional[str]:
+        """选择已有文件（QFileDialog.getOpenFileName）。"""
+        file_path, _ = QFileDialog.getOpenFileName(parent, title, start_dir, name_filter)
+        return os.path.normpath(file_path) if file_path else None
+
+    def ask_directory(self, parent: QWidget, title: str, start_dir: str) -> Optional[str]:
+        """选择文件夹（QFileDialog.getExistingDirectory）。"""
+        directory = QFileDialog.getExistingDirectory(parent, title, start_dir)
+        return os.path.normpath(directory) if directory else None
+
     def ask_close_action(self, parent: QWidget, running_count: int,
-                         can_tray: bool) -> str:
+                         can_tray: bool, notice: str = "") -> str:
         """关窗三选一（CloseActionDialog）。"""
-        dialog = CloseActionDialog(running_count, can_tray=can_tray, parent=parent)
+        dialog = CloseActionDialog(running_count, can_tray=can_tray, parent=parent,
+                                   notice=notice)
         return self._run_and_dispose(dialog, lambda: dialog.choice, CLOSE_ACTION_CANCEL)
 
     def open_folder(self, path: str) -> None:
@@ -155,3 +183,7 @@ class QtDialogs:
     def copy_pixmap(self, pixmap: QPixmap) -> None:
         """图片放入剪贴板。"""
         QApplication.clipboard().setPixmap(pixmap)
+
+    def copy_text(self, text: str) -> None:
+        """文本放入剪贴板。"""
+        QApplication.clipboard().setText(text)
