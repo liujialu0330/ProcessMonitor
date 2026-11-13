@@ -17,13 +17,13 @@ English | [简体中文](./README.zh-CN.md)
 
 </div>
 
-## 2.0 development build
+## Version 2.0.0
 
-The source version is `2.0.0-beta.1`. It adds process trees and same-name process groups, automatic markers and stop conditions, crash evidence and restart recovery, evidence bundles, reusable multi-target plans, comparison of up to four tasks, and scenario references. Monitoring offers card and list views; the task library supports search, stars, and batch deletion.
+Version `2.0.0` adds process trees and same-name process groups, automatic markers and stop conditions, crash evidence and restart recovery, evidence bundles, reusable multi-target plans, comparison of up to four tasks, and scenario references. Monitoring offers card and list views; the task library supports search, stars, and batch deletion.
 
 The first launch upgrades older databases to schema v5 and keeps a `.bak_v1` backup. Large databases may take time to migrate; the default data directory stays the same. Keep enough free disk space and read the [upgrade and rollback notes](CHANGELOG.md).
 
-As of November 13, 2026, the 2.0 implementation, functional regression, remote CI, performance, installation/uninstallation, and both rollback paths have been validated. The project owner has excluded the remaining 24-hour soak, device-specific checks, and multi-user trial from the requirements for this source submission. Those checks were not run and are not counted as passes. The source remains a beta; a formal Release and its live automatic-update channel have not been published and verified. See the [acceptance record](doc/2.0.0验收记录.md) for results, installer hashes, and scope.
+Download the [2.0.0 installer](https://github.com/liujialu0330/ProcessMonitor/releases/tag/v2.0.0), or check for updates from version 1.4.1. The implementation, functional regression, remote CI, performance, installation/uninstallation, and both rollback paths have been validated. The remaining 24-hour soak, device-specific checks, and multi-user trial were not run and are not counted as passes. The project owner will test the complete live application-update flow after publication. See the [acceptance record](doc/2.0.0验收记录.md) for results and scope.
 
 ```bat
 python main.py
@@ -166,7 +166,7 @@ python -m pytest tests/
 ## 🗺 Roadmap
 
 - [ ] Export data to Excel format
-- [x] Compare up to four tasks (2.0 development build)
+- [x] Compare up to four tasks (v2.0.0)
 - Threshold alerts are outside the current scope.
 
 See [CHANGELOG.md](./CHANGELOG.md) or [GitHub Releases](https://github.com/liujialu0330/ProcessMonitor/releases) for the full release history.
