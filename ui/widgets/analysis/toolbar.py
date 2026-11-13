@@ -15,10 +15,10 @@ compact 档位（ui.layout_breakpoints）下范围改用下拉（七段并排放
 from typing import Optional
 
 from PyQt5.QtCore import pyqtSignal
-from PyQt5.QtWidgets import QGridLayout, QHBoxLayout, QSizePolicy, QWidget
+from PyQt5.QtWidgets import QGridLayout, QHBoxLayout, QScrollArea, QSizePolicy, QWidget
 from qfluentwidgets import (
     Action, BodyLabel, CardWidget, ComboBox, DropDownPushButton, FluentIcon, PushButton,
-    RoundMenu, SegmentedWidget, TogglePushButton, TransparentDropDownPushButton)
+    RoundMenu, SegmentedWidget, TogglePushButton, TransparentDropDownPushButton, TransparentToolButton)
 
 from core.history_query import BASELINE_RANGE_KEY, CUSTOM_RANGE_KEY, DEFAULT_RANGE_KEY
 from ui.layout_breakpoints import COMPACT, REGULAR
@@ -54,11 +54,10 @@ RAW_VALUES_SHOW_TEXT = "显示原始值"
 RAW_VALUES_HIDE_TEXT = "隐藏原始值"
 DELETE_TEXT = "删除此任务数据"
 
-# 卡片内边距上下 14、左右 16；控件间距 8。卡片内容宽度窄于下面的值时，成员下拉换到第 3 行；
+# 卡片内边距上下 14、左右 16；控件间距 8。成员下拉按实际最小宽度换行；
 # 视图切换换到第 2 行（范围是七段分段控件时要 860，是下拉时 600 就放得下）
 CARD_PADDING_V = 14
 SPACING = 8
-MEMBER_INLINE_MIN_WIDTH = 860
 VIEWS_INLINE_MIN_WIDTH = 860
 VIEWS_INLINE_MIN_WIDTH_COMBO = 600
 TASK_SLOT_MIN_WIDTH = 240
@@ -91,8 +90,8 @@ class AnalysisToolbar(CardWidget):
         self._task_slot_layout = QHBoxLayout(self.task_slot)
         self._task_slot_layout.setContentsMargins(0, 0, 0, 0)
 
-        self.compare_button = TogglePushButton(FluentIcon.SYNC, "对比任务", self)
-        self.compare_button.setToolTip("选第二个任务，叠加曲线并排比较分轮增量")
+        self.compare_button = TogglePushButton(FluentIcon.LAYOUT, "对比任务", self)
+        self.compare_button.setToolTip("最多对比四个任务，按轮次或时间对齐并比较各指标")
         self.compare_button.toggled.connect(self.compare_toggled)
 
         self.export_button = DropDownPushButton(FluentIcon.SHARE, "导出报告", self)
@@ -105,7 +104,8 @@ class AnalysisToolbar(CardWidget):
             self.export_actions[key] = action
         self.export_button.setMenu(self.export_menu)
 
-        self.refresh_button = PushButton(FluentIcon.SYNC, "刷新", self)
+        self.refresh_button = TransparentToolButton(FluentIcon.SYNC, self)
+        self.refresh_button.setToolTip("刷新分析（F5）")
         self.refresh_button.clicked.connect(self.refresh_clicked)
 
         self.more_button = TransparentDropDownPushButton(FluentIcon.MORE, "更多", self)
@@ -152,7 +152,7 @@ class AnalysisToolbar(CardWidget):
         range_layout = QHBoxLayout(self.range_slot)
         range_layout.setContentsMargins(0, 0, 0, 0)
         range_layout.setSpacing(0)
-        range_layout.addWidget(self.range_segmented, 1)
+        range_layout.addWidget(self.range_segmented)
         range_layout.addWidget(self.range_combo)
         self.view_segmented = self._segmented(VIEW_OPTIONS, VIEW_SMALL, self.view_mode_changed)
         self.time_segmented = self._segmented(TIME_OPTIONS, TIME_ABSOLUTE, self.time_mode_changed)
@@ -160,9 +160,26 @@ class AnalysisToolbar(CardWidget):
         views_layout = QHBoxLayout(self.views)
         views_layout.setContentsMargins(0, 0, 0, 0)
         views_layout.setSpacing(SPACING)
-        views_layout.addWidget(BodyLabel("视图", self.views))
-        views_layout.addWidget(self.view_segmented)
-        views_layout.addWidget(self.time_segmented)
+        self.view_segmented.hide()
+        self.time_segmented.hide()
+        self.view_menu_button = TransparentDropDownPushButton(FluentIcon.VIEW, '视图', self.views)
+        view_menu = RoundMenu(parent=self)
+        self._view_actions = {}
+        self._time_actions = {}
+        for options, current, signal, actions in (
+                (VIEW_OPTIONS, VIEW_SMALL, self.view_mode_changed, self._view_actions),
+                (TIME_OPTIONS, TIME_ABSOLUTE, self.time_mode_changed, self._time_actions)):
+            if actions is self._time_actions:
+                view_menu.addSeparator()
+            for key, label in options:
+                action = Action(label, self)
+                action.setCheckable(True)
+                action.setChecked(key == current)
+                action.triggered.connect(lambda _=False, k=key, sig=signal: sig.emit(k))
+                view_menu.addAction(action)
+                actions[key] = action
+        self.view_menu_button.setMenu(view_menu)
+        views_layout.addWidget(self.view_menu_button)
         self.grid.addWidget(self.range_label, 1, 0)
         self.grid.addWidget(self.range_slot, 1, 1)
         self.grid.setColumnStretch(1, 1)
@@ -194,13 +211,16 @@ class AnalysisToolbar(CardWidget):
     def set_task_selector(self, widget: QWidget) -> None:
         widget.setSizePolicy(QSizePolicy.Expanding, widget.sizePolicy().verticalPolicy())
         self._task_slot_layout.addWidget(widget)
+        self.update_layout()
 
     def set_member_selector(self, widget: QWidget) -> None:
         self._member_layout.addWidget(widget)
+        self.update_layout()
 
     def set_members_visible(self, visible: bool) -> None:
         """进程组任务才显示成员下拉。"""
         self.member_box.setVisible(visible)
+        self.update_layout()
 
     def members_visible(self) -> bool:
         return not self.member_box.isHidden()
@@ -256,9 +276,13 @@ class AnalysisToolbar(CardWidget):
 
     def set_view_mode(self, key: str) -> None:
         self._set_silently(self.view_segmented, key)
+        for name, action in self._view_actions.items():
+            action.setChecked(name == key)
 
     def set_time_mode(self, key: str) -> None:
         self._set_silently(self.time_segmented, key)
+        for name, action in self._time_actions.items():
+            action.setChecked(name == key)
 
     # ---------- 命令 ----------
 
@@ -308,15 +332,42 @@ class AnalysisToolbar(CardWidget):
         """视图切换是否与范围同在一行（放不下时单占一行）。"""
         return bool(self._views_inline)
 
+    def _available_content_width(self) -> int:
+        width = content_width_of(self)
+        margins = self.grid.contentsMargins()
+        insets = margins.left() + margins.right()
+        parent = self.parentWidget()
+        while parent is not None:
+            if isinstance(parent, QScrollArea):
+                # 容器可能已被旧布局撑宽，不能再用撑宽后的尺寸决定保持同行。
+                return min(width, max(0, parent.viewport().width() - insets))
+            layout = parent.layout()
+            if layout is not None:
+                margins = layout.contentsMargins()
+                insets += margins.left() + margins.right()
+            parent = parent.parentWidget()
+        return width
+
+    def _member_inline_width(self) -> int:
+        items = [self.top.itemAt(i) for i in range(self.top.count())
+                 if self.top.itemAt(i).widget() is not self.member_box]
+        visible = [item for item in items if not item.isEmpty()]
+        margins = self.top.contentsMargins()
+        width = sum(item.minimumSize().width() for item in visible)
+        member_width = max(self.member_box.minimumWidth(),
+                           self._member_layout.minimumSize().width())
+        return (width + member_width + self.top.spacing() * len(visible)
+                + margins.left() + margins.right())
+
     def update_layout(self, content_width: Optional[int] = None) -> bool:
         """按卡片内容宽度摆放：放不下时视图切换换到第 2 行、成员下拉换到第 3 行；
         摆法没变不重排，返回是否重排。"""
         if content_width is None:
-            content_width = content_width_of(self)
+            content_width = self._available_content_width()
         views_min = (VIEWS_INLINE_MIN_WIDTH_COMBO if self.range_as_combo()
                      else VIEWS_INLINE_MIN_WIDTH)
         views_inline = content_width >= views_min
-        member_inline = content_width >= MEMBER_INLINE_MIN_WIDTH
+        member_inline = content_width >= self._member_inline_width()
         if (views_inline, member_inline) == (self._views_inline, self._member_inline):
             return False
         self._views_inline, self._member_inline = views_inline, member_inline

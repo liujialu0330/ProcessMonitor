@@ -127,7 +127,7 @@ def test_click_row_selects_metric_and_program_select_is_silent(table):
     table.metric_selected.connect(picked.append)
     table.select_metric(GDI)
     assert picked == [] and table.selected_metric() == GDI
-    table.table.cellClicked.emit(0, 2)
+    table.table.setCurrentCell(0, 2)
     assert picked == [MEM]
     table.select_metric("unknown")
     assert table.selected_metric() is None

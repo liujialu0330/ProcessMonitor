@@ -34,10 +34,11 @@ IPC（自动打点服务用监控页 Presenter 持有的那一份，全程只有
 显示或无窗口模式就绪）后把各阶段耗时写一条 INFO 日志。
 
 无窗口模式（--background，pmctl 在 GUI 不在时拉起）走 _run_headless：第 1~4 步相同，之后
-只加载配置（不设主题与排版、不导入 ui.main_window），同步迁移（不显示进度窗口），
+加载纯配置与运行服务（不导入 Fluent 或 ui 模块），同步迁移（不显示进度窗口），
 build_context，HeadlessRuntime 持有自动打点服务并每秒驱动（阶段快照的报告图片用同一渲染函数
 离屏绘制），自身监控每 60 秒采一次，把上下文交给 IPC，进入事件循环；不建任何顶层窗口、托盘、
-全局快捷键与界面看门狗。quit 命令、Ctrl+C 或 --idle-exit-s 空闲到时经
+全局快捷键与界面看门狗。首次导出图片时才将内存配置交给界面适配并载入报告渲染。
+QApplication 保留以支持离屏报告与系统会话结束信号。quit 命令、Ctrl+C 或 --idle-exit-s 空闲到时经
 ShutdownCoordinator 收尾后退出，退出码 0。
 
 --self-test（打包自检，见 app.self_test）在 run() 的最开头分流，不走上面的顺序：它自己解析
@@ -60,7 +61,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
 import config
 from app.paths import (
@@ -74,11 +75,13 @@ if TYPE_CHECKING:
     from core.session_recovery import RecoveryCandidate
     from core.monitor_manager import MonitorManager
     from core.power_guard import PowerGuard
+    from core.runtime_services import RuntimeServices
     from core.self_monitor import SelfMonitor
     from core.shutdown import ThreadRegistry
     from core.storage_guard import StorageGuard
     from data.database import Database
     from data.db.migrations.runner import MigrationReport, MigrationRunner, ProbeResult
+    from settings_store import RuntimeSettings
     from ui.main_window import MainWindow
     from ui.services import UiServices
 
@@ -137,12 +140,12 @@ class AppContext:
     paths: AppPaths
     db: "Database"
     manager: "MonitorManager"
-    services: "UiServices"
+    services: Union["UiServices", "RuntimeServices"]
     registry: "ThreadRegistry"
     maintenance: "MaintenanceService"
     reconcile: "ReconcileResult"
     window: Optional["MainWindow"] = None
-    # 监控期间阻止系统空闲睡眠（跟随 cfg.keep_awake_while_monitoring）
+    # 监控期间阻止系统空闲睡眠；GUI 跟随配置项变化，后台使用启动配置。
     power_guard: Optional["PowerGuard"] = None
     # 本程序自身的资源占用（每 60 秒一次，24 小时环形缓冲；诊断信息用）与驱动它的定时器
     self_monitor: Optional["SelfMonitor"] = None
@@ -168,9 +171,10 @@ class AppContext:
 def build_context(paths: AppPaths, *, registry=None,
                   retention_days: Optional[int] = None,
                   report: Optional["MigrationReport"] = None,
-                  legacy_importer=None) -> AppContext:
+                  legacy_importer=None,
+                  runtime_settings: Optional["RuntimeSettings"] = None) -> AppContext:
     """
-    组装 Database / MonitorManager / 维护服务 / 界面服务 / 阻止睡眠守卫（不建 QApplication 与窗口）。
+    组装 Database / MonitorManager / 维护服务 / 运行服务 / 阻止睡眠守卫（不建 QApplication 与窗口）。
 
     Args:
         paths: 应用路径（调用方负责 ensure_dirs）
@@ -181,6 +185,8 @@ def build_context(paths: AppPaths, *, registry=None,
         legacy_importer: 启动校正里导回降级数据的执行方式（见
             MaintenanceService.startup_reconcile）；run() 传 import_legacy_with_progress，
             None 时同步导回
+        runtime_settings: 后台模式已加载的纯配置；给定时只组装运行服务，不导入界面层。
+            None 保持有窗口模式的配置绑定与界面服务。
     """
     from core.maintenance_service import MaintenanceService
     from core.monitor_manager import MonitorManager
@@ -211,8 +217,11 @@ def build_context(paths: AppPaths, *, registry=None,
     manager = MonitorManager(db=db)
     maintenance = MaintenanceService(db, manager)
     if retention_days is None:
-        from app_config import cfg
-        retention_days = cfg.get(cfg.retention_days)
+        if runtime_settings is None:
+            from app_config import cfg
+            retention_days = cfg.get(cfg.retention_days)
+        else:
+            retention_days = runtime_settings.get('retention_days')
 
     # 会话锁：残留且记录的进程已不在 = 上次异常退出，此时被测进程还活着的 running 任务先
     # 留着、等用户决定是否续采；只读库不写锁也不续采
@@ -246,11 +255,17 @@ def build_context(paths: AppPaths, *, registry=None,
 
     if registry is None:
         registry = ThreadRegistry()
-    from ui.services import production_services
-    services = production_services(manager, registry)
-    from app_config import cfg
     from core.power_guard import PowerGuard
-    power_guard = PowerGuard.from_config_item(manager, cfg.keep_awake_while_monitoring)
+    if runtime_settings is None:
+        from ui.services import production_services
+        from app_config import cfg
+        services = production_services(manager, registry)
+        power_guard = PowerGuard.from_config_item(manager, cfg.keep_awake_while_monitoring)
+    else:
+        from core.runtime_services import production_runtime_services
+        services = production_runtime_services()
+        power_guard = PowerGuard(
+            manager, enabled=bool(runtime_settings.get('keep_awake_while_monitoring')))
     from core.self_monitor import SelfMonitor
     from core.storage_guard import StorageGuard
     storage_guard = StorageGuard(manager, maintenance, registry, paths.db_path,
@@ -491,14 +506,21 @@ def strip_background_args(argv: List[str]) -> List[str]:
     return result
 
 
-def command_settings():
-    """IPC 命令处理器读取的用户设置（自动化开关、默认指标与采集间隔），都在用时现读"""
-    from app_config import cfg, interval_range
+def command_settings(runtime_settings: Optional["RuntimeSettings"] = None):
+    """IPC 设置始终在用时现读；后台使用纯配置，有窗口时保留 ConfigItem 的实时绑定。"""
     from core.ipc.commands import CommandSettings
+    if runtime_settings is None:
+        from app_config import cfg, interval_range
+
+        def get(name: str) -> Any:
+            return cfg.get(getattr(cfg, name))
+    else:
+        from settings_schema import interval_range
+        get = runtime_settings.get
     return CommandSettings(
-        automation_enabled=lambda: bool(cfg.get(cfg.automation_enabled)),
-        default_metrics=lambda: list(cfg.get(cfg.last_metrics)),
-        default_interval=lambda: float(cfg.get(cfg.default_interval)),
+        automation_enabled=lambda: bool(get('automation_enabled')),
+        default_metrics=lambda: list(get('last_metrics')),
+        default_interval=lambda: float(get('default_interval')),
         interval_range=lambda: tuple(float(v) for v in interval_range()),
         task_limit=config.MAX_MONITOR_TASKS)
 
@@ -517,6 +539,30 @@ def render_stage_snapshot_image(task, analysis, generated_at, range_desc):
     由写入器给出（"全部（运行中第 N 次阶段快照）"）。在界面线程调用，无窗口模式也可用。"""
     from ui.widgets.analysis.report_sheet import render_report_for
     return render_report_for(task, analysis, generated_at, range_desc)
+
+
+class _HeadlessReportRenderer:
+    """第一次绘图才接入界面配置，复用启动时的内存快照，不重新读取或改写配置文件。"""
+
+    def __init__(self, settings: "RuntimeSettings", config_path: str):
+        self._snapshot = settings.snapshot()
+        self._config_path = config_path
+        self._prepared = False
+
+    def _prepare(self) -> None:
+        if self._prepared:
+            return
+        from app_config import apply_runtime_snapshot
+        apply_runtime_snapshot(self._snapshot, self._config_path)
+        self._prepared = True
+
+    def report(self, task, analysis, generated_at):
+        self._prepare()
+        return render_report_image_for_ipc(task, analysis, generated_at)
+
+    def stage(self, task, analysis, generated_at, range_desc):
+        self._prepare()
+        return render_stage_snapshot_image(task, analysis, generated_at, range_desc)
 
 
 def start_self_monitor(ctx: AppContext, interval_ms: int = SELF_MONITOR_INTERVAL_MS):
@@ -665,44 +711,40 @@ def _attach_ipc_to_window(guard, ctx: AppContext, window) -> None:
 
 def _run_headless(app, guard, paths: AppPaths, idle_exit_s: float, *,
                   exit_process: Callable[[int], None], trace=None,
-                  argv: Optional[List[str]] = None) -> int:
+                  argv: Optional[List[str]] = None,
+                  runtime_settings: "RuntimeSettings") -> int:
     """
-    无窗口模式（--background）：加载配置 → 同步迁移 → build_context → HeadlessRuntime
-    → 把上下文交给 IPC → 事件循环。不导入 ui.main_window，不建窗口、托盘与全局快捷键；
+    无窗口模式（--background）：使用已加载配置 → 同步迁移 → build_context → HeadlessRuntime
+    → 把上下文交给 IPC → 事件循环。常态不导入 ui，首次绘图由延迟适配接入报告渲染；
+    不建可见窗口、托盘与全局快捷键。
     迁移不显示进度窗口（没有窗口可依附，pmctl 会一直等到就绪或超时）。
     """
     argv = argv if argv is not None else []
-    from app_config import load_app_config
     from core.headless import HeadlessRuntime
     from core.ipc.commands import CommandContext
     from data.db.migrations.runner import MigrationOutcome
 
-    load_app_config(paths)
-    _mark(trace, "配置")
-    if not _automation_enabled():
-        # 无窗口实例只能经命令行控制：开关关着时留下来既收不到命令、也没有界面可用
-        logger.warning("设置里已关闭“允许命令行与脚本控制”，无窗口模式不启动，直接退出")
-        return EXIT_AUTOMATION_DISABLED
     report = new_migration_runner(paths).migrate()
     if report.outcome is MigrationOutcome.FAILED_KEPT:
         logger.error("数据库升级失败，原文件在 %s，无窗口模式退出", _kept_db_path(report, paths))
         return EXIT_MIGRATION_FAILED
     _mark(trace, "迁移")
-    ctx = build_context(paths, report=report)
+    ctx = build_context(paths, report=report, runtime_settings=runtime_settings)
     _mark(trace, "组装")
     dispatcher = getattr(guard, 'dispatcher', None)
+    renderer = _HeadlessReportRenderer(runtime_settings, paths.config_path)
     runtime = HeadlessRuntime(
         ctx.manager, ctx.registry, ctx.db, idle_exit_s=idle_exit_s,
         busy=(dispatcher.has_pending if dispatcher is not None else None),
-        stage_renderer=render_stage_snapshot_image,
+        stage_renderer=renderer.stage,
         quit_hooks=([ctx.storage_guard.stop] if ctx.storage_guard is not None else []),
         exit_hooks=[lambda: release_session_lock(ctx)])
     if dispatcher is not None:
-        dispatcher.set_settings(command_settings())
+        dispatcher.set_settings(command_settings(runtime_settings))
         dispatcher.set_context(CommandContext(
             manager=ctx.manager, db=ctx.db, auto_marker=runtime.auto_marker,
             registry=ctx.registry, clock=ctx.services.clock, quit=runtime.quit,
-            report_renderer=render_report_image_for_ipc, handle_auto_export=True,
+            report_renderer=renderer.report, handle_auto_export=True,
             launcher=getattr(ctx.services, "launcher", None),
             log_path=getattr(ctx.services, "log_path", None)))
     runtime.start()
@@ -722,10 +764,12 @@ def _run_headless(app, guard, paths: AppPaths, idle_exit_s: float, *,
     return exit_code
 
 
-def _automation_enabled() -> bool:
+def _automation_enabled(runtime_settings: Optional["RuntimeSettings"] = None) -> bool:
     """设置里的"允许命令行与脚本控制"（读失败按开启处理：不能因读配置出错让 pmctl 无从诊断）"""
     try:
-        return bool(command_settings().automation_enabled())
+        settings = (command_settings() if runtime_settings is None
+                    else command_settings(runtime_settings))
+        return bool(settings.automation_enabled())
     except Exception:
         logger.error("读取命令行控制开关失败，按开启处理", exc_info=True)
         return True
@@ -812,7 +856,15 @@ def run(argv: List[str], *, exit_process: Callable[[int], None] = os._exit,
                 # 已运行的是无窗口模式：没有窗口可激活，不提示的话用户会以为"打不开"
                 message_box(MESSAGE_BOX_TITLE, BACKGROUND_RUNNING_TEXT)
             return 0
-    # 尽早开始 IPC 监听：pmctl 拉起后台实例后马上就会连，组装完成前回 not_ready
+    runtime_settings = None
+    if background:
+        from settings_store import load_settings
+        runtime_settings = load_settings(paths.config_path, paths.prefs_path)
+        _mark(trace, "配置")
+        if not _automation_enabled(runtime_settings):
+            logger.warning("设置里已关闭“允许命令行与脚本控制”，无窗口模式不启动，直接退出")
+            return EXIT_AUTOMATION_DISABLED
+    # 开关确认后才监听，避免短暂向客户端暴露一个随即退出的后台实例。
     listening = guard.listen()
     _mark(trace, "单实例与命令行监听")
 
@@ -821,7 +873,7 @@ def run(argv: List[str], *, exit_process: Callable[[int], None] = os._exit,
             logger.error("无窗口模式无法开始 IPC 监听，退出（否则没有办法控制或结束它）")
             return EXIT_IPC_UNAVAILABLE
         return _run_headless(app, guard, paths, idle_exit_s, exit_process=exit_process,
-                             trace=trace, argv=argv)
+                             trace=trace, argv=argv, runtime_settings=runtime_settings)
 
     _apply_preferences(app, paths)
     _mark(trace, "配置与主题")

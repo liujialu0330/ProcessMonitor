@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import pyqtgraph as pg
 import pytest
 from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtWidgets import QWidget
 from qfluentwidgets import Theme, qconfig
 
 from core.analysis.trend import Judgement, LinearFit, Verdict
@@ -133,8 +134,8 @@ def test_waiting_restart_pill_text_color_and_pause_button(card):
     assert card.status == STATUS_WAITING_RESTART and card.waiting_restart
     # 警示色（与"已暂停"同一令牌，文字不同）
     assert _colors(card.status_label) == ("#9d5d00", "#fce100")
-    assert not card.pause_button.isEnabled()
-    assert "没有数据可暂停" in card.pause_button.toolTip()
+    assert card.pause_button.isEnabled()
+    assert "重启后的采集状态" in card.pause_button.toolTip()
     assert "等它重新启动" in card.status_label.toolTip()
     assert card.marker_button.isEnabled() and card.stop_button.isEnabled()   # 其余操作照常
 
@@ -383,7 +384,7 @@ def test_leaving_waiting_hands_the_task_paused_state_to_the_card(
     card = board_double.card(task_id)
     _update_info(restart_manager, task_id, waiting_restart=True, restart_count=1, restart_limit=3)
     restart_manager.task_waiting_restart.emit(task_id, True)
-    assert card.paused_args == [None]                 # 等待期间任务状态是 WAITING，不带暂停信息
+    assert card.paused_args == [False]                # 等待期间也携带续接后的暂停意图
     # 续接前处于暂停：任务回到 PAUSED，快照里 is_paused 仍为真
     _update_info(restart_manager, task_id, waiting_restart=False, is_paused=True)
     restart_manager.task_waiting_restart.emit(task_id, False)
@@ -396,14 +397,18 @@ def test_waiting_end_refreshes_a_real_card_that_never_saw_the_pause(
         qapp, restart_manager, services, host):
     """端到端：真实卡片不知道暂停（暂停来自命令行，且发生在卡片建出来之前）；续接后任务回到
     暂停，卡片的暂停按钮与状态胶囊随 waiting_restart_changed(False) 刷新"""
+    # 与真实监控页一致，让刷新定时器与其访问的控件由同一对象管理生命周期。
+    scope = QWidget(host)
+
     class RealCardBoard(RestartBoard):
         def create_card(self, info):
             self.cards[info.task_id] = TaskCard(
-                info.task_id, info.process_name, info.pid, list(info.metric_types))
+                info.task_id, info.process_name, info.pid, list(info.metric_types), parent=scope)
             return self.cards[info.task_id]
 
     board_double = RealCardBoard()
-    presenter = MonitorPresenter(restart_manager, services, FakeForm(), board_double, host)
+    presenter = MonitorPresenter(restart_manager, services, FakeForm(), board_double, host,
+                                 parent=scope)
     task_id = _start(presenter)
     card = board_double.card(task_id)
     try:
@@ -416,7 +421,9 @@ def test_waiting_end_refreshes_a_real_card_that_never_saw_the_pause(
         assert card.status_label.text() == "● 已暂停"
         assert card.pause_button.text() == "恢复" and card.pause_button.isEnabled()
     finally:
-        dispose_widget(card)
+        dispose_widget(scope)
+    from PyQt5 import sip
+    assert sip.isdeleted(presenter) and sip.isdeleted(card)
 
 
 def test_waiting_signal_for_unknown_or_finished_task_is_ignored(

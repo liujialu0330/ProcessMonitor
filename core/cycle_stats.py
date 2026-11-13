@@ -70,6 +70,47 @@ class Histogram:
     def p95_ms(self) -> Optional[int]:
         return self.percentile_ms(P95)
 
+    def snapshot(self) -> dict:
+        return {'counts': list(self.counts), 'max_s': self.max_s}
+
+    @classmethod
+    def restore(cls, data) -> 'Histogram':
+        if not isinstance(data, dict):
+            raise ValueError('直方图格式不正确')
+        counts = data.get('counts')
+        maximum = data.get('max_s')
+        if (not isinstance(counts, list) or len(counts) != len(BUCKET_BOUNDS_MS) + 1
+                or any(type(n) is not int or n < 0 for n in counts)
+                or type(maximum) not in (int, float) or not math.isfinite(maximum)
+                or maximum < 0):
+            raise ValueError('直方图计数或最大值不正确')
+        result = cls()
+        result.counts = list(counts)
+        result.total = sum(counts)
+        result.max_s = maximum
+        return result
+
+
+def merge_histograms(current: dict, prior: Optional[dict] = None) -> Optional[dict]:
+    """合并分布而非合并 p95；旧格式或损坏内容返回 None，调用方保守降级。"""
+    try:
+        inputs = [current] if prior is None else [current, prior]
+        if any(not isinstance(d, dict) or d.get('version') != 1
+               or d.get('bounds_ms') != list(BUCKET_BOUNDS_MS) for d in inputs):
+            return None
+        result = {'version': 1, 'bounds_ms': list(BUCKET_BOUNDS_MS)}
+        for name in ('lag', 'collect', 'write'):
+            merged = Histogram()
+            for data in inputs:
+                hist = Histogram.restore(data[name])
+                merged.counts = [a + b for a, b in zip(merged.counts, hist.counts)]
+                merged.total += hist.total
+                merged.max_s = max(merged.max_s, hist.max_s)
+            result[name] = merged.snapshot()
+        return result
+    except (KeyError, TypeError, ValueError):
+        return None
+
 
 class CycleStats:
     """
@@ -165,6 +206,11 @@ class CycleStats:
             collect_p95_ms=self.collect_hist.p95_ms(),
             write_p95_ms=self.write_hist.p95_ms(),
         )
+
+    def histograms(self) -> dict:
+        return {'version': 1, 'bounds_ms': list(BUCKET_BOUNDS_MS),
+                'lag': self.lag_hist.snapshot(), 'collect': self.collect_hist.snapshot(),
+                'write': self.write_hist.snapshot()}
 
     @property
     def has_data(self) -> bool:

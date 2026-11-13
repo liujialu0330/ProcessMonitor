@@ -267,7 +267,7 @@ def test_user_stop_while_waiting_ends_promptly(db, started):
     assert task.end_time >= _markers(db, tid, 'crash')[0].timestamp + timedelta(seconds=3)
 
 
-def test_pause_is_rejected_while_waiting_restart(db, started):
+def test_pause_is_remembered_while_waiting_restart(db, started):
     finder = ScriptedFinder()
     rig = build_rig(db, segments={100: [1]}, codes={100: 0}, finder=finder, resume=True)
     results = []
@@ -280,7 +280,7 @@ def test_pause_is_rejected_while_waiting_restart(db, started):
 
     finder.on_call = on_call
     run_to_end(rig.worker, started)
-    assert results == [False]
+    assert results == [True]
     assert rig.stops == [StopReason.PROCESS_EXITED]
 
 

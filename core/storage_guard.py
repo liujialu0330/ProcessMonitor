@@ -11,7 +11,7 @@ StorageGuard 是界面线程上的 QObject，一个 1 秒定时器驱动三项�
    常驻提示）；回升到 300 MB 以上发 space_recovered，但不自动恢复任务，由用户手动继续。守卫
    自己记住暂停了哪些任务（paused_task_ids / space_paused_changed），界面据此标出"因磁盘空间
    不足暂停"；用户手动恢复、任务结束或被移除时，对应任务从集合里去掉。
-   仍低于 200 MB 时，用户手动恢复或新建的任务会在下一次检查被再次暂停（只记日志，不重复提示）。
+   严重不足时，新建与续接任务立即暂停；用户手动恢复时先重新检查空间，未达到恢复线则再次暂停。
 2. -wal 兜底 checkpoint（默认每 5 分钟）：-wal 超过 64 MB 时在后台线程做一次
    TRUNCATE（被挡住退到 PASSIVE），前后大小与耗时记日志。维护进行中跳过；作业期间维护锁被占
    （MaintenanceService.begin_storage_job），清理与重建汇总开始不了，二者不会同时碰库。
@@ -191,6 +191,13 @@ class StorageGuard(QObject):
             sig = getattr(manager, name, None)
             if sig is not None:
                 sig.connect(self._on_task_left_pause)
+        for name in ('task_started', 'task_restarted', 'task_waiting_restart'):
+            sig = getattr(manager, name, None)
+            if sig is not None:
+                sig.connect(self._on_task_activity)
+        resumed = getattr(manager, 'task_resumed', None)
+        if resumed is not None:
+            resumed.connect(self._on_task_resumed)
         # 采集线程写库遇到磁盘已满：与"空间低于 200 MB"同一路径暂停任务
         full_signal = getattr(manager, 'storage_full_detected', None)
         if full_signal is not None:
@@ -334,6 +341,16 @@ class StorageGuard(QObject):
             self._paused_ids.discard(task_id)
             self.space_paused_changed.emit(frozenset(self._paused_ids))
 
+    def _on_task_activity(self, *_args) -> None:
+        """严重不足期间任务启动、续接或恢复时立即暂停，不等下一个磁盘检查节拍。"""
+        if self._critical and not self._stopped:
+            self._pause_running_tasks()
+
+    def _on_task_resumed(self, *_args) -> None:
+        if self._critical and not self._stopped:
+            self.check_disk()
+            self._on_task_activity()
+
     @pyqtSlot()
     def report_storage_full(self) -> None:
         """数据层报告"磁盘已满"（StorageFullError / SQLITE_FULL）：与"低于 200 MB"同一路径——
@@ -414,17 +431,22 @@ class StorageGuard(QObject):
         if self._wal_worker is not None or self._maintenance.is_busy():
             self._quick_check_at = now + QUICK_CHECK_RETRY_S
             return False
+        if not self._maintenance.begin_storage_job():
+            self._quick_check_at = now + QUICK_CHECK_RETRY_S
+            return False
         self._quick_check_at = None    # 只跑一次
-        worker = _QuickCheckWorker(self._maintenance)
-        self._qc_worker = worker
-        worker.result.connect(self._on_quick_check_result)
-        worker.finished.connect(lambda w=worker: self._on_quick_check_finished(w))
         try:
+            worker = _QuickCheckWorker(self._maintenance)
+            self._qc_worker = worker
+            worker.result.connect(self._on_quick_check_result)
+            worker.finished.connect(lambda w=worker: self._on_quick_check_finished(w))
             self._registry.register(worker, name=QUICK_CHECK_THREAD_NAME, cancel=worker.cancel,
                                     timeout_ms=QUICK_CHECK_THREAD_TIMEOUT_MS)
             worker.start()
         except Exception:
             self._qc_worker = None
+            self._maintenance.end_storage_job()
+            self._quick_check_at = now + QUICK_CHECK_RETRY_S
             raise
         logger.info("开始后台数据库完整性检查（quick_check，只读连接）")
         return True
@@ -432,6 +454,7 @@ class StorageGuard(QObject):
     def _on_quick_check_finished(self, worker) -> None:
         if self._qc_worker is worker:
             self._qc_worker = None
+            self._maintenance.end_storage_job()
 
     def _on_quick_check_result(self, result) -> None:
         if result is None:

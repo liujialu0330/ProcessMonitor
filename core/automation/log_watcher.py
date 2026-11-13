@@ -2,7 +2,8 @@
 日志文件增量读尾（LogWatcher）
 
 每次 poll() 只读上次读到的位置之后新写入的完整行，逐行匹配正则，返回匹配结果。由自动
-打点服务在界面线程每个 tick 调用一次：不开线程、不长期持有文件句柄（Windows 上持有句柄
+打点服务每个 tick 调用一次。本地路径同步读取，UNC 路径由 AsyncLogWatcher 隔离到后台；
+不长期持有文件句柄（Windows 上持有句柄
 会让被测程序的日志轮转——改名或删除——失败）。
 
 - 开始监听时文件已存在：从文件末尾开始，只看之后新写的行（旧内容是上一次运行留下的）；
@@ -20,6 +21,7 @@
 import logging
 import os
 import re
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, List, Optional, Tuple, Union
@@ -39,6 +41,83 @@ SLOW_POLL_INTERVAL_S = 30.0
 
 # 文件身份：(索引号或创建时间的种类, 值)
 _Identity = Tuple[str, Any]
+
+
+class AsyncLogWatcher:
+    """网络文件读取隔离到一个在途守护线程；线程不访问 Qt、管理器或数据库。
+
+    关闭/暂停使在途结果失效，不等待可能卡住的网络 I/O。单次至多缓存一批结果，
+    关闭后不再启动工作，已在途的系统调用返回后自行释放。
+    """
+
+    def __init__(self, *args, factory=None, **kwargs):
+        self._factory = factory or LogWatcher
+        self._args, self._kwargs = args, kwargs
+        self._lock = threading.Lock()
+        self._watcher = None
+        self._busy = False
+        self._closed = False
+        self._paused = False
+        self._generation = 0
+        self._ready = []
+        self._launch()
+
+    def _launch(self) -> None:
+        with self._lock:
+            if self._busy or self._closed:
+                return
+            self._busy = True
+            generation = self._generation
+        worker = threading.Thread(target=self._read, args=(generation,),
+                                  name='网络日志读尾', daemon=True)
+        try:
+            worker.start()
+        except Exception:
+            with self._lock:
+                self._busy = False
+            raise
+
+    def _read(self, generation: int) -> None:
+        matches = []
+        try:
+            if self._watcher is None:
+                self._watcher = self._factory(*self._args, **self._kwargs)
+            else:
+                matches = self._watcher.poll()
+        except Exception:
+            logger.exception('后台日志读取失败')
+        finally:
+            with self._lock:
+                if not self._closed and not self._paused and generation == self._generation:
+                    self._ready = matches
+                self._busy = False
+
+    def poll(self) -> List['LogMatch']:
+        with self._lock:
+            ready, self._ready = self._ready, []
+            if self._closed or self._paused:
+                ready = []
+        self._launch()
+        return ready
+
+    def set_paused(self, paused: bool) -> None:
+        with self._lock:
+            if paused != self._paused:
+                self._paused = paused
+                self._generation += 1
+                self._ready = []
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            self._generation += 1
+            self._ready = []
+
+
+def make_log_watcher(path, pattern, encoding=DEFAULT_LOG_ENCODING, clock=None):
+    """UNC 路径包括首次 stat 都在后台执行，本地文件沿用轻量同步读尾。"""
+    watcher = AsyncLogWatcher if path.replace('/', '\\').startswith('\\\\') else LogWatcher
+    return watcher(path, pattern, encoding, clock)
 
 
 @dataclass(frozen=True)

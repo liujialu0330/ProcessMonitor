@@ -84,12 +84,14 @@ def test_already_running_process_starts_immediately(env, query):
     assert board.waiting == {} and not presenter._wait_timer.isActive()
 
 
-def test_several_instances_pick_newest(env, query):
+def test_several_instances_require_explicit_target(env, query):
     presenter, manager, form, board = env
     presenter.on_wait_requested(_wait())
     query.processes.extend([(2001, "notepad.exe", 50.0), (2002, "Notepad.exe", 90.0)])
     presenter.poll_waits()
-    assert [c[0] for c in manager.created] == [2002]
+    assert manager.created == []
+    assert board.waiting == {} and presenter.wait_ids() == []
+    assert not presenter._wait_timer.isActive()
 
 
 def test_name_without_exe_suffix_also_matches(env, query):

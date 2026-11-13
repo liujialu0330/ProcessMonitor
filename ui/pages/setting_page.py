@@ -19,18 +19,18 @@ from PyQt5.QtWidgets import QWidget
 from qfluentwidgets import (
     ScrollArea, ExpandLayout, SettingCardGroup, OptionsSettingCard, ComboBoxSettingCard,
     PushSettingCard, SettingCard, StateToolTip, LineEdit, TransparentToolButton, PushButton,
-    FluentIcon as FIF, setTheme, qconfig, Theme
+    FluentIcon as FIF, setTheme, qconfig, Theme, Pivot, ComboBox, TransparentPushButton
 )
 
 from app_config import (
-    DEFAULT_EXPORT_NAME_TEMPLATE, cfg, get_export_name_template, set_export_name_template,
+    DEFAULT_EXPORT_NAME_TEMPLATE, cfg, get_export_name_template, set_export_name_template, update_values,
 )
 from core.diagnostics import collect_diagnostics, write_diagnostic_bundle
 from core.naming_template import (
     available_fields_text, preview_filename, unknown_fields,
 )
 from core.maintenance_service import (
-    BUSY_EXPORT_RUNNING, BUSY_MAINTENANCE_RUNNING, BUSY_STORAGE_JOB_RUNNING,
+    BUSY_DELETION_RUNNING, BUSY_EXPORT_RUNNING, BUSY_MAINTENANCE_RUNNING, BUSY_STORAGE_JOB_RUNNING,
     BUSY_TASKS_RUNNING, MaintenanceBusy, MaintenanceService,
 )
 from core.workers.base import BackgroundTask, CancelToken
@@ -131,6 +131,7 @@ _BUSY_REASON_TEXTS = {
     BUSY_EXPORT_RUNNING: "正在导出数据，请等导出完成后再清理数据库",
     BUSY_MAINTENANCE_RUNNING: "数据库正在清理中，请稍候",
     BUSY_STORAGE_JOB_RUNNING: "数据库正在做例行整理，请几秒后再试",
+    BUSY_DELETION_RUNNING: "正在删除任务数据，请等待删除完成后再清理数据库",
 }
 _BUSY_FALLBACK_TEXT = "数据库正忙，请稍后再清理"
 # 重建汇总被拒绝的原因 → 提示文案
@@ -139,6 +140,7 @@ _REBUILD_BUSY_TEXTS = {
     BUSY_EXPORT_RUNNING: "正在导出数据，请等导出完成后再重建汇总",
     BUSY_MAINTENANCE_RUNNING: "数据库正在维护中，请稍候",
     BUSY_STORAGE_JOB_RUNNING: "数据库正在做例行整理，请几秒后再试",
+    BUSY_DELETION_RUNNING: "正在删除任务数据，请等待删除完成后再重建汇总",
 }
 _REBUILD_BUSY_FALLBACK_TEXT = "数据库正忙，请稍后再重建汇总"
 
@@ -172,6 +174,26 @@ class RebuildRollupsWorker(BackgroundTask):
 
     def execute(self, token: CancelToken):
         return self.maintenance_service.rebuild_rollups(already_locked=True)
+
+
+class BackupDeletionWorker(BackgroundTask):
+    def __init__(self, maintenance, path, parent=None):
+        super().__init__(parent)
+        self.maintenance, self.path = maintenance, path
+
+    def execute(self, token):
+        if not token.is_cancelled:
+            self.maintenance.delete_migration_backup(self.path, already_locked=True)
+            return self.path
+
+
+class BackupListWorker(BackgroundTask):
+    def __init__(self, maintenance, parent=None):
+        super().__init__(parent)
+        self.maintenance = maintenance
+
+    def execute(self, token):
+        return [] if token.is_cancelled else self.maintenance.list_migration_backups()
 
 
 # 修饰键（单独按下时不算完成输入）
@@ -238,7 +260,8 @@ class SettingPage(ScrollArea):
                  services: UiServices, parent=None, *,
                  maintenance: Optional[MaintenanceService] = None,
                  hotkey: Optional[MarkerHotkey] = None,
-                 diagnostics_provider: Optional[Callable[[], Any]] = None):
+                 diagnostics_provider: Optional[Callable[[], Any]] = None,
+                 about_group: Optional[AboutUpdateGroup] = None):
         """初始化页面
 
         设置卡片直接绑定 cfg 的 ConfigItem（卡片自身负责读写与落盘）；
@@ -274,6 +297,9 @@ class SettingPage(ScrollArea):
         self._state_tooltip: StateToolTip = None
         self._diagnostics_provider = diagnostics_provider
         self._bundle_worker: Optional[DiagnosticBundleWorker] = None
+        self._backup_worker = None
+        self._backup_list_worker = None
+        self._backup_paths = []
         self.open_bundle_folder_button: Optional[PushButton] = None
         # "数据"分组顶部的完整性警告卡片（quick_check 未通过时才显示，见 show_integrity_warning）
         self.integrity_card: Optional[SettingCard] = None
@@ -286,7 +312,9 @@ class SettingPage(ScrollArea):
         self._init_notify_group()
         self._init_data_group()
         self._init_export_group()
-        self.about_group = AboutUpdateGroup(services, self.scroll_widget)
+        self.about_group = about_group or AboutUpdateGroup(services, self.scroll_widget)
+        self.about_group.setParent(self.scroll_widget)
+        self.about_group.show()
 
         self._init_layout()
         self._connect_signals()
@@ -294,15 +322,17 @@ class SettingPage(ScrollArea):
         # 构造时先刷新一次，避免在首次 showEvent 触发前卡片停留在占位文案
         self._refresh_data_management_state()
         self._refresh_hotkey_card()
+        self.refresh_migration_backups()
 
     # ========== 分组 ==========
 
     def _init_general_group(self):
         """常规：主题 · 默认采集间隔 · 关闭行为 · 监控期间阻止睡眠 · 打点快捷键"""
-        self.general_group = SettingCardGroup("常规", self.scroll_widget)
+        self.general_group = SettingCardGroup("外观", self.scroll_widget)
         # 旧分组名都指向"常规"：外部读取与冒烟测试仍用这些属性
         self.appearance_group = self.general_group
-        self.monitor_group = self.general_group
+        self.monitor_group = SettingCardGroup('监控默认值', self.scroll_widget)
+        self.shortcuts_group = SettingCardGroup('打点与快捷键', self.scroll_widget)
         self.behavior_group = self.general_group
 
         self.theme_card = OptionsSettingCard(
@@ -314,7 +344,7 @@ class SettingPage(ScrollArea):
             cfg.default_interval, FIF.STOP_WATCH, "默认采集间隔",
             "新建任务时的初始值，创建时仍可调整",
             parent=self.general_group, suffix=" 秒")
-        self.general_group.addSettingCard(self.default_interval_card)
+        self.monitor_group.addSettingCard(self.default_interval_card)
 
         self.close_to_tray_card = CnSwitchSettingCard(
             FIF.MINIMIZE, "关闭窗口时最小化到托盘",
@@ -326,26 +356,42 @@ class SettingPage(ScrollArea):
         self.keep_awake_card = CnSwitchSettingCard(
             FIF.POWER_BUTTON, KEEP_AWAKE_TITLE, KEEP_AWAKE_CONTENT,
             configItem=cfg.keep_awake_while_monitoring, parent=self.general_group)
-        self.general_group.addSettingCard(self.keep_awake_card)
+        self.monitor_group.addSettingCard(self.keep_awake_card)
 
         # 命令处理器每条请求都现读该配置项，切换即生效
         self.automation_card = CnSwitchSettingCard(
             FIF.COMMAND_PROMPT, AUTOMATION_TITLE, AUTOMATION_CONTENT,
             configItem=cfg.automation_enabled, parent=self.general_group)
-        self.general_group.addSettingCard(self.automation_card)
+        self.monitor_group.addSettingCard(self.automation_card)
 
         # 打点快捷键：录入框 + 恢复默认；说明行显示当前状态（可用 / 不可用的原因）
         self.hotkey_card = SettingCard(
             FIF.TAG, "打点快捷键", hotkey_status_text(None), parent=self.general_group)
         self.hotkey_edit = HotkeyEdit(self.hotkey_card)
         self.hotkey_edit.setToolTip("点击后按下新的组合键；Backspace 清空表示不使用；Esc 放弃")
-        self.hotkey_reset_button = TransparentToolButton(FIF.RETURN, self.hotkey_card)
+        self.hotkey_reset_button = TransparentPushButton('恢复默认', self.hotkey_card)
         self.hotkey_reset_button.setToolTip(f"恢复默认（{DEFAULT_MARKER_HOTKEY}）")
         self.hotkey_card.hBoxLayout.addWidget(self.hotkey_edit, 0, Qt.AlignRight)
         self.hotkey_card.hBoxLayout.addSpacing(4)
         self.hotkey_card.hBoxLayout.addWidget(self.hotkey_reset_button, 0, Qt.AlignRight)
         self.hotkey_card.hBoxLayout.addSpacing(16)
-        self.general_group.addSettingCard(self.hotkey_card)
+        self.shortcuts_group.addSettingCard(self.hotkey_card)
+        from ui.metric_presets import metric_presets
+        self.preset_card = SettingCard(FIF.FLAG, '默认指标预设',
+                                      '新建任务时使用；选择“沿用上次”可记住临时调整', self.monitor_group)
+        self.default_preset_combo = ComboBox(self.preset_card)
+        self.default_preset_combo.addItems(['沿用上次', *metric_presets()])
+        self.default_preset_combo.setCurrentText(cfg.get(cfg.default_metric_preset) or '沿用上次')
+        self.default_preset_combo.currentTextChanged.connect(
+            lambda text: update_values([(cfg.default_metric_preset, '' if text == '沿用上次' else text)]))
+        self.preset_card.hBoxLayout.addWidget(self.default_preset_combo)
+        self.preset_card.hBoxLayout.addSpacing(16)
+        self.monitor_group.addSettingCard(self.preset_card)
+        self.guide_reset_card = PushSettingCard('重新显示', FIF.INFO, '使用引导',
+                                               '重新显示首次开始监控与记录基线的提示',
+                                               parent=self.shortcuts_group)
+        self.guide_reset_card.clicked.connect(self.reset_guides)
+        self.shortcuts_group.addSettingCard(self.guide_reset_card)
 
     def _init_notify_group(self):
         """通知：窗口不在前台时是否用系统通知提醒"""
@@ -365,7 +411,7 @@ class SettingPage(ScrollArea):
                            for days in self.services.preferences.retention_options()]
         self.retention_card = OptionsSettingCard(
             cfg.retention_days, FIF.DELETE, "历史数据保留",
-            "启动时清理超过保留期限的已结束任务",
+            "启动时清理超过保留期限的已结束任务，场景参考始终保留",
             texts=retention_texts, parent=self.data_group)
         self.data_group.addSettingCard(self.retention_card)
 
@@ -397,6 +443,22 @@ class SettingPage(ScrollArea):
         self.open_dir_card.contentLabel.setToolTip(normalized_path)
         self.open_dir_card.button.setToolTip(normalized_path)
         self.data_group.addSettingCard(self.open_dir_card)
+        self.copy_data_path_button = TransparentPushButton('复制路径', self.open_dir_card)
+        self.copy_data_path_button.clicked.connect(
+            lambda: self.services.dialogs.copy_text(os.path.dirname(os.path.abspath(self.db.db_path))))
+        self.open_dir_card.hBoxLayout.addWidget(self.copy_data_path_button)
+        self.open_dir_card.hBoxLayout.addSpacing(16)
+        self.backup_card = PushSettingCard('删除备份', FIF.DELETE, '迁移备份',
+                                          getattr(self.db, 'backup_path', None) or '本次启动没有迁移备份',
+                                          parent=self.data_group)
+        self.backup_card.setVisible(bool(getattr(self.db, 'backup_path', None)))
+        self.backup_card.clicked.connect(self.delete_migration_backup)
+        self.backup_combo = ComboBox(self.backup_card)
+        self.backup_combo.setMaximumWidth(240)
+        self.backup_combo.currentIndexChanged.connect(self._backup_selected)
+        self.backup_card.hBoxLayout.insertWidget(self.backup_card.hBoxLayout.count() - 2,
+                                                self.backup_combo)
+        self.data_group.addSettingCard(self.backup_card)
 
         # 报告配色：卡片只写配置，报告渲染时现读（ui/widgets/analysis/report_sheet）
         self.report_color_card = ComboBoxSettingCard(
@@ -421,6 +483,13 @@ class SettingPage(ScrollArea):
         """导出：文件命名模板（输入框 + 实时预览 + 恢复默认）。预览随输入实时更新，模板在输入
         完成（回车或失去焦点）时才写入配置，免得键入一半的 {pro 被存下来。"""
         self.export_group = SettingCardGroup("导出", self.scroll_widget)
+        self.data_group.cardLayout.removeWidget(self.report_color_card)
+        self.export_group.addSettingCard(self.report_color_card)
+        self.export_dir_card = PushSettingCard('选择目录', FIF.FOLDER, '默认导出目录',
+                                              cfg.get(cfg.default_export_dir) or '每次导出时选择',
+                                              parent=self.export_group)
+        self.export_dir_card.clicked.connect(self.choose_default_export_dir)
+        self.export_group.addSettingCard(self.export_dir_card)
         self.name_template_card = SettingCard(
             FIF.EDIT, NAME_TEMPLATE_TITLE, "", parent=self.export_group)
         self.name_template_edit = LineEdit(self.name_template_card)
@@ -429,7 +498,7 @@ class SettingPage(ScrollArea):
         self.name_template_edit.setClearButtonEnabled(True)
         self.name_template_edit.setToolTip(NAME_TEMPLATE_TIP)
         self.name_template_edit.setText(get_export_name_template())
-        self.name_template_reset_button = PushButton(
+        self.name_template_reset_button = TransparentPushButton(
             NAME_TEMPLATE_RESET_TEXT, self.name_template_card)
         self.name_template_card.hBoxLayout.addWidget(self.name_template_edit, 0, Qt.AlignRight)
         self.name_template_card.hBoxLayout.addSpacing(8)
@@ -507,11 +576,24 @@ class SettingPage(ScrollArea):
         self.expand_layout.setContentsMargins(24, 24, 24, 24)
         self.page_title = PageTitleLabel("设置", self.scroll_widget)
         self.expand_layout.addWidget(self.page_title)
+        self.pivot = Pivot(self.scroll_widget)
+        self.expand_layout.addWidget(self.pivot)
         self.expand_layout.addWidget(self.general_group)
+        self.expand_layout.addWidget(self.monitor_group)
+        self.expand_layout.addWidget(self.shortcuts_group)
         self.expand_layout.addWidget(self.notify_group)
-        self.expand_layout.addWidget(self.data_group)
         self.expand_layout.addWidget(self.export_group)
+        self.expand_layout.addWidget(self.data_group)
         self.expand_layout.addWidget(self.about_group)
+        for key, group in (('appearance', self.general_group), ('monitor', self.monitor_group),
+                           ('shortcuts', self.shortcuts_group), ('notify', self.notify_group),
+                           ('export', self.export_group), ('data', self.data_group),
+                           ('about', self.about_group)):
+            group.setMaximumWidth(1000)
+            self.pivot.addItem(key, group.titleLabel.text(),
+                               onClick=lambda g=group: self.verticalScrollBar().setValue(g.y()))
+        self.pivot.setCurrentItem('appearance')
+        self.pivot.setMaximumWidth(1000)
 
         self.setWidget(self.scroll_widget)
         self.setWidgetResizable(True)
@@ -576,6 +658,89 @@ class SettingPage(ScrollArea):
     def scroll_to_about(self) -> None:
         """滚动到"关于与更新"分组（托盘/提示条"查看更新"跳转过来时用）。"""
         self.verticalScrollBar().setValue(self.about_group.y())
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, 'name_template_edit'):
+            self.name_template_edit.setFixedWidth(max(150, min(340, self.viewport().width() - 430)))
+
+    def reset_guides(self):
+        update_values([(cfg.guide_started, False), (cfg.guide_baseline, False)])
+        self.services.notifier.success(self, '引导已重置', '下次开始监控和记录基线时会再次显示提示')
+
+    def choose_default_export_dir(self):
+        directory = self.services.dialogs.ask_directory(
+            self, '选择默认导出目录', cfg.get(cfg.default_export_dir))
+        if directory:
+            update_values([(cfg.default_export_dir, os.path.normpath(directory))])
+            self.export_dir_card.setContent(os.path.normpath(directory))
+
+    def delete_migration_backup(self):
+        index = self.backup_combo.currentIndex()
+        path = self._backup_paths[index] if 0 <= index < len(self._backup_paths) else None
+        if not path or not self.services.dialogs.confirm(
+                self, '删除迁移备份', f'删除后无法通过这份备份恢复升级前的数据：\n{path}', '删除备份'):
+            return
+        try:
+            self.maintenance.begin()
+        except Exception as exc:
+            self.services.notifier.error(self, '删除备份失败', str(exc))
+            return
+        worker = BackupDeletionWorker(self.maintenance, path)
+        self._backup_worker = worker
+        self.backup_card.button.setEnabled(False)
+        worker.result.connect(self._backup_deleted)
+        worker.failed.connect(lambda message: self.services.notifier.error(self, '删除备份失败', message))
+        worker.finished.connect(self._backup_finished)
+        try:
+            self.services.threads.register(worker, name='删除迁移备份')
+            worker.start()
+        except Exception:
+            self._backup_finished()
+            raise
+
+    def _backup_deleted(self, path):
+        if path:
+            self._update_backups([p for p in self._backup_paths if p != path])
+            self.services.notifier.success(self, '备份已删除', '当前数据库和监控记录不受影响')
+
+    def _backup_finished(self):
+        self.maintenance.end()
+        self._backup_worker = None
+        self.backup_card.button.setEnabled(bool(self._backup_paths))
+
+    def refresh_migration_backups(self):
+        if self._backup_list_worker is not None:
+            return
+        worker = BackupListWorker(self.maintenance)
+        self._backup_list_worker = worker
+        worker.result.connect(self._update_backups)
+        worker.finished.connect(self._backup_list_finished)
+        self.services.threads.register(worker, name='查找迁移备份')
+        worker.start()
+
+    def _backup_list_finished(self):
+        self._backup_list_worker = None
+
+    def _update_backups(self, paths):
+        self._backup_paths = list(paths or [])
+        self.backup_combo.blockSignals(True)
+        self.backup_combo.clear()
+        self.backup_combo.addItems([os.path.basename(path) for path in self._backup_paths])
+        preferred = getattr(self.db, 'backup_path', None)
+        if preferred in self._backup_paths:
+            self.backup_combo.setCurrentIndex(self._backup_paths.index(preferred))
+        self.backup_combo.blockSignals(False)
+        self.backup_card.setVisible(bool(self._backup_paths))
+        self.backup_card.button.setEnabled(bool(self._backup_paths) and self._backup_worker is None)
+        self._backup_selected(self.backup_combo.currentIndex())
+
+    def _backup_selected(self, index):
+        if 0 <= index < len(self._backup_paths):
+            path = self._backup_paths[index]
+            self.backup_card.setContent('升级前的数据库副本；确认不再需要回退后可删除')
+            self.backup_card.setToolTip(path)
+            self.backup_combo.setToolTip(path)
 
     # ========== 诊断信息 ==========
 

@@ -35,12 +35,13 @@ StageSnapshotWriter 在后台写报告图片与摘要 CSV（失败每个任务�
 中文文案（表单错误、提示）集中在这里；控件只发信号、显示给定内容。
 """
 import logging
+import itertools
 import os
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
-from PyQt5.QtCore import QObject, QTimer, pyqtSignal
+from PyQt5.QtCore import QObject, QTimer, pyqtSignal, pyqtSlot
 from PyQt5.QtWidgets import QWidget
 
 import config
@@ -54,7 +55,9 @@ from core.report_worker import ReportJob, ReportWorker
 from core.process_launcher import LaunchSpec, ProcessLauncher
 from core.wait_service import WaitMatch, WaitService
 from core.workers.terminate_worker import close_in_background
+from core.workers.live_stats_worker import LiveStatsRequest, LiveStatsWorker
 from data.errors import StorageError
+from data.mappers import normalize_ms
 from data.models import TARGET_NAME, TARGET_PID, TARGET_TREE
 from ui.formatting import (
     TARGET_KIND_TEXTS, AUTO_EXPORT_BUSY, AUTO_EXPORT_DONE_TITLE, AUTO_EXPORT_FAILED_TITLE,
@@ -65,7 +68,7 @@ from ui.formatting import (
     unavailable_reason_text,
 )
 from ui.presenters.marker_feedback import CardMarkerCommands, MarkerFeedback
-from ui.services import EVENT_TASK_ABNORMAL, EVENT_TASK_ERROR, UiServices
+from ui.services import EVENT_TASK_ABNORMAL, EVENT_TASK_ERROR, NoticeAction, UiServices
 from ui.storage_notices import SPACE_PAUSE_REASON
 from ui.widgets.analysis.marker_menu import MarkerEditFlow
 from ui.widgets.analysis.report_sheet import render_report_for
@@ -89,6 +92,8 @@ RESTARTED_INFOBAR_MS = 4000
 TICK_INTERVAL_MS = 1000
 # 等待进程启动的轮询间隔（毫秒）
 WAIT_POLL_INTERVAL_MS = 1000
+# 等待采样落库的重建必须有界；暂停后没有新采样，也能等一次在途写入完成。
+LIVE_STATS_RETRY_DELAYS_MS = (250, 1000, 3000, 10000)
 
 STOP_CONFIRM_HINT = "停止后不能继续记录到这个任务；要继续请用“同配置再测”。已采集的数据会保留。"
 
@@ -170,6 +175,8 @@ class _TaskEntry:
     close_on_stop: bool = False
     # 监控目标类型：pid / tree / name（后两者是进程组任务）
     target_kind: str = TARGET_PID
+    scenario: str = ''
+    build: str = ''
 
     @property
     def is_group(self) -> bool:
@@ -230,7 +237,7 @@ class MonitorPresenter(QObject):
                  export_worker_factory: Optional[Callable] = None,
                  wait_service: Optional[WaitService] = None,
                  snapshot_writer: Optional[StageSnapshotWriter] = None,
-                 launcher=None):
+                 launcher=None, live_stats_worker_factory=None):
         super().__init__(parent)
         self.manager = manager
         self.services = services
@@ -243,6 +250,15 @@ class MonitorPresenter(QObject):
         self._export_worker_factory = export_worker_factory or ReportWorker
         # 进行中的自动导出线程（持有引用直到线程结束）
         self._export_workers: List[Any] = []
+        self._live_worker_factory = live_stats_worker_factory or LiveStatsWorker
+        self._live_sequence = itertools.count(1)
+        self._live_generations = {}
+        self._live_workers = {}
+        self._live_boundaries = {}
+        self._live_shutdown = False
+        self._live_retries = {}
+        self._live_retry_attempts = {}
+        self._live_retry_needed = set()
 
         self._tasks: Dict[str, _TaskEntry] = {}
         # 启动 / 关闭被测程序；勾选"停止时关闭"的任务 {task_id: (PID, 创建时间)}
@@ -259,6 +275,7 @@ class MonitorPresenter(QObject):
                              else WaitService(manager, services.process_query,
                                               services.clock, self))
         self._waits: Dict[str, WaitRequest] = {}
+        self.wait_service.failed.connect(self._on_wait_failed)
         # 当前显示中的错误提示 {(task_id, 内容): 提示对象}：错误提示不自动消失，
         # 同一任务同一错误重复上报时不再叠加
         self._error_bars: Dict[Tuple[str, str], Any] = {}
@@ -267,6 +284,11 @@ class MonitorPresenter(QObject):
         # 每个任务一个迷你图右键菜单流程：菜单弹出后是非阻塞的，动作触发时流程对象必须还在，
         # 所以按任务缓存、随卡片一起释放
         self._marker_flows: Dict[str, MarkerEditFlow] = {}
+        self._cleared_cards = []
+        self._clear_generation = 0
+        self._clear_timer = QTimer(self)
+        self._clear_timer.setSingleShot(True)
+        self._clear_timer.timeout.connect(self._expire_cleared_cards)
 
         # 每秒刷新运行中卡片的"已运行"等时间文案（有运行中卡片时才走）
         self._tick_timer = QTimer(self)
@@ -302,7 +324,14 @@ class MonitorPresenter(QObject):
         manager.task_added.connect(self.on_task_added)
         manager.task_started.connect(self.on_task_started)
         manager.task_stopped.connect(self.on_task_stopped)
-        manager.data_updated.connect(self.on_data_updated)
+        plan_saved = getattr(manager, 'task_plan_saved', None)
+        if plan_saved is not None:
+            plan_saved.connect(self._on_plan_saved)
+        sample_updated = getattr(manager, 'sample_updated', None)
+        if sample_updated is None:
+            manager.data_updated.connect(self.on_data_updated)
+        else:
+            sample_updated.connect(self.on_sample_updated)
         manager.markers_changed.connect(self.on_markers_changed)
         manager.error_occurred.connect(self.on_error)
         manager.metrics_unavailable.connect(self.on_metrics_unavailable)
@@ -329,6 +358,8 @@ class MonitorPresenter(QObject):
         self.auto_marker = (auto_marker if auto_marker is not None
                             else AutoMarkerService(manager, services.clock, self))
         self.auto_marker.auto_stopped.connect(self.on_auto_stopped)
+        self.auto_marker.marker_added.connect(
+            lambda task_id, marker: self._marker_feedback.announce([(task_id, marker)]))
         self.auto_marker.export_requested.connect(self.on_export_requested)
         self.form.browse_log_requested.connect(self.on_browse_log)
         self.form.browse_export_dir_requested.connect(self.on_browse_export_dir)
@@ -508,7 +539,9 @@ class MonitorPresenter(QObject):
                 'target_kind': request.target_kind}
         task_id = self.manager.create_task(
             request.pid, request.name, metrics, request.interval,
-            note=request.note, create_time=request.create_time, **extra)
+            note=request.note, create_time=request.create_time,
+            **({key: value for key, value in (('scenario', request.scenario), ('build', request.build))
+                if value}), **extra)
         if not task_id:
             if request.launch is not None:
                 logger.warning("被测程序已启动但没能创建任务: pid=%s", request.pid)
@@ -588,6 +621,7 @@ class MonitorPresenter(QObject):
         return entry.plan if entry is not None else None
 
     def _apply_plan(self, task_id: str, plan: AutomationPlan) -> None:
+        self.manager.seed_restart_policy(task_id, plan.resume_on_restart, plan.restart_limit)
         entry = self._tasks.get(task_id)
         if entry is not None:
             entry.plan = plan
@@ -608,13 +642,21 @@ class MonitorPresenter(QObject):
                 entry.plan_saved = True     # 没有可写的数据库（降级或测试），不再重试
             return False
         try:
-            saved = bool(store.save_plan(task_id, plan.to_json()))
+            save = getattr(self.manager, 'save_task_plan', store.save_plan)
+            saved = bool(save(task_id, plan.to_json()))
         except StorageError:
             logger.error("保存自动化方案失败: task_id=%s", task_id, exc_info=True)
             saved = False
         if entry is not None:
             entry.plan_saved = saved
+        if saved and not hasattr(self.manager, 'save_task_plan'):
+            self.manager.release_restart_policy_seed(task_id)
         return saved
+
+    def _on_plan_saved(self, task_id: str) -> None:
+        entry = self._tasks.get(task_id)
+        if entry is not None:
+            entry.plan_saved = True
 
     def _retry_save_plan(self, task_id: str) -> None:
         entry = self._tasks.get(task_id)
@@ -784,7 +826,8 @@ class MonitorPresenter(QObject):
             self._warn("请先选择要监控的指标")
             return None
         had_tasks = self._has_items()
-        wait_id = self.wait_service.add(request, starter=self._start_waited)
+        wait_id = self.wait_service.add(request, starter=self._start_waited,
+                                       timeout_s=getattr(request, 'timeout_s', None))
         self._waits[wait_id] = request
         self.board.add_waiting(wait_id, request.name, request.note)
         self._set_has_tasks(had_tasks)
@@ -795,6 +838,12 @@ class MonitorPresenter(QObject):
     def on_wait_cancel(self, wait_id: str) -> None:
         """占位卡的"取消等待"。"""
         self._drop_wait(wait_id)
+
+    def _on_wait_failed(self, wait_id: str, reason: str) -> None:
+        if wait_id not in self._waits:
+            return
+        self._drop_wait(wait_id)
+        self._warn(reason.split(':', 1)[1] if ':' in reason else '等待进程启动失败，请重新选择目标')
 
     def _drop_wait(self, wait_id: str) -> None:
         self.wait_service.cancel(wait_id)
@@ -813,7 +862,7 @@ class MonitorPresenter(QObject):
 
     def poll_waits(self) -> None:
         """查一遍各等待中的进程（定时器每秒调用；测试可直接调用）：出现即移除占位卡，
-        按请求参数建任务。同名进程有多个时取最新启动的那个（WaitService 负责查找）。"""
+        按请求参数建任务；同名多个时提示选择具体 PID（WaitService 负责查找）。"""
         self.wait_service.poll()
 
     def _start_waited(self, wait_id: str, match: WaitMatch) -> Optional[str]:
@@ -823,7 +872,8 @@ class MonitorPresenter(QObject):
         return self.start_monitoring(TaskRequest(
             pid=match.pid, name=match.name, create_time=match.create_time,
             metrics=request.metrics, interval=request.interval, note=request.note,
-            plan=request.plan, target_kind=getattr(request, 'target_kind', TARGET_PID)))
+            plan=request.plan, target_kind=getattr(request, 'target_kind', TARGET_PID),
+            scenario=getattr(request, 'scenario', ''), build=getattr(request, 'build', '')))
 
     # ========== manager 信号 ==========
 
@@ -835,7 +885,8 @@ class MonitorPresenter(QObject):
         self._tasks[task_id] = _TaskEntry(
             task_id=task_id, pid=info.pid, process_name=info.process_name,
             metric_types=tuple(info.metric_types), interval=info.interval, note=info.note,
-            target_kind=getattr(info, 'target_kind', TARGET_PID))
+            target_kind=getattr(info, 'target_kind', TARGET_PID),
+            scenario=getattr(info, 'scenario', ''), build=getattr(info, 'build', ''))
         self.board.create_card(info)
         self._sync_counts()
         self._set_has_tasks(had_tasks)
@@ -848,6 +899,7 @@ class MonitorPresenter(QObject):
         if card is not None:
             card.set_started_at(self.services.clock.now())
         self._adopt_external_plan(task_id)
+        self._request_live_stats(task_id)
         self._sync_counts()
 
     def _adopt_external_plan(self, task_id: str) -> None:
@@ -890,7 +942,7 @@ class MonitorPresenter(QObject):
         card.set_waiting_restart(waiting, getattr(info, 'restart_count', 0),
                                  getattr(info, 'restart_limit', 0),
                                  getattr(info, 'exit_code', None),
-                                 **({} if waiting else {'paused': bool(info.is_paused)}))
+                                 paused=bool(info.is_paused))
 
     def on_task_restarted(self, task_id: str, count: int) -> None:
         """被测进程已重启、任务续接到新进程：卡片 PID 换成新的（取自任务快照）、退出等待，
@@ -906,6 +958,7 @@ class MonitorPresenter(QObject):
             card.set_pid(pid)
         extra = {'paused': bool(info.is_paused)} if info is not None else {}
         card.set_waiting_restart(False, count, getattr(info, 'restart_limit', 0), **extra)
+        self._request_live_stats(task_id)
         shown_pid = pid if entry.target_kind != TARGET_NAME else None
         self.services.notifier.info(
             self.host, RESTARTED_TITLE, f"{entry.process_name}：{restarted_hint_text(count, shown_pid)}",
@@ -933,6 +986,7 @@ class MonitorPresenter(QObject):
             # 任务行此时一定已落库：一个周期都没采到就结束时，方案在这里补存
             self._retry_save_plan(task_id)
             self.board.finish_card(task_id, reason, self.services.clock.now(), exit_code)
+            self._request_live_stats(task_id)
             self.form.forget_process_if(entry.pid)
             self._sync_tick_timer()
 
@@ -959,13 +1013,149 @@ class MonitorPresenter(QObject):
 
     def on_data_updated(self, task_id: str, values: dict) -> None:
         """每采集周期一次：卡片采集次数为内存自增，基线样本在内存里累积，不查库。"""
+        self.on_sample_updated(task_id, values, self.services.clock.now())
+
+    def on_sample_updated(self, task_id: str, values: dict, timestamp) -> None:
+        """采集事件可能早于落库；精确时间用于与后台聚合水位去重合并。"""
         card = self.board.card(task_id)
         if card is None:
             return
-        card.update_values(values, self.services.clock.now())
+        card.update_values(values, timestamp)
         card.increment_count()
         self._feed_baseline(task_id, values)
         self._retry_save_plan(task_id)
+        stats = getattr(card, 'live_stats', None)
+        if (stats is not None and stats.needs_rebuild
+                and task_id not in self._live_workers and task_id not in self._live_retries):
+            self._request_live_stats(task_id)
+
+    def _cancel_live_stats(self, task_id):
+        self._live_generations.pop(task_id, None)
+        self._live_boundaries.pop(task_id, None)
+        self._live_retry_attempts.pop(task_id, None)
+        self._live_retry_needed.discard(task_id)
+        pending = self._live_retries.pop(task_id, None)
+        if pending is not None:
+            pending[2].stop()
+            pending[2].deleteLater()
+        worker = self._live_workers.pop(task_id, None)
+        if worker is not None:
+            worker.cancel()
+
+    def shutdown_live_stats(self) -> None:
+        """真退出先使所有结果失效，排队中的采集/停止信号也不能再开查询。"""
+        self._live_shutdown = True
+        for task_id in tuple(self._live_generations):
+            self._cancel_live_stats(task_id)
+        self._live_generations.clear()
+        self._live_boundaries.clear()
+
+    def _request_live_stats(self, task_id, markers=None, *, retry_attempt=0):
+        """仅发后台聚合请求；基线、重启、卡片生命周期各自使旧结果过期。"""
+        if self._live_shutdown:
+            return
+        card = self.board.card(task_id)
+        entry = self._tasks.get(task_id)
+        if (entry is None or card is None or self._db is None
+                or not hasattr(self._db, 'analytics')
+                or not hasattr(card, 'restore_live_stats')):
+            return
+        markers = self.manager.list_markers(task_id) if markers is None else markers
+        since = self._live_since(task_id, markers)
+        self._cancel_live_stats(task_id)
+        sequence = next(self._live_sequence)
+        self._live_generations[task_id] = sequence
+        self._live_boundaries[task_id] = since
+        self._live_retry_attempts[task_id] = retry_attempt
+        card.invalidate_live_stats(since)
+        request = LiveStatsRequest(task_id, entry.metric_types, since, sequence)
+        try:
+            worker = self._live_worker_factory(self._db, request)
+            self._live_workers[task_id] = worker
+            worker.result.connect(self._on_live_stats_result)
+            worker.failed.connect(self._on_live_stats_failed)
+            worker.finished.connect(self._on_live_stats_finished)
+            self.services.threads.register(worker, name='卡片趋势重建',
+                                           cancel=worker.cancel, timeout_ms=3000)
+            worker.start()
+        except Exception:
+            self._cancel_live_stats(task_id)
+            logger.exception('启动卡片趋势重建失败: task_id=%s', task_id)
+
+    def _live_since(self, task_id, markers):
+        baseline = self.manager.get_baseline(task_id, markers)
+        boundaries = [m.timestamp for m in markers if m.kind == 'restart']
+        if baseline is not None:
+            boundaries.append(baseline.timestamp)
+        return normalize_ms(max(boundaries)) if boundaries else None
+
+    @pyqtSlot(object)
+    def _on_live_stats_result(self, result):
+        if result is None:
+            return
+        request = result.request
+        worker = self._live_workers.get(request.task_id)
+        if (self._live_shutdown
+                or self._live_generations.get(request.task_id) != request.sequence
+                or worker is None or worker.is_cancelled):
+            return
+        card = self.board.card(request.task_id)
+        if card is not None and request.task_id in self._tasks:
+            if card.restore_live_stats(result.aggregates, request.since):
+                self._live_retry_needed.discard(request.task_id)
+            else:
+                self._live_retry_needed.add(request.task_id)
+
+    @pyqtSlot(str)
+    def _on_live_stats_failed(self, message):
+        worker = self.sender()
+        if worker is not None:
+            logger.warning('卡片趋势重建失败: task_id=%s, %s', worker.request.task_id, message)
+            task_id = worker.request.task_id
+            if (not self._live_shutdown and not worker.is_cancelled
+                    and self._live_workers.get(task_id) is worker
+                    and self._live_generations.get(task_id) == worker.request.sequence):
+                self._live_retry_needed.add(task_id)
+
+    @pyqtSlot()
+    def _on_live_stats_finished(self):
+        worker = self.sender()
+        if worker is not None and self._live_workers.get(worker.request.task_id) is worker:
+            task_id = worker.request.task_id
+            self._live_workers.pop(task_id, None)
+            if task_id in self._live_retry_needed:
+                self._live_retry_needed.discard(task_id)
+                if not worker.is_cancelled:
+                    self._schedule_live_stats_retry(task_id, worker.request.sequence)
+
+    def _schedule_live_stats_retry(self, task_id, sequence):
+        attempt = self._live_retry_attempts.get(task_id, 0)
+        if (self._live_shutdown or self._live_generations.get(task_id) != sequence
+                or task_id not in self._tasks or task_id in self._live_workers
+                or task_id in self._live_retries or attempt >= len(LIVE_STATS_RETRY_DELAYS_MS)):
+            return
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        self._live_retries[task_id] = (sequence, attempt + 1, timer)
+        timer.timeout.connect(self._on_live_stats_retry)
+        timer.start(LIVE_STATS_RETRY_DELAYS_MS[attempt])
+
+    @pyqtSlot()
+    def _on_live_stats_retry(self):
+        timer = self.sender()
+        for task_id, pending in tuple(self._live_retries.items()):
+            sequence, attempt, expected_timer = pending
+            if timer is not expected_timer:
+                continue
+            self._live_retries.pop(task_id, None)
+            timer.stop()
+            timer.deleteLater()
+            card = self.board.card(task_id)
+            if (not self._live_shutdown and self._live_generations.get(task_id) == sequence
+                    and task_id in self._tasks and task_id not in self._live_workers
+                    and card is not None and card.live_stats.needs_rebuild):
+                self._request_live_stats(task_id, retry_attempt=attempt)
+            return
 
     # ========== 基线 ==========
 
@@ -1007,15 +1197,35 @@ class MonitorPresenter(QObject):
         markers = self.manager.list_markers(task_id)
         card.set_markers(markers)
 
+        update_rounds = getattr(card, 'set_round_deltas', None)
+        sample_at = getattr(self.manager, 'sample_values_at', None)
+        baseline_marker = self.manager.get_baseline(task_id, markers)
+        if update_rounds is not None and sample_at is not None and baseline_marker is not None:
+            rounds = [m for m in markers if m.kind == 'user' and m.timestamp >= baseline_marker.timestamp]
+            if rounds:
+                end = sample_at(task_id, entry.metric_types, rounds[-1].timestamp)
+                first = sample_at(task_id, entry.metric_types, baseline_marker.timestamp)
+                previous = sample_at(task_id, entry.metric_types,
+                                     rounds[-2].timestamp if len(rounds) > 1 else baseline_marker.timestamp)
+                update_rounds({m: (v - first[m]) / len(rounds) for m, v in end.items() if m in first},
+                              {m: v - previous[m] for m, v in end.items() if m in previous})
+            else:
+                update_rounds({}, {})
+
         baseline = self.manager.get_baseline(task_id, markers)
         if baseline is None:
             if entry.baseline is not None:
                 entry.baseline = None
                 card.clear_baseline()
+                self._request_live_stats(task_id, markers)
+            elif self._live_since(task_id, markers) != self._live_boundaries.get(task_id):
+                self._request_live_stats(task_id, markers)
             return
         current = entry.baseline
         if (current is not None and current.marker_id == baseline.id
                 and current.timestamp == baseline.timestamp):
+            if self._live_since(task_id, markers) != self._live_boundaries.get(task_id):
+                self._request_live_stats(task_id, markers)
             return
 
         seed = self.manager.baseline_samples(task_id, baseline)
@@ -1025,6 +1235,7 @@ class MonitorPresenter(QObject):
             tracker.settled = seed.settled or entry.finished
         entry.baseline = tracker
         card.set_baseline(baseline.timestamp, self.baseline_values(task_id))
+        self._request_live_stats(task_id, markers)
 
     def on_metrics_unavailable(self, task_id: str,
                                reasons: Dict[str, UnavailableReason]) -> None:
@@ -1088,7 +1299,8 @@ class MonitorPresenter(QObject):
 
     def on_resume(self, task_id: str) -> None:
         if self._command(self.manager.resume_task, task_id):
-            self._show_paused(task_id, False)
+            # 存储守卫可能在恢复信号中立即重新暂停，最终显示管理器的真实状态。
+            self._show_paused(task_id, self.manager.is_task_paused(task_id))
             # 定时打点从恢复的这一刻重新计时
             self.auto_marker.process(task_id)
 
@@ -1112,7 +1324,7 @@ class MonitorPresenter(QObject):
 
     def on_task_resumed(self, task_id: str) -> None:
         if task_id != self._commanding:
-            self._show_paused(task_id, False)
+            self._show_paused(task_id, self.manager.is_task_paused(task_id))
 
     def set_space_paused(self, task_ids) -> None:
         """存储守卫因磁盘空间不足暂停的任务集合有变化：集合内（且确实在暂停）的卡片标注
@@ -1134,6 +1346,11 @@ class MonitorPresenter(QObject):
         # 竖线落在事件之后，短周期下甚至把增长归到下一轮
         clicked_at = self.services.clock.now()
         default_label = self.manager.next_marker_label(task_id)
+        group_of = getattr(self.manager, 'task_group', lambda _tid: None)
+        group = group_of(task_id)
+        ids = ([tid for tid in self.active_task_ids() if group_of(tid) == group]
+               if group else [task_id])
+        defaults = {tid: self.manager.next_marker_label(tid) for tid in ids}
         label = self.services.dialogs.ask_marker_label(
             self._dialog_parent(), default_label, clicked_at,
             process_name=entry.process_name, pid=entry.marker_pid)
@@ -1143,12 +1360,17 @@ class MonitorPresenter(QObject):
             self._warn("打点名称不能为空")
             return
 
-        marker = self.manager.add_marker(
-            task_id, label, clicked_at, kind=default_marker_kind(default_label, label))
-        if marker is None:
+        batch, added = object(), []
+        for tid in ids:
+            marker = self.manager.add_marker(
+                tid, label, clicked_at,
+                kind=default_marker_kind(defaults[tid], label),
+                **({'undo_group': batch} if group else {}))
+            if marker is not None:
+                added.append((tid, marker))
+        if len(added) != len(ids):
             self.services.notifier.error(self.host, "打点失败", "未能保存打点，请查看日志")
-            return
-        self._marker_feedback.announce([(task_id, marker)])
+        self._marker_feedback.announce(added)
 
     def undo_last_marker(self) -> None:
         """撤销最近一次新增的打点（主窗口的 Ctrl+Z）：30 秒内有效，结果经 Notifier 提示。"""
@@ -1193,7 +1415,10 @@ class MonitorPresenter(QObject):
             return []
         ids = self.active_task_ids()
         if task_id is not None:
-            ids = [task_id] if task_id in ids else []
+            group_of = getattr(self.manager, 'task_group', lambda _tid: None)
+            group = group_of(task_id)
+            ids = ([tid for tid in ids if group_of(tid) == group] if group
+                   else [task_id] if task_id in ids else [])
         if not ids:
             self.quick_marker_feedback.emit(
                 QUICK_MARKER_NONE, "没有可打点的任务", "请先在监控页开始监控")
@@ -1234,7 +1459,7 @@ class MonitorPresenter(QObject):
                 metrics=entry.metric_types,
                 interval=entry.interval or self.form.interval(), note=entry.note,
                 plan=entry.plan, launch=entry.launch, close_on_stop=entry.close_on_stop,
-                target_kind=entry.target_kind))
+                target_kind=entry.target_kind, scenario=entry.scenario, build=entry.build))
 
         if entry.target_kind == TARGET_NAME:
             # 同名进程不依赖某个具体进程：直接按进程名再开一个
@@ -1242,7 +1467,7 @@ class MonitorPresenter(QObject):
                 pid=0, name=entry.process_name, create_time=None,
                 metrics=entry.metric_types,
                 interval=entry.interval or self.form.interval(), note=entry.note,
-                plan=entry.plan, target_kind=TARGET_NAME))
+                plan=entry.plan, target_kind=TARGET_NAME, scenario=entry.scenario, build=entry.build))
 
         # 精确匹配（不区分大小写）并排除本程序自身：被测的同名进程（如 python.exe）
         # 退出后，不能因为只剩本程序同名而自动监控起自己
@@ -1253,12 +1478,15 @@ class MonitorPresenter(QObject):
                 pid=pid, name=entry.process_name, create_time=create_time,
                 metrics=entry.metric_types,
                 interval=entry.interval or self.form.interval(), note=entry.note,
-                plan=entry.plan, target_kind=entry.target_kind))
+                plan=entry.plan, target_kind=entry.target_kind, scenario=entry.scenario, build=entry.build))
 
         set_kind = getattr(self.form, 'set_target_kind', None)
         if entry.is_group and set_kind is not None:
             set_kind(entry.target_kind)   # 进程树：交给用户重新选根进程
         self.form.fill_search(entry.process_name)
+        if hasattr(self.form, 'scenario_edit'):
+            self.form.scenario_edit.setText(entry.scenario)
+            self.form.build_edit.setText(entry.build)
         if entry.plan is not None:
             # 交给用户自己选进程时，把上次的自动化方案填回表单，"开始"时一并沿用
             self.form.set_automation_plan(entry.plan)
@@ -1276,6 +1504,7 @@ class MonitorPresenter(QObject):
     def on_close(self, task_id: str) -> None:
         """从列表移除卡片（历史数据仍保留）。"""
         had_tasks = self._has_items()
+        self._cancel_live_stats(task_id)
         self._tasks.pop(task_id, None)
         self._drop_marker_flow(task_id)
         self.board.remove_card(task_id)
@@ -1288,14 +1517,52 @@ class MonitorPresenter(QObject):
         finished = [task_id for task_id, entry in self._tasks.items() if entry.finished]
         if not finished:
             return
+        self._expire_cleared_cards()
         had_tasks = self._has_items()
         for task_id in finished:
-            self._tasks.pop(task_id, None)
+            self._cancel_live_stats(task_id)
+            entry = self._tasks.pop(task_id, None)
             self._drop_marker_flow(task_id)
-            self.board.remove_card(task_id)
+            take = getattr(self.board, 'take_card', None)
+            if take is not None:
+                card = take(task_id)
+                if card is not None:
+                    self._cleared_cards.append((entry, card))
+            else:
+                self.board.remove_card(task_id)
             self.snapshot_writer.forget(task_id)
         self._sync_counts()
         self._set_has_tasks(had_tasks)
+        if self._cleared_cards:
+            self._clear_timer.start(30000)
+            generation = self._clear_generation
+            self.services.notifier.route('tasks.cleared', 'success', '已清除结束的卡片',
+                                         '历史数据仍保留；30 秒内可撤销',
+                                         action=NoticeAction('撤销', lambda: self.undo_clear_finished(generation)),
+                                         anchor=self.host)
+
+    def _expire_cleared_cards(self):
+        self._clear_timer.stop()
+        self._clear_generation += 1
+        for _entry, card in self._cleared_cards:
+            card.deleteLater()
+        self._cleared_cards = []
+
+    def undo_clear_finished(self, generation=None):
+        if generation is not None and generation != self._clear_generation:
+            self.services.notifier.info(self.host, '撤销已过期', '这次清除已超过时限或被后续操作替代')
+            return False
+        saved, self._cleared_cards = self._cleared_cards, []
+        self._clear_timer.stop()
+        self._clear_generation += 1
+        had_tasks = self._has_items()
+        for entry, card in saved:
+            self._tasks[entry.task_id] = entry
+            self.board.add_card(card, reconnect=False)
+            self._request_live_stats(entry.task_id)
+        self._sync_counts()
+        self._set_has_tasks(had_tasks)
+        return bool(saved)
 
 
 def _unique_path(path: str) -> str:

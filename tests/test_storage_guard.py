@@ -346,24 +346,28 @@ def test_user_resumed_task_is_repaused_while_still_below_200mb(env):
     guard, rec = env.make()
     _check(env, guard, 150 * MB)
     env.manager.user_resumes('a')
-    assert 'a' not in guard.paused_task_ids()    # 用户恢复后不再算"守卫暂停的"
+    assert 'a' in guard.paused_task_ids()       # 严重不足时立即重新暂停
     _check(env, guard, 140 * MB)
     assert 'a' in env.manager.paused and 'a' in guard.paused_task_ids()
     assert len(rec.critical) == 1                # 不重复提示
 
 
-def test_user_resumed_task_is_left_alone_between_200_and_300mb(env):
+def test_critical_hysteresis_keeps_task_paused_until_300mb(env):
     guard, rec = env.make()
     _check(env, guard, 150 * MB)
     env.manager.user_resumes('a')
     calls = len(env.manager.pause_calls)
     _check(env, guard, 250 * MB)
-    assert len(env.manager.pause_calls) == calls and 'a' in env.manager.running
+    assert len(env.manager.pause_calls) == calls and 'a' in env.manager.paused
+    _check(env, guard, 300 * MB)
+    env.manager.user_resumes('a')
+    assert 'a' in env.manager.running
 
 
 def test_paused_ids_follow_resume_stop_and_remove(env):
     guard, rec = env.make()
     _check(env, guard, 150 * MB)
+    _check(env, guard, 300 * MB)
     rec.paused_changes.clear()
     env.manager.user_resumes('a')
     env.manager.task_stopped.emit('b', object())
@@ -388,6 +392,7 @@ def test_report_storage_full_follows_the_critical_path(env):
 
 def test_report_storage_full_repauses_resumed_tasks(env):
     guard, rec = env.make()
+    env.disk.free = 150 * MB
     guard.report_storage_full()
     env.manager.user_resumes('b')
     guard.report_storage_full()

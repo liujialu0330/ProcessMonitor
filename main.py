@@ -6,6 +6,10 @@
 """
 import sys
 
+from utils.runtime_env import configure_math_threads
+
+configure_math_threads()
+
 if "--self-test" in sys.argv[1:]:
     # 打包自检：窗口程序里导入失败（缺运行库）时，PyInstaller 引导程序会弹模态错误框并一直
     # 等人点击，构建脚本就会无限等下去。这里改为把原因写出来并以失败码退出

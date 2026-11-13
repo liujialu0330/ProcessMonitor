@@ -120,7 +120,8 @@ def test_show_error_and_fill_search(form):
 
 def test_tab_order_follows_visual_order(form):
     chain = [form.picker.combo.line_edit, form.interval_spinbox, form.metric_button,
-             form.note_input, form.wait_checkbox, form.start_button]
+             form.note_input, form.scenario_edit, form.build_edit, form.wait_checkbox,
+             form.wait_timeout_input, form.start_button]
     for first, second in zip(chain, chain[1:]):
         widget = first.nextInFocusChain()
         # SpinBox 等复合控件内部可能还有子控件：沿焦点链找到下一个声明的控件

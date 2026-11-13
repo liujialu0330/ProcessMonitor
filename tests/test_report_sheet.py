@@ -356,7 +356,7 @@ def test_setting_page_report_color_card(qapp, db, tmp_path):
         assert [card.comboBox.itemText(i) for i in range(card.comboBox.count())] == list(
             REPORT_COLOR_TEXTS)
         assert card.comboBox.currentIndex() == 0
-        assert card in page.data_group.findChildren(type(card))
+        assert card in page.export_group.findChildren(type(card))
 
         card.comboBox.setCurrentIndex(1)
         assert cfg.get(item) == REPORT_SCHEME_FOLLOW

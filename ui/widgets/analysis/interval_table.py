@@ -19,6 +19,7 @@ from qfluentwidgets import (CaptionLabel, CardWidget, SegmentedWidget, StrongBod
 from core.report import interval_spans
 from ui.formatting import INTERVAL_HEADERS, interval_row_texts
 from ui.typography import TypeScale, data_font
+from ui.layout_breakpoints import COMPACT, REGULAR
 from ui.widgets.history.common import CARD_PADDING_H
 from ui.widgets.history.sample_table import SampleTable
 from utils.metrics import get_metric_display_name
@@ -48,6 +49,9 @@ class IntervalTable(CardWidget):
         self.table = TableWidget(self)
         self.table.setColumnCount(len(INTERVAL_HEADERS))
         self.table.setHorizontalHeaderLabels(list(INTERVAL_HEADERS))
+        for column in range(self.table.columnCount()):
+            self.table.horizontalHeaderItem(column).setTextAlignment(
+                Qt.AlignVCenter | (Qt.AlignLeft if column == 0 else Qt.AlignRight))
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeToContents)
         header.setStretchLastSection(True)
@@ -61,7 +65,8 @@ class IntervalTable(CardWidget):
         self.table.setBorderVisible(True)
         self.table.setBorderRadius(8)
         self._fit_height()
-        self.table.cellClicked.connect(self._on_cell_clicked)
+        self.table.currentCellChanged.connect(
+            lambda row, column, _old_row, _old_column: self._on_cell_clicked(row, column))
         self.table.setToolTip("点击一行把趋势图缩放到该区间")
 
         title_row = QHBoxLayout()
@@ -86,6 +91,7 @@ class IntervalTable(CardWidget):
         spans = interval_spans(self._intervals, markers)
         table = self.table
         table.setUpdatesEnabled(False)
+        table.blockSignals(True)
         try:
             table.setRowCount(len(self._intervals))
             for r, (item, span) in enumerate(zip(self._intervals, spans)):
@@ -95,8 +101,10 @@ class IntervalTable(CardWidget):
                     cell.setFont(self._font)
                     cell.setTextAlignment(Qt.AlignVCenter | (
                         Qt.AlignLeft if c == 0 else Qt.AlignRight))
+                    cell.setToolTip("\n".join(f"{title}：{value}" for title, value in zip(INTERVAL_HEADERS, texts)))
                     table.setItem(r, c, cell)
         finally:
+            table.blockSignals(False)
             table.setUpdatesEnabled(True)
         self._fit_height()
 
@@ -104,6 +112,14 @@ class IntervalTable(CardWidget):
         # 高度贴合行数：区间只有几段时不留大片空白，焦点区下面的大图随之上移
         rows = min(max(1, self.table.rowCount()), MAX_VISIBLE_ROWS)
         self.table.setFixedHeight(HEADER_HEIGHT + rows * ROW_HEIGHT + 4)
+
+    def set_tier(self, tier: str) -> None:
+        # 窄屏保留区间、时长、终值、增量；完整行内容仍可悬停读取。
+        hidden = {2, 5, 6, 7} if tier == COMPACT else ({2, 6, 7} if tier == REGULAR else set())
+        for column in range(self.table.columnCount()):
+            self.table.setColumnHidden(column, column in hidden)
+        self.hint_label.setVisible(tier != COMPACT)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
 
     def clear(self) -> None:
         self.set_intervals(None, [])

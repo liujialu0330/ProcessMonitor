@@ -85,6 +85,13 @@ class FakeManager(QObject):
         self.paused_ids = set()
         self.maintenance = False
         self.exports = 0
+        self.restart_seeds = {}
+
+    def seed_restart_policy(self, task_id, enabled, limit):
+        self.restart_seeds[task_id] = (enabled, limit)
+
+    def release_restart_policy_seed(self, task_id):
+        self.restart_seeds.pop(task_id, None)
 
     def create_task(self, pid, name, metrics, interval=None, note='', create_time=None):
         self.created.append((pid, name, list(metrics), interval, note, create_time))
@@ -1444,6 +1451,16 @@ def test_external_pause_and_resume_update_card(presenter, manager, board):
     manager.resume_task(task_id)
 
     assert board.cards[task_id].calls == [("set_paused", True), ("set_paused", False)]
+
+
+def test_resume_rejected_by_storage_guard_keeps_card_paused(presenter, manager, board):
+    task_id = _add_task(manager)
+    # 恢复信号发出前，模拟先连接的守卫把状态重新置为暂停。
+    manager.paused_ids.add(task_id)
+    presenter.on_resume(task_id)
+    assert board.cards[task_id].calls[-1] == ('set_paused', True)
+    manager.resume_task(task_id)
+    assert board.cards[task_id].calls[-1] == ('set_paused', True)
 
 
 def test_external_pause_for_unknown_task_is_ignored(presenter, manager, board):

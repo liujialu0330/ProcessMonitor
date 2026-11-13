@@ -70,10 +70,12 @@ def test_write_latency_per_cycle(synth_cache, tmp_path, perf):
             _remove_db_files(path)
         p50s.append(statistics.median(latencies))
         p95s.append(_percentile(latencies, 95))
-    perf.check_median('write_cycle_p50', p50s,
-                      desc=f'单周期写入 5 指标 p50（{info["rows"]} 行库，{WRITE_CYCLES} 次）')
-    perf.check_median('write_cycle_p95', p95s,
-                      desc=f'单周期写入 5 指标 p95（{info["rows"]} 行库，{WRITE_CYCLES} 次）')
+    perf.check_many([
+        ('write_cycle_p50', p50s,
+         f'单周期写入 5 指标 p50（{info["rows"]} 行库，{WRITE_CYCLES} 次）'),
+        ('write_cycle_p95', p95s,
+         f'单周期写入 5 指标 p95（{info["rows"]} 行库，{WRITE_CYCLES} 次）'),
+    ])
 
 
 def test_migration_v1_to_current(synth_cache, tmp_path, perf):

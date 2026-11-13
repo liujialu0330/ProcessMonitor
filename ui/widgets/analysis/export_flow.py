@@ -72,7 +72,8 @@ class AnalysisExportFlow(QObject):
         self._host = host
         self._render = render
         self._name_template = name_template or app_config.get_export_name_template
-        self.last_dir = (QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation)
+        self.last_dir = (app_config.cfg.get(app_config.cfg.default_export_dir)
+                         or QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation)
                          or os.path.expanduser('~'))
         self.open_folder_button: Optional[PushButton] = None
         self.copy_path_button: Optional[PushButton] = None
@@ -160,6 +161,44 @@ class AnalysisExportFlow(QObject):
             return False
         self.last_dir = os.path.dirname(chosen) or self.last_dir
         self.status_changed.emit("正在导出…")
+        return True
+
+    def run_comparison(self, kind, panel) -> bool:
+        from core.workers.comparison_worker import ComparisonExportJob, ComparisonExportWorker
+        result = self._vm.last_compare
+        if result is None or not result.entries:
+            self._warn(('暂无对比数据', '请先选择要对比的任务并等待加载完成'))
+            return False
+        if self._vm.export_worker is not None:
+            self._warn(BUSY)
+            return False
+        if self._vm.is_maintenance_running():
+            self._warn(MAINTENANCE)
+            return False
+        extension = '.png' if kind == 'image' else '.csv'
+        chosen = self._ask('导出任务对比', '任务对比' + extension,
+                           'PNG 图片 (*.png)' if kind == 'image' else 'CSV 文件 (*.csv)')
+        if not chosen:
+            return False
+        if not chosen.lower().endswith(extension):
+            chosen += extension
+        if os.path.exists(chosen) and not self._services.dialogs.confirm(
+                self._host.window(), '文件已存在', f'是否覆盖？\n{chosen}', '覆盖'):
+            return False
+        try:
+            image = panel.render_image() if kind == 'image' else None
+            job = ComparisonExportJob(chosen, result.entries, result.metrics,
+                                       result.metric, panel.alignment, image)
+            reason = self._vm.start_export(job, worker_factory=ComparisonExportWorker)
+        except Exception as exc:
+            logger.exception('对比报告导出失败')
+            self._on_failed(str(exc))
+            return False
+        if reason:
+            self._warn(BUSY if reason == EXPORT_BUSY else MAINTENANCE)
+            return False
+        self.last_dir = os.path.dirname(chosen) or self.last_dir
+        self.status_changed.emit('正在导出任务对比…')
         return True
 
     @staticmethod

@@ -14,6 +14,24 @@
 import os
 import sys
 
+INSTALLER_LIMIT_MB = 100
+DIRECTORY_LIMIT_MB = 350
+MB = 1_000_000
+
+
+def check_budgets(directory: str, installer: str) -> list:
+    """按完整字节数比较，不因整数显示向下取整放过略超限的产物。MB 按十进制。"""
+    if not os.path.isdir(directory) or not os.path.isfile(installer):
+        raise FileNotFoundError('程序目录或安装包不存在')
+    size, _ = collect_stats(directory)
+    installer_size = os.path.getsize(installer)
+    problems = []
+    for label, actual, limit in (('安装包', installer_size, INSTALLER_LIMIT_MB),
+                                  ('程序目录', size, DIRECTORY_LIMIT_MB)):
+        if actual > limit * MB:
+            problems.append(f'{label} {actual / MB:.2f} MB，超过 {limit} MB')
+    return problems
+
 
 def collect_stats(dir_path: str) -> tuple:
     """
@@ -39,6 +57,14 @@ def collect_stats(dir_path: str) -> tuple:
 
 
 if __name__ == '__main__':
+    if len(sys.argv) == 4 and sys.argv[1] == '--check':
+        try:
+            problems = check_budgets(sys.argv[2], sys.argv[3])
+        except OSError as exc:
+            print(str(exc))
+            sys.exit(1)
+        print('\n'.join(problems) if problems else '体积检查通过：安装包 ≤ 100 MB、程序目录 ≤ 350 MB')
+        sys.exit(1 if problems else 0)
     if len(sys.argv) < 2:
         print(0)
         print(0)
@@ -51,6 +77,6 @@ if __name__ == '__main__':
         sys.exit(1)
 
     size_bytes, count = collect_stats(target_dir)
-    size_mb = size_bytes // (1024 * 1024)
+    size_mb = size_bytes // MB
     print(size_mb)
     print(count)

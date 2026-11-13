@@ -6,17 +6,18 @@ import logging
 import statistics
 import threading
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from PyQt5 import sip
-from PyQt5.QtCore import QObject, pyqtSignal
+from PyQt5.QtCore import QObject, QTimer, pyqtSignal
 
 from core.contracts import StopReason, TaskInfo, TaskStatus
 from core.group_aggregator import MemberSnapshot
-from core.monitor_task import (ACTIVE_STATES, LIVE_STATES, SYSTEM_CLOCK, MonitorWorker,
-                               WorkerState)
+from core.monitor_task import (ACTIVE_STATES, LIVE_STATES, SYSTEM_CLOCK, SYSTEM_MARKER_LABELS,
+                               MonitorWorker, WorkerState)
 from core.process_tree import GroupSpec
 from core.snapshot_hub import SnapshotHub, default_hub
 from core.target_info import TargetInfo
@@ -43,36 +44,6 @@ _BASELINE_WINDOW_SLACK = timedelta(seconds=5)
 
 # 被测目标元数据探针线程名前缀（日志与排查用）
 TARGET_PROBE_THREAD_PREFIX = "目标元数据探针"
-
-# 打点撤销：新增后多少秒内可以撤销（含基线打点）；最多记住的待撤销打点数
-UNDO_WINDOW_SECONDS = 30
-_UNDO_KEEP = 20
-# 撤销结果：成功 / 已超过时限 / 没有可撤销的打点（含已被删除）/ 写库失败
-UNDO_OK = 'ok'
-UNDO_EXPIRED = 'expired'
-UNDO_NOTHING = 'nothing'
-UNDO_FAILED = 'failed'
-
-
-@dataclass(frozen=True)
-class UndoOutcome:
-    """撤销打点的结果。markers 为这次撤销掉的打点（成功时非空；同一批打点一起撤销）。"""
-    status: str
-    markers: Tuple[Marker, ...] = ()
-
-    @property
-    def ok(self) -> bool:
-        return self.status == UNDO_OK
-
-
-@dataclass
-class _UndoEntry:
-    """一条可撤销的新增打点。demoted_ids 是新增基线时被降为普通打点的旧基线：撤销时
-    要恢复，否则它们会多算一个用户打点，下一个默认名的编号就错了。"""
-    marker: Marker
-    added_at: datetime
-    group: object
-    demoted_ids: Tuple[int, ...] = ()
 
 # 打点撤销：新增后多少秒内可以撤销（含基线打点）；最多记住的待撤销打点数
 UNDO_WINDOW_SECONDS = 30
@@ -184,6 +155,8 @@ class MonitorManager(QObject):
     task_stopped = pyqtSignal(str, object)  # 任务停止信号 (task_id, StopReason)
     task_removed = pyqtSignal(str)         # 任务移除信号 (task_id)
     data_updated = pyqtSignal(str, dict)   # 数据更新信号 (task_id, {指标类型: 指标值})
+    sample_updated = pyqtSignal(str, dict, object)   # 同一采样的原始时间，可能早于落库
+    task_plan_saved = pyqtSignal(str)      # 方案已实际落库，调用方可清除待保存状态
     error_occurred = pyqtSignal(str, str)  # 错误信号 (task_id, error_message)
     # 指标不可用信号 (task_id, {指标类型: UnavailableReason})
     metrics_unavailable = pyqtSignal(str, dict)
@@ -208,6 +181,7 @@ class MonitorManager(QObject):
     # 某任务写库遇到磁盘已满 (task_id)：存储守卫据此暂停任务（见 StorageGuard）。先于管理器
     # 自己的兜底暂停发出，守卫才能把该任务记入"因空间不足暂停"
     storage_full_detected = pyqtSignal(str)
+    task_library_changed = pyqtSignal()
     # 内部：探针线程通知本对象所在线程来取结果 (task_id)；结果本身放在 _probe_results 里，
     # 退出路径的 join_all 不经事件循环也能直接取走
     _target_probed = pyqtSignal(str)
@@ -253,6 +227,17 @@ class MonitorManager(QObject):
         self._probe_lock = threading.Lock()
         self._target_infos: Dict[str, TargetInfo] = {}
         self._pending_meta: Dict[str, str] = {}
+        self._pending_identity: Dict[str, Tuple[str, str]] = {}
+        self._pending_groups: Dict[str, Optional[str]] = {}
+        self._pending_plans: Dict[str, Optional[str]] = {}
+        self._pending_system_markers: List[Tuple[str, str, datetime]] = []
+        self._task_library_needs_refresh = False
+        self._shutting_down = False
+        self._shutdown_flushing = False
+        self._pending_write_timer = QTimer(self)
+        self._pending_write_timer.setSingleShot(True)
+        self._pending_write_timer.setInterval(250)
+        self._pending_write_timer.timeout.connect(self._retry_pending_task_writes)
         self._target_probed.connect(self._on_target_probed)
 
         # 任务字典 {task_id: MonitorWorker}
@@ -260,6 +245,10 @@ class MonitorManager(QObject):
 
         # 维护锁：数据库清理/压缩期间禁止创建、启动任务
         self._maintenance = False
+        self._storage_job_count = 0
+        # 单任务删除只锁住目标任务；其他任务仍可采集，维护/导出/健康作业与之互斥。
+        self._deleting_ids = set()
+        self._deletion_completions = {}
 
         # 进行中的导出数：导出线程长时间读库，与压缩数据库互相抢锁，二者互斥
         self._export_count = 0
@@ -277,7 +266,8 @@ class MonitorManager(QObject):
                     create_time: Optional[float] = None, *,
                     target_kind: str = TARGET_PID,
                     resume_on_restart: Optional[bool] = None,
-                    restart_limit: Optional[int] = None) -> Optional[str]:
+                    restart_limit: Optional[int] = None,
+                    scenario: str = '', build: str = '') -> Optional[str]:
         """
         创建新的监控任务
 
@@ -304,6 +294,8 @@ class MonitorManager(QObject):
         """
         if target_kind not in TARGET_KINDS:
             raise ValueError(f"未知的监控目标类型 {target_kind!r}，可选：{', '.join(TARGET_KINDS)}")
+        if len(scenario.strip()) > 120 or len(build.strip()) > 120:
+            raise ValueError('场景和版本各不能超过 120 个字符')
         group_spec: Optional[GroupSpec] = None
         metric_types = list(metric_types)
         if target_kind == TARGET_TREE:
@@ -315,8 +307,10 @@ class MonitorManager(QObject):
             metric_types.append(PROCESS_COUNT)
 
         # 数据库清理/压缩期间不允许新建任务
-        if self._maintenance:
-            self.error_occurred.emit('', '正在清理数据库，请稍后再试')
+        if self._maintenance or self._shutting_down:
+            message = (self.storage_write_block_reason() if self._shutting_down else
+                       '正在清理数据库，请稍后再试')
+            self.error_occurred.emit('', message)
             return None
 
         # 检查任务数量限制
@@ -342,6 +336,8 @@ class MonitorManager(QObject):
             restart_limit=restart_limit,
             **self._worker_options,
         )
+        task.task_model.scenario = scenario.strip()
+        task.task_model.build = build.strip()
         self._connect_worker(task)
         return self._register_worker(task)
 
@@ -349,6 +345,9 @@ class MonitorManager(QObject):
         """连接任务信号（工作线程发出，经队列在本对象所在的 GUI 线程执行）。"""
         task.members_changed.connect(self._on_task_members_changed)
         task.data_updated.connect(self._on_task_data_updated)
+        sample_signal = getattr(task, 'sample_updated', None)
+        if sample_signal is not None:
+            sample_signal.connect(self.sample_updated)
         task.task_stopped.connect(self._on_task_stopped)
         task.error_occurred.connect(self._on_task_error)
         task.metrics_unavailable.connect(self._on_task_metrics_unavailable)
@@ -372,13 +371,30 @@ class MonitorManager(QObject):
         task.set_restart_policy(enabled, limit)
         return True
 
+    def seed_restart_policy(self, task_id: str, enabled: bool, limit: int) -> bool:
+        """启动前交付方案策略，覆盖方案还未落库的短暂间隙。"""
+        task = self._tasks.get(task_id)
+        if task is None:
+            return False
+        task.seed_restart_policy(enabled, limit)
+        return True
+
+    def release_restart_policy_seed(self, task_id: str) -> bool:
+        """方案持久化成功后恢复由数据库动态读取策略。"""
+        task = self._tasks.get(task_id)
+        if task is None:
+            return False
+        task.release_restart_policy_seed()
+        return True
+
     def recover_task(self, task_id: str) -> bool:
         """
         工具重启后续采：用库里的任务行重建采集线程（任务 ID、开始时间与已有数据都不变），
         目标进程仍在运行且创建时间一致时才有意义（由调用方事先判定，见 core.session_recovery）。
         线程启动后写"续采"打点；中断期间是数据空洞。已在管理器中、维护中、数量已满返回 False。
         """
-        if self._maintenance or task_id in self._tasks:
+        if (self._maintenance or self._shutting_down
+                or task_id in self._deleting_ids or task_id in self._tasks):
             return False
         if len(self._tasks) >= config.MAX_MONITOR_TASKS:
             self.task_limit_reached.emit()
@@ -408,6 +424,10 @@ class MonitorManager(QObject):
                          else None),
             restart_count=restarts, recovering=True, start_time=record.start_time,
             **self._worker_options)
+        # 共享打点查询优先取运行中模型，续采不能只在数据库里保留方案身份。
+        task.task_model.scenario = record.scenario
+        task.task_model.build = record.build
+        task.task_model.group_id = record.group_id
         self._connect_worker(task)
         self._register_worker(task)
         logger.info("续采任务: task_id=%s pid=%s", task_id, record.pid)
@@ -432,7 +452,8 @@ class MonitorManager(QObject):
             bool: 启动是否成功
         """
         task = self._tasks.get(task_id)
-        if self._maintenance or task is None:
+        if (self._maintenance or self._shutting_down
+                or task_id in self._deleting_ids or task is None):
             return False
         if task.state is not WorkerState.WAITING:
             return False
@@ -500,8 +521,15 @@ class MonitorManager(QObject):
             bool: 暂停是否成功
         """
         task = self._tasks.get(task_id)
-        if task is None or not task.pause(timestamp):
+        when = timestamp if timestamp is not None else self._clock.now()
+        deferred = self._storage_writes_deferred()
+        changed = (task is not None and
+                   (task.pause(when, write_marker=False) if deferred else task.pause(timestamp)))
+        if not changed:
             return False
+        if deferred:
+            self._pending_system_markers.append((task_id, 'pause', when))
+            self._schedule_pending_writes()
         self.task_paused.emit(task_id)
         self.markers_changed.emit(task_id)
         return True
@@ -519,8 +547,15 @@ class MonitorManager(QObject):
             bool: 恢复是否成功
         """
         task = self._tasks.get(task_id)
-        if task is None or not task.resume(timestamp):
+        when = timestamp if timestamp is not None else self._clock.now()
+        deferred = self._storage_writes_deferred()
+        changed = (task is not None and
+                   (task.resume(when, write_marker=False) if deferred else task.resume(timestamp)))
+        if not changed:
             return False
+        if deferred:
+            self._pending_system_markers.append((task_id, 'resume', when))
+            self._schedule_pending_writes()
         self.task_resumed.emit(task_id)
         self.markers_changed.emit(task_id)
         return True
@@ -595,31 +630,196 @@ class MonitorManager(QObject):
         except Exception:
             logger.warning("被测目标元数据序列化失败: task_id=%s", task_id, exc_info=True)
         else:
-            if not self._save_pending_meta(task_id) and task_id not in self._tasks:
-                # 任务已结束并移出管理器：任务行若此时还不存在，就再也不会有了
-                self._drop_pending_meta(task_id)
+            self._save_pending_meta(task_id)
+            self._drop_missing_task_writes(task_id)
         self.target_info_ready.emit(task_id, info)
 
     def _save_pending_meta(self, task_id: str) -> bool:
-        """把挂起的元数据写进 tasks.meta_json。命中任务行或写库失败都不再重试
-        （失败重试只会每个周期刷一条同样的错误日志）；任务行尚不存在返回 False、继续挂起。"""
+        """以短锁等待保存元数据；删除期间或临时写失败时保留待存值。"""
         meta_json = self._pending_meta.get(task_id)
         if meta_json is None:
             return True
+        if self._storage_writes_deferred():
+            return False
         store = getattr(self.db, 'tasks', None)
         if store is None:
             self._pending_meta.pop(task_id, None)
             return False
         try:
-            saved = bool(store.save_meta(task_id, meta_json))
+            with self._short_storage_write():
+                saved = bool(store.save_meta(task_id, meta_json))
         except StorageError:
-            logger.error("保存被测目标元数据失败: task_id=%s", task_id, exc_info=True)
-            self._pending_meta.pop(task_id, None)
+            logger.debug("被测目标元数据暂未保存，稍后重试: task_id=%s", task_id, exc_info=True)
+            self._schedule_pending_writes()
             return False
         if saved:
+            self._task_library_needs_refresh = True
+            # 文件版本是默认值，后台探针晚到不得覆盖用户编辑的版本。
+            try:
+                import json
+                version = json.loads(meta_json).get('file_version')
+                if version and hasattr(store, 'set_default_build'):
+                    with self._short_storage_write():
+                        store.set_default_build(task_id, str(version))
+            except StorageError:
+                self._schedule_pending_writes()
+                return False
+            except (ValueError, TypeError, AttributeError):
+                logger.warning('填充被测程序默认版本失败: task_id=%s', task_id, exc_info=True)
             self._pending_meta.pop(task_id, None)
             logger.info("被测目标元数据已保存: task_id=%s", task_id)
+            self._schedule_pending_writes()
         return saved
+
+    def _storage_writes_deferred(self) -> bool:
+        return (self._maintenance or self.has_task_deletions()
+                or (self._shutting_down and not self._shutdown_flushing))
+
+    def storage_write_block_reason(self) -> str:
+        """主线程交互写入使用的快速门禁，不尝试获取 SQLite 写锁。"""
+        if self._shutting_down:
+            return '程序正在退出，暂不能编辑'
+        if self.has_task_deletions():
+            return '正在删除任务数据，请等待删除完成后再编辑'
+        if self._maintenance:
+            return '数据库正在维护，请稍后再编辑'
+        if getattr(self.db, 'read_only', False):
+            return '数据库为只读，暂不能编辑'
+        return ''
+
+    def _reject_marker_write(self, task_id: str = '') -> bool:
+        reason = self.storage_write_block_reason()
+        if reason:
+            self.error_occurred.emit(task_id or '', reason)
+        return bool(reason)
+
+    def _short_storage_write(self):
+        limit = getattr(self.db, 'write_timeout', None)
+        return limit(10) if limit is not None else nullcontext()
+
+    def _pending_write_ids(self):
+        return set(self._pending_meta).union(
+            self._pending_identity, self._pending_groups, self._pending_plans,
+            (item[0] for item in self._pending_system_markers))
+
+    def _schedule_pending_writes(self) -> None:
+        if self._shutting_down or not (self._pending_write_ids() or self._task_library_needs_refresh):
+            self._pending_write_timer.stop()
+        elif not self._pending_write_timer.isActive():
+            self._pending_write_timer.start()
+
+    def begin_shutdown(self) -> None:
+        """退出后不再自动重试；只允许协调器在写库线程结束后做最后一次显式补存。"""
+        self._shutting_down = True
+        self._pending_write_timer.stop()
+
+    def _retry_pending_task_writes(self) -> None:
+        if not self._shutting_down:
+            self.flush_pending_task_writes()
+
+    def _drop_missing_task_writes(self, task_id: str) -> None:
+        # 已结束不等于不存在。只有确认没有任务行，才能丢弃已接受的待保存内容。
+        worker = self._tasks.get(task_id)
+        may_create_row = (worker is not None and
+                          (not self._shutdown_flushing or worker.isRunning()))
+        if (self._storage_writes_deferred() or may_create_row
+                or task_id not in self._pending_write_ids()):
+            return
+        store = getattr(self.db, 'tasks', None)
+        get = getattr(store, 'get', None)
+        if get is None:
+            return
+        try:
+            if get(task_id) is not None:
+                return
+        except StorageError:
+            return
+        self._drop_pending_meta(task_id)
+        self._pending_identity.pop(task_id, None)
+        self._pending_groups.pop(task_id, None)
+        self._pending_plans.pop(task_id, None)
+        self._pending_system_markers = [item for item in self._pending_system_markers
+                                        if item[0] != task_id]
+
+    def save_task_plan(self, task_id: str, plan_json: Optional[str]) -> bool:
+        """接收方案保存请求；未落库由管理器保留，成功前不释放启动策略。"""
+        self._pending_plans[task_id] = plan_json
+        saved = self._save_pending_plan(task_id)
+        self._schedule_pending_writes()
+        return saved
+
+    def _save_pending_plan(self, task_id: str) -> bool:
+        if task_id not in self._pending_plans:
+            return True
+        if self._storage_writes_deferred():
+            return False
+        store = getattr(self.db, 'tasks', None)
+        if store is None:
+            return False
+        payload = self._pending_plans[task_id]
+        try:
+            with self._short_storage_write():
+                if not store.save_plan(task_id, payload):
+                    return False
+        except StorageError:
+            logger.debug('方案暂未保存，稍后重试: task_id=%s', task_id, exc_info=True)
+            return False
+        self._pending_plans.pop(task_id, None)
+        self.release_restart_policy_seed(task_id)
+        self.task_plan_saved.emit(task_id)
+        return True
+
+    def _save_pending_system_markers(self, task_id: str, deadline: float) -> None:
+        for item in tuple(self._pending_system_markers):
+            if item[0] != task_id:
+                continue
+            if time.monotonic() >= deadline:
+                return
+            _, kind, when = item
+            try:
+                with self._short_storage_write():
+                    self.db.markers.add(task_id, when, SYSTEM_MARKER_LABELS[kind], kind)
+            except StorageError:
+                return
+            self._pending_system_markers.remove(item)
+            self.markers_changed.emit(task_id)
+
+    def flush_pending_task_writes(self, *, deadline: Optional[float] = None) -> bool:
+        """补存已接受的短写入；退出时可直接调用，不依赖排队的 finished 信号。"""
+        if self._shutting_down and deadline is None:
+            return False
+        self._shutdown_flushing = self._shutting_down
+        try:
+            return self._flush_pending_task_writes(deadline=deadline)
+        finally:
+            self._shutdown_flushing = False
+
+    def _flush_pending_task_writes(self, *, deadline: Optional[float]) -> bool:
+        self._pending_write_timer.stop()
+        for worker, complete in tuple(self._deletion_completions.items()):
+            if worker.isFinished():
+                complete()
+        if self._storage_writes_deferred():
+            self._schedule_pending_writes()
+            return False
+        limit = deadline if deadline is not None else time.monotonic() + 0.05
+        for task_id in self._pending_write_ids():
+            if time.monotonic() >= limit:
+                break
+            self._save_pending_task_settings(task_id)
+            if time.monotonic() < limit:
+                self._save_pending_meta(task_id)
+            if time.monotonic() < limit:
+                self._save_pending_plan(task_id)
+            self._drop_missing_task_writes(task_id)
+            if time.monotonic() < limit:
+                self._save_pending_system_markers(task_id, limit)
+        if self._task_library_needs_refresh:
+            self._task_library_needs_refresh = False
+            if not self._shutting_down:
+                self.task_library_changed.emit()
+        self._schedule_pending_writes()
+        return not self._pending_write_ids()
 
     def _drop_pending_meta(self, task_id: str) -> None:
         if self._pending_meta.pop(task_id, None) is not None:
@@ -662,7 +862,9 @@ class MonitorManager(QObject):
             start_time=model.start_time,
             end_time=model.end_time,
             create_time=task.expected_create_time,
-            is_paused=state is WorkerState.PAUSED,
+            is_paused=(state is WorkerState.PAUSED or
+                       (state is WorkerState.WAITING_RESTART
+                        and getattr(task, '_paused_before_wait', False))),
             is_stopping=state is WorkerState.STOPPING,
             quality=_quality_of(task),
             target_kind=getattr(task, 'target_kind', TARGET_PID),
@@ -691,7 +893,9 @@ class MonitorManager(QObject):
     def is_task_paused(self, task_id: str) -> bool:
         """任务是否处于暂停状态（不在 manager 中返回 False）"""
         task = self._tasks.get(task_id)
-        return task is not None and task.state is WorkerState.PAUSED
+        return task is not None and (task.state is WorkerState.PAUSED or
+                                    (task.state is WorkerState.WAITING_RESTART
+                                     and getattr(task, '_paused_before_wait', False)))
 
     def has_running_task_for_pid(self, pid: int) -> bool:
         """该 PID 是否已有在采集（未在停止）的单进程任务（进程树 / 按名任务不算：它们监控的
@@ -828,7 +1032,8 @@ class MonitorManager(QObject):
         并返回 True，此后 create_task / start_task / begin_export 被拒绝，直到
         end_maintenance。
         """
-        if self.has_running_tasks() or self.has_running_exports():
+        if (self._shutting_down or self._maintenance or self.has_task_deletions() or self.has_storage_jobs()
+                or self.has_running_tasks() or self.has_running_exports()):
             return False
         self._maintenance = True
         return True
@@ -836,6 +1041,42 @@ class MonitorManager(QObject):
     def end_maintenance(self):
         """退出数据库维护状态"""
         self._maintenance = False
+        self._schedule_pending_writes()
+
+    def begin_storage_job(self) -> bool:
+        """所有维护服务实例共享健康作业计数，只在管理器线程调用。"""
+        if self._shutting_down or self._maintenance or self.has_task_deletions():
+            return False
+        self._storage_job_count += 1
+        return True
+
+    def end_storage_job(self) -> None:
+        self._storage_job_count = max(0, self._storage_job_count - 1)
+
+    def has_storage_jobs(self) -> bool:
+        return self._storage_job_count > 0
+
+    def has_task_deletions(self) -> bool:
+        return bool(self._deleting_ids)
+
+    def task_deletion_block_reason(self, task_id: str) -> str:
+        """删除的主线程门禁；不读库，最终状态/参考确认仍在删除事务内校验。"""
+        if self._shutting_down:
+            return '程序正在退出，暂不能删除任务'
+        if getattr(self.db, 'read_only', False):
+            return '数据库为只读，不能删除任务'
+        if self._maintenance:
+            return '数据库正在维护，请稍后再删除'
+        if self.has_running_exports():
+            return '正在导出数据，请等待导出完成后再删除'
+        if self.has_storage_jobs():
+            return '数据库正在做例行检查，请稍后再删除'
+        if self.has_task_deletions():
+            return '正在删除任务数据，请稍候'
+        task = self._tasks.get(task_id)
+        if task is not None and task.state in LIVE_STATES:
+            return '任务正在运行中，请先停止任务再删除'
+        return ''
 
     def is_maintenance_running(self) -> bool:
         """是否处于数据库维护状态"""
@@ -846,7 +1087,7 @@ class MonitorManager(QObject):
         登记一次导出（启动导出线程前调用）。维护进行中时拒绝返回 False；否则计数加一
         并返回 True。每次成功的 begin_export 都必须对应一次 end_export。
         """
-        if self._maintenance:
+        if self._shutting_down or self._maintenance or self.has_task_deletions():
             return False
         self._export_count += 1
         return True
@@ -883,7 +1124,7 @@ class MonitorManager(QObject):
             Optional[Marker]: 带数据库 ID 的打点；任务不存在、名称为空或写库失败返回 None
         """
         label = (label or '').strip()
-        if not label:
+        if not label or self._reject_marker_write(task_id):
             return None
         if kind not in MARKER_KINDS:
             raise ValueError(f"未知的打点类型 {kind!r}，可选：{', '.join(MARKER_KINDS)}")
@@ -925,7 +1166,7 @@ class MonitorManager(QObject):
             bool: 是否改成功（名称为空、打点不存在或写库失败返回 False）
         """
         label = (label or '').strip()
-        if not label:
+        if not label or self._reject_marker_write(self._marker_owner.get(marker_id, task_id)):
             return False
         try:
             changed = self.db.markers.update_label(marker_id, label)
@@ -948,6 +1189,8 @@ class MonitorManager(QObject):
         Returns:
             bool: 是否删除成功
         """
+        if self._reject_marker_write(self._marker_owner.get(marker_id, task_id)):
+            return False
         try:
             deleted = self.db.markers.delete(marker_id)
         except StorageError:
@@ -967,6 +1210,8 @@ class MonitorManager(QObject):
         Returns:
             bool: 是否设置成功（打点不属于该任务、是系统打点或写库失败返回 False）
         """
+        if self._reject_marker_write(task_id):
+            return False
         markers = self.list_markers(task_id)
         target = next((m for m in markers if m.id == marker_id), None)
         if target is None or target.kind not in ('user', 'baseline'):
@@ -1132,6 +1377,8 @@ class MonitorManager(QObject):
                                   if e.added_at > anchor.added_at]
             return UndoOutcome(UNDO_EXPIRED)
         group = [e for e in self._undo_entries if e.group is anchor.group]
+        if self._reject_marker_write(anchor.marker.task_id):
+            return UndoOutcome(UNDO_FAILED)
         undone: List[Marker] = []
         failed = False
         for entry in reversed(group):
@@ -1172,15 +1419,193 @@ class MonitorManager(QObject):
             return
         self.markers_changed.emit(owner)
 
-    def delete_task_data(self, task_id: str) -> bool:
+    def delete_task_data(self, task_id: str, *, allow_reference: bool = False) -> bool:
         """
         删除任务的全部数据（任务行、数据点、标记）。
         任务仍在 _tasks 中且可能写库（运行、暂停、停止收尾中）时拒绝，返回 False。
         """
-        task = self._tasks.get(task_id)
-        if task is not None and task.state in LIVE_STATES:
+        if self.task_deletion_block_reason(task_id):
+            return False
+        store = getattr(self.db, 'tasks', None)
+        record = store.get(task_id) if store is not None else None
+        if record is not None and record.status != TaskStatus.STOPPED.value:
+            return False
+        if record is not None and record.is_reference and not allow_reference:
             return False
         return self.db.delete_task(task_id)
+
+    def update_task_identity(self, task_id: str, scenario: str, build: str) -> bool:
+        """界面/命令行编辑测试场景与版本的唯一写入口。"""
+        if (self._shutting_down or self._maintenance or task_id in self._deleting_ids
+                or getattr(self.db, 'read_only', False)):
+            raise ValueError('数据库只读或正在维护，暂不能编辑任务')
+        scenario, build = scenario.strip(), build.strip()
+        if len(scenario) > 120 or len(build) > 120:
+            raise ValueError('场景和版本各不能超过 120 个字符')
+        worker = self._tasks.get(task_id)
+        if self.has_task_deletions():
+            if worker is None:
+                raise ValueError(self.storage_write_block_reason())
+            # 运行中或刚创建的任务继续接受身份，明确留在待保存队列。
+            worker.task_model.scenario, worker.task_model.build = scenario, build
+            self._pending_identity[task_id] = (scenario, build)
+            self._schedule_pending_writes()
+            self.task_library_changed.emit()
+            return True
+        # 写库失败时不提交内存变化；不存在的初始任务行才进入明确的待补存状态。
+        saved = self.db.tasks.update_identity(task_id, scenario, build)
+        if worker is not None:
+            worker.task_model.scenario, worker.task_model.build = scenario, build
+        if saved:
+            self._pending_identity.pop(task_id, None)
+        if not saved and worker is not None:
+            self._pending_identity[task_id] = (scenario, build)
+        if saved or worker is not None:
+            self.task_library_changed.emit()
+        return saved or worker is not None
+
+    def set_task_group(self, task_ids, group_id: Optional[str]) -> None:
+        ids = tuple(dict.fromkeys(task_ids))
+        if (self._shutting_down or self._maintenance or self._deleting_ids.intersection(ids)
+                or getattr(self.db, 'read_only', False)):
+            raise ValueError('数据库只读或正在维护，暂不能设置任务组')
+        if not ids:
+            return
+        if self.has_task_deletions():
+            if any(task_id not in self._tasks for task_id in ids):
+                raise ValueError(self.storage_write_block_reason())
+            for task_id in ids:
+                self._tasks[task_id].task_model.group_id = group_id
+                self._pending_groups[task_id] = group_id
+            self._schedule_pending_writes()
+            return
+        # 已落库成员在同一事务更新；任一写入失败时数据库与内存都保留原组。
+        saved_count = self.db.tasks.set_group(ids, group_id)
+        for task_id in ids:
+            worker = self._tasks.get(task_id)
+            if worker is not None:
+                worker.task_model.group_id = group_id
+            if saved_count == len(ids):
+                self._pending_groups.pop(task_id, None)
+            elif worker is not None:
+                self._pending_groups[task_id] = group_id
+
+    def task_group(self, task_id: str) -> Optional[str]:
+        worker = self._tasks.get(task_id)
+        record = worker.task_model if worker is not None else self.db.tasks.get(task_id)
+        return getattr(record, 'group_id', None)
+
+    def _save_pending_task_settings(self, task_id: str) -> None:
+        if self._storage_writes_deferred():
+            return
+        try:
+            identity = self._pending_identity.get(task_id)
+            if identity is not None:
+                with self._short_storage_write():
+                    if self.db.tasks.update_identity(task_id, *identity):
+                        self._pending_identity.pop(task_id, None)
+                        self._task_library_needs_refresh = True
+            if task_id in self._pending_groups:
+                group_id = self._pending_groups[task_id]
+                ids = tuple(tid for tid, group in self._pending_groups.items() if group == group_id)
+                with self._short_storage_write():
+                    count = self.db.tasks.set_group(ids, group_id)
+                if count:
+                    self._task_library_needs_refresh = True
+                # 同一次分组已落库的成员始终在一个事务更新；新任务行缺席时继续保留。
+                if count == len(ids):
+                    for tid in ids:
+                        self._pending_groups.pop(tid, None)
+        except StorageError:
+            logger.debug('测试身份或任务组暂未保存，稍后重试: task_id=%s', task_id, exc_info=True)
+        self._schedule_pending_writes()
+
+    def set_task_reference(self, task_id: str, enabled: bool = True) -> bool:
+        reason = self.storage_write_block_reason()
+        if reason:
+            raise ValueError(reason)
+        worker = self._tasks.get(task_id)
+        if enabled and worker is not None and worker.state in LIVE_STATES:
+            raise ValueError('请等待任务结束后再设为参考')
+        saved = self.db.tasks.set_reference(task_id, enabled)
+        if saved:
+            self.task_library_changed.emit()
+        return saved
+
+    def set_task_starred(self, task_id: str, starred: bool) -> bool:
+        reason = self.storage_write_block_reason()
+        if reason:
+            raise ValueError(reason)
+        saved = self.db.tasks.set_starred(task_id, starred)
+        if saved:
+            self.task_library_changed.emit()
+        return saved
+
+    def start_task_deletion(self, task_ids, registry, *, allow_references=False,
+                            on_result=None, on_failed=None, on_finished=None):
+        """主线程先占用维护锁，再启动后台事务；失败、取消与完成均释放锁。"""
+        ids = tuple(dict.fromkeys(task_ids))
+        if not ids:
+            raise ValueError('请先选择任务')
+        if getattr(self.db, 'read_only', False) or self._maintenance or not self.begin_maintenance():
+            raise ValueError('请先停止监控并等待导出或维护完成，再删除任务')
+
+        def finished():
+            self.end_maintenance()
+            self.task_library_changed.emit()
+
+        try:
+            return self._start_deletion_worker(
+                ids, registry, allow_references=allow_references, finished=finished,
+                on_result=on_result, on_failed=on_failed, on_finished=on_finished)
+        except Exception:
+            self.end_maintenance()
+            raise
+
+    def start_single_task_deletion(self, task_id, registry, *, allow_reference=False,
+                                   on_result=None, on_failed=None, on_finished=None):
+        """删除一个已结束任务；目标锁不影响其他监控，所有数据库工作在登记线程中。"""
+        reason = self.task_deletion_block_reason(task_id)
+        if reason:
+            raise ValueError(reason)
+        self._deleting_ids.add(task_id)
+
+        def finished():
+            self._deleting_ids.discard(task_id)
+            self._schedule_pending_writes()
+            self.task_library_changed.emit()
+
+        try:
+            return self._start_deletion_worker(
+                (task_id,), registry, allow_references=allow_reference, finished=finished,
+                on_result=on_result, on_failed=on_failed, on_finished=on_finished)
+        except Exception:
+            self._deleting_ids.discard(task_id)
+            raise
+
+    def _start_deletion_worker(self, ids, registry, *, allow_references, finished,
+                               on_result, on_failed, on_finished):
+        from core.task_library import TaskDeletionWorker
+        worker = TaskDeletionWorker(self.db.tasks, ids, allow_references=allow_references)
+        def complete():
+            if self._deletion_completions.pop(worker, None) is not None:
+                finished()
+        # 门禁先释放，页面再刷新按钮；登记表最后释放QThread对象。
+        self._deletion_completions[worker] = complete
+        worker.finished.connect(complete)
+        if on_result is not None:
+            worker.result.connect(on_result)
+        if on_failed is not None:
+            worker.failed.connect(on_failed)
+        if on_finished is not None:
+            worker.finished.connect(on_finished)
+        try:
+            registry.register(worker, name='删除任务数据', cancel=worker.cancel, timeout_ms=3000)
+            worker.start()
+        except Exception:
+            self._deletion_completions.pop(worker, None)
+            raise
+        return worker
 
     def load_historical_tasks(self) -> List[TaskRecord]:
         """
@@ -1202,8 +1627,11 @@ class MonitorManager(QObject):
         if task is None:
             return
         self._target_infos.pop(task_id, None)
-        if task_id in self._pending_meta and not self._save_pending_meta(task_id):
-            self._drop_pending_meta(task_id)
+        self._save_pending_meta(task_id)
+        self._save_pending_task_settings(task_id)
+        self._save_pending_plan(task_id)
+        self._drop_missing_task_writes(task_id)
+        self._schedule_pending_writes()
         sip.transferto(task, None)
         task.deleteLater()
         self.task_removed.emit(task_id)
@@ -1224,13 +1652,16 @@ class MonitorManager(QObject):
         """任务数据更新处理：首个周期到达时任务行已落库，挂起的元数据在这里补存"""
         if task_id in self._pending_meta:
             self._save_pending_meta(task_id)
+        self._save_pending_task_settings(task_id)
+        self._save_pending_plan(task_id)
         self.data_updated.emit(task_id, values)
 
     def _on_task_stopped(self, task_id: str, reason: StopReason):
-        """任务停止处理：收尾已写过任务行（一个周期都没采到就结束时元数据在这里补存）；
-        仍写不进去说明任务行从未落库，放弃"""
-        if task_id in self._pending_meta and not self._save_pending_meta(task_id):
-            self._drop_pending_meta(task_id)
+        """任务停止时尝试补存；删除或短暂写锁阻挡不代表任务行不存在。"""
+        self._save_pending_meta(task_id)
+        self._save_pending_task_settings(task_id)
+        self._save_pending_plan(task_id)
+        self._schedule_pending_writes()
         self.task_stopped.emit(task_id, reason)
 
     def _on_task_restarted(self, task_id: str, _pid: int, count: int) -> None:

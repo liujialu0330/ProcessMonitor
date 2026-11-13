@@ -35,6 +35,7 @@ class Maintenance:
         校正之后调用：先把上次崩溃遗留的 running 任务校正为 stopped，否则"刚崩溃、其实
         还新鲜"的任务可能在同一次启动里被当成过期任务误删。
         判断口径 COALESCE(end_time, start_time) < 截止时间，兜底 end_time 为空的老数据。
+        场景参考不参与自动清理，只能由用户显式确认删除。
 
         Returns:
             int: 被删除的任务数
@@ -46,7 +47,8 @@ class Maintenance:
             with self._factory.transaction() as cursor:
                 cursor.execute('''
                     SELECT task_id FROM tasks
-                    WHERE status = 'stopped' AND COALESCE(end_time, start_time) < ?
+                    WHERE status = 'stopped' AND COALESCE(is_reference, 0) = 0
+                        AND COALESCE(end_time, start_time) < ?
                 ''', (cutoff,))
                 task_ids = [row[0] for row in cursor.fetchall()]
                 for task_id in task_ids:

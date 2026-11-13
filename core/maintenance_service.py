@@ -8,9 +8,8 @@
 - rebuild_rollups：设置页"重建汇总"，按样本重算分钟汇总与空洞，耗时，由后台线程调用
 
 另有存储健康的后台作业（core.storage_guard）：-wal 过大时的兜底 checkpoint 与启动后的
-quick_check。兜底 checkpoint 经 begin_storage_job() / end_storage_job() 登记，与清理、
-重建汇总互斥（登记时维护进行中则被拒，登记期间 begin() 抛 MaintenanceBusy）；quick_check 只用
-只读连接、不写库，不登记，维护开始时由守卫推迟。
+quick_check。两者都经 begin_storage_job() / end_storage_job() 登记，与清理、删除和
+重建汇总互斥；quick_check 虽然只读，也必须登记，避免它的读连接阻塞压缩。
 
 维护锁（MonitorManager.begin_maintenance / end_maintenance）只经本服务持有与释放，
 调用方不直接碰 manager。两种用法（cleanup_and_vacuum 与 rebuild_rollups 相同）：
@@ -21,6 +20,10 @@ quick_check。兜底 checkpoint 经 begin_storage_job() / end_storage_job() 登�
   后台线程真正占锁之前"任务或导出趁机开始的窗口。
 """
 import logging
+import os
+import re
+import stat
+from pathlib import Path
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Collection, Optional
 
@@ -42,11 +45,13 @@ BUSY_TASKS_RUNNING = 'tasks_running'
 BUSY_EXPORT_RUNNING = 'export_running'
 BUSY_MAINTENANCE_RUNNING = 'maintenance_running'
 BUSY_STORAGE_JOB_RUNNING = 'storage_job_running'
+BUSY_DELETION_RUNNING = 'deletion_running'
 
 
 class MaintenanceBusy(Exception):
     """维护被拒绝：有运行中的监控任务（'tasks_running'）、导出进行中（'export_running'）、
-    已有维护在进行（'maintenance_running'）或存储健康的后台作业正在跑（'storage_job_running'）"""
+    已有维护在进行（'maintenance_running'）、删除进行中（'deletion_running'）或
+    存储健康的后台作业正在跑（'storage_job_running'）"""
 
     def __init__(self, reason: str):
         super().__init__(reason)
@@ -151,7 +156,9 @@ class MaintenanceService:
         """
         if self._manager.is_maintenance_running():
             raise MaintenanceBusy(BUSY_MAINTENANCE_RUNNING)
-        if self._storage_jobs > 0:
+        if getattr(self._manager, 'has_task_deletions', lambda: False)():
+            raise MaintenanceBusy(BUSY_DELETION_RUNNING)
+        if self.has_storage_job():
             raise MaintenanceBusy(BUSY_STORAGE_JOB_RUNNING)
         if not self._manager.begin_maintenance():
             reason = (BUSY_TASKS_RUNNING if self._manager.has_running_tasks()
@@ -161,6 +168,56 @@ class MaintenanceService:
     def end(self) -> None:
         """释放维护锁（与 begin() 成对，应在界面线程调用；未占用时调用无副作用）"""
         self._manager.end_maintenance()
+
+    def delete_migration_backup(self, path: str, *, already_locked: bool = False) -> None:
+        """删除明确选择的本库迁移备份；不允许越目录、链接、库本体或升级失败时删除。
+
+        界面先确认，再 begin() 并交后台执行 already_locked=True，最后在界面 end()。
+        """
+        if getattr(self._db, 'read_only', False) or getattr(self._db, 'migration_failed', False):
+            raise ValueError('数据库只读或升级未成功，不能删除迁移备份')
+        if not already_locked:
+            self.begin()
+        try:
+            database = Path(self._db.db_path).resolve(strict=True)
+            candidate = Path(path).absolute()
+            pattern = re.escape(database.name) + r'\.bak_v\d+(?:_\d{8}_\d{6})?(?:_\d+)?'
+            if (candidate.parent.resolve() != database.parent
+                    or not re.fullmatch(pattern, candidate.name, flags=re.IGNORECASE)):
+                raise ValueError('只能删除当前数据库目录内的迁移备份')
+            info = candidate.lstat()
+            if (not stat.S_ISREG(info.st_mode) or candidate.is_symlink()
+                    or getattr(info, 'st_file_attributes', 0) & 0x400
+                    or os.path.samefile(candidate, database)):
+                raise ValueError('所选文件不是可删除的独立迁移备份')
+            candidate.unlink()
+            if os.path.normcase(str(candidate)) == os.path.normcase(str(self._db.backup_path or '')):
+                self._db.backup_path = None
+            logger.info('已删除用户选择的迁移备份：%s', candidate)
+        finally:
+            if not already_locked:
+                self.end()
+
+    def list_migration_backups(self) -> list:
+        """发现以往启动留下的独立备份，最新在前；不依赖仅本次有效的 db.backup_path。"""
+        database = Path(self._db.db_path).resolve()
+        pattern = re.escape(database.name) + r'\.bak_v\d+(?:_\d{8}_\d{6})?(?:_\d+)?'
+        found = []
+        try:
+            for candidate in database.parent.iterdir():
+                if not re.fullmatch(pattern, candidate.name, flags=re.IGNORECASE):
+                    continue
+                try:
+                    info = candidate.lstat()
+                    if (stat.S_ISREG(info.st_mode) and not candidate.is_symlink()
+                            and not getattr(info, 'st_file_attributes', 0) & 0x400
+                            and not os.path.samefile(candidate, database)):
+                        found.append((info.st_mtime_ns, str(candidate)))
+                except OSError:
+                    continue
+        except OSError:
+            logger.warning('无法读取迁移备份列表：%s', database.parent, exc_info=True)
+        return [path for _, path in sorted(found, reverse=True)]
 
     def cleanup_and_vacuum(self, retention_days: int, *,
                            already_locked: bool = False) -> CleanupResult:
@@ -224,6 +281,9 @@ class MaintenanceService:
         begin() 在作业结束前抛 MaintenanceBusy(BUSY_STORAGE_JOB_RUNNING)。每次成功的
         begin_storage_job 都必须对应一次 end_storage_job（线程 finished 时调用）。
         """
+        begin = getattr(self._manager, 'begin_storage_job', None)
+        if begin is not None:
+            return begin()
         if self._manager.is_maintenance_running():
             return False
         self._storage_jobs += 1
@@ -231,15 +291,21 @@ class MaintenanceService:
 
     def end_storage_job(self) -> None:
         """注销一个存储健康后台作业（界面线程，作业线程 finished 之后）"""
-        self._storage_jobs = max(0, self._storage_jobs - 1)
+        end = getattr(self._manager, 'end_storage_job', None)
+        if end is not None:
+            end()
+        else:
+            self._storage_jobs = max(0, self._storage_jobs - 1)
 
     def has_storage_job(self) -> bool:
         """是否有存储健康后台作业在跑"""
-        return self._storage_jobs > 0
+        query = getattr(self._manager, 'has_storage_jobs', None)
+        return query() if query is not None else self._storage_jobs > 0
 
     def is_busy(self) -> bool:
         """数据库维护是否正在进行（守卫据此推迟 quick_check、跳过兜底 checkpoint）"""
-        return self._manager.is_maintenance_running()
+        return (self._manager.is_maintenance_running()
+                or getattr(self._manager, 'has_task_deletions', lambda: False)())
 
     def wal_size_bytes(self) -> int:
         """-wal 文件的字节数（不存在为 0）"""

@@ -2,7 +2,7 @@
 监控页周期路径无查库验证
 TaskCard 计数为内存计数（卡片建时置 0，每收到一次 data_updated +1），不在每个采集
 周期调用 Database.get_sample_count。用源码静态检查（等价于 grep 调用点）钉死这条
-回归线：MonitorPresenter.on_data_updated 是 data_updated 信号槽，每采集周期触发一次，
+回归线：MonitorPresenter.on_sample_updated 是精确采样信号槽，每采集周期触发一次，
 一旦有人重新引入 get_sample_count 调用，本用例即失败。
 """
 import inspect
@@ -11,9 +11,9 @@ from ui.components.task_card import TaskCard
 from ui.presenters.monitor_presenter import MonitorPresenter
 
 
-def test_on_data_updated_does_not_call_get_sample_count():
-    """data_updated 槽函数源码中不应出现 get_sample_count 调用"""
-    source = inspect.getsource(MonitorPresenter.on_data_updated)
+def test_on_sample_updated_does_not_call_get_sample_count():
+    """采样槽函数源码中不应出现 get_sample_count 调用"""
+    source = inspect.getsource(MonitorPresenter.on_sample_updated)
     assert "get_sample_count" not in source
 
 

@@ -7,6 +7,7 @@
 页面依赖全部经 UiServices 注入，manager 用真实 MonitorManager（不启动采集线程）。
 """
 import os
+from datetime import timedelta
 
 import pytest
 from PyQt5.QtCore import Qt
@@ -223,7 +224,7 @@ def test_invalid_target_shows_error_under_field_and_clears_on_edit(
 
 
 def test_page_has_no_separate_pid_box(page):
-    """PID 直接在搜索框输入（P10）：表单里除搜索框外只剩备注一个单行输入框
+    """PID 直接在搜索框输入；其余输入框用于备注、等待和方案身份
     （"自动化"折叠区里的日志路径、匹配规则与导出目录，"启动被测程序"折叠区里的程序路径、
     参数与工作目录不算）"""
     from qfluentwidgets import EditableComboBox, LineEdit
@@ -231,7 +232,8 @@ def test_page_has_no_separate_pid_box(page):
              if not isinstance(w, EditableComboBox)
              and not page.form.automation.isAncestorOf(w)
              and not page.form.launch_options.isAncestorOf(w)]
-    assert edits == [page.form.note_input]
+    assert set(edits) == {page.form.note_input, page.form.scenario_edit,
+                          page.form.build_edit, page.form.wait_timeout_input, page.plan_flow.name}
 
 
 # ---------- 卡片按钮连线 ----------
@@ -241,16 +243,17 @@ def test_data_updated_shows_values_delta_and_count(page, manager):
     card = page.board.cards()[task_id]
     private, gdi = MetricType.MEMORY_PRIVATE, MetricType.NUM_GDI_OBJECTS
 
-    manager.data_updated.emit(task_id, {private: 1024.0, gdi: 100.0})
-    manager.data_updated.emit(task_id, {private: 3072.0, gdi: 103.0})
+    manager.sample_updated.emit(task_id, {private: 1024.0, gdi: 100.0},
+                                DEFAULT_FAKE_NOW - timedelta(seconds=1))
+    manager.sample_updated.emit(task_id, {private: 3072.0, gdi: 103.0}, DEFAULT_FAKE_NOW)
 
     assert card.value_labels[private].text() == "3 MB"
-    # 无基线：比开始时（相对时间取注入时钟，替身时钟不走，故为 0 秒前）
-    assert card.delta_labels[private].text() == "比开始时（0 秒前）+2 MB"
-    assert card.delta_labels[gdi].text() == "比开始时（0 秒前）+3 个"
-    assert card.trend_delta_label.text() == "比开始时（0 秒前）+2 MB"
+    # 无基线：比开始时；使用采样时间，两批样本相隔一秒。
+    assert card.delta_labels[private].text() == "比开始时（1 秒前）+2 MB"
+    assert card.delta_labels[gdi].text() == "比开始时（1 秒前）+3 个"
+    assert card.trend_delta_label.text() == "比开始时（1 秒前）+2 MB"
     assert card.count == 2
-    assert card.count_label.text() == "已运行 0 秒 · 每 1 秒 · 2 次采集"
+    assert card.count_label.text() == "已运行 1 秒 · 每 1 秒 · 2 次采集"
 
 
 def test_metrics_unavailable_marks_card(page, manager, services):
@@ -309,9 +312,9 @@ def test_marker_button_writes_marker_via_manager(page, manager, db, services):
     # 卡片进入"较基线"模式，基线值要等基线之后的 5 个样本
     assert card.baseline is not None
     assert card.delta_labels[MetricType.MEMORY_PRIVATE].text() == "基线采样中"
-    for value in (1024.0, 2048.0, 3072.0, 4096.0, 5120.0):
-        manager.data_updated.emit(task_id, {MetricType.MEMORY_PRIVATE: value})
-    manager.data_updated.emit(task_id, {MetricType.MEMORY_PRIVATE: 6144.0})
+    for index, value in enumerate((1024.0, 2048.0, 3072.0, 4096.0, 5120.0, 6144.0)):
+        manager.sample_updated.emit(task_id, {MetricType.MEMORY_PRIVATE: value},
+                                    DEFAULT_FAKE_NOW + timedelta(seconds=index))
     assert card.delta_labels[MetricType.MEMORY_PRIVATE].text() == "较基线 +3 MB"
 
 
@@ -321,8 +324,9 @@ def test_stopped_card_is_kept_in_finished_group(page, manager, monkeypatch):
     task_id = _add_card(manager, note="备注A")
     other_id = _add_card(manager)
     card = page.board.cards()[task_id]
-    manager.data_updated.emit(task_id, {MetricType.MEMORY_PRIVATE: 1024.0})
-    manager.data_updated.emit(task_id, {MetricType.MEMORY_PRIVATE: 2048.0})
+    manager.sample_updated.emit(task_id, {MetricType.MEMORY_PRIVATE: 1024.0},
+                                DEFAULT_FAKE_NOW - timedelta(seconds=1))
+    manager.sample_updated.emit(task_id, {MetricType.MEMORY_PRIVATE: 2048.0}, DEFAULT_FAKE_NOW)
     monkeypatch.setattr(manager, "running_task_count", lambda: 1)
 
     manager.task_stopped.emit(task_id, StopReason.USER)
@@ -468,7 +472,9 @@ def test_header_title_subtitle_summary_and_refresh(page, services):
     from ui.pages.monitor_page import PAGE_SUBTITLE, PAGE_TITLE, REFRESH_TEXT
     assert (PAGE_TITLE, REFRESH_TEXT) == ("监控", "刷新进程")
     assert PAGE_SUBTITLE == "选择被测进程开始记录；每轮操作后点“打点”即可量化泄漏"
-    assert page.refresh_button.text() == REFRESH_TEXT
+    assert page.refresh_button.text() == ''
+    assert 'F5' in page.refresh_button.toolTip()
+    assert page.form.top_row.indexOf(page.refresh_button) >= 0
     query = services.process_query
     before = sum(1 for name, _ in query.calls if name == 'list_processes')
     page.refresh_button.click()

@@ -299,7 +299,7 @@ def test_auto_path_follows_estimated_rows(db, monkeypatch):
     expected = AnalyticsRepo(db._factory, path='raw').aggregates(task_id, MEM)
     assert close(auto.aggregates(task_id, MEM), expected)
     assert used == []                                       # 300 行远低于阈值：原始路径
-    monkeypatch.setattr(analytics_repo, 'RAW_PATH_MAX_ROWS', 299)
+    monkeypatch.setattr(analytics_repo, 'AGGREGATE_RAW_PATH_MAX_ROWS', 299)
     assert close(auto.aggregates(task_id, MEM), expected)
     assert len(used) == 1                                   # 估算 300 行 > 299：汇总路径
     assert close(auto.aggregates(task_id, MEM, since=T0 + timedelta(minutes=200)),
@@ -311,6 +311,54 @@ def test_auto_path_follows_estimated_rows(db, monkeypatch):
 def test_invalid_path_rejected(db):
     with pytest.raises(ValueError):
         AnalyticsRepo(db._factory, path='fast')
+
+
+def test_medium_interval_uses_rollup_only_for_aggregates(db, monkeypatch):
+    """约一万点的完整操作轮不应再扫描原始数据求各阶和，分桶选择阈值不随之改变。"""
+    _task(db, 'medium', 1.0, (MEM,))
+    db.points.append([DataPoint('medium', T0 + timedelta(seconds=i, milliseconds=123),
+                                1000.0 + i * .01, MEM)
+                      for i in range(10_000) if not 1215 <= i < 1240])
+    used = []
+    original = db.analytics._rollup_sums
+
+    def rolled(*args):
+        used.append(args)
+        return original(*args)
+
+    monkeypatch.setattr(db.analytics, '_rollup_sums', rolled)
+    # 首末都切在分钟中间，空洞也位于分钟内部。
+    since = T0 + timedelta(seconds=11, microseconds=500)
+    until = T0 + timedelta(seconds=9977, milliseconds=650)
+    actual = db.analytics.aggregates('medium', MEM, since, until)
+    raw = AnalyticsRepo(db._factory, path='raw')
+    raw_used = []
+    monkeypatch.setattr(raw, '_rollup_sums', lambda *args: raw_used.append(args))
+    expected = raw.aggregates('medium', MEM, since, until)
+    assert len(used) == 1 and raw_used == []
+    assert close(actual, expected)
+    assert (actual.count, actual.first_ts, actual.last_ts) == (
+        expected.count, expected.first_ts, expected.last_ts)
+    with db._factory.connect() as conn:
+        sid = conn.execute('SELECT series_id FROM series WHERE task_id = ?', ('medium',)).fetchone()[0]
+        lo, hi = analytics_repo.ms_range(since, until)
+        assert db.analytics._use_rollup(conn, [sid], lo, hi) is False
+
+
+def test_explicit_aggregate_paths_override_both_automatic_thresholds(db, monkeypatch):
+    task_id, _interval, _metrics = _seed_minute(db)
+    monkeypatch.setattr(analytics_repo, 'RAW_PATH_MAX_ROWS', 0)
+    monkeypatch.setattr(analytics_repo, 'AGGREGATE_RAW_PATH_MAX_ROWS', 0)
+    raw = AnalyticsRepo(db._factory, path='raw')
+    rolled = AnalyticsRepo(db._factory, path='rollup')
+    raw_calls, rollup_calls = [], []
+    raw_sum = raw._raw_sums
+    rollup_sum = rolled._rollup_sums
+    monkeypatch.setattr(raw, '_raw_sums', lambda *args: raw_calls.append(args) or raw_sum(*args))
+    monkeypatch.setattr(rolled, '_rollup_sums',
+                        lambda *args: rollup_calls.append(args) or rollup_sum(*args))
+    assert close(raw.aggregates(task_id, MEM), rolled.aggregates(task_id, MEM))
+    assert len(raw_calls) == len(rollup_calls) == 1
 
 
 # ========== 整包取回（fetch_packed） ==========

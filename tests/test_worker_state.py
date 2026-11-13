@@ -71,6 +71,18 @@ def _record_state_at_stop(worker) -> list:
     return seen
 
 
+def test_pause_during_restart_is_preserved_without_cancelling_search(make_worker):
+    worker = make_worker()
+    worker._state = WorkerState.WAITING_RESTART
+    assert worker.pause()
+    assert worker.state is WorkerState.WAITING_RESTART and worker.is_paused()
+    assert not worker.pause()
+    assert worker.resume()
+    assert worker.state is WorkerState.WAITING_RESTART and not worker.is_paused()
+    assert worker.stop()
+    assert not worker.resume()
+
+
 # ========== 状态集合与派生查询 ==========
 
 def test_state_sets():

@@ -13,22 +13,22 @@ FluentWindow 外壳：侧栏 监控 / 分析 / 设置（底部），窗口宽度
 常驻横幅（同时让监控页禁止开始监控与打点）、数据目录位于同步盘的警告。
 """
 import logging
+import html
 import os
 from typing import Any, Callable, List, Optional
 
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QIcon, QKeySequence
-from PyQt5.QtWidgets import QApplication, QShortcut, QSystemTrayIcon
+from PyQt5.QtWidgets import QApplication, QShortcut, QSystemTrayIcon, QWidget
 from qfluentwidgets import (
-    FluentWindow, NavigationDisplayMode, NavigationItemPosition, FluentIcon
+    FluentWindow, NavigationDisplayMode, NavigationItemPosition, FluentIcon, qconfig
 )
 
 from core.shutdown import ShutdownCoordinator
 from ui.hotkey import MarkerHotkey
 from ui.layout_breakpoints import COMPACT, LayoutBreakpoints
-from ui.pages.analysis_page import AnalysisPage
 from ui.pages.monitor_page import MonitorPage
-from ui.pages.setting_page import SettingPage
+from ui.pages.about_update import AboutUpdateGroup
 from ui.presenters.monitor_presenter import QUICK_MARKER_OK
 from ui.services import (
     CLOSE_ACTION_CANCEL, CLOSE_ACTION_TRAY, EVENT_QUICK_MARKER, EVENT_TRAY_HIDDEN,
@@ -166,6 +166,8 @@ class MainWindow(FluentWindow):
         self._attach_notifier()
         self._init_hotkey()
         self._apply_startup_state()
+        from ui.shortcuts import WindowShortcuts
+        self.shortcuts = WindowShortcuts(self)
 
         # "跟随系统"主题：系统切换深浅色后界面跟上（只在 AUTO 模式下生效，见 ui.theme_follow）
         self.theme_watcher = SystemThemeWatcher(self).start()
@@ -271,6 +273,8 @@ class MainWindow(FluentWindow):
         """初始化窗口属性"""
         # 设置窗口标题（包含版本号）
         self.setWindowTitle(f"{config.APP_NAME} v{config.APP_VERSION}")
+        self._refresh_title_colors()
+        qconfig.themeChanged.connect(self._refresh_title_colors)
 
         # 窗口位置与大小：沿用上次记住的（还在某块屏幕上时），否则默认大小居中到主屏
         self.setMinimumSize(config.WINDOW_MIN_WIDTH, config.WINDOW_MIN_HEIGHT)
@@ -285,6 +289,14 @@ class MainWindow(FluentWindow):
 
         # 设置窗口背景为透明，让Fluent Design的背景效果生效
         self.setStyleSheet("MainWindow{background: transparent}")
+
+    def _refresh_title_colors(self, *_args):
+        from ui.theme_tokens import TERTIARY, pick
+        label = self.titleBar.titleLabel
+        label.setTextFormat(Qt.RichText)
+        label.setText(f'{html.escape(config.APP_NAME)} '
+                      f'<span style="color:{pick(TERTIARY)}">v{html.escape(config.APP_VERSION)}</span>')
+        label.adjustSize()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -331,15 +343,17 @@ class MainWindow(FluentWindow):
             self.db, self.monitor_manager, self.services, parent=self,
             hotkey_text=hotkey_text)
         # 分析页（历史数据 + 导出合并）：只读库，打点编辑与导出登记经 manager
-        self.analysis_page = AnalysisPage(
-            self.db, self.monitor_manager, self.services, parent=self)
+        self._analysis_content = None
+        self._analysis_slot = QWidget(self)
+        self._analysis_slot.setObjectName('analysisPage')
         # 设置页数据管理卡片需要 db（查询占用/清理压缩）与 manager（维护锁、
         # 是否有运行中任务决定清理按钮是否可用）；快捷键卡片需要快捷键服务
-        self.setting_page = SettingPage(
-            self.db, self.monitor_manager, self.services, parent=self,
-            hotkey=self.hotkey, diagnostics_provider=self.diagnostics_provider)
+        self._setting_content = None
+        self._setting_slot = QWidget(self)
+        self._setting_slot.setObjectName('settingPage')
         # 原"关于"页已并入设置页；about_group 指向该分组（更新流程的入口都在它上面）
-        self.about_group = self.setting_page.about_group
+        self.about_group = AboutUpdateGroup(self.services, self)
+        self.about_group.hide()
 
         # 默认采集间隔联动：设置页改动后实时同步到新建表单的默认值
         # （不影响已创建任务，只影响下一次新建）
@@ -359,18 +373,47 @@ class MainWindow(FluentWindow):
         self.addSubInterface(
             self.monitor_page, FluentIcon.SPEED_HIGH, '监控', NavigationItemPosition.TOP)
         self.addSubInterface(
-            self.analysis_page, FluentIcon.MARKET, '分析', NavigationItemPosition.TOP)
+            self._analysis_slot, FluentIcon.MARKET, '分析', NavigationItemPosition.TOP)
         self.addSubInterface(
-            self.setting_page, FluentIcon.SETTING, '设置', NavigationItemPosition.BOTTOM)
+            self._setting_slot, FluentIcon.SETTING, '设置', NavigationItemPosition.BOTTOM)
 
         # 默认显示监控页面（启动时 _apply_startup_state 再按记忆调整）
         self.switchTo(self.monitor_page)
         self.stackedWidget.currentChanged.connect(self._schedule_state_save)
-        self.analysis_page.vm.selection_changed.connect(self._schedule_state_save)
-        self.analysis_page.vm.view_mode_changed.connect(self._schedule_state_save)
-        self.analysis_page.vm.time_mode_changed.connect(self._schedule_state_save)
-        self.analysis_page.toolbar.range_changed.connect(self._schedule_state_save)
-        self.analysis_page.summary_table.columns_changed.connect(self._schedule_state_save)
+
+    @property
+    def analysis_page(self):
+        if self._analysis_content is None:
+            from ui.pages.analysis_page import AnalysisPage
+            page = AnalysisPage(self.db, self.monitor_manager, self.services, parent=self)
+            self._analysis_content = page
+            self.stackedWidget.removeWidget(self._analysis_slot)
+            self.stackedWidget.addWidget(page)
+            page.restore_memory(self._saved_memory.analysis)
+            for signal in (page.vm.selection_changed, page.vm.view_mode_changed,
+                           page.vm.time_mode_changed, page.toolbar.range_changed,
+                           page.summary_table.columns_changed):
+                signal.connect(self._schedule_state_save)
+        return self._analysis_content
+
+    @property
+    def setting_page(self):
+        if self._setting_content is None:
+            from ui.pages.setting_page import SettingPage
+            page = SettingPage(self.db, self.monitor_manager, self.services, parent=self,
+                               hotkey=self.hotkey, diagnostics_provider=self.diagnostics_provider,
+                               about_group=self.about_group)
+            self._setting_content = page
+            self.stackedWidget.removeWidget(self._setting_slot)
+            self.stackedWidget.addWidget(page)
+        return self._setting_content
+
+    def switchTo(self, interface):
+        if interface is getattr(self, '_analysis_slot', None):
+            interface = self.analysis_page
+        elif interface is getattr(self, '_setting_slot', None):
+            interface = self.setting_page
+        super().switchTo(interface)
 
     # ========== 通知渠道 ==========
 
@@ -388,20 +431,22 @@ class MainWindow(FluentWindow):
 
     def _page_key(self) -> str:
         current = self.stackedWidget.currentWidget()
-        if current is self.analysis_page:
+        if current is self._analysis_content or current is self._analysis_slot:
             return PAGE_ANALYSIS
-        if current is self.setting_page:
+        if current is self._setting_content or current is self._setting_slot:
             return PAGE_SETTING
         return PAGE_MONITOR
 
     def _page_for_key(self, key: str):
-        return {PAGE_ANALYSIS: self.analysis_page,
-                PAGE_SETTING: self.setting_page}.get(key, self.monitor_page)
+        if key == PAGE_ANALYSIS:
+            return self.analysis_page
+        if key == PAGE_SETTING:
+            return self.setting_page
+        return self.monitor_page
 
     def _apply_startup_state(self) -> None:
         """按记忆恢复启动页与分析页状态；有运行中任务时启动页固定为监控页。"""
         memory = self._saved_memory
-        self.analysis_page.restore_memory(memory.analysis)
         if self.monitor_manager.has_running_tasks():
             self.show_monitor_page()
         else:
@@ -423,7 +468,8 @@ class MainWindow(FluentWindow):
         return WindowMemory(
             geometry=(rect.x(), rect.y(), rect.width(), rect.height()),
             maximized=self.isMaximized(), page=self._page_key(),
-            analysis=self.analysis_page.memory_snapshot())
+            analysis=(self._analysis_content.memory_snapshot() if self._analysis_content is not None
+                      else self._saved_memory.analysis))
 
     def _schedule_state_save(self, *_args) -> None:
         if self._state_tracking:
@@ -474,7 +520,7 @@ class MainWindow(FluentWindow):
         self.storage_notices = StorageNotices(
             guard, self.services.notifier, self, db_path=getattr(guard, 'db_path', None),
             set_pause_marks=self.monitor_page.presenter.set_space_paused,
-            show_integrity=self.setting_page.show_integrity_warning, parent=self)
+            show_integrity=lambda text: self.setting_page.show_integrity_warning(text), parent=self)
 
     def _stop_storage_guard(self) -> None:
         if self.storage_guard is None:
@@ -494,6 +540,16 @@ class MainWindow(FluentWindow):
         self.tray.show_requested.connect(self._show_from_tray)
         self.tray.quit_requested.connect(self._quit_from_tray)
         self.tray.marker_requested.connect(self._on_tray_marker_requested)
+        self._tray_summary_timer = QTimer(self)
+        self._tray_summary_timer.setInterval(1000)
+        self._tray_summary_timer.timeout.connect(self._refresh_tray_summary)
+        self._tray_summary_timer.start()
+
+    def _refresh_tray_summary(self):
+        if self.tray is not None and not self._shutdown_started:
+            board = self.monitor_page.board
+            self.tray.set_tooltip(f'{config.APP_NAME}\n{board.summary()}\n'
+                                  f'{board.rising_count()} 个任务持续上涨')
 
     def _init_hotkey(self) -> None:
         """全局打点快捷键：按下即为全部运行中的任务打点；改键/失效时同步监控页引导文案。"""
@@ -746,6 +802,8 @@ class MainWindow(FluentWindow):
         # 收尾期间不再切主题（窗口已隐藏，重刷样式表只会拖慢退出）
         self.theme_watcher.stop()
         try:
+            # 已完成线程仍可能有结果排在Qt队列里，先关闭重建入口再等待采集与后台作业。
+            self.monitor_page.presenter.shutdown_live_stats()
             self._run_shutdown()
             # 收尾完成才显式 accept；异常路径下 QCloseEvent 默认已是 accepted，
             # 且 finally 的 quit() 与入口的 os._exit() 兜底退出，不依赖这一行

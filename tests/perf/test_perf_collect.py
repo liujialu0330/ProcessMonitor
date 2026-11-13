@@ -80,8 +80,7 @@ def test_list_processes_cold_and_hot(perf, subprocess_env):
 
 
 # ---------------------------------------------------------------- 快照路径
-# 以下条目在 budgets.json 回填前只记录、不按预算比较（PerfSession.record），改为按
-# 2.0.0 规划的目标值断言：目标 × 机器系数。
+# 快照分项仅观察；整体目标经同一check入口比较并记录实际使用的上限。
 
 # 5 任务 1 秒周期的采集 CPU 目标（规划 §6）：单次快照 + 5 × 每任务从快照取值
 COLLECT_5_TASKS_TARGET_MS_PER_S = 15.0
@@ -103,7 +102,7 @@ print(json.dumps({"cold": cold, "count": n, "available": hub.available()}))
 def _record(perf, name, samples, unit, desc):
     value = statistics.median(samples)
     perf.session.record(name, value, unit, desc, samples)
-    print(f"\n[perf] {name}: 实测 {value:.1f} {unit}（{desc}；仅记录，未入预算）")
+    print(f"\n[perf] {name}: 实测 {value:.1f} {unit}（{desc}；仅观察，不作断言）")
     return value
 
 
@@ -137,11 +136,9 @@ def test_collect_snapshot_path(perf):
                           f'{COLLECT_CALLS} 次中位数）')
 
     per_second = snapshot_ms + TASKS * per_task_us / 1000
-    perf.session.record('collect_5_tasks_ms_per_s', per_second, 'ms',
-                        '5 任务 1 秒周期采集开销 = 单次快照 + 5 × 每任务取值')
-    limit = COLLECT_5_TASKS_TARGET_MS_PER_S * perf.session.factor
-    print(f"\n[perf] collect_5_tasks_ms_per_s: {per_second:.2f} ms/s（目标 {limit:.1f}）")
-    assert per_second <= limit
+    perf.check('collect_5_tasks_ms_per_s', per_second, 'ms/s',
+               '5 任务 1 秒周期采集开销 = 单次快照 + 5 × 每任务取值',
+               target=COLLECT_5_TASKS_TARGET_MS_PER_S)
 
 
 def test_list_processes_cold_snapshot(perf, subprocess_env):
@@ -150,9 +147,10 @@ def test_list_processes_cold_snapshot(perf, subprocess_env):
     if not runs[-1]['available']:
         pytest.skip("全系统快照不可用")
     assert all(r['count'] > 0 for r in runs)
-    value = _record(perf, 'list_processes_cold_snapshot', [r['cold'] for r in runs], 'ms',
-                    f"快照路径 list_processes 冷（新进程首次，含自检，{runs[-1]['count']} 个进程）")
-    assert value <= LIST_COLD_TARGET_MS * perf.session.factor
+    samples = [r['cold'] for r in runs]
+    perf.check('list_processes_cold_snapshot', statistics.median(samples), 'ms',
+               f"快照路径 list_processes 冷（新进程首次，含自检，{runs[-1]['count']} 个进程）",
+               samples=samples, target=LIST_COLD_TARGET_MS)
 
 
 def test_import_main_window_cold(perf, subprocess_env):

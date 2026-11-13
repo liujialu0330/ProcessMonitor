@@ -203,7 +203,7 @@ def test_member_view_uses_member_series_keys_without_requery(
     assert vm.last_snapshot.request.metric in (MEM, COUNT)
 
     # 成员视图里切指标：认序列键，也不查库
-    page.summary_table.table.cellClicked.emit(1, 0)
+    page.summary_table.table.setCurrentCell(1, 0)
     assert vm.current_metric == COUNT
     assert shown[-1].request.metric == f"{COUNT}@a.exe"
     assert page.trend_panel.focus_metric() == f"{COUNT}@a.exe"

@@ -211,6 +211,7 @@ def test_sparkline_ticks_for_baseline_and_user_markers(card):
 # ---------- 按钮与文案 ----------
 
 def test_action_buttons_text(card):
+    card.resize(1100, 300)
     assert [b.text() for b in (card.marker_button, card.analysis_button,
                                card.pause_button, card.stop_button)] == [
         "打点", "分析", "暂停", "停止"]
@@ -278,8 +279,8 @@ def test_six_columns_use_short_delta_text_with_full_tooltip(qapp):
 
         widget.resize(600, 300)
         assert widget.value_columns() < 6
-        assert label.text() == "比开始时（12 分钟前）+85.23 MB"
-        assert "\n" not in label.toolTip()
+        assert label.text() == "较开始 +85.23 MB"
+        assert label.toolTip().startswith("比开始时（12 分钟前）+85.23 MB\n")
 
         widget.resize(1300, 300)
         widget.set_baseline(T0 + timedelta(minutes=1))

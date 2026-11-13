@@ -62,7 +62,7 @@ def test_activate_row_emits_interval_bounds(table, db):
     table.interval_activated.connect(lambda s, e: got.append((s, e)))
     table.activate_row(2)
     assert got == [(BASE + timedelta(seconds=40), BASE + timedelta(seconds=70))]
-    table.table.cellClicked.emit(0, 3)
+    table.table.setCurrentCell(0, 3)
     assert got[-1][0] == BASE
     table.activate_row(99)                          # 越界忽略
     assert len(got) == 2

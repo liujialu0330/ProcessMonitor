@@ -112,14 +112,15 @@ def test_manager_stop_while_waiting_ends_with_crashed_reason(manager):
     assert stopped == [StopReason.CRASHED]
 
 
-def test_pause_is_rejected_for_waiting_task(manager):
+def test_pause_is_remembered_for_waiting_task(manager):
     finder = LiveFinder()
     _arm(manager, finder)
     tid = _create(manager)
     manager.start_task(tid)
     assert poll_until(lambda: manager.get_task_info(tid).waiting_restart, timeout=10)
-    assert manager.pause_task(tid) is False
+    assert manager.pause_task(tid) is True
     assert manager.get_task_info(tid).waiting_restart
+    assert manager.get_task_info(tid).is_paused
 
 
 def test_set_restart_policy_overrides_for_running_task(manager):

@@ -12,7 +12,8 @@ float/int 直接 TypeError，杜绝"把秒级 epoch 当毫秒比较、过滤静�
 - 汇总路径：读分钟汇总 rollup_1m 与写时空洞 series_gaps（规则见 data.repos.rollup），
   范围两端不完整的汇总行（以及分桶时跨桶边界的汇总行）回到 samples 取原始样本。
 范围内样本数（按 rollup_1m 的 SUM(count) 估算，一次主键范围查询）超过 RAW_PATH_MAX_ROWS
-时走汇总路径。依赖空洞口径的查询（gaps、buckets）只有在空洞口径与写入时相同
+时走汇总路径；聚合独立使用较小的 AGGREGATE_RAW_PATH_MAX_ROWS 阈值。
+依赖空洞口径的查询（gaps、buckets）只有在空洞口径与写入时相同
 （gap_factor 为默认值、interval_seconds 等于任务的采集周期）时才走汇总路径。
 构造参数 path 可强制某条路径（测试比对两条路径用；强制汇总时口径不符仍走原始）。
 
@@ -42,6 +43,8 @@ from data.repos.rollup import DEFAULT_GAP_FACTOR, MINUTE_MS  # noqa: F401  DEFAU
 
 # 范围内样本数超过它时走汇总路径（原始路径扫 20 万行约几十毫秒，再多就该读汇总）
 RAW_PATH_MAX_ROWS = 200_000
+# 聚合只合并各阶和，几千行之后分钟汇总即可摊薄边界补读成本；分桶仍保留独立的大范围阈值。
+AGGREGATE_RAW_PATH_MAX_ROWS = 8192
 
 PATH_RAW = 'raw'
 PATH_ROLLUP = 'rollup'
@@ -262,15 +265,16 @@ class AnalyticsRepo:
     # ========== 路径选择 ==========
 
     def _use_rollup(self, conn: sqlite3.Connection, sids: Sequence[int],
-                    lo: int, hi: int) -> bool:
-        """范围内样本数（按汇总行估算）是否超过 RAW_PATH_MAX_ROWS；path 参数优先"""
+                    lo: int, hi: int, *, raw_limit: Optional[int] = None) -> bool:
+        """范围内样本数（按汇总行估算）是否超过对应阈值；path 参数优先"""
         if self._path is not None:
             return self._path == PATH_ROLLUP
         row = conn.execute(f'''
             SELECT SUM(count) FROM rollup_1m
             WHERE series_id IN ({_sid_list(sids)}) AND bucket_ms > ? AND bucket_ms <= ?
         ''', (lo - MINUTE_MS, hi)).fetchone()
-        return (row[0] or 0) > RAW_PATH_MAX_ROWS
+        limit = RAW_PATH_MAX_ROWS if raw_limit is None else raw_limit
+        return (row[0] or 0) > limit
 
     def _gap_rule_matches(self, conn: sqlite3.Connection, task_id: str,
                           interval_seconds: Optional[float], gap_factor: float) -> bool:
@@ -334,7 +338,8 @@ class AnalyticsRepo:
                 'SELECT ts_ms, value FROM samples WHERE series_id = ? '
                 'AND ts_ms BETWEEN ? AND ? ORDER BY ts_ms DESC LIMIT 1', rng).fetchone()
             origin = first_row['ts_ms']
-            if self._use_rollup(conn, [sid], lo, hi):
+            if self._use_rollup(conn, [sid], lo, hi,
+                                raw_limit=AGGREGATE_RAW_PATH_MAX_ROWS):
                 sums = self._rollup_sums(conn, sid, lo, hi, origin)
             else:
                 sums = self._raw_sums(conn, sid, [(lo, hi)], origin)

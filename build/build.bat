@@ -203,11 +203,11 @@ if not exist "%SRC_INSTALLER%" (
     exit /b 1
 )
 for %%I in ("%SRC_INSTALLER%") do set "SETUP_BYTES=%%~zI"
-set /a SETUP_MB=!SETUP_BYTES! / 1048576
+set /a SETUP_MB=!SETUP_BYTES! / 1000000
 echo %GREEN%√ 安装包: %SRC_INSTALLER%（!SETUP_MB! MB）%NC%
-:: 体积门槛（安装包 36 MB、onedir 105 MB）只提示不拦截：包体裁剪与体积门禁是另一项工作
-if !SETUP_MB! gtr 36 echo %YELLOW%提示: 安装包超过规划门槛 36 MB%NC%
-if %sizeMB% gtr 105 echo %YELLOW%提示: onedir 超过规划门槛 105 MB%NC%
+:: 按用户确认的十进制 MB 目标校验完整字节数，超限中止交付。
+python build\dist_stats.py --check "dist\进程监控助手" "%SRC_INSTALLER%"
+if !errorlevel! neq 0 exit /b 1
 echo.
 
 echo ========================================

@@ -182,6 +182,9 @@ class HistoryViewModel(QObject):
     error = pyqtSignal(str, str)
     baseline_changed = pyqtSignal(bool)
     range_reset = pyqtSignal(str)
+    delete_busy_changed = pyqtSignal(bool)
+    delete_succeeded = pyqtSignal(str)
+    delete_failed = pyqtSignal(str)
 
     def __init__(self, db, manager, services, *,
                  worker_runner: Optional[HistoryRunner] = None,
@@ -219,6 +222,8 @@ class HistoryViewModel(QObject):
         # 自动切过去，而不是一直停在启动时的旧任务上
         self.selection_is_auto: bool = False
         self.is_busy: bool = False
+        self._delete_worker = None
+        self._delete_task_id: Optional[str] = None
         # 最近一次显示出来的快照；空状态下为 None
         self.last_snapshot: Optional[HistorySnapshot] = None
         # 当前任务是否有基线打点（最近一次查询结果）
@@ -271,15 +276,24 @@ class HistoryViewModel(QObject):
 
     @property
     def can_delete(self) -> bool:
-        """当前任务可否删除：须已选中且不在运行（运行中删除会与写入竞争）"""
-        return bool(self.current_task_id) and not self._current_is_running()
+        """删除只锁目标任务；维护、导出、健康作业及当前删除期间不可重复发起。"""
+        return bool(self.current_task_id) and not self.delete_hint
 
     @property
     def delete_hint(self) -> str:
-        """删除不可用时给用户的原因（选中了运行中任务）；其余情况为空串"""
+        """删除不可用时给用户的原因。"""
+        if self.delete_pending:
+            return '正在删除任务数据，请稍候'
         if self.current_task_id and self._current_is_running():
             return DELETE_BLOCKED_RUNNING
+        query = getattr(self._manager, 'task_deletion_block_reason', None)
+        if self.current_task_id and query is not None:
+            return query(self.current_task_id)
         return ""
+
+    @property
+    def delete_pending(self) -> bool:
+        return self._delete_worker is not None
 
     @property
     def has_pending_query(self) -> bool:
@@ -397,20 +411,50 @@ class HistoryViewModel(QObject):
         if self.current_task_id:
             self._request_load()
 
-    def delete_current(self) -> bool:
-        """
-        经 manager 删除当前任务的全部数据，成功后重载列表。确认交互由页面负责。
-
-        Returns:
-            bool: 是否删除成功；未选中或任务运行中时直接返回 False（不调用 manager）
-        """
+    def delete_current(self, *, allow_reference: bool = False,
+                       expected_task_id: Optional[str] = None) -> bool:
+        """启动后台删除；返回是否已启动，最终结果经delete_succeeded/failed报告。"""
         task_id = self.current_task_id
+        if expected_task_id is not None and task_id != expected_task_id:
+            # 模态确认期间仍处理刷新事件，不能让变化后的选择替换已确认目标。
+            self.delete_failed.emit('所选任务已变化，请重新确认后重试')
+            return False
         if not task_id or not self.can_delete:
             return False
-        if not self._manager.delete_task_data(task_id):
+        self._delete_task_id = task_id
+        try:
+            self._delete_worker = self._manager.start_single_task_deletion(
+                task_id, self._services.threads, allow_reference=allow_reference,
+                on_result=self._on_delete_result, on_failed=self._on_delete_failed,
+                on_finished=self._on_delete_finished)
+        except Exception as exc:
+            self._delete_task_id = None
+            self._delete_worker = None
+            logger.error('启动任务删除失败: task_id=%s', task_id, exc_info=True)
+            self.delete_failed.emit(str(exc) or '未能启动后台删除')
             return False
-        self.reload_tasks()
+        self.delete_busy_changed.emit(True)
         return True
+
+    @pyqtSlot(object)
+    def _on_delete_result(self, count) -> None:
+        if not count:
+            self.delete_failed.emit('所选任务已变化，请刷新后重试')
+            return
+        task_id = self._delete_task_id
+        self.reload_tasks()
+        if task_id is not None:
+            self.delete_succeeded.emit(task_id)
+
+    @pyqtSlot(str)
+    def _on_delete_failed(self, message: str) -> None:
+        self.delete_failed.emit(message)
+
+    @pyqtSlot()
+    def _on_delete_finished(self) -> None:
+        self._delete_worker = None
+        self._delete_task_id = None
+        self.delete_busy_changed.emit(False)
 
     def on_tick(self) -> None:
         """

@@ -107,6 +107,10 @@ class Database:
         """普通连接上下文（commit/rollback/close 语义见 ConnectionFactory.connect）"""
         return self._factory.connect()
 
+    def write_timeout(self, timeout_ms: int):
+        """短事务可选择较短的锁等待；作用域仅影响调用线程。"""
+        return self._factory.write_timeout(timeout_ms)
+
     def _transaction(self):
         """显式事务上下文（BEGIN IMMEDIATE，见 ConnectionFactory.transaction）"""
         return self._factory.transaction()

@@ -22,6 +22,7 @@ import sys
 import time
 import xml.etree.ElementTree as ET
 from datetime import datetime
+from functools import partial
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from core.ipc import client as ipc
@@ -119,10 +120,65 @@ class UsageError(ClientError):
     exit_code = EXIT_USAGE
 
 
+class _TextOutput:
+    """默认重定向用 UTF-8；终端和注入流保留编码，无法表示的字符可逆转义。
+
+    不重配置调用方的流；冻结程序也不依赖 PYTHONIOENCODING。显式 out/err 的编码
+    决定实际字节，默认 stdout/stderr 的管道与文件输出则始终可按 UTF-8 读取。
+    """
+
+    def __init__(self, stream, *, redirect_utf8=False):
+        self._stream = stream
+        self._buffer = getattr(stream, 'buffer', None) if redirect_utf8 else None
+
+    def write(self, text: str) -> int:
+        size = len(text)
+        if self._buffer is not None:
+            self._stream.flush()
+            self._buffer.write(text.encode('utf-8', errors='backslashreplace'))
+        else:
+            encoding = getattr(self._stream, 'encoding', None)
+            if encoding:
+                text = text.encode(encoding, errors='backslashreplace').decode(encoding)
+            self._stream.write(text)
+        return size
+
+    def flush(self) -> None:
+        self._stream.flush()
+
+
+def _output_stream(stream, default):
+    if isinstance(stream, _TextOutput):
+        return stream
+    if stream is None:
+        return _TextOutput(default, redirect_utf8=not default.isatty())
+    return _TextOutput(stream)
+
+
+class _OutputParser(argparse.ArgumentParser):
+    """帮助与参数错误也使用同一输出约定，并遵循 main 注入的输出流。"""
+
+    def __init__(self, *args, out=None, err=None, **kwargs):
+        self._out = _output_stream(out, sys.stdout)
+        self._err = _output_stream(err, sys.stderr)
+        super().__init__(*args, **kwargs)
+
+    def add_subparsers(self, **kwargs):
+        kwargs.setdefault('parser_class', partial(type(self), out=self._out, err=self._err))
+        return super().add_subparsers(**kwargs)
+
+    def _print_message(self, message, file=None):
+        if message:
+            stream = (self._err if file is sys.stderr else self._out
+                      if file is None or file is sys.stdout else _output_stream(file, file))
+            stream.write(message)
+            stream.flush()
+
+
 # ---------- 参数 ----------
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog=PROG, description=DESCRIPTION, epilog=EPILOG)
+def build_parser(*, out=None, err=None) -> argparse.ArgumentParser:
+    parser = _OutputParser(prog=PROG, description=DESCRIPTION, epilog=EPILOG, out=out, err=err)
     parser.add_argument('--data-dir', help=HELP['data_dir'])
     parser.add_argument('--timeout', type=float, default=DEFAULT_TIMEOUT_S, help=HELP['timeout'])
     parser.add_argument('--json', action='store_true', help=HELP['json'])
@@ -136,7 +192,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser('status', help=CMD_HELP['status'])
 
     start = sub.add_parser('start', help=CMD_HELP['start'])
-    target = start.add_mutually_exclusive_group(required=True)
+    target = start.add_mutually_exclusive_group()
     target.add_argument('--pid', type=int, help=HELP['pid'])
     target.add_argument('--name', help=HELP['name'])
     target.add_argument('--group-name', metavar='进程名', help=HELP['group_name'])
@@ -150,6 +206,7 @@ def build_parser() -> argparse.ArgumentParser:
     marker = sub.add_parser('marker', help=CMD_HELP['marker'])
     marker.add_argument('--task', default='all', help=HELP['task_or_all'])
     marker.add_argument('--label', help=HELP['label'])
+    marker.add_argument('--group', help='仅给该测试方案组内的运行中任务共享打点')
 
     for name in ('pause', 'resume', 'stop'):
         p = sub.add_parser(name, help=CMD_HELP[name])
@@ -168,6 +225,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     verdict = sub.add_parser('verdict', help=CMD_HELP['verdict'])
     verdict.add_argument('--task', required=True, help=HELP['task'])
+    verdict.add_argument('--vs-reference', action='store_true', help='与同场景参考任务比较每轮增量')
 
     sub.add_parser('quit', help=CMD_HELP['quit'])
 
@@ -198,6 +256,8 @@ def _add_task_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--interval', type=float, help=HELP['interval'])
     parser.add_argument('--note', help=HELP['note'])
     parser.add_argument('--plan', help=HELP['plan'])
+    parser.add_argument('--scenario', help='测试场景（用于参考基线与任务筛选）')
+    parser.add_argument('--build', help='被测版本（不填时取被测文件版本）')
 
 
 def _add_launch_options(parser: argparse.ArgumentParser) -> None:
@@ -247,8 +307,13 @@ def _read_plan(path: Optional[str]) -> Optional[Dict[str, Any]]:
     if not path:
         return None
     try:
-        with open(path, encoding='utf-8-sig') as f:
-            data = json.load(f)
+        # 同时限制旧自动化 JSON 与完整测试方案，避免异常大文件耗尽客户端内存。
+        max_bytes = 1024 * 1024
+        with open(path, 'rb') as f:
+            raw = f.read(max_bytes + 1)
+        if len(raw) > max_bytes:
+            raise ValueError('方案文件不能超过 1 MB')
+        data = json.loads(raw.decode('utf-8-sig'))
     except (OSError, ValueError) as exc:
         raise UsageError(MSG_PLAN_READ.format(path=path, detail=exc)) from None
     if not isinstance(data, dict):
@@ -276,6 +341,10 @@ def _start_args(args, *, pid: Optional[int] = None, name: Optional[str] = None,
         payload['interval'] = args.interval
     if args.note is not None:
         payload['note'] = args.note
+    for key in ('scenario', 'build'):
+        value = getattr(args, key, None)
+        if value is not None:
+            payload[key] = value
     if plan:
         payload['plan'] = plan
     if getattr(args, 'wait', False) and launch is None:
@@ -302,7 +371,7 @@ def default_session_factory(args, err=None):
     launch = None if args.no_launch else ipc.launch_command(
         os.path.abspath(args.data_dir) if args.data_dir else None,
         idle_exit_s=getattr(args, 'idle_exit', DEFAULT_IDLE_EXIT_S))
-    stream = err or sys.stderr
+    stream = _output_stream(err, sys.stderr)
 
     def on_waiting(message: str) -> None:
         print(MSG_WAITING.format(message=message), file=stream, flush=True)
@@ -422,8 +491,8 @@ class Cli:
     def __init__(self, args, session_factory: Callable, out=None, err=None):
         self.args = args
         self._factory = session_factory
-        self.out = out or sys.stdout
-        self.err = err or sys.stderr
+        self.out = _output_stream(out, sys.stdout)
+        self.err = _output_stream(err, sys.stderr)
         self.client = None
 
     def emit(self, text: str) -> None:
@@ -449,7 +518,8 @@ class Cli:
             timeout = self.args.timeout
         response = self.session().request(cmd, payload or {}, timeout=timeout)
         if self.args.json:
-            self.emit(json.dumps(response.raw, ensure_ascii=False))
+            # 机器可读流保持 ASCII 子集，冻结程序在 GBK 重定向下也可按 UTF-8 解析。
+            self.emit(json.dumps(response.raw, ensure_ascii=True))
         if not response.ok:
             raise ServerError(response)
         return response.result or {}
@@ -497,6 +567,12 @@ class Cli:
         return EXIT_OK
 
     def cmd_start(self) -> int:
+        raw_plan = _read_plan(self.args.plan)
+        if raw_plan is not None and 'targets' in raw_plan:
+            return self._start_template(raw_plan)
+        if not any((self.args.pid is not None, self.args.name, self.args.group_name,
+                    self.args.launch)):
+            raise UsageError('start 需要指定目标，或使用包含目标的 --plan 测试方案')
         launch = launch_payload(self.args)
         if launch is not None and self.args.wait:
             raise UsageError(MSG_LAUNCH_NO_WAIT)
@@ -508,14 +584,46 @@ class Cli:
         else:
             target_kind, name = ('tree' if self.args.tree else None), self.args.name
         payload = _start_args(self.args, pid=self.args.pid, name=name, launch=launch,
-                              plan=_read_plan(self.args.plan), target_kind=target_kind)
+                              plan=raw_plan, target_kind=target_kind)
         result = self.call('start', payload, timeout=None if self.args.wait else self.args.timeout)
         if not self.args.json:
             self.emit(result.get('task_id', ''))
         return EXIT_OK
 
+    def _start_template(self, data) -> int:
+        from core.plans import TestPlan
+        if any((self.args.pid is not None, self.args.name, self.args.group_name,
+                self.args.launch, self.args.tree, self.args.metrics, self.args.interval is not None,
+                self.args.note is not None, self.args.wait, self.args.wait_timeout is not None,
+                self.args.scenario is not None, self.args.build is not None,
+                self.args.launch_args is not None, self.args.launch_cwd is not None,
+                self.args.close_on_stop)):
+            raise UsageError('完整测试方案已包含目标和配置，请修改方案文件后运行')
+        try:
+            plan = TestPlan.from_dict(data)
+        except ValueError as exc:
+            raise UsageError(str(exc)) from None
+        result = self.call('start_plan', {'plan': plan.to_dict()},
+                           timeout=None if any(t.wait for t in plan.targets) else self.args.timeout)
+        for item in result.get('results') or []:
+            index = item.get('index')
+            if item.get('ok'):
+                if not self.args.json:
+                    self.emit(f"{index}. {(item.get('result') or {}).get('task_id', '')}")
+            else:
+                message = (item.get('error') or {}).get('message', '未知错误')
+                print(f'目标 {index} 未开始：{message}', file=self.err, flush=True)
+        group_id = result.get('group_id')
+        if group_id and not self.args.json:
+            self.emit(f'共享打点组：{group_id}（pmctl marker --group {group_id}）')
+        return EXIT_ERROR if result.get('failed') else EXIT_OK
+
     def cmd_marker(self) -> int:
         payload = {'task_id': self.args.task}
+        if self.args.group:
+            if self.args.task != 'all':
+                raise UsageError('--group 与 --task 不能同时使用')
+            payload['group_id'] = self.args.group
         if self.args.label:
             payload['label'] = self.args.label
         result = self.call('marker', payload)
@@ -558,10 +666,24 @@ class Cli:
         return EXIT_OK
 
     def cmd_verdict(self) -> int:
-        result = self.call('verdict', {'task_id': self.args.task}, timeout=None)
+        payload = {'task_id': self.args.task}
+        if self.args.vs_reference:
+            payload['vs_reference'] = True
+        result = self.call('verdict', payload, timeout=None)
         verdict = result.get('verdict')
         if not self.args.json:
             self._print_verdict(self.args.task, result)
+        if self.args.vs_reference:
+            comparison = result.get('reference', {})
+            status = comparison.get('status', 'incomparable')
+            if not self.args.json:
+                self.emit({'regression': '较参考发生回归', 'comparable': '未发现较参考回归',
+                           'incomparable': '与参考不可比'}.get(status, status))
+                if comparison.get('reason'):
+                    self.emit(comparison['reason'])
+            if verdict == 'target_exited':
+                return 30
+            return {'regression': 10, 'comparable': 0, 'incomparable': 20}.get(status, 20)
         return exit_code_for_verdict(verdict)
 
     def cmd_quit(self) -> int:
@@ -721,7 +843,8 @@ class Cli:
 
 def main(argv: Optional[Sequence[str]] = None, *, session_factory: Optional[Callable] = None,
          out=None, err=None) -> int:
-    parser = build_parser()
+    out, err = _output_stream(out, sys.stdout), _output_stream(err, sys.stderr)
+    parser = build_parser(out=out, err=err)
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:

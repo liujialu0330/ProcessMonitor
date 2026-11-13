@@ -80,6 +80,12 @@ class MonitorTask:
     # 被测进程退出后续接同一任务的策略（由 TaskRepo.save_plan 随方案同步；上限 0 表示不续接）
     resume_on_restart: bool = False
     restart_limit: int = 0
+    # 测试身份与参考关系使用 v5 预留列；星标存在 meta_json 中，不改变数据库结构。
+    scenario: str = ''
+    build: str = ''
+    is_reference: bool = False
+    starred: bool = False
+    group_id: Optional[str] = None
 
     def is_running(self) -> bool:
         """判断任务是否正在运行"""

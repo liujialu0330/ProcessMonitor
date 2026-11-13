@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Set
 from PyQt5.QtCore import QTimer
 from PyQt5.QtGui import QImage
 from PyQt5.QtWidgets import QSizePolicy, QStackedWidget, QVBoxLayout, QWidget
-from qfluentwidgets import CaptionLabel, FluentIcon, IndeterminateProgressBar
+from qfluentwidgets import CaptionLabel, FluentIcon, IndeterminateProgressBar, TogglePushButton
 
 from core.history_query import CUSTOM_RANGE_KEY, RANGE_KEYS, HistorySnapshot, TaskAnalysis
 from ui.formatting import (
@@ -42,6 +42,8 @@ from ui.viewmodels.analysis_vm import (
 from ui.viewmodels.history_auto_refresh import HistoryAutoRefresh
 from ui.viewmodels.history_vm import EMPTY_NO_TASKS, HistoryRunner, ordered_metrics
 from ui.widgets.analysis.compare_panel import ComparePanel
+from ui.widgets.analysis.reference_controls import ReferenceControls
+from ui.widgets.analysis.task_library import TaskLibraryPanel
 from ui.widgets.analysis.export_flow import AnalysisExportFlow
 from ui.widgets.analysis.interval_table import LowerViews
 from ui.widgets.analysis.marker_menu import MarkerEditFlow
@@ -82,7 +84,7 @@ class AnalysisPage(PageScaffold):
                  defer: Optional[Callable[[Callable[[], None]], None]] = None,
                  **vm_options):
         """worker_runner / defer / vm_options 透传给 AnalysisViewModel（测试注入同步执行器）。"""
-        super().__init__("分析", parent=parent, spacing=SECTION_SPACING)
+        super().__init__("分析", "查看趋势与每轮变化，对比测试结果并导出证据", parent=parent, spacing=SECTION_SPACING)
         self.setObjectName("analysisPage")
         self.db, self.manager, self.services = db, manager, services
         self.vm = AnalysisViewModel(
@@ -100,16 +102,36 @@ class AnalysisPage(PageScaffold):
         self.export_flow = AnalysisExportFlow(
             self.vm, services, self, self.render_report, parent=self)
         self._connect()
+        self._set_tab_order()
 
     # ========== 组装 ==========
 
     def _init_ui(self) -> None:
         self.task_selector = TaskSelector(placeholder="选择要分析的监控任务")
+        self.task_selector.set_grouped(True)
         self.toolbar = AnalysisToolbar()
         self.toolbar.set_task_selector(self.task_selector)
         self.member_selector = MemberSelector()
         self.toolbar.set_member_selector(self.member_selector)
         self.add_section(self.toolbar)
+        self.reference_controls = ReferenceControls(self.manager, self.services)
+        self.task_library = TaskLibraryPanel(self.manager, self.services)
+        self.add_section(self.reference_controls)
+        self.add_section(self.task_library)
+        # 编辑与批量管理按需展开，首屏优先显示当前任务的结论和区间数据。
+        self.reference_toggle = TogglePushButton(FluentIcon.TAG, '场景与参考', self)
+        self.reference_toggle.setToolTip('编辑测试场景、版本和参考基线')
+        self.reference_toggle.toggled.connect(self.reference_controls.setVisible)
+        self.add_header_widget(self.reference_toggle)
+        self.reference_controls.hide()
+        self.task_library.layout().removeWidget(self.task_library.toggle_button)
+        self.add_header_widget(self.task_library.toggle_button)
+        self.task_library.toggle_button.clicked.connect(self._sync_task_library_visibility)
+        self.task_library.hide()
+        self.analysis_hint = CaptionLabel('')
+        self.analysis_hint.setWordWrap(True)
+        self.analysis_hint.hide()
+        self.add_section(self.analysis_hint)
         self.export_status_label = CaptionLabel("")
         self.export_status_label.setVisible(False)
         self.add_section(self.export_status_label)
@@ -165,6 +187,12 @@ class AnalysisPage(PageScaffold):
         vm, bar, trend = self.vm, self.toolbar, self.trend_panel
         # 控件 → 视图模型
         self.task_selector.task_selected.connect(self._on_task_selected)
+        self.reference_controls.identity_changed.connect(self._refresh_task_identity)
+        self.reference_controls.compare_requested.connect(self._compare_reference)
+        self.task_library.task_selected.connect(self.select_task)
+        self.task_library.changed.connect(vm.reload_tasks)
+        vm.reference_ready.connect(self._on_reference_ready)
+
         bar.range_changed.connect(self._on_range_changed)
         bar.view_mode_changed.connect(vm.set_view_mode)
         bar.time_mode_changed.connect(vm.set_time_mode)
@@ -177,6 +205,8 @@ class AnalysisPage(PageScaffold):
         self.member_selector.member_selected.connect(vm.select_member)
         self.member_panel.member_selected.connect(vm.select_member)
         self.compare_panel.task_selected.connect(vm.set_compare_task)
+        self.compare_panel.tasks_selected.connect(vm.set_compare_tasks)
+        self.compare_panel.export_requested.connect(self._export_comparison)
         self.compare_panel.close_requested.connect(lambda: self._set_compare_open(False))
         trend.region_selected.connect(vm.set_custom_range)
         trend.context_menu_requested.connect(self.marker_flow.show_menu)
@@ -188,6 +218,11 @@ class AnalysisPage(PageScaffold):
         # 视图模型 → 控件
         vm.tasks_changed.connect(self._on_tasks_changed)
         vm.tasks_refreshed.connect(self._on_tasks_refreshed)
+        vm.delete_busy_changed.connect(lambda _busy: self._sync_delete_state())
+        vm.delete_succeeded.connect(lambda _task_id: self.services.notifier.success(
+            self, '删除成功', '该任务的历史数据已删除'))
+        vm.delete_failed.connect(lambda message: self.services.notifier.error(
+            self, '删除失败', message))
         vm.selection_changed.connect(self._on_selection_changed)
         vm.analysis_ready.connect(self._on_analysis)
         vm.members_changed.connect(self._on_members_changed)
@@ -204,12 +239,30 @@ class AnalysisPage(PageScaffold):
         vm.export_busy.connect(lambda busy: bar.set_export_enabled(not busy))
         vm.error.connect(lambda title, content: self.services.notifier.error(self, title, content))
 
+    def _set_tab_order(self):
+        controls = [self.reference_toggle, self.task_library.toggle_button,
+                    self.task_selector.search_edit, self.task_selector.combo,
+                    self.toolbar.compare_button, self.toolbar.export_button,
+                    self.toolbar.refresh_button, self.toolbar.more_button,
+                    self.toolbar.range_combo, self.toolbar.view_menu_button,
+                    self.reference_controls.scenario_edit, self.reference_controls.build_edit,
+                    self.reference_controls.save_button, self.reference_controls.reference_button,
+                    self.reference_controls.star_button, self.reference_controls.compare_button,
+                    self.summary_table.table,
+                    self.interval_table.table]
+        for first, second in zip(controls, controls[1:]):
+            QWidget.setTabOrder(first, second)
+
+    def _sync_task_library_visibility(self) -> None:
+        self.task_library.setVisible(not self.task_library.body.isHidden())
+
     def _apply_tier(self, tier: str) -> None:
         """档位变化：各控件自己决定怎么调整（页面不判断宽度）。"""
         self.toolbar.set_tier(tier)
         self.verdict_banner.set_tier(tier)
         self.summary_table.set_tier(tier)
         self.trend_panel.set_tier(tier)
+        self.interval_table.set_tier(tier)
 
     # ========== 公开接口 ==========
 
@@ -259,6 +312,33 @@ class AnalysisPage(PageScaffold):
                                  self.services.clock.now())
         return render_report_image(text, vm.last_analysis, origin=self._origin_epoch())
 
+    def refresh(self):
+        self.vm.refresh()
+
+    def export_report(self):
+        return self.export_flow.run('report')
+
+    def copy_report_image(self):
+        return self.export_flow.run('copy')
+
+    def focus_search(self):
+        search = getattr(self.task_selector, 'search_edit', None)
+        (search if search is not None else self.task_selector.combo).setFocus()
+
+    def select_range_index(self, index):
+        from ui.widgets.analysis.toolbar import RANGE_OPTIONS
+        if not 0 <= index < len(RANGE_OPTIONS):
+            return
+        key = RANGE_OPTIONS[index][0]
+        item = self.toolbar.range_segmented.items[key]
+        if item.isEnabled():
+            self.toolbar.set_range(key)
+            if key != CUSTOM_RANGE_KEY:
+                self.vm.set_range(key)
+
+    def _export_comparison(self, kind):
+        return self.export_flow.run_comparison(kind, self.compare_panel)
+
     # ========== 控件 → 视图模型 ==========
 
     def _on_task_selected(self, task_id: Optional[str], explicit: bool) -> None:
@@ -280,7 +360,8 @@ class AnalysisPage(PageScaffold):
     def _sync_compare_options(self) -> None:
         options = self._compare_options.rebuild(
             self.vm.compare_candidates(), self.vm.running_ids, self.services.clock.now())
-        self.compare_panel.set_options(options, keep_id=self.vm.compare_task_id)
+        self.compare_panel.set_options(options, keep_id=self.vm.compare_task_id,
+                                       keep_ids=self.vm.compare_task_ids)
 
     def _should_skip_refresh(self) -> bool:
         """定时刷新跳过：用户正在看图（悬停/拖动）、主窗口已最小化。"""
@@ -292,6 +373,7 @@ class AnalysisPage(PageScaffold):
     # ========== 视图模型 → 控件 ==========
 
     def _on_tasks_changed(self, tasks: list, running: Set[str], now) -> None:
+        self.task_library.set_tasks(tasks)
         options = self._task_options.rebuild(tasks, running, now)
         self.task_selector.set_options(options, keep_id=self.vm.current_task_id)
         self.task_selector.setEnabled(bool(options))
@@ -300,6 +382,7 @@ class AnalysisPage(PageScaffold):
         self._sync_delete_state()
 
     def _on_tasks_refreshed(self, tasks: list, running: Set[str], now) -> None:
+        self.task_library.refresh_tasks(tasks)
         latest = {task.task_id: task for task in tasks}
         changed = self._task_options.refresh_running(now, running, latest)
         options = self._task_options.options()
@@ -310,8 +393,19 @@ class AnalysisPage(PageScaffold):
     def _on_selection_changed(self, task_id: Optional[str], metric: Optional[str],
                               _explicit: bool) -> None:
         self.task_selector.select_by_id(task_id, silent=True)
+        self.reference_controls.set_task(self.vm.current_task)
+        reference = self.vm.last_reference
+        current = self.vm.current_task
+        keep_reference = (reference is not None and current is not None
+                          and reference.task_id == task_id
+                          and reference.scenario == current.scenario
+                          and self.vm.current_member is None)
+        # 换焦点指标复用同一份分析，不会再次发 analysis_ready；参考列也应复用。
+        self.summary_table.set_reference(reference if keep_reference else None)
         self.summary_table.select_metric(self.vm.series_key(metric))
         self.toolbar.set_members_visible(self.vm.is_group_task)
+        if self.compare_panel.isVisible():
+            self._sync_compare_options()
         self._sync_delete_state()
 
     def _on_members_changed(self, options: list) -> None:
@@ -347,6 +441,40 @@ class AnalysisPage(PageScaffold):
         self.trend_panel.set_relative_origin(self._origin_epoch())
         self.trend_panel.set_analysis(analysis, keep_view=analysis.auto_refresh,
                                       order=order, focus=focus)
+        self._update_analysis_hint(analysis)
+        vm.refresh_reference(vm.last_analysis)
+
+
+    def _refresh_task_identity(self, task_id):
+        self.vm.reload_tasks()
+        if self.vm.current_task_id == task_id:
+            self.reference_controls.set_task(self.vm.current_task)
+            self.vm.refresh_reference(self.vm.last_analysis)
+
+    def _compare_reference(self, task_id):
+        self._set_compare_open(True)
+        self.vm.set_compare_task(task_id)
+
+    def _on_reference_ready(self, comparison):
+        self.reference_controls.set_result(comparison)
+        self.summary_table.set_reference(comparison if self.vm.current_member is None else None)
+
+    def _update_analysis_hint(self, analysis):
+        snapshots = list(analysis.snapshots.values())
+        hints = []
+        if snapshots and all(s.baseline is None for s in snapshots):
+            hints.append('尚未设置基线：预热稳定后打一次点，或在趋势图上右键设为基线')
+        judged = [s for s in snapshots if s.judgement is not None]
+        if judged and all(str(s.judgement.verdict) == 'insufficient' for s in judged):
+            snapshot = judged[0]
+            stats = snapshot.stats or {}
+            count = stats.get('count', 0)
+            span = stats.get('span_seconds', 0)
+            required = max(600, 30 * snapshot.interval_seconds)
+            hints.append(f'趋势数据不足：已有 {count} / 30 个样本，'
+                         f'跨度 {span / 60:.1f} / {required / 60:.1f} 分钟')
+        self.analysis_hint.setText('；'.join(hints))
+        self.analysis_hint.setVisible(bool(hints))
 
     def _table_rows(self, snapshots: list, analysis: TaskAnalysis) -> list:
         """摘要表各行。进程组的上限占比写"—"（GDI/USER 的 10000 是单个进程的口径）：合计
@@ -417,6 +545,9 @@ class AnalysisPage(PageScaffold):
         self.content_stack.setCurrentWidget(self.body)
 
     def _on_empty_state(self, title: str, hint: str) -> None:
+        self.analysis_hint.hide()
+        self.reference_controls.set_task(self.vm.current_task)
+        self.summary_table.set_reference(None)
         self._analysis_at = None
         self.verdict_banner.clear()
         self.summary_table.clear()
@@ -485,10 +616,12 @@ class AnalysisPage(PageScaffold):
                 f"确定要删除任务「{self._delete_title(task)}」的全部历史数据吗？"
                 "此操作不可恢复。", "删除"):
             return
-        if self.vm.delete_current():
-            notifier.success(self, "删除成功", "该任务的历史数据已删除")
-        else:
-            notifier.error(self, "删除失败", "删除任务数据失败，请查看日志")
+        reference = bool(getattr(task, 'is_reference', False))
+        if reference and not self.services.dialogs.confirm(
+                self.window(), '删除场景参考',
+                f'该任务是场景「{task.scenario}」的参考。删除后，该场景将没有参考任务。', '删除参考'):
+            return
+        self.vm.delete_current(expected_task_id=task.task_id, allow_reference=reference)
 
     @staticmethod
     def _delete_title(task) -> str:

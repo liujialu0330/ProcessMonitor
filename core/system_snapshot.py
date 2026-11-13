@@ -3,7 +3,8 @@
 
 一次系统调用取回全部进程的线程数、句柄数、内存各项、IO 计数与 CPU 时间，代替
 psutil 逐进程、逐指标的调用（psutil 的 num_threads() 自己就会取一次全系统快照，
-单次约 16 ms）。只读，不需要特权，不打开任何进程句柄。
+单次约 16 ms）。常规采集只读，不需要特权，不逐进程打开句柄；首次自检时另核对
+两个系统 PID 的 psutil 创建时间口径，避免不同权限下的身份值不一致。
 
 结构体按类型（c_size_t / c_void_p / c_ulonglong / LARGE_INTEGER）用 ctypes 声明，
 由 ctypes 负责对齐；解析时再按 ctypes 给出的字段偏移生成 struct 格式串，用
@@ -33,6 +34,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, NamedTuple, Optional, Tuple
 
+import psutil
+
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROCESS_INFORMATION_CLASS = 5
@@ -55,9 +58,9 @@ EXPECTED_THREAD_INFO_SIZE = {8: 80, 4: 64}
 # FILETIME（1601 年起的 100 ns）→ epoch 秒，与 psutil 的 C 实现同一算式，结果逐位相同
 _FILETIME_EPOCH_OFFSET = 116444736000000000
 _TICKS_PER_SECOND = 10_000_000
-# psutil 对 PID 0（空闲进程）与 4（System）的 create_time() 返回 0.0，进程列表的
-# 现状口径也是 0.0；快照里这两个条目带的是开机时刻，按 psutil 口径改为 0.0
-_ZERO_CREATE_TIME_PIDS = frozenset({0, 4})
+# psutil 可读 GetProcessTimes 时返回实际创建时间，权限回退路径可能为 0；
+# 系统进程身份在本次开机内不变，只在自检成功时核对一次，不放进采集热路径。
+_SYSTEM_PIDS = (0, 4)
 
 
 def _pointer_size() -> int:
@@ -148,7 +151,7 @@ class ProcessSample(NamedTuple):
     parent_pid: int
     # ImageName；PID 0 为空串（显示名由调用方按 psutil 口径补，见 process_catalog）
     name: str
-    # epoch 秒，与 psutil.Process.create_time() 一致；PID 0/4 为 0.0
+    # epoch 秒；快照器会按本机 psutil 口径校正 PID 0/4，原始解析保留内核时间。
     create_time: float
     num_threads: int
     handle_count: int
@@ -322,7 +325,7 @@ def parse_buffer(buffer, length: int, layout: Layout,
     是指向其内部的绝对地址）。只读前 length 字节；越界或步长异常抛 _LayoutError。
     """
     if taken_at is None:
-        taken_at = TakenAt(time.monotonic(), time.time())
+        taken_at = TakenAt(time.perf_counter(), time.time())
     base = ctypes.addressof(buffer)
     view = memoryview(buffer).cast('B')
     if length > len(view):
@@ -361,8 +364,7 @@ def parse_buffer(buffer, length: int, layout: Layout,
                 'utf-16-le', 'replace')
 
         pid = pid or 0
-        create_time = (0.0 if pid in _ZERO_CREATE_TIME_PIDS
-                       else _filetime_to_epoch(create_ticks))
+        create_time = _filetime_to_epoch(create_ticks)
         processes[pid] = new_sample(ProcessSample, (
             pid, parent_pid or 0, name, create_time, num_threads, handle_count,
             session_id, base_priority, working_set, peak_working_set, private_bytes,
@@ -477,6 +479,7 @@ class NtProcessSnapshotter:
         self._disabled_reason: Optional[str] = None
         self._layout: Optional[Layout] = None
         self._buffer_size = INITIAL_BUFFER_SIZE
+        self._system_create_times: Dict[int, float] = {}
         # 自检通过后的诊断信息（结构大小、首条目步长等），供汇报与排查
         self.diagnostics: Dict[str, int] = {}
 
@@ -546,7 +549,19 @@ class NtProcessSnapshotter:
         except Exception as e:
             self._disable(f"自检异常：{e}", exc_info=True)
         else:
+            self._cache_system_create_times()
             logger.info("全系统进程快照自检通过：%s", self.diagnostics)
+
+    def _cache_system_create_times(self) -> None:
+        """只读一次公共 API，兼容系统进程可访问或权限回退时的不同时间口径。"""
+        for pid in _SYSTEM_PIDS:
+            try:
+                self._system_create_times[pid] = psutil.Process(pid).create_time()
+            except (psutil.Error, OSError):
+                # 连 psutil 的回退也不可用时没有可比较身份；保留 Nt 原始时间，
+                # 不因这个系统条目的访问权限禁用全系统快照或伪造一个零值。
+                logger.debug("无法核对系统进程创建时间，保留快照原值：pid=%s", pid,
+                             exc_info=True)
 
     def _check_with_idle_thread_locked(self) -> Dict[str, int]:
         """本进程线程数不足 2 个：临时起一个空闲线程，让快照里本进程有两个以上的线程
@@ -580,12 +595,17 @@ class NtProcessSnapshotter:
             raise SnapshotUnavailable(self._disabled_reason)
         with self._lock:
             buffer, length = self._fill_buffer_locked()
-            taken_at = TakenAt(time.monotonic(), time.time())
+            taken_at = TakenAt(time.perf_counter(), time.time())
             try:
-                return parse_buffer(buffer, length, self._layout, taken_at)
+                snapshot = parse_buffer(buffer, length, self._layout, taken_at)
             except _LayoutError as e:
                 self._disable(f"解析失败：{e}")
                 raise SnapshotUnavailable(self._disabled_reason) from e
+            for pid, created in self._system_create_times.items():
+                sample = snapshot.processes.get(pid)
+                if sample is not None:
+                    snapshot.processes[pid] = sample._replace(create_time=created)
+            return snapshot
 
     def _fill_buffer_locked(self):
         """调用系统接口填满缓冲区，返回 (缓冲区, 有效长度)。"""

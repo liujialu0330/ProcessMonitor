@@ -139,7 +139,7 @@ def test_loads_summary_small_multiples_and_intervals(loaded):
 def test_focus_switch_reuses_batch(loaded, runner):
     page, _task = loaded
     queries = len(runner.requests)
-    page.summary_table.table.cellClicked.emit(1, 0)
+    page.summary_table.table.setCurrentCell(1, 0)
     assert page.current_metric == HANDLES
     assert len(runner.requests) == queries            # 复用已取回的快照，不重查
     assert "句柄数" in page.interval_table.title_label.text()
@@ -277,7 +277,8 @@ def test_overlay_and_compare_legends_sit_outside_plot(loaded, db, manager):
     page.vm.reload_tasks()
     page.toolbar.compare_button.setChecked(True)
     page.compare_panel.task_selected.emit(old.task_id)
-    assert page.compare_panel.legend.names() == ["当前任务", "对比任务"]
+    assert len(page.compare_panel.legend.names()) == 2
+    assert "demo.exe" in page.compare_panel.legend.names()[0]
     assert not page.compare_panel.chart.legend.isVisible()
 
 
@@ -375,6 +376,8 @@ def test_delete_task_data(loaded, db, services):
     page, task = loaded
     services.dialogs.push('confirm', True)
     page.toolbar.delete_clicked.emit()
+    assert process_events_until(lambda: not page.vm.delete_pending
+                                and not services.threads.entries())
     assert services.notifier.last('success').title == "删除成功"
     assert db.get_task(task.task_id) is None
     assert page.content_stack.currentWidget() is page.empty_state_card
@@ -446,11 +449,12 @@ def test_compare_panel_overlays_two_tasks(loaded, db, manager):
     assert page.compare_panel.isVisible()
     page.compare_panel.task_selected.emit(old.task_id)
     assert page.vm.compare_task_id == old.task_id
-    assert page.compare_panel.chart.legend_names() == ["当前任务", "对比任务"]
+    assert len(page.compare_panel.chart.legend_names()) == 2
+    assert "demo.exe" in page.compare_panel.chart.legend_names()[0]
     assert page.compare_panel.primary_rounds.texts()
     assert page.compare_panel.other_rounds.texts()
 
-    page.summary_table.table.cellClicked.emit(1, 0)     # 切焦点：对比跟随
+    page.summary_table.table.setCurrentCell(1, 0)     # 切焦点：对比跟随
     assert "句柄数" in page.compare_panel.message_label.text()
 
     page.compare_panel.close_requested.emit()
@@ -690,12 +694,14 @@ def test_delete_confirm_texts_and_goes_through_manager(loaded, db, manager, serv
                                                        monkeypatch):
     page, task = loaded
     deleted = []
-    real = manager.delete_task_data
-    monkeypatch.setattr(manager, 'delete_task_data',
-                        lambda tid: deleted.append(tid) or real(tid))
+    real = manager.start_single_task_deletion
+    monkeypatch.setattr(manager, 'start_single_task_deletion',
+                        lambda tid, *args, **kw: deleted.append(tid) or real(tid, *args, **kw))
     services.dialogs.push('confirm', True)
 
     page.toolbar.delete_action.trigger()
+    assert process_events_until(lambda: not page.vm.delete_pending
+                                and not services.threads.entries())
 
     confirm = services.dialogs.last_call('confirm')
     assert confirm['parent'] is page.window()
@@ -708,17 +714,47 @@ def test_delete_confirm_texts_and_goes_through_manager(loaded, db, manager, serv
 def test_delete_cancelled_or_failed_keeps_task(loaded, db, manager, services, monkeypatch):
     page, task = loaded
     services.dialogs.push('confirm', False)
-    monkeypatch.setattr(manager, 'delete_task_data', lambda tid: pytest.fail("取消后不应删除"))
+    monkeypatch.setattr(manager, 'start_single_task_deletion',
+                        lambda *_a, **_kw: pytest.fail("取消后不应删除"))
     page.toolbar.delete_action.trigger()
     assert db.get_task(task.task_id) is not None
     assert services.notifier.notices == []
 
     services.dialogs.push('confirm', True)
-    monkeypatch.setattr(manager, 'delete_task_data', lambda tid: False)
+    def fail(*_a, **_kw):
+        raise ValueError('模拟启动删除失败')
+    monkeypatch.setattr(manager, 'start_single_task_deletion', fail)
     page.toolbar.delete_action.trigger()
     error, = services.notifier.messages('error')
     assert error.title == "删除失败" and error.effective_duration == -1
     assert db.get_task(task.task_id) is not None
+
+
+@pytest.mark.parametrize('reference', [False, True])
+def test_delete_confirmation_cannot_follow_a_changed_selection(
+        loaded, db, manager, services, monkeypatch, reference):
+    page, first = loaded
+    second = _seed(db, manager, name='another.exe', metrics=[MEM], samples=10,
+                   markers=(), baseline=None)
+    page.vm.reload_tasks()
+    page.select_task(first.task_id)
+    page.vm.current_task.is_reference = reference
+    calls = []
+
+    def confirm(*args, **kwargs):
+        calls.append(args)
+        if len(calls) == (2 if reference else 1):
+            page.select_task(second.task_id)
+        return True
+
+    monkeypatch.setattr(services.dialogs, 'confirm', confirm)
+    monkeypatch.setattr(manager, 'start_single_task_deletion',
+                        lambda *_a, **_kw: pytest.fail('选择变化后不得删除任何任务'))
+    page._on_delete_clicked()
+    assert len(calls) == (2 if reference else 1)
+    assert db.tasks.get(first.task_id) is not None
+    assert db.tasks.get(second.task_id) is not None
+    assert '变化' in services.notifier.messages('error')[-1].content
 
 
 def test_delete_disabled_for_running_task(make_page, db, manager, services):

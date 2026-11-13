@@ -235,7 +235,7 @@ def test_busy_started_during_confirm_refused_before_thread(setting, manager, not
     setting._on_cleanup_clicked()
 
     assert setting._cleanup_worker is None
-    assert setting.services.threads.entries() == []
+    assert not [e for e in setting.services.threads.entries() if e.name == '清理数据库']
     assert manager.is_maintenance_running() is False
     assert notifier.levels() == ["warning"]
     notice = notifier.last("warning")
@@ -389,7 +389,7 @@ def test_cleanup_worker_registered_and_released(setting, dialogs):
 
     setting._on_cleanup_clicked()
     worker = setting._cleanup_worker
-    entries = setting.services.threads.entries()
+    entries = [e for e in setting.services.threads.entries() if e.name == '清理数据库']
     assert [(e.name, e.thread, e.cancel, e.timeout_ms) for e in entries] == [
         ("清理数据库", worker, None, 5000)]
 
@@ -687,10 +687,10 @@ def test_update_downloader_registered_with_cancel(about, monkeypatch):
 
 # ---------- 分组与文案（常规 / 数据 / 关于与更新） ----------
 
-def test_three_groups_in_order(setting):
+def test_settings_groups_follow_workflow(setting):
     from qfluentwidgets import SettingCardGroup
     groups = [w for w in setting.scroll_widget.children() if isinstance(w, SettingCardGroup)]
-    assert [g.titleLabel.text() for g in groups] == ["常规", "通知", "数据", "导出", "关于与更新"]
+    assert [g.titleLabel.text() for g in groups] == ["外观", "监控默认值", "打点与快捷键", "通知", "数据", "导出", "关于与更新"]
     assert setting.about_group is groups[-1]
     general = [setting.theme_card, setting.default_interval_card,
                setting.close_to_tray_card, setting.hotkey_card]

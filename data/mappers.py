@@ -204,7 +204,21 @@ def row_to_task(row: sqlite3.Row) -> MonitorTask:
         stop_reason=(stop_reason_of(row['meta_json']) if _has(row, 'meta_json') else None),
         resume_on_restart=bool(row['resume_on_restart']) if _has(row, 'resume_on_restart') else False,
         restart_limit=(row['restart_limit'] or 0) if _has(row, 'restart_limit') else 0,
+        scenario=(row['scenario'] or '') if _has(row, 'scenario') else '',
+        build=(row['build'] or '') if _has(row, 'build') else '',
+        is_reference=bool(row['is_reference']) if _has(row, 'is_reference') else False,
+        starred=starred_of(row['meta_json']) if _has(row, 'meta_json') else False,
+        group_id=(row['group_id'] or None) if _has(row, 'group_id') else None,
     )
+
+
+def starred_of(meta_json: Optional[str]) -> bool:
+    """星标是任务库偏好；旧任务或损坏的附加信息视为未标星。"""
+    try:
+        meta = json.loads(meta_json) if meta_json else {}
+        return isinstance(meta, dict) and meta.get('starred') is True
+    except (ValueError, TypeError):
+        return False
 
 
 def row_to_point(row: sqlite3.Row) -> DataPoint:
