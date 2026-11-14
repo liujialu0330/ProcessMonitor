@@ -225,7 +225,8 @@ class AnalysisExportFlow(QObject):
         names = paths_from_image_choice(base + REPORT_IMAGE_SUFFIX)
         job = vm.report_job(image=image, image_path=names.image, csv_path=names.csv,
                             summary_path=names.summary)
-        analysis = vm.last_analysis
+        # 与 report_job / render_report 一样固定为合计口径；成员选择仅影响屏幕查看。
+        analysis = vm.export_analysis()
         log_path = self._log_path()
         clock = self._services.clock
 

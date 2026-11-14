@@ -4,8 +4,8 @@
 四个分组：
 - 常规：应用主题 · 默认采集间隔 · 关闭行为 · 监控期间阻止睡眠 · 打点快捷键
 - 数据：历史数据保留 · 压缩数据库（按保留策略决定是否同时清理过期任务）· 重建分钟汇总 · 数据目录
-  · 报告配色（导出的报告图片固定浅色 / 跟随主题）· 诊断信息（复制诊断信息到剪贴板 / 在后台导出 zip 诊断包）
-- 导出：文件命名模板（报告、明细 CSV、证据包的默认文件名，带实时预览）
+  · 诊断信息（复制诊断信息到剪贴板 / 在后台导出 zip 诊断包）
+- 导出：报告配色（固定浅色 / 跟随主题）· 文件命名模板（报告、明细 CSV、证据包的默认文件名，带实时预览）
 - 关于与更新：版本与项目主页 · 检查更新（原"关于"页并入，见 ui/pages/about_update）
 """
 import logging
@@ -403,7 +403,7 @@ class SettingPage(ScrollArea):
         self.notify_group.addSettingCard(self.notify_background_card)
 
     def _init_data_group(self):
-        """数据：历史数据保留 · 压缩数据库 · 重建汇总 · 数据目录 · 报告配色 · 诊断信息"""
+        """数据：历史数据保留 · 压缩数据库 · 重建汇总 · 数据目录 · 诊断信息"""
         self.data_group = SettingCardGroup("数据", self.scroll_widget)
         self._init_integrity_card()
         # 选项文案与 ConfigItem 校验器的可选值逐一对应：可选值只在应用配置里定义一份
@@ -460,12 +460,6 @@ class SettingPage(ScrollArea):
                                                 self.backup_combo)
         self.data_group.addSettingCard(self.backup_card)
 
-        # 报告配色：卡片只写配置，报告渲染时现读（ui/widgets/analysis/report_sheet）
-        self.report_color_card = ComboBoxSettingCard(
-            cfg.report_color_scheme, FIF.PALETTE, REPORT_COLOR_TITLE, REPORT_COLOR_CONTENT,
-            texts=list(REPORT_COLOR_TEXTS), parent=self.data_group)
-        self.data_group.addSettingCard(self.report_color_card)
-
         # 诊断信息：复制到剪贴板（同步，几十毫秒）/ 导出 zip 诊断包（后台线程）
         self.diagnostics_card = SettingCard(
             FIF.DEVELOPER_TOOLS, DIAGNOSTICS_TITLE, DIAGNOSTICS_CONTENT, parent=self.data_group)
@@ -483,7 +477,11 @@ class SettingPage(ScrollArea):
         """导出：文件命名模板（输入框 + 实时预览 + 恢复默认）。预览随输入实时更新，模板在输入
         完成（回车或失去焦点）时才写入配置，免得键入一半的 {pro 被存下来。"""
         self.export_group = SettingCardGroup("导出", self.scroll_widget)
-        self.data_group.cardLayout.removeWidget(self.report_color_card)
+        # ExpandLayout 的 addWidget() 维护独立控件列表，普通 removeWidget() 无法把
+        # 控件移出该列表。报告配色从一开始只属于“导出”，避免两个布局轮流摆放同一卡片。
+        self.report_color_card = ComboBoxSettingCard(
+            cfg.report_color_scheme, FIF.PALETTE, REPORT_COLOR_TITLE, REPORT_COLOR_CONTENT,
+            texts=list(REPORT_COLOR_TEXTS), parent=self.export_group)
         self.export_group.addSettingCard(self.report_color_card)
         self.export_dir_card = PushSettingCard('选择目录', FIF.FOLDER, '默认导出目录',
                                               cfg.get(cfg.default_export_dir) or '每次导出时选择',
@@ -737,6 +735,9 @@ class SettingPage(ScrollArea):
         self.backup_card.setVisible(bool(self._backup_paths))
         self.backup_card.button.setEnabled(bool(self._backup_paths) and self._backup_worker is None)
         self._backup_selected(self.backup_combo.currentIndex())
+        # ExpandLayout 只在子控件 resize 时重测高度；异步显示或隐藏备份卡片不会触发
+        # 该路径。主动重测，确保下方诊断卡片不会被数据分组裁掉。
+        self.data_group.adjustSize()
 
     def _backup_selected(self, index):
         if 0 <= index < len(self._backup_paths):

@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from core.history_query import CUSTOM_RANGE_KEY, DEFAULT_RANGE_KEY, TaskAnalysis
+from core.history_query import CUSTOM_RANGE_KEY, DEFAULT_RANGE_KEY, TaskAnalysis, run_history_query
 from core.monitor_manager import MonitorManager
 from data.models import DataPoint, MonitorTask
 from tests.doubles import FakeClock
@@ -169,7 +169,8 @@ def test_custom_range_queries_with_until_and_clears(qapp, db, manager, services)
 
     vm.set_range('1h')
     assert vm.custom_range is None and rec.custom[-1] == (None, None)
-    assert runner.requests[-1].range_key == '1h' and runner.requests[-1].until is None
+    assert runner.requests[-1].range_key == '1h'
+    assert runner.requests[-1].until == runner.requests[-1].anchor
     with pytest.raises(ValueError):
         vm.set_range(CUSTOM_RANGE_KEY)
 
@@ -293,6 +294,58 @@ def test_export_command_writes_files_and_unregisters(qapp, db, manager, services
     assert header[:2] == ["时间", "已运行(秒)"]
     assert os.path.exists(summary_path)
     assert task.task_id   # 任务仍在
+
+
+def test_report_job_uses_current_analysis_snapshot_not_stale_running_task_count(
+        qapp, db, manager, services):
+    task = seed(db, samples=120)
+    task.status, task.end_time = 'running', None
+    db.save_task(task)
+    manager.add_marker(task.task_id, "基线", BASE + timedelta(seconds=20), kind='baseline')
+    vm = make_vm(db, manager, services)
+    vm.reload_tasks()
+    vm.set_range('baseline')
+
+    # 当前任务列表仍是120次采样；分析完成后数据库增加新点，不重新加载分析快照。
+    db.save_data_points([
+        DataPoint(task.task_id, BASE + timedelta(seconds=120), 3000.0, MEM),
+        DataPoint(task.task_id, BASE + timedelta(seconds=120), 4000.0, HANDLES),
+    ])
+    job = vm.report_job(csv_path='ignored.csv')
+
+    assert job.data_since == BASE + timedelta(seconds=20)
+    assert job.data_until == BASE + timedelta(seconds=119)
+    assert "# 采集次数: 100" in job.metadata
+    assert "# 结束: 2026-07-16 16:01:59" in job.metadata
+
+
+def test_analysis_batch_retries_at_common_cutoff_when_running_data_changes(
+        qapp, db, manager, services):
+    task = seed(db, samples=20)
+
+    class RacingRunner:
+        def __init__(self):
+            self.requests = []
+
+        def __call__(self, request, on_done):
+            index = len(self.requests)
+            self.requests.append(request)
+            on_done(run_history_query(db, request))
+            if index == 0:
+                db.save_data_points([
+                    DataPoint(task.task_id, BASE + timedelta(seconds=20), 2000.0, MEM),
+                    DataPoint(task.task_id, BASE + timedelta(seconds=20), 3000.0, HANDLES),
+                ])
+
+    runner = RacingRunner()
+    vm = make_vm(db, manager, services, runner)
+    vm.reload_tasks()
+
+    # 初次两指标读到不同任务末尾时，视图模型以较早末尾重读整批；不会发布混合快照。
+    assert len(runner.requests) == 4
+    assert all(snapshot.request.until == BASE + timedelta(seconds=19)
+               for snapshot in vm.last_analysis.snapshots.values())
+    assert all(snapshot.total_count == 20 for snapshot in vm.last_analysis.snapshots.values())
 
 
 def test_export_refused_during_maintenance(qapp, db, manager, services, tmp_path):

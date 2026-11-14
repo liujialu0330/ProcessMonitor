@@ -12,6 +12,7 @@ import csv
 import logging
 import os
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, List, Optional, Tuple
 
 from core.report import (MEMBER_SUMMARY_TITLE, SUMMARY_HEADER, build_report_csv_header,
@@ -45,6 +46,10 @@ class ReportJob:
     metadata: Tuple[str, ...] = ()
     summary_rows: Tuple[tuple, ...] = ()
     gap_seconds: Optional[float] = None
+    # 分析页当前快照的原始数据边界（闭区间）。None 沿用全任务导出，供自动导出、
+    # 命令行等没有界面分析范围的调用方兼容使用。
+    data_since: Optional[datetime] = None
+    data_until: Optional[datetime] = None
 
     def paths(self) -> List[str]:
         return [p for p in (self.image_path, self.csv_path, self.summary_path) if p]
@@ -129,7 +134,9 @@ class ReportWorker(BackgroundTask):
         processed = rows = 0
         # 进程组的明细只导出合计序列：成员序列另以"成员汇总"段附在末尾（pid 任务没有成员序列）
         options = {} if task.target_kind == TARGET_PID else {'include_members': False}
-        batches = self.db.points.iter_batches(task.task_id, FETCH_BATCH_SIZE, **options)
+        batches = self.db.points.iter_batches(
+            task.task_id, FETCH_BATCH_SIZE, since=self.job.data_since,
+            until=self.job.data_until, **options)
         try:
             markers = self.db.markers.list(task.task_id)
 
@@ -176,7 +183,7 @@ class ReportWorker(BackgroundTask):
                             continue
                         points = self.db.points.fetch(PointQuery(
                             task.task_id, member_series_key(metric, member.member_key),
-                            limit=1))
+                            since=self.job.data_since, until=self.job.data_until, limit=1))
                         if points:
                             last_values[(member.member_key, metric)] = points[-1].value
         except Exception:

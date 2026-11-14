@@ -92,7 +92,8 @@ class HistoryRequest:
 
     - since：显示起点；anchor 为空、或范围为"自基线"时由 run_history_query 现算，
       此时这里的值不被使用；
-    - until：查询终点，预留——统计与分桶查询尚不支持终点，非空会被拒绝；
+    - until：查询终点。自定义范围由调用方指定；其余范围在锚点已知时取该锚点，
+      使同一份分析不会在读取过程中混入稍后才写入的样本；
     - anchor：调用方缓存的锚点（该任务最后一次采样时间）；为空表示由查询现取；
     - request_seq：LatestRequestGate 发的序号，结果回来时据此判断是否过期；
     - auto_refresh：是否为运行中任务的定时刷新（界面据此保留用户的缩放/平移）；
@@ -299,7 +300,9 @@ def build_request(task_id: str, metric: Optional[str], range_key: str, *,
         if since is None or until is None or until < since:
             raise ValueError("自定义范围需要 since <= until")
     else:
-        since, until = compute_since(range_key, anchor), None
+        # 以锚点封住右边界。运行中任务的各指标查询可能跨越一次新的采集写入；
+        # 若不固定终点，图表、摘要和随后导出的明细会落在不同时间快照里。
+        since, until = compute_since(range_key, anchor), anchor
     return HistoryRequest(
         task_id=task_id, metric=metric, range_key=range_key,
         since=since, until=until,
@@ -415,8 +418,6 @@ def run_history_query(db, request: HistoryRequest) -> HistorySnapshot:
     （编程错误）照常抛出，由调用方（后台线程外壳）记录并打包。
     """
     custom = request.range_key == CUSTOM_RANGE_KEY
-    if request.until is not None and not custom:
-        raise ValueError("只有自定义范围支持终点 until")
     try:
         task_info = db.tasks.get(request.task_id)
         if task_info is None:
@@ -426,7 +427,8 @@ def run_history_query(db, request: HistoryRequest) -> HistorySnapshot:
         if anchor is None:
             anchor = resolve_anchor(db, task_info)
             request = replace(request, anchor=anchor, since=(
-                request.since if custom else compute_since(request.range_key, anchor)))
+                request.since if custom else compute_since(request.range_key, anchor)),
+                until=request.until if request.until is not None else anchor)
 
         markers = db.markers.list(request.task_id)
         baseline_marker = find_baseline(markers)
@@ -446,7 +448,11 @@ def _query_data(db, request: HistoryRequest, task_info, anchor: Optional[datetim
     task_id, metric, since, until = (
         request.task_id, request.metric, request.since, request.until)
     interval = float(task_info.interval or 0.0)
-    segment_start, segment_number, segment_count = segment_of(markers, until)
+    # 默认范围仍按任务最新的启动段判断：重启打点可能刚写入、下一次采样尚未来得及落库，
+    # 此时应显示“本段暂无可统计数据”，不能因为导出/刷新冻结在上一个样本而误把旧进程
+    # 的数据当作新段。刷选的自定义范围才以右端点决定所在启动段。
+    segment_start, segment_number, segment_count = segment_of(
+        markers, until if request.range_key == CUSTOM_RANGE_KEY else None)
     baseline_segment = 1
     if baseline_marker is not None:
         at = _bound(baseline_marker.timestamp)
@@ -464,9 +470,8 @@ def _query_data(db, request: HistoryRequest, task_info, anchor: Optional[datetim
         return HistorySnapshot(points=points, baseline=baseline, **base)
 
     if not metric:
-        buckets = db.analytics.legacy_buckets(task_id, None, request.max_buckets, since=since)
-        if until is not None:
-            buckets = [p for p in buckets if p.timestamp <= until]
+        buckets = db.analytics.legacy_buckets(
+            task_id, None, request.max_buckets, since=since, until=until)
         baseline = BaselineInfo(baseline_marker, None, 0) if baseline_marker else None
         return HistorySnapshot(points=points, buckets=buckets, total_count=len(points),
                                baseline=baseline, stats_since=since, **base)
@@ -475,8 +480,9 @@ def _query_data(db, request: HistoryRequest, task_info, anchor: Optional[datetim
     if request.baseline_only and baseline_marker is not None:
         stats_since = (_bound(baseline_marker.timestamp) if since is None
                        else max(since, _bound(baseline_marker.timestamp)))
-        # 基线落在自定义范围之后：这段数据没有"基线之后"，统计退回整个显示范围
-        if until is not None and stats_since > until:
+        # 基线落在自定义范围之后：这段数据没有"基线之后"，统计退回整个显示范围。
+        # 其他范围的 until 只是冻结本次快照，不能把“基线在全部数据之后”误算成整段数据。
+        if request.range_key == CUSTOM_RANGE_KEY and until is not None and stats_since > until:
             stats_since = since
     # 只统计最后一次启动之后的数据：更早的样本属于另一个进程
     if segment_start is not None and (stats_since is None or segment_start > stats_since):
@@ -512,7 +518,7 @@ def _query_data(db, request: HistoryRequest, task_info, anchor: Optional[datetim
     break_instants = tuple(m.timestamp for m in markers if m.kind in BREAK_MARKER_KINDS)
     gaps = merge_gaps(gaps, db.analytics.break_pairs(
         task_id, break_instants, since=since, until=until, metric=metric))
-    buckets = _chart_points(db, request, total_count)
+    buckets = _chart_points(db, request)
 
     rate_series: List[DataPoint] = []
     rate_stats = peak_rises = None
@@ -554,17 +560,15 @@ def _query_data(db, request: HistoryRequest, task_info, anchor: Optional[datetim
         band=band, intervals=intervals, **base)
 
 
-def _chart_points(db, request: HistoryRequest, total_count: int) -> List[DataPoint]:
-    """图表用的降采样点（真实数据点）。有终点（自定义范围）时：范围内点数不多就直接取
-    原始点，否则按起点分桶后裁掉终点之后的部分（分桶查询没有终点条件）。"""
+def _chart_points(db, request: HistoryRequest) -> List[DataPoint]:
+    """图表用的降采样点（真实数据点）。
+
+    ``legacy_buckets`` 也接收闭区间终点，因此运行中任务的冻结快照与自定义范围都不会在
+    分桶时吸收稍后写入的样本。"""
     task_id, metric, since, until = (
         request.task_id, request.metric, request.since, request.until)
-    if until is not None and total_count <= 2 * request.max_buckets:
-        return db.points.fetch(PointQuery(task_id, metric, since=since, until=until))
-    buckets = db.analytics.legacy_buckets(task_id, metric, request.max_buckets, since=since)
-    if until is not None:
-        buckets = [p for p in buckets if p.timestamp <= until]
-    return buckets
+    return db.analytics.legacy_buckets(
+        task_id, metric, request.max_buckets, since=since, until=until)
 
 
 def _intervals(db, task_id: str, metric: str, markers: List[Marker],
