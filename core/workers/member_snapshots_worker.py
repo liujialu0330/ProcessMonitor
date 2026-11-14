@@ -31,12 +31,14 @@ __all__ = ['MemberBundle', 'MemberRequest', 'MemberSnapshotsWorker', 'load_membe
 @dataclass(frozen=True)
 class MemberRequest:
     """一次成员曲线加载：任务、要读的指标（合计里有哪些指标）与同一查询范围。
-    range_key / since / until / table_limit / max_buckets 与合计查询取同样的值，口径一致。"""
+    range_key / since / until / anchor / table_limit / max_buckets 与合计查询取同样的值，
+    口径一致。"""
     task_id: str
     metrics: Tuple[str, ...]
     range_key: str
     since: Optional[datetime] = None
     until: Optional[datetime] = None
+    anchor: Optional[datetime] = None
     table_limit: Optional[int] = None
     max_buckets: Optional[int] = None
     request_seq: int = 0
@@ -48,6 +50,8 @@ class MemberRequest:
             options['since'] = self.since
         if self.until is not None:
             options['until'] = self.until
+        if self.anchor is not None:
+            options['anchor'] = self.anchor
         if self.table_limit is not None:
             options['table_limit'] = self.table_limit
         if self.max_buckets is not None:

@@ -22,6 +22,11 @@ if PROJECT_ROOT not in sys.path:
 # 无窗口环境跑 PyQt5：涉及 QThread/QObject 的用例需要一个 QApplication 实例存在，
 # offscreen 平台不弹出任何窗口；若外部已设置 QT_QPA_PLATFORM 则尊重外部设置
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
+# 本机 PyQt5 安装不随 Qt 带字体目录时，offscreen 后端会回退到不存在的包内路径，
+# 字符度量随之不稳定，响应式列宽断言会在同一 Windows 主机上时绿时红。CI 已显式设置
+# 此变量；本地测试也在 QApplication 创建前对齐到系统字体目录。
+if os.name == 'nt' and os.path.isdir(r'C:\Windows\Fonts'):
+    os.environ.setdefault('QT_QPA_FONTDIR', r'C:\Windows\Fonts')
 
 # 与正式入口一致：必须早于图表依赖，避免测试进程使用另一套数学库线程默认值。
 from utils.runtime_env import configure_math_threads  # noqa: E402

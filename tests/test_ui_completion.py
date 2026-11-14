@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 from PyQt5.QtCore import QObject, Qt, pyqtSignal
 from PyQt5.QtTest import QTest
+from PyQt5 import sip
 
 from app_config import cfg, update_values
 from core.monitor_manager import MonitorManager
@@ -87,6 +88,54 @@ def test_list_row_is_compact_and_actions_target_same_card(qapp):
     finally:
         row.deleteLater()
         card.deleteLater()
+
+
+def test_list_row_menu_stays_alive_until_closed_and_triggers_pause(qapp):
+    """RoundMenu.exec()非阻塞：行控件必须持有菜单，直到用户选中或关闭它。"""
+    card = TaskCard('t', 'demo.exe', 1, ['num_handles'])
+    row = TaskListRow(card)
+    pauses = []
+    card.pause_requested.connect(pauses.append)
+    try:
+        menu = row._menu()
+        qapp.processEvents()
+        assert row._active_menu is menu and not sip.isdeleted(menu)
+        pause = menu.menuActions()[0]
+        QTest.mouseClick(menu.view.viewport(), Qt.LeftButton,
+                         pos=menu.view.visualItemRect(pause.property('item')).center())
+        qapp.processEvents()
+        assert pauses == ['t'] and row._active_menu is None
+    finally:
+        if row._active_menu is not None:
+            row._active_menu.close()
+        row.deleteLater()
+        card.deleteLater()
+
+
+def test_plan_menu_stays_alive_until_closed_and_runs_action(qapp, db, tmp_path, monkeypatch):
+    """方案菜单不能在show_menu返回时被deleteLater；点击后仍应调用对应操作。"""
+    services = make_services()
+    form = NewTaskForm(services.process_query, services.preferences)
+    signals = _WaitSignals()
+    presenter = SimpleNamespace(wait_service=signals)
+    flow = PlanFlow(db, presenter, form, services, store=PlanStore(tmp_path))
+    called = []
+    monkeypatch.setattr(flow, 'save_current', lambda: called.append('saved'))
+    try:
+        menu = flow.show_menu()
+        qapp.processEvents()
+        assert flow._active_menu is menu and not sip.isdeleted(menu)
+        save = next(action for action in menu.menuActions()
+                    if action.text() == '另存当前配置')
+        QTest.mouseClick(menu.view.viewport(), Qt.LeftButton,
+                         pos=menu.view.visualItemRect(save.property('item')).center())
+        qapp.processEvents()
+        assert called == ['saved'] and flow._active_menu is None
+    finally:
+        if flow._active_menu is not None:
+            flow._active_menu.close()
+        flow.deleteLater()
+        dispose_widget(form)
 
 
 class _WaitSignals(QObject):

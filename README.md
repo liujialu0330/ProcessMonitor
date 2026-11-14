@@ -17,15 +17,17 @@ English | [简体中文](./README.zh-CN.md)
 
 </div>
 
-## Version 2.0.1
+## Version 2.0.2
 
-Version 2.0.1 fixes an exception when clicking section navigation in Settings. All seven sections are covered by real mouse-click regression tests and desktop interaction checks; see the [fix verification](doc/2.0.1修复验收.md).
+Version 2.0.2 makes a live analysis, its report image, CSV files and evidence bundle use the same frozen data boundary, so samples written after export starts cannot appear only in the files. It also fixes the Monitor page plan and task action menus disappearing immediately, and fixes Settings card ownership and dynamic-height clipping. See the [2.0.2 fix verification](doc/2.0.2修复验收.md).
+
+Version 2.0.1 fixes an exception when clicking section navigation in Settings. All seven sections are covered by real mouse-click regression tests and desktop interaction checks; see the [2.0.1 fix verification](doc/2.0.1修复验收.md).
 
 Version `2.0.0` adds process trees and same-name process groups, automatic markers and stop conditions, crash evidence and restart recovery, evidence bundles, reusable multi-target plans, comparison of up to four tasks, and scenario references. Monitoring offers card and list views; the task library supports search, stars, and batch deletion.
 
 The first launch upgrades older databases to schema v5 and keeps a `.bak_v1` backup. Large databases may take time to migrate; the default data directory stays the same. Keep enough free disk space and read the [upgrade and rollback notes](CHANGELOG.md).
 
-Download the [2.0.1 installer](https://github.com/liujialu0330/ProcessMonitor/releases/tag/v2.0.1), or check for updates from version 1.4.1 or 2.0.0. In 2.0.0, scroll to the bottom of Settings to reach the update button. The implementation, functional regression, remote CI, performance, installation/uninstallation, and both rollback paths have been validated. The remaining 24-hour soak, device-specific checks, and multi-user trial were not run and are not counted as passes. See the [acceptance record](doc/2.0.0验收记录.md) for the original 2.0 scope and the [fix verification](doc/2.0.1修复验收.md) for the navigation regression.
+Download the [2.0.2 installer](https://github.com/liujialu0330/ProcessMonitor/releases/tag/v2.0.2), or check for updates from version 1.4.1, 2.0.0 or 2.0.1. In 2.0.0, scroll to the bottom of Settings to reach the update button. The implementation, functional regression, remote CI, performance, installation/uninstallation, and both rollback paths have been validated. The remaining 24-hour soak, device-specific checks, and multi-user trial were not run and are not counted as passes. See the [acceptance record](doc/2.0.0验收记录.md) for the original 2.0 scope and the [fix verification](doc/2.0.2修复验收.md) for the latest patch.
 
 ```bat
 python main.py

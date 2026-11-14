@@ -230,14 +230,17 @@ def test_manual_load_and_auto_refresh_are_identical(
     # 1) 查询参数：同一批查询（每个指标一组），明细 since / limit 与分桶上限钉死
     expected_since = (None if since_minutes is None
                       else BASE + timedelta(minutes=since_minutes))
+    expected_until = _LAST
     assert manual_calls == auto_calls
     tables = sorted(key for label, key, _kw in manual_calls if label == 'table')
-    assert tables == sorted((m, expected_since, None, TABLE_LIMIT) for m in (MEM, THREADS))
+    assert tables == sorted((m, expected_since, expected_until, TABLE_LIMIT)
+                            for m in (MEM, THREADS))
     # 分桶查询的位置参数为 (task_id, 指标, 分桶上限)
     bucket_limits = [key[2] for label, key, _kw in manual_calls
                      if label in ('buckets', 'legacy_buckets')]
     assert bucket_limits and set(bucket_limits) == {MAX_BUCKETS}
     assert manual.request.since == auto.request.since == expected_since
+    assert manual.request.until == auto.request.until == expected_until
 
     # 2) 查询结果：每个指标的快照逐项相等（DataPoint/Marker 是 dataclass，按值比较）
     _assert_same_analysis(manual_analysis, auto_analysis)
@@ -281,7 +284,7 @@ def test_out_of_range_metric_shows_same_empty_state_on_both_paths(vm, db, monkey
     thread_calls = sorted(label for label, key, kw in manual_calls
                           if THREADS in key or ('metric', THREADS) in kw)
     assert thread_calls == ['table']
-    assert ('table', (THREADS, expected_since, None, TABLE_LIMIT), ()) in manual_calls
+    assert ('table', (THREADS, expected_since, _LAST, TABLE_LIMIT), ()) in manual_calls
     assert empties == [("所选时间范围内暂无数据", "尝试切换到「全部」查看完整历史")] * 2
     assert vm.last_analysis is None
 

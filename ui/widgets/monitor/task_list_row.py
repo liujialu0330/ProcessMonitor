@@ -38,6 +38,7 @@ class TaskListRow(CardWidget):
     def __init__(self, card, parent=None):
         super().__init__(parent)
         self.card, self.expanded = card, False
+        self._active_menu = None
         self.setFixedHeight(48)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 6, 8, 6)
@@ -77,6 +78,8 @@ class TaskListRow(CardWidget):
         self.expanded_changed.emit(self.expanded)
 
     def _menu(self):
+        if self._active_menu is not None:
+            self._active_menu.close()
         menu = RoundMenu(parent=self)
         action = Action('恢复' if self.card.is_paused else '暂停', menu)
         action.triggered.connect(self.card._on_pause_button_clicked)
@@ -84,7 +87,15 @@ class TaskListRow(CardWidget):
         stop = Action('停止监控', menu)
         stop.triggered.connect(lambda: self.card.stop_requested.emit(self.card.task_id))
         menu.addAction(stop)
+        self._active_menu = menu
+        menu.closedSignal.connect(lambda m=menu: self._release_menu(m))
         menu.exec(self.more.mapToGlobal(self.more.rect().bottomLeft()))
+        return menu
+
+    def _release_menu(self, menu):
+        """等待非阻塞菜单关闭后再释放，保证用户能够点击其中的动作。"""
+        if self._active_menu is menu:
+            self._active_menu = None
         menu.deleteLater()
 
     def refresh(self):

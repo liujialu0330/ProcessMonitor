@@ -699,6 +699,41 @@ def test_settings_groups_follow_workflow(setting):
     assert setting.hotkey_card.titleLabel.text() == "打点快捷键"
 
 
+def test_report_color_card_is_owned_only_by_export_group(setting):
+    """报告配色不能被“数据”和“导出”两个 ExpandLayout 同时摆放。"""
+    setting.resize(1280, 900)
+    setting.show()
+    QApplication.processEvents()
+
+    card = setting.report_color_card
+    assert card.parentWidget() is setting.export_group
+    setting.export_group.cardLayout.setGeometry(setting.export_group.cardLayout.geometry())
+    expected_geometry = card.geometry()
+
+    # 此前 data_group 的私有控件列表仍保留卡片，会把它挪出 export_group 的可见区域。
+    setting.data_group.cardLayout.setGeometry(setting.data_group.cardLayout.geometry())
+
+    assert card.geometry() == expected_geometry
+    assert card.y() + card.height() <= setting.export_group.height()
+
+
+def test_showing_migration_backup_remeasures_data_group(setting, tmp_path):
+    """异步查到迁移备份后，诊断卡片仍须落在数据分组的可见范围内。"""
+    setting.resize(1280, 900)
+    setting.show()
+    QApplication.processEvents()
+    assert setting.backup_card.isHidden()
+    original_height = setting.data_group.height()
+
+    setting._update_backups([str(tmp_path / 'monitor.db.bak_v1')])
+    QApplication.processEvents()
+
+    assert not setting.backup_card.isHidden()
+    assert setting.data_group.height() > original_height
+    assert (setting.diagnostics_card.y() + setting.diagnostics_card.height()
+            <= setting.data_group.height())
+
+
 def test_maintenance_button_text_follows_retention(setting, prefs):
     from ui.pages.setting_page import maintenance_button_text
     assert maintenance_button_text(0) == "压缩数据库"

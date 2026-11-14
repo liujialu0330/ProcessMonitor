@@ -208,6 +208,46 @@ def analysis_span(analysis: "TaskAnalysis") -> Optional[Tuple[datetime, datetime
     return min(starts), max(ends)
 
 
+@dataclass(frozen=True)
+class ExportScope:
+    """当前分析结果能够安全导出的原始数据范围。
+
+    分析页的图和摘要已经来自一批不可变的 ``HistorySnapshot``。明细 CSV 必须使用同一
+    起止，不能在后台重新把运行中任务后来写入的样本也扫进去。不同指标偶尔在不同周期
+    缺值时，取它们已显示终点中的最晚一个；较早结束的指标在后续 CSV 行自然为空，不会
+    凭空制造其未分析过的值。
+    """
+    since: Optional[datetime] = None
+    until: Optional[datetime] = None
+    sample_count: int = 0
+
+
+def export_scope(analysis: Optional["TaskAnalysis"]) -> ExportScope:
+    """从当前合计分析结果导出一份不可变的数据范围和显示口径的采样次数。"""
+    if analysis is None:
+        return ExportScope()
+    snapshots = [snapshot for snapshot in analysis.snapshots.values()
+                 if snapshot is not None and snapshot.ok]
+    if not snapshots:
+        return ExportScope()
+    starts = [snapshot.request.since for snapshot in snapshots
+              if snapshot.request.since is not None]
+    ends = []
+    for snapshot in snapshots:
+        stats = snapshot.stats or {}
+        end = stats.get('last_ts')
+        if end is None and snapshot.buckets:
+            end = snapshot.buckets[-1].timestamp
+        if end is None and snapshot.points:
+            end = snapshot.points[-1].timestamp
+        if end is not None:
+            ends.append(end)
+    return ExportScope(
+        since=max(starts) if starts else None,
+        until=max(ends) if ends else None,
+        sample_count=max((snapshot.total_count for snapshot in snapshots), default=0))
+
+
 def _split_summary_line(line: str) -> Tuple[str, str]:
     label, _sep, value = line.partition(': ')
     return label, value

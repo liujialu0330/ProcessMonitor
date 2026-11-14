@@ -276,7 +276,9 @@ class PointRepo:
                 for sid, ms, value in rows]
 
     def iter_batches(self, task_id: str, batch_size: int = 5000, *,
-                     include_members: bool = True) -> Iterator[List[DataPoint]]:
+                     include_members: bool = True,
+                     since: Optional[datetime] = None,
+                     until: Optional[datetime] = None) -> Iterator[List[DataPoint]]:
         """
         按时间升序分批流式产出任务的全部数据点（每个序列一个有序游标，按 (时间, 序列号)
         归并），避免一次性载入内存。同一时刻的多个指标相邻产出、按序列建立顺序排列。
@@ -284,14 +286,16 @@ class PointRepo:
 
         include_members 为 False 时不读进程组的成员序列（指标键带 "@"），只产出合计
         序列：明细导出只要合计，成员序列的行数是合计的几十倍，不必读出来再丢掉。
+        since / until 为闭区间边界；报告导出据此锁定界面已分析的快照，避免读进之后写入的数据。
         """
         if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
             raise ValueError(f"batch_size 必须是正整数，收到 {batch_size!r}")
         # 参数校验放在生成器外，调用时立即报错，而不是等到第一次 next()
-        return self._iter_batches(task_id, batch_size, include_members)
+        lo, hi = ms_range(since, until)
+        return self._iter_batches(task_id, batch_size, include_members, lo, hi)
 
     def _iter_batches(self, task_id: str, batch_size: int,
-                      include_members: bool) -> Iterator[List[DataPoint]]:
+                      include_members: bool, lo: int, hi: int) -> Iterator[List[DataPoint]]:
         with storage_errors(f"流式读取数据点 {task_id} "):
             with self._factory.connect() as conn:
                 series = task_series(conn, task_id)
@@ -305,7 +309,8 @@ class PointRepo:
                     cursor = conn.cursor()
                     cursor.row_factory = None
                     cursor.execute('SELECT ts_ms, series_id, value FROM samples '
-                                   'WHERE series_id = ? ORDER BY ts_ms', (sid,))
+                                   'WHERE series_id = ? AND ts_ms BETWEEN ? AND ? ORDER BY ts_ms',
+                                   (sid, lo, hi))
                     cursors.append(cursor)
                 batch: List[DataPoint] = []
                 for ms, sid, value in heapq.merge(*cursors):

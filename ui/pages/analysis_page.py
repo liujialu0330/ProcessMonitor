@@ -308,9 +308,10 @@ class AnalysisPage(PageScaffold):
     def render_report(self) -> QImage:
         """按当前分析结果离屏渲染报告图片（导出与复制共用）。"""
         vm = self.vm
-        text = build_report_text(vm.current_task, vm.last_analysis, vm.range_description(),
+        analysis = vm.export_analysis()
+        text = build_report_text(vm.current_task, analysis, vm.range_description(),
                                  self.services.clock.now())
-        return render_report_image(text, vm.last_analysis, origin=self._origin_epoch())
+        return render_report_image(text, analysis, origin=self._origin_epoch())
 
     def refresh(self):
         self.vm.refresh()

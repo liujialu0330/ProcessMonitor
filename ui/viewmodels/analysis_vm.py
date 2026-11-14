@@ -41,7 +41,7 @@ from core.history_query import (
     BASELINE_RANGE_KEY, CUSTOM_RANGE_KEY, DEFAULT_RANGE_KEY, RANGE_KEYS,
     HistorySnapshot, SegmentAnalysis, TaskAnalysis, build_request, build_segment)
 from core.monitor_manager import default_marker_kind
-from core.report import gap_threshold_seconds, metadata_lines, summary_rows
+from core.report import export_scope, gap_threshold_seconds, metadata_lines, summary_rows
 from core.workers.base import LatestRequestGate
 from core.workers.member_snapshots_worker import (
     MemberBundle, MemberRequest, MemberSnapshotsWorker, load_member_bundle)
@@ -335,6 +335,15 @@ class AnalysisViewModel(HistoryViewModel):
         return range_text(self.range_key, self.custom_range,
                           baseline.timestamp if baseline is not None else None)
 
+    def export_analysis(self) -> Optional[TaskAnalysis]:
+        """导出所用的合计分析结果。
+
+        进程组的成员选择只改变屏幕上的查看对象；报告、明细与证据包始终导出合计序列，
+        并在明细末尾附成员汇总。这是既有产品口径，集中到这里避免图片、摘要和 CSV 分别
+        读取 ``view_analysis()`` / ``last_analysis`` 而意外混用成员与合计。
+        """
+        return self.last_analysis
+
     # ========== 范围与视图 ==========
 
     def set_range(self, range_key: str) -> None:
@@ -428,7 +437,8 @@ class AnalysisViewModel(HistoryViewModel):
 
     # ========== 多指标查询 ==========
 
-    def _start_query(self, auto_refresh: bool, forced: bool = False) -> None:
+    def _start_query(self, auto_refresh: bool, forced: bool = False, *,
+                     anchor: Optional[datetime] = None) -> None:
         self._reference_gate.invalidate()
         self._compare_gate.invalidate()
         self._compare_parts.clear()
@@ -443,7 +453,9 @@ class AnalysisViewModel(HistoryViewModel):
         if forced:
             self._forced_seqs.add(batch.seq)
         since, until = self.custom_range or (None, None)
-        anchor = self._cached_anchor(task_id)
+        # 有显式锚点时是上一批发现多个指标读到不同末尾后的重试；否则沿用历史页
+        # 的缓存锚点。每个请求仍在后台取数，不能为统一截止点把整批读取搬回 UI 线程。
+        anchor = anchor or self._cached_anchor(task_id)
         requests = []
         for metric in metrics:
             request = build_request(
@@ -457,6 +469,7 @@ class AnalysisViewModel(HistoryViewModel):
         if group:
             member_request = MemberRequest(
                 task_id, tuple(metrics), self.range_key, since=since, until=until,
+                anchor=anchor,
                 table_limit=self._table_limit, max_buckets=self._max_buckets,
                 request_seq=next(self._part_seq))
             self._member_parts[member_request.request_seq] = batch
@@ -543,6 +556,12 @@ class AnalysisViewModel(HistoryViewModel):
         self._forced_seqs.discard(batch.seq)
         if not self._gate.is_current(batch.seq):
             return
+        cutoff = self._resync_cutoff(batch)
+        if cutoff is not None:
+            # 运行中任务在各指标查询之间写入新样本时，首次并行读取可能各自卡在不同
+            # 时刻。用其中最早的已见终点重读整批，报告、摘要与明细才有共同快照。
+            self._start_query(batch.auto_refresh, forced, anchor=cutoff)
+            return
         snapshots: Dict[str, HistorySnapshot] = dict(batch.snapshots)
         focus = snapshots.get(self.current_metric) or next(iter(snapshots.values()))
         failed = next((s for s in snapshots.values() if s.error is not None), None)
@@ -561,6 +580,20 @@ class AnalysisViewModel(HistoryViewModel):
             self._pending_bundle = None
             if not batch.auto_refresh and self._gate.is_current(batch.seq):
                 self._set_busy(False)
+
+    @staticmethod
+    def _resync_cutoff(batch: _Batch) -> Optional[datetime]:
+        """返回需要重读整批的共同截止点；已一致或自定义范围无需重读。"""
+        if batch.range_key == CUSTOM_RANGE_KEY:
+            return None
+        snapshots = list(batch.snapshots.values())
+        if batch.bundle is not None and batch.bundle.error is None:
+            snapshots.extend(batch.bundle.snapshots.values())
+        endpoints = {snapshot.request.until for snapshot in snapshots
+                     if snapshot is not None and snapshot.request.until is not None}
+        if len(endpoints) <= 1:
+            return None
+        return min(endpoints)
 
     def _emit_snapshot(self, snapshot: HistorySnapshot) -> None:
         if self._pending_analysis is not None:
@@ -914,20 +947,24 @@ class AnalysisViewModel(HistoryViewModel):
         task = self.current_task
         if task is None:
             return None
-        running = self._current_is_running()
-        end_time = None if running else (task.end_time or task.last_sample_at)
-        analysis = self.last_analysis
+        analysis = self.export_analysis()
+        scope = export_scope(analysis)
+        end_time = scope.until
+        if end_time is None and not self._current_is_running():
+            end_time = task.end_time or task.last_sample_at
         rows = summary_rows(analysis.snapshots) if analysis is not None else []
-        # 采集次数取任务列表里的记录（不在主线程另查库）；运行中任务以导出时刻为准略有出入
+        # 采样数与范围都取已显示的分析快照，不能使用运行中任务列表里可能滞后的冗余计数。
         metadata = metadata_lines(
             task, exported_at=self._services.clock.now(),
-            range_text=self.range_description(), sample_count=task.sample_count or None,
+            range_text=self.range_description(),
+            sample_count=scope.sample_count or task.sample_count or None,
             end_time=end_time)
         return ReportJob(
             task=task, csv_path=csv_path, summary_path=summary_path,
             image_path=image_path, image=image, metadata=tuple(metadata),
             summary_rows=tuple(tuple(r) for r in rows),
-            gap_seconds=gap_threshold_seconds(task.interval))
+            gap_seconds=gap_threshold_seconds(task.interval),
+            data_since=scope.since, data_until=scope.until)
 
     def start_export(self, job: ReportJob,
                      worker_factory: Optional[Callable] = None) -> Optional[str]:

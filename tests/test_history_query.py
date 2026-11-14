@@ -91,7 +91,7 @@ def test_build_request_with_anchor_computes_since():
                             max_buckets=9, seq=42)
     assert request == HistoryRequest(
         task_id="t", metric=MEM, range_key='1h',
-        since=anchor - timedelta(hours=1), until=None, table_limit=7,
+        since=anchor - timedelta(hours=1), until=anchor, table_limit=7,
         max_buckets=9, anchor=anchor, request_seq=42, auto_refresh=False)
 
 
@@ -125,6 +125,7 @@ def test_run_query_resolves_anchor_like_old_page(db, range_key, has_data, offset
     expected_anchor = BASE + timedelta(seconds=4) if has_data else None
     assert snapshot.task_last_at == expected_anchor
     assert snapshot.request.anchor == expected_anchor
+    assert snapshot.request.until == expected_anchor
     assert snapshot.error is None and snapshot.ok
 
 
@@ -425,13 +426,31 @@ def test_programming_error_propagates(db, monkeypatch):
         run_history_query(db, _request(task.task_id))
 
 
-def test_until_is_rejected(db):
+def test_until_freezes_non_custom_query(db):
     task = _seed_task(db, samples=3)
     request = HistoryRequest(
         task_id=task.task_id, metric=MEM, range_key='all', since=None,
         until=BASE, table_limit=10, max_buckets=10, anchor=None, request_seq=1)
-    with pytest.raises(ValueError):
-        run_history_query(db, request)
+    snapshot = run_history_query(db, request)
+    assert snapshot.request.until == BASE
+    assert [point.timestamp for point in snapshot.points] == [BASE]
+
+
+def test_until_also_limits_bucketed_chart_points(db):
+    """冻结快照不能只裁掉桶标签：桶内数值也不能来自截止点之后。"""
+    task = _seed_series(db, list(range(20)))
+    until = BASE + timedelta(minutes=10)
+    request = HistoryRequest(
+        task_id=task.task_id, metric=MEM, range_key='all', since=None,
+        until=until, table_limit=50, max_buckets=2, anchor=until, request_seq=1)
+
+    snapshot = run_history_query(db, request)
+
+    assert snapshot.total_count == 11
+    assert snapshot.stats['last_ts'] == until
+    assert snapshot.buckets
+    assert max(point.timestamp for point in snapshot.buckets) <= until
+    assert max(point.value for point in snapshot.buckets) <= 10
 
 
 def test_snapshot_defaults():

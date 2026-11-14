@@ -216,6 +216,16 @@ def test_member_view_uses_member_series_keys_without_requery(
     assert len(runner.requests) == queries
 
 
+def test_member_selection_keeps_export_on_aggregate_analysis(make_page, seesaw_members):
+    """成员下拉只改变屏幕视图；导出契约始终是合计序列加成员汇总。"""
+    page = make_page()
+    vm = open_group(page, seesaw_members)
+    aggregate = vm.last_analysis
+    assert vm.select_member("a.exe")
+    assert vm.view_analysis() is not aggregate
+    assert vm.export_analysis() is aggregate
+
+
 def test_member_view_survives_auto_refresh(make_page, runner, member_runner, seesaw_members):
     page = make_page()
     vm = open_group(page, seesaw_members)

@@ -170,6 +170,15 @@ def test_iter_batches_early_close_releases_connection(repo, factory, seeded):
     assert _raw(factory, 'SELECT COUNT(*) FROM samples') == 21
 
 
+def test_iter_batches_respects_closed_time_range(repo, seeded):
+    since = BASE + timedelta(seconds=3)
+    until = BASE + timedelta(seconds=5)
+    flat = [point for batch in repo.iter_batches(
+        seeded, batch_size=2, since=since, until=until) for point in batch]
+    assert [point.timestamp for point in flat] == [
+        since, since, BASE + timedelta(seconds=4), BASE + timedelta(seconds=4), until, until]
+
+
 def test_iter_batches_rejects_bad_batch_size_immediately(repo):
     with pytest.raises(ValueError):
         repo.iter_batches('t', batch_size=0)

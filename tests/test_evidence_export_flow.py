@@ -4,6 +4,7 @@
 日志摘录打成一个 zip；完成提示带"打开文件夹"；导出登记 begin_export/end_export 与线程
 登记表；失败常驻提示、不留半个 zip、工作目录清理干净。
 """
+import csv
 import json
 import os
 import tempfile
@@ -158,6 +159,43 @@ def test_evidence_export_writes_complete_zip(env, tmp_path, work_root):
     assert services.dialogs.last_call('open_folder')['path'] == str(out)
     # 临时工作目录已删除
     assert os.listdir(work_root) == []
+
+
+def test_evidence_export_keeps_current_baseline_snapshot(env, tmp_path):
+    page, task, services, _manager = env
+    page.vm.set_range('baseline')
+    analysis = page.vm.export_analysis()
+    snapshot = analysis.snapshots[MEM]
+    assert snapshot.stats['count'] == 500
+
+    # 分析已经完成后再写两个点。证据包不能把它们混入当前已显示的报告范围。
+    db = page.vm._db
+    db.save_data_points([
+        DataPoint(task.task_id, BASE + timedelta(seconds=SAMPLES), 999999.0, MEM),
+        DataPoint(task.task_id, BASE + timedelta(seconds=SAMPLES), 999999.0, HANDLES),
+        DataPoint(task.task_id, BASE + timedelta(seconds=SAMPLES + 1), 999999.0, MEM),
+        DataPoint(task.task_id, BASE + timedelta(seconds=SAMPLES + 1), 999999.0, HANDLES),
+    ])
+    chosen = str(tmp_path / "冻结证据.zip")
+    services.dialogs.push('ask_save_path', chosen)
+    page.toolbar.export_requested.emit(EXPORT_EVIDENCE)
+    assert _wait_done(services, 'success')
+
+    base = task_basename(task)
+    with zipfile.ZipFile(chosen) as archive:
+        detail_rows = list(csv.reader(
+            archive.read(f"{base}.csv").decode('utf-8-sig').splitlines()))
+        summary_rows = list(csv.reader(
+            archive.read(f"{base}_摘要.csv").decode('utf-8-sig').splitlines()))
+    detail_header = next(i for i, row in enumerate(detail_rows) if row and row[0] == '时间')
+    detail = [row for row in detail_rows[detail_header + 1:] if row]
+    assert detail[0][0] == '2026-07-16 16:01:40'
+    assert detail[-1][0] == '2026-07-16 16:09:59'
+    assert len(detail) == 500
+    metadata = [row[0] for row in detail_rows[:detail_header] if row]
+    assert '# 范围: 自基线（16:01:40 起）' in metadata
+    assert '# 采集次数: 500' in metadata
+    assert '# 采集次数: 500' in [row[0] for row in summary_rows if row]
 
 
 def test_evidence_export_asks_before_overwrite(env, tmp_path):

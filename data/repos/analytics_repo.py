@@ -864,7 +864,8 @@ class AnalyticsRepo:
         }
 
     def legacy_buckets(self, task_id: str, metric: Optional[str], max_points: int,
-                       since: Optional[datetime] = None) -> List[DataPoint]:
+                       since: Optional[datetime] = None,
+                       until: Optional[datetime] = None) -> List[DataPoint]:
         """
         图表用的降采样（Database.get_task_data_points_bucketed 的实现）：返回真实数据点，
         按时间升序（同一时刻按值升序），去掉 (时间, 值) 完全相同的重复点。
@@ -877,7 +878,7 @@ class AnalyticsRepo:
         """
         if not isinstance(max_points, int) or isinstance(max_points, bool) or max_points < 1:
             raise ValueError(f'max_points 必须是 >= 1 的整数，实际为 {max_points!r}')
-        lo, hi = ms_range(since, None)
+        lo, hi = ms_range(since, until)
         with self._connect('读取分桶数据点') as conn:
             series = task_series(conn, task_id, metric)
             if not series:

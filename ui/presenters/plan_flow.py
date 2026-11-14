@@ -18,6 +18,7 @@ class PlanFlow(QObject):
         self.store = store or PlanStore(os.path.dirname(os.path.abspath(db.db_path)))
         self.plans = {}
         self._pending_groups = {}
+        self._active_menu = None
         self.combo = ComboBox(form)
         self.combo.setMinimumWidth(140)
         self.combo.setMaximumWidth(200)
@@ -46,6 +47,8 @@ class PlanFlow(QObject):
         self.combo.blockSignals(False)
 
     def show_menu(self):
+        if self._active_menu is not None:
+            self._active_menu.close()
         menu = RoundMenu(parent=self.form)
         for label, callback in (
             ('运行选中方案', self.run_selected), ('另存当前配置', self.save_current),
@@ -55,7 +58,15 @@ class PlanFlow(QObject):
             action = Action(label, menu)
             action.triggered.connect(lambda _checked=False, cb=callback: self._guard(cb))
             menu.addAction(action)
+        self._active_menu = menu
+        menu.closedSignal.connect(lambda m=menu: self._release_menu(m))
         menu.exec(self.button.mapToGlobal(self.button.rect().bottomLeft()))
+        return menu
+
+    def _release_menu(self, menu):
+        """菜单关闭后才释放；RoundMenu.exec() 是非阻塞显示，不能在调用后立即销毁。"""
+        if self._active_menu is menu:
+            self._active_menu = None
         menu.deleteLater()
 
     def _guard(self, callback):

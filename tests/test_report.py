@@ -16,7 +16,7 @@ from core.history_query import TaskAnalysis, build_request, run_history_query
 from core.report import (
     ELAPSED_COLUMN_NAME, METADATA_PREFIX, SUMMARY_HEADER, ReportPaths,
     build_report_csv_header, downsample_footnote, format_elapsed, gap_threshold_seconds,
-    interval_spans, metadata_lines, paths_from_image_choice, report_rows, summary_rows,
+    export_scope, interval_spans, metadata_lines, paths_from_image_choice, report_rows, summary_rows,
     task_basename)
 from core.workers.base import CancelToken
 from data.models import DataPoint, Marker, MonitorTask
@@ -172,6 +172,39 @@ def test_report_worker_writes_three_files(qapp, db, tmp_path):
     assert not [p for p in os.listdir(tmp_path) if p.endswith(".tmp")]
 
 
+def test_report_worker_locks_csv_to_analyzed_baseline_snapshot(qapp, db, tmp_path):
+    task = _seed(db, offsets=range(100), markers=())
+    db.markers.add(task.task_id, BASE + timedelta(seconds=20), "基线", 'baseline')
+    analysis = TaskAnalysis(task.task_id, 'baseline', {
+        metric: run_history_query(db, build_request(task.task_id, metric, 'baseline', analysis=True))
+        for metric in task.metric_types})
+    scope = export_scope(analysis)
+    assert (scope.since, scope.until, scope.sample_count) == (
+        BASE + timedelta(seconds=20), BASE + timedelta(seconds=99), 80)
+
+    # 模拟运行中任务在分析完成后继续写入：导出的明细必须仍与当前图和摘要一致。
+    db.save_data_points(_points(task, [100, 101]))
+    target = tmp_path / "范围锁定.csv"
+    worker = ReportWorker(db, ReportJob(
+        task=task, csv_path=str(target), data_since=scope.since, data_until=scope.until,
+        metadata=tuple(metadata_lines(
+            task, exported_at=BASE, range_text="自基线", sample_count=scope.sample_count,
+            end_time=scope.until)),
+        summary_rows=tuple(tuple(row) for row in summary_rows(analysis.snapshots))))
+    result = worker.execute(CancelToken())
+
+    with open(target, encoding="utf-8-sig") as f:
+        rows = list(csv.reader(f))
+    header_index = next(i for i, row in enumerate(rows) if row and row[0] == '时间')
+    data = [row for row in rows[header_index + 1:] if row]
+    assert result.row_count == 80 and result.point_count == 160
+    assert data[0][0] == "2026-07-16 16:00:20"
+    assert data[-1][0] == "2026-07-16 16:01:39"
+    assert all("16:00:00" not in row[0] for row in data)
+    assert all("16:01:40" not in row[0] and "16:01:41" not in row[0] for row in data)
+    assert "# 采集次数: 80" in [row[0] for row in rows if row]
+
+
 def test_report_worker_cancel_keeps_existing_targets(qapp, db, tmp_path):
     task = _seed(db)
     tmp_path = tmp_path / "out"
@@ -274,7 +307,7 @@ def test_report_worker_storage_error_mid_read_emits_failed(qapp, db, tmp_path, m
     out = _out_dir(tmp_path)
     real = db.points.iter_batches
 
-    def _failing(task_id, batch_size=5000):
+    def _failing(task_id, batch_size=5000, **_options):
         def gen():
             yield from list(real(task_id, batch_size))[:1]
             raise StorageError("流式读取数据点失败: disk I/O error")
