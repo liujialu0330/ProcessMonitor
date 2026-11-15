@@ -35,7 +35,7 @@ class StopReason(Enum):
 
 class UnavailableReason(Enum):
     """单个指标无法采集的原因（经 metrics_unavailable 信号传给界面）。"""
-    ACCESS_DENIED = 'access_denied'          # 无权访问，以管理员运行可采集
+    ACCESS_DENIED = 'access_denied'          # 无权访问，可尝试以管理员运行后重试
     PROCESS_EXITING = 'process_exiting'      # 进程正在退出（僵尸态）
     NOT_IN_SESSION = 'not_in_session'        # 进程不在当前桌面会话，提权也无法采集
     NOT_SUPPORTED = 'not_supported'          # 当前平台不支持该指标

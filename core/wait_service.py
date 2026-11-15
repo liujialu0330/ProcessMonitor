@@ -120,6 +120,10 @@ class WaitService(QObject):
         entry = self._waits.get(wait_id)
         return entry.request if entry is not None else None
 
+    def deadline_of(self, wait_id: str) -> Optional[datetime]:
+        entry = self._waits.get(wait_id)
+        return entry.deadline if entry is not None else None
+
     def has_waits(self) -> bool:
         return bool(self._waits)
 

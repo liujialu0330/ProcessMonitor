@@ -618,6 +618,11 @@ class MainWindow(FluentWindow):
         self._really_quit = True
         self.close()
 
+    def finish_elevated_restart(self) -> None:
+        """交接已保存后沿正常关闭路径释放窗口与线程，采集任务由交接屏障收尾。"""
+        self._really_quit = True
+        self.close()
+
     def quit_for_install(self) -> None:
         """更新安装流程（install_requested）：无论"关闭时最小化到托盘"是否
         开启，都必须走真退出路径——否则该开关开启时，安装向导已经启动，主程序却被

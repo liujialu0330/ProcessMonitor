@@ -34,7 +34,7 @@ from core.process_collector import (DEFAULT_SNAPSHOT_MAX_AGE_S, SAMPLERS, Metric
                                     read_snapshot_metric, uses_snapshot)
 from core.snapshot_hub import SnapshotHub, default_hub
 from data.models import TARGET_NAME, TARGET_TREE
-from utils.metrics import MetricType
+from utils.metrics import CPU_USAGE_METRICS, MetricType
 
 logger = logging.getLogger(__name__)
 
@@ -310,9 +310,9 @@ class SnapshotTreeSource:
             # 同理，别的僵尸条目不是在运行的成员，不计入实例与进程总数
             pids = [pid for pid in pids if procs[pid].num_threads > 0]
         snapshot_metrics = [m for m in metrics if uses_snapshot(m)
-                            and m != MetricType.CPU_PERCENT]
+                            and m not in CPU_USAGE_METRICS]
         process_metrics = [m for m in metrics if not uses_snapshot(m) and m in SAMPLERS
-                           and m != MetricType.CPU_PERCENT]
+                           and m not in CPU_USAGE_METRICS]
         readings: List[InstanceReading] = []
         for pid in pids:
             sample = procs[pid]
@@ -352,7 +352,7 @@ class SnapshotTreeSource:
             procs[info['pid']] = ProcLite(info['pid'], info.get('ppid') or 0, name,
                                           create_time)
         root_alive, root_ct, pids = self._resolve(procs, spec, root_create_time)
-        wanted = [m for m in metrics if m in SAMPLERS and m != MetricType.CPU_PERCENT]
+        wanted = [m for m in metrics if m in SAMPLERS and m not in CPU_USAGE_METRICS]
         taken = time.perf_counter()
         readings: List[InstanceReading] = []
         for pid in pids:

@@ -46,6 +46,7 @@ from ui.widgets.monitor.process_picker import (
 )
 from utils.metrics import (
     LEAK_CHECK_PRESET, PROCESS_COUNT, filter_group_metrics, get_metric_display_name,
+    new_task_metric_type,
 )
 
 NOTE_MAX_LENGTH = MAX_NOTE_CHARS
@@ -300,6 +301,7 @@ class NewTaskForm(CardWidget):
     def set_metrics_summary(self, metrics: Sequence[str]) -> None:
         """设置本表单当前目标类型的已选指标（新建任务将使用它们）并刷新摘要。
         进程组任务的选择里对组不适用的指标会被剔除，进程总数始终在末尾。"""
+        metrics = list(dict.fromkeys(new_task_metric_type(key) for key in metrics))
         if self._is_group():
             self._group_metrics = self._with_process_count(filter_group_metrics(metrics))
         else:
@@ -381,6 +383,49 @@ class NewTaskForm(CardWidget):
 
     def note(self) -> str:
         return self.note_input.text().strip()
+
+    def restart_draft(self) -> dict:
+        """保存尚未提交的输入，包含折叠区域里暂时未启用的值。"""
+        launch = self.launch_options
+        return {
+            'kind': self._kind, 'metrics': list(self._metrics),
+            'group_metrics': self._group_metrics,
+            'selection': self.picker.restart_selection(),
+            'interval': self.interval(), 'note': self.note_input.text(),
+            'scenario': self.scenario_edit.text(), 'build': self.build_edit.text(),
+            'wait': self.wait_enabled(), 'wait_timeout': self.wait_timeout_input.text(),
+            'collapsed': self.is_collapsed(),
+            'toggle_visible': not self.expand_button.isHidden(),
+            'automation': self.automation.plan().to_dict(),
+            'automation_expanded': self.automation.is_expanded(),
+            'launch': {
+                'enabled': launch.is_enabled(), 'expanded': launch.is_expanded(),
+                'exe': launch.exe_edit.text(), 'args': launch.args_edit.text(),
+                'cwd': launch.cwd_edit.text(), 'close': launch.close_on_stop()}}
+
+    def restore_restart_draft(self, draft: dict) -> None:
+        self._metrics = list(draft['metrics'])
+        self._group_metrics = draft.get('group_metrics')
+        self.set_target_kind(draft['kind'])
+        self._refresh_metric_summary()
+        self.picker.restore_restart_selection(draft['selection'])
+        self.interval_spinbox.setValue(int(draft['interval']))
+        self.note_input.setText(draft['note'])
+        self.scenario_edit.setText(draft['scenario'])
+        self.build_edit.setText(draft['build'])
+        self.set_wait_enabled(draft['wait'])
+        self.wait_timeout_input.setText(draft['wait_timeout'])
+        self.automation.set_plan(AutomationPlan.from_dict(draft['automation']))
+        self.automation.set_expanded(draft['automation_expanded'])
+        launch = draft['launch']
+        self.launch_options.exe_edit.setText(launch['exe'])
+        self.launch_options.args_edit.setText(launch['args'])
+        self.launch_options.cwd_edit.setText(launch['cwd'])
+        self.launch_options.close_check.setChecked(launch['close'])
+        self.launch_options.enable_check.setChecked(launch['enabled'])
+        self.launch_options.set_expanded(launch['expanded'])
+        self._show_details(not draft['collapsed'])
+        self.expand_button.setVisible(draft['toggle_visible'])
 
     # ========== 等待进程启动 ==========
 

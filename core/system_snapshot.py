@@ -200,7 +200,8 @@ class SystemSnapshot:
 
     def context_switches(self, pid: int) -> Optional[int]:
         """该进程全部线程的上下文切换次数之和（psutil num_ctx_switches().voluntary
-        同口径）；进程不在快照里或快照不含线程数组时返回 None。"""
+        同口径，包含主动等待与被抢占，线程退出会移除其计数）；进程不在快照里或
+        快照不含线程数组时返回 None。"""
         located = self._threads.get(pid)
         if located is None or self._raw is None:
             return None

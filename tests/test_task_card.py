@@ -296,6 +296,48 @@ def test_value_label_is_20px_semibold(card):
     assert font.weight() >= 63
 
 
+def test_restart_view_preserves_values_count_and_downsampling(card, qapp):
+    card.set_started_at(T0)
+    for index in range(613):
+        card.update_values({PRIVATE: 1000 + index, GDI: 20 + index},
+                           T0 + timedelta(seconds=index))
+        card.increment_count()
+    card.select_trend_metric(GDI)
+    saved = card.restart_view()
+    restored = TaskCard('t1', 'demo.exe', 1234, [PRIVATE, GDI], interval=1)
+    try:
+        restored.set_started_at(T0)
+        restored.restore_restart_view(saved)
+        assert restored.restart_view() == saved
+        assert restored.count == 613
+        assert restored.value_labels[PRIVATE].text() == card.value_labels[PRIVATE].text()
+        assert restored.sparkline.series() == card.sparkline.series()
+        for index in range(613, 800):
+            values = {PRIVATE: 1000 + index, GDI: 20 + index}
+            when = T0 + timedelta(seconds=index)
+            restored.update_values(values, when)
+            card.update_values(values, when)
+        assert restored.sparkline.series() == card.sparkline.series()
+    finally:
+        dispose_widget(restored)
+
+
+def test_restart_view_keeps_unavailable_values_marked(card):
+    card.update_values({PRIVATE: 1024, GDI: 10}, T0)
+    card.mark_unavailable({GDI: UnavailableReason.ACCESS_DENIED})
+    saved = card.restart_view()
+    restored = TaskCard('t1', 'demo.exe', 1234, [PRIVATE, GDI])
+    try:
+        restored.restore_restart_view(saved)
+        assert restored.value_labels[GDI].text() == '不可用'
+        assert GDI in restored._unavailable
+        restored.update_values({GDI: 11}, T0 + timedelta(seconds=2))
+        assert GDI not in restored._unavailable
+        assert restored.value_labels[GDI].text() != '不可用'
+    finally:
+        dispose_widget(restored)
+
+
 def test_clicking_cell_switches_sparkline_metric(card):
     assert card.trend_metric == PRIVATE
     card.update_values({PRIVATE: 1.0 * MB, GDI: 10}, T0)

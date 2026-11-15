@@ -5,6 +5,8 @@ core/report.build_report_csv_header
 """
 from datetime import datetime, timedelta
 
+import pytest
+
 from core.export import pivot_timed_rows
 from core.report import build_report_csv_header
 from data.models import MonitorTask, DataPoint
@@ -39,12 +41,16 @@ def test_report_csv_header_single_metric():
     assert header == ['时间', '已运行(秒)', '进程名称', 'PID', '工作集内存(KB)', '打点']
 
 
-def test_report_csv_header_multi_metric():
-    task = _make_task(["memory_rss", "cpu_percent", "cpu_priority"])
+@pytest.mark.parametrize('cpu_metric, cpu_name', [
+    ('cpu_percent_total', 'CPU使用率'),
+    ('cpu_percent', 'CPU使用率（旧版按核累计）'),
+])
+def test_report_csv_header_multi_metric(cpu_metric, cpu_name):
+    task = _make_task(["memory_rss", cpu_metric, "cpu_priority"])
     header = build_report_csv_header(task)
     # cpu_priority 无单位，不应带括号
     assert header == ['时间', '已运行(秒)', '进程名称', 'PID',
-                      '工作集内存(KB)', 'CPU使用率(%)', '基本优先级', '打点']
+                      '工作集内存(KB)', f'{cpu_name}(%)', '基本优先级', '打点']
 
 
 def test_pivot_timed_rows_multi_metric_alignment():

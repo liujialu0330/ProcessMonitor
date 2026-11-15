@@ -623,3 +623,30 @@ def test_name_kind_placeholder_asks_for_a_name(form):
     assert "进程名" in form.picker.combo.line_edit.placeholderText()
     _pick_kind(form, 'pid')
     assert form.picker.combo.line_edit.placeholderText() == plain
+
+
+@pytest.mark.parametrize('kind', ['pid', 'tree', 'name'])
+def test_restart_draft_preserves_selection_and_hidden_values(form, qapp, prefs, kind):
+    form.set_target_kind(kind)
+    form.set_metrics_summary([MetricType.MEMORY_USS, MetricType.NUM_HANDLES])
+    form.picker.set_text('beta.exe · PID 1002')
+    form.note_input.setText('  未开始的测试  ')
+    form.scenario_edit.setText('扫描')
+    form.build_edit.setText('V6.1')
+    form.wait_timeout_input.setText('12.5')
+    form.automation.set_plan(AutomationPlan(timed_marker_seconds=30))
+    form.launch_options.exe_edit.setText('C:/Program Files/demo.exe')
+    form.launch_options.args_edit.setText('--image "C:/示例 图片.png"')
+    form.launch_options.cwd_edit.setText('C:/工作目录')
+    form.launch_options.close_check.setChecked(True)
+    form.set_collapsed(True)
+    form._toggle_details()
+    saved = form.restart_draft()
+    restored = NewTaskForm(FakeProcessQuery(PROCESSES), prefs)
+    try:
+        restored.restore_restart_draft(saved)
+        assert restored.restart_draft() == saved
+        assert restored.picker.resolve().create_time == 1002.5
+        assert restored.metrics() == form.metrics()
+    finally:
+        restored.close()

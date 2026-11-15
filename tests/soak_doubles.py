@@ -127,6 +127,13 @@ class SegmentCollector:
     def alive_instances(self):
         return []
 
+    def counter_state(self) -> dict:
+        """此替身只模拟水位量，组接口没有需要跨实例累加的状态。"""
+        return {'totals': {}, 'members': [], 'truncated': False}
+
+    def restore_counter_state(self, state: dict) -> None:
+        assert state == self.counter_state()
+
 
 class ScriptedFinder:
     """

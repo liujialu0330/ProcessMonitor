@@ -78,6 +78,14 @@ def test_process_count_is_not_duplicated(make_manager):
     assert mgr.get_task(task_id).metric_types == ['process_count', MEM]
 
 
+def test_new_task_upgrades_legacy_cpu_without_duplicate_series(make_manager):
+    manager = make_manager(sample_source())
+    task_id = manager.create_task(
+        ROOT_PID, 'app.exe', [MetricType.CPU_PERCENT_LEGACY, MetricType.CPU_PERCENT, MEM],
+        1.0, target_kind=TARGET_TREE)
+    assert manager.get_task(task_id).metric_types == [MetricType.CPU_PERCENT, MEM, 'process_count']
+
+
 def test_create_name_task_forces_pid_zero_and_ignores_create_time(make_manager):
     mgr = make_manager(sample_source())
     task_id = mgr.create_task(1234, 'Worker.exe', [MEM], 0.05, create_time=99.0,

@@ -15,6 +15,11 @@ from utils.metrics import DEPRECATED_METRICS, MetricType, all_metric_types
 _FAKE_PID = 4321
 
 
+@pytest.fixture(autouse=True)
+def single_logical_cpu(monkeypatch):
+    monkeypatch.setattr(pc.psutil, 'cpu_count', lambda logical=True: 1)
+
+
 def _fake_process(**overrides):
     """假 psutil.Process：各字段取值互不相同，便于发现取错字段/漏换算"""
     mem = SimpleNamespace(
@@ -106,6 +111,7 @@ _EXPECTED = {
     MetricType.MEMORY_NUM_PAGE_FAULTS: 12345.0,
     MetricType.MEMORY_USS: 900.0,
     MetricType.CPU_PERCENT: 37.5,
+    MetricType.CPU_PERCENT_LEGACY: 37.5,
     MetricType.CPU_USER_TIME: 1.25,
     MetricType.CPU_SYSTEM_TIME: 0.75,
     MetricType.CPU_PRIORITY: 32.0,
@@ -365,8 +371,27 @@ def test_snapshot_cpu_percent_is_time_delta_over_wall_delta():
     c = _snapshot_collector(hub, _psutil_forbidden(cpu_percent=lambda interval=None: 0.0))
     c.prime_cpu()
     assert c.collect_metrics([MetricType.CPU_PERCENT]) == {MetricType.CPU_PERCENT: 50.0}
-    # 多核并行可超过 100%（与 psutil 同口径，按单核计）
-    assert c.collect_metrics([MetricType.CPU_PERCENT]) == {MetricType.CPU_PERCENT: 200.0}
+    assert c.collect_metrics([MetricType.CPU_PERCENT]) == {MetricType.CPU_PERCENT: 100.0}
+
+
+@pytest.mark.parametrize('logical_cpus, expected', [(1, 100.0), (8, 100.0), (16, 50.0), (32, 25.0)])
+def test_cpu_uses_system_capacity_and_keeps_legacy_series(monkeypatch, logical_cpus, expected):
+    monkeypatch.setattr(pc.psutil, 'cpu_count', lambda logical=True: logical_cpus)
+    hub, _ = _hub_of(_snap(10.0, user_time=1.0, kernel_time=1.0),
+                     _snap(12.0, user_time=17.0, kernel_time=1.0))
+    collector = _snapshot_collector(hub, _psutil_forbidden())
+    collector.prime_cpu()
+    assert collector.collect_metrics([MetricType.CPU_PERCENT, MetricType.CPU_PERCENT_LEGACY]) == {
+        MetricType.CPU_PERCENT: expected, MetricType.CPU_PERCENT_LEGACY: 800.0}
+
+
+def test_cpu_psutil_and_single_metric_use_system_capacity(monkeypatch):
+    monkeypatch.setattr(pc.psutil, 'cpu_count', lambda logical=True: 16)
+    process = _fake_process(cpu_percent=lambda interval=None: 800.0)
+    collector = _collector(process)
+    assert collector.collect_metrics([MetricType.CPU_PERCENT]) == {MetricType.CPU_PERCENT: 50.0}
+    assert collector.collect_metric(MetricType.CPU_PERCENT) == 50.0
+    assert collector.collect_metric(MetricType.CPU_PERCENT_LEGACY) == 800.0
 
 
 def test_snapshot_cpu_percent_without_baseline_is_unavailable_not_zero():

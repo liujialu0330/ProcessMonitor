@@ -5,13 +5,16 @@ GroupAggregator：逐实例读数 → 合计序列 + 成员序列（纯逻辑，
 PID 复用）；CPU 使用率逐实例差分；进程总数；零成员周期；成员名截断；峰值类不适用；
 成员合并不区分大小写；实例出现 / 消失与 members_changed。
 """
+import json
+
 import pytest
 
 from core.contracts import UnavailableReason
 from core.group_aggregator import GroupAggregator
 from core.process_tree import Observation
 from tests.group_doubles import inst
-from utils.metrics import (MAX_GROUP_MEMBERS, PROCESS_COUNT, MetricType, member_series_key)
+from utils.metrics import (MAX_GROUP_MEMBERS, PROCESS_COUNT, GroupAggregation, MetricType,
+                           group_aggregation, member_series_key, REGISTRY)
 
 
 def obs(instances, mono=1000.0):
@@ -24,6 +27,50 @@ def total_of(sample, metric):
 
 def member_of(sample, metric, member):
     return sample.values[member_series_key(metric, member)]
+
+
+@pytest.mark.parametrize('metric', [key for key in REGISTRY
+                                  if group_aggregation(key) is GroupAggregation.DELTA_SUM])
+def test_counter_state_preserves_totals_and_rebases_instances(metric):
+    original = GroupAggregator(max_members=2)
+    original.update(obs([inst('A.EXE', 1, **{metric: 100}),
+                         inst('b.exe', 2, **{metric: 40})]), [metric])
+    original.update(obs([inst('A.EXE', 1, **{metric: 130}),
+                         inst('b.exe', 2, **{metric: 60}),
+                         inst('overflow.exe', 3, **{metric: 10})]), [metric])
+    original.update(obs([inst('A.EXE', 1, **{metric: 140}),
+                         inst('overflow.exe', 3, **{metric: 15})]), [metric])
+    restored = GroupAggregator(max_members=2)
+    restored.restore_counter_state(json.loads(json.dumps(original.counter_state())))
+    assert restored.tracked_members() == {'a.exe': 'A.EXE', 'b.exe': 'b.exe'}
+    assert restored.members_truncated
+    # 同一实例、复用 PID 和新实例在重启后都先建起点，空档增长不计入。
+    sample = restored.update(obs([
+        inst('A.EXE', 1, **{metric: 900}),
+        inst('b.exe', 2, create_time=9999, **{metric: 2}),
+        inst('new.exe', 4, **{metric: 1000})]), [metric])
+    assert total_of(sample, metric) == 65
+    assert member_of(sample, metric, 'a.exe') == 40
+    assert member_of(sample, metric, 'b.exe') == 20
+    next_sample = restored.update(obs([
+        inst('A.EXE', 1, **{metric: 910}),
+        inst('b.exe', 2, create_time=9999, **{metric: 7}),
+        inst('new.exe', 4, **{metric: 1008})]), [metric])
+    assert total_of(next_sample, metric) == 88
+    assert member_of(next_sample, metric, 'a.exe') == 50
+    assert member_of(next_sample, metric, 'b.exe') == 25
+    assert list(restored.tracked_members()) == ['a.exe', 'b.exe']
+
+
+@pytest.mark.parametrize('value', [-1, float('nan'), float('inf'), True])
+def test_invalid_counter_state_keeps_existing_state(value):
+    aggregator = GroupAggregator()
+    aggregator.update(obs([inst('a.exe', 1, io_read_count=1)]), ['io_read_count'])
+    before = aggregator.counter_state()
+    state = {'totals': {'io_read_count': value}, 'members': [], 'truncated': False}
+    with pytest.raises(ValueError):
+        aggregator.restore_counter_state(state)
+    assert aggregator.counter_state() == before
 
 
 # ========== 水位类 ==========
@@ -156,14 +203,16 @@ def test_pid_reuse_is_a_different_instance_for_cumulative_baseline():
 # ========== CPU 使用率 ==========
 
 def test_cpu_percent_is_differenced_per_instance_and_summed():
-    agg = GroupAggregator()
+    agg = GroupAggregator(logical_cpus=4)
     base = [inst('a.exe', 1, cpu=10.0), inst('b.exe', 2, cpu=20.0)]
     agg.prime(obs(base, 1000.0))
     sample = agg.update(obs([inst('a.exe', 1, cpu=10.5), inst('b.exe', 2, cpu=21.0)], 1001.0),
-                        [MetricType.CPU_PERCENT])
-    assert total_of(sample, MetricType.CPU_PERCENT) == 150.0
-    assert member_of(sample, MetricType.CPU_PERCENT, 'a.exe') == 50.0
-    assert member_of(sample, MetricType.CPU_PERCENT, 'b.exe') == 100.0
+                        [MetricType.CPU_PERCENT, MetricType.CPU_PERCENT_LEGACY])
+    assert total_of(sample, MetricType.CPU_PERCENT) == 37.5
+    assert member_of(sample, MetricType.CPU_PERCENT, 'a.exe') == 12.5
+    assert member_of(sample, MetricType.CPU_PERCENT, 'b.exe') == 25.0
+    assert total_of(sample, MetricType.CPU_PERCENT_LEGACY) == 150.0
+    assert member_of(sample, MetricType.CPU_PERCENT_LEGACY, 'b.exe') == 100.0
 
 
 def test_cpu_new_instance_is_excluded_in_its_first_cycle():

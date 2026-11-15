@@ -8,7 +8,7 @@
 也可以是 epoch 秒（同一次调用里与空洞的类型一致即可）。
 """
 from bisect import bisect_left
-from typing import List, Sequence, Tuple, TypeVar
+from typing import Iterator, List, Optional, Sequence, Tuple, TypeVar
 
 T = TypeVar('T')
 Gap = Tuple[T, T]
@@ -47,11 +47,26 @@ def per_second_rates(points: Sequence[Tuple[T, float]],
     """
     累计量的每秒速率：相邻两点的差 / 间隔秒数，记在后一点的时刻上。
     跨空洞的那一段不算（空洞里发生了多少无从得知，摊平会把尖峰抹掉），
-    时间相同的两点也跳过；points 须升序。时间为 datetime 时按 total_seconds 计间隔。
+    时间相同的两点与计数回落的区间也跳过；points 须升序。
+    时间为 datetime 时按 total_seconds 计间隔。
     """
+    return [(stamp, delta / seconds) for stamp, delta, seconds in _counter_steps(points, gaps)]
+
+
+def average_counter_rate(points: Sequence[Tuple[T, float]],
+                         gaps: Sequence[Gap] = ()) -> Optional[float]:
+    """有效观测区间的时间加权平均速率，跳过计数回落和采集空洞。"""
+    total_delta = total_seconds = 0.0
+    for _, delta, seconds in _counter_steps(points, gaps):
+        total_delta += delta
+        total_seconds += seconds
+    return total_delta / total_seconds if total_seconds > 0 else None
+
+
+def _counter_steps(points: Sequence[Tuple[T, float]],
+                   gaps: Sequence[Gap]) -> Iterator[Tuple[T, float, float]]:
     ordered = sorted(gaps, key=lambda g: g[0])
     starts = [g[0] for g in ordered]
-    result: List[Tuple[T, float]] = []
     for (t0, v0), (t1, v1) in zip(points, points[1:]):
         dt = t1 - t0
         seconds = dt.total_seconds() if hasattr(dt, 'total_seconds') else float(dt)
@@ -59,8 +74,9 @@ def per_second_rates(points: Sequence[Tuple[T, float]],
             continue
         if ordered and crosses_gap(t0, t1, starts, ordered):
             continue
-        result.append((t1, (v1 - v0) / seconds))
-    return result
+        if v1 < v0:
+            continue
+        yield t1, v1 - v0, seconds
 
 
 def count_rises(values: Sequence[float]) -> int:

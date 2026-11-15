@@ -7,7 +7,7 @@ import math
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Callable, Dict, Optional, List, Tuple
@@ -28,7 +28,7 @@ from data.mappers import to_ms
 from data.models import (TARGET_NAME, TARGET_PID, TARGET_TREE, DataPoint, MemberRecord,
                          QualityStats, TaskRecord)
 from data.errors import StorageError, StorageFullError
-from utils.metrics import MetricType, is_member_series
+from utils.metrics import CPU_USAGE_METRICS, MetricType, is_member_series
 import config
 
 if TYPE_CHECKING:
@@ -194,7 +194,8 @@ class MonitorWorker(QThread):
                  restart_limit: Optional[int] = None,
                  restart_count: int = 0,
                  recovering: bool = False,
-                 start_time: Optional[datetime] = None):
+                 start_time: Optional[datetime] = None,
+                 restart_state: Optional[dict] = None):
         """
         初始化监控任务
 
@@ -257,6 +258,12 @@ class MonitorWorker(QThread):
         # 都会读写，一律经 _state_lock
         self._state_lock = threading.Lock()
         self._state = WorkerState.WAITING
+        self._restart_state = restart_state or {}
+        self._handoff_requested = threading.Event()
+        self._handoff_ready = threading.Event()
+        self._handoff_error: Optional[str] = None
+        self._handoff_committed = False
+        self._waiting_target: Optional[RestartTarget] = None
 
         # 调度唤醒事件：stop()/pause()/resume() 置位，让等待中的工作线程立即醒来
         self._wake = threading.Event()
@@ -268,6 +275,8 @@ class MonitorWorker(QThread):
         self.group_spec = group_spec
         self.target_kind = group_spec.kind if group_spec is not None else TARGET_PID
         self.collector = self._build_collector(pid, group_spec)
+        if group_spec is not None and 'group_counters' in self._restart_state:
+            self.collector.restore_counter_state(self._restart_state['group_counters'])
 
         # 退出取证与续接：退出码句柄只在 pid / tree 任务取（按名监控没有单一的被测进程）
         self._exit_probe_factory = exit_probe_factory or open_exit_probe
@@ -370,6 +379,8 @@ class MonitorWorker(QThread):
             logger.warning("task_id=%s 状态为 %s，忽略重复启动",
                            self.task_id, self.state.value)
             return
+        if self._restart_state.get('paused'):
+            self._transition((WorkerState.RUNNING,), WorkerState.PAUSED)
         self._wake.clear()
         super().start(priority)
 
@@ -382,6 +393,8 @@ class MonitorWorker(QThread):
         测试可在当前线程直接调用 run()：WAITING 视同已 start()。
         """
         self._transition((WorkerState.WAITING,), WorkerState.RUNNING)
+        if self._restart_state.get('paused'):
+            self._transition((WorkerState.RUNNING,), WorkerState.PAUSED)
         if self.state is WorkerState.STOPPED:
             # 启动前已被停止（WAITING -> STOPPED）：没有任何东西需要收尾
             return
@@ -420,9 +433,24 @@ class MonitorWorker(QThread):
         self._task_saved = self.db.save_task(self.task_model)
         logger.info("任务启动: task_id=%s pid=%s process=%s metrics=%s",
                     self.task_id, self.pid, self.process_name, self.metric_types)
+        if self._recovering:
+            self._load_prior_quality()
+            self._add_marker('recover', RECOVER_MARKER_LABEL, clock.now())
+            self.markers_changed.emit(self.task_id)
 
-        # 检查进程是否存在
-        if not self.collector.is_process_running():
+        # 原目标已退出但正在等待重启的任务，需要先接回等待状态。
+        if self._restart_state.get('waiting_target'):
+            target = dict(self._restart_state['waiting_target'])
+            target['ancestor_pids'] = frozenset(target.get('ancestor_pids', ()))
+            self._waiting_target = RestartTarget(**target)
+            self._exe_path = self._waiting_target.exe_path
+            self._refresh_restart_policy(force=True)
+            self.last_exit_code = self._restart_state.get('exit_code')
+            self._last_exit = TargetExit(
+                self.last_exit_code, StopReason(self._restart_state['exit_reason']))
+            if not self._wait_for_restart(self._last_exit):
+                return self._last_exit.reason
+        elif not self.collector.is_process_running():
             error_msg = f"进程 {self.process_name} (PID: {self.pid}) 不存在或无法访问"
             self.error_occurred.emit(self.task_id, error_msg)
             return StopReason.PROCESS_NOT_FOUND
@@ -442,17 +470,13 @@ class MonitorWorker(QThread):
             self._backfill_create_time(actual_create_time)
 
         # 进程确认存在后立刻取退出码句柄：晚了进程可能已退出，就读不到退出码了
-        if not self._open_forensics():
+        if self._exit_probe is None and not self._open_forensics():
             return self._fail_pid_reused()
         self._refresh_restart_policy(force=True)
-        if self._recovering:
-            self._load_prior_quality()
-            self._add_marker('recover', RECOVER_MARKER_LABEL, clock.now())
-            self.markers_changed.emit(self.task_id)
 
         # 含CPU使用率指标时先预热，丢弃cpu_percent首次返回的无效0值。预热后要隔满
         # 一个周期再采：紧接着采的 CPU 样本统计窗口近乎为零，仍是 0 或量化尖峰
-        cpu_primed = MetricType.CPU_PERCENT in self.metric_types
+        cpu_primed = bool(CPU_USAGE_METRICS.intersection(self.metric_types))
         if cpu_primed:
             self.collector.prime_cpu()
 
@@ -467,6 +491,8 @@ class MonitorWorker(QThread):
         next_deadline = self._first_deadline(clock.monotonic(), cpu_primed)
         stats.start_segment(next_deadline)
         while True:
+            if self._handoff_barrier():
+                next_deadline = self._first_deadline(clock.monotonic(), cpu_primed)
             state = self.state
             if state not in ACTIVE_STATES:
                 break
@@ -492,13 +518,14 @@ class MonitorWorker(QThread):
 
             # 等到本周期截止时间；被唤醒后重新检查状态（调用方先改状态再 set 事件，
             # 故 clear 之后读到的状态一定是最新的）
-            while self.state is WorkerState.RUNNING:
+            while (self.state is WorkerState.RUNNING
+                   and not self._handoff_requested.is_set()):
                 remaining = next_deadline - clock.monotonic()
                 if remaining <= 0:
                     break
                 clock.wait(self._wake, remaining)
                 self._wake.clear()
-            if self.state is not WorkerState.RUNNING:
+            if self.state is not WorkerState.RUNNING or self._handoff_requested.is_set():
                 continue   # 暂停或停止：回到循环顶部按新状态处理
             self._refresh_restart_policy()
 
@@ -843,13 +870,17 @@ class MonitorWorker(QThread):
                     self.task_id, self.process_name, self.restart_count, self._policy[1],
                     "，等待前处于暂停" if self._paused_before_wait else "")
         self.waiting_restart_changed.emit(self.task_id, True)
-        target = self._restart_target()
+        target = self._waiting_target or self._restart_target()
+        self._waiting_target = target
         self._release_group_instances()
         finder = self._restart_finder or default_restart_finder()
         prepared: Optional[_PreparedRestart] = None
         # 找到了但核对身份不通过的候选（它在被接上前一刻已退出、PID 被复用）：不再重复处理
         rejected = set()
         while self.state is WorkerState.WAITING_RESTART:
+            self._handoff_barrier()
+            if self.state is not WorkerState.WAITING_RESTART:
+                break
             try:
                 hit = finder(target)
             except Exception:
@@ -875,6 +906,7 @@ class MonitorWorker(QThread):
             return False
         try:
             self._adopt_restarted_process(prepared)
+            self._waiting_target = None
         finally:
             self.waiting_restart_changed.emit(self.task_id, False)
         return True
@@ -949,6 +981,8 @@ class MonitorWorker(QThread):
         """续接到新进程：换采集器与退出码句柄、更新任务行的 PID 与创建时间、写"重启"打点。
         任务 ID、开始时间与已有数据都不变；等待期间是数据空洞，不补任何数据点。"""
         old_pid = self.pid
+        if self.group_spec is not None:
+            new.collector.restore_counter_state(self.collector.counter_state())
         self._close_probe()
         self.pid = new.pid
         self.expected_create_time = new.create_time
@@ -986,7 +1020,7 @@ class MonitorWorker(QThread):
 
     def _begin_restarted_segment(self) -> float:
         """续接后开始新的计划周期段：与任务刚启动时一样先预热 CPU，返回首个截止时间。"""
-        cpu_primed = MetricType.CPU_PERCENT in self.metric_types
+        cpu_primed = bool(CPU_USAGE_METRICS.intersection(self.metric_types))
         if cpu_primed:
             self.collector.prime_cpu()
         deadline = self._first_deadline(self._clock.monotonic(), cpu_primed)
@@ -1068,6 +1102,66 @@ class MonitorWorker(QThread):
         logger.warning("task_id=%s 部分指标不可用（不记录数据）: %s",
                        self.task_id, fresh)
         self.metrics_unavailable.emit(self.task_id, fresh)
+
+    def prepare_handoff(self) -> bool:
+        """在周期边界冻结并刷新数据，失败可释放屏障继续原任务。"""
+        with self._state_lock:
+            if self._state not in ACTIVE_STATES:
+                return False
+            self._handoff_error = None
+            self._handoff_ready.clear()
+            self._handoff_requested.set()
+        self._wake.set()
+        return True
+
+    def _handoff_barrier(self) -> bool:
+        if not self._handoff_requested.is_set():
+            return False
+        self.cycle_stats.end_segment(self._clock.monotonic())
+        try:
+            self._flush_buffer()
+            if (not self._ensure_task_row() or self._data_buffer
+                    or self._pending_appeared or self._pending_last_seen):
+                raise OSError('任务仍有未保存的采集数据')
+            if not self._save_quality():
+                raise OSError('任务采集质量尚未保存')
+        except Exception as exc:
+            self._handoff_error = str(exc)
+        self._handoff_ready.set()
+        while self._handoff_requested.is_set() and self.state in ACTIVE_STATES:
+            self._wake.wait(0.1)
+            self._wake.clear()
+        if not self._handoff_committed and self.state is WorkerState.RUNNING:
+            if CPU_USAGE_METRICS.intersection(self.metric_types):
+                self.collector.prime_cpu()
+            self.cycle_stats.start_segment(self._clock.monotonic())
+        return True
+
+    def handoff_status(self) -> Tuple[bool, Optional[str]]:
+        return self._handoff_ready.is_set(), self._handoff_error
+
+    def handoff_state(self) -> dict:
+        state = {'paused': self.is_paused()}
+        if self.group_spec is not None:
+            state['group_counters'] = self.collector.counter_state()
+        if self._waiting_target is not None:
+            state['waiting_target'] = asdict(self._waiting_target)
+            state['waiting_target']['ancestor_pids'] = sorted(self._waiting_target.ancestor_pids)
+            state['exit_reason'] = self._last_exit.reason.value
+            state['exit_code'] = self.last_exit_code
+        return state
+
+    def cancel_handoff(self) -> None:
+        self._handoff_requested.clear()
+        self._wake.set()
+
+    def commit_handoff(self) -> None:
+        with self._state_lock:
+            if not self._handoff_ready.is_set() or self._handoff_error:
+                raise RuntimeError('任务尚未完成保存')
+            self._handoff_committed = True
+            self._state = WorkerState.STOPPING
+        self._wake.set()
 
     def stop(self) -> bool:
         """
@@ -1212,6 +1306,13 @@ class MonitorWorker(QThread):
         Args:
             reason: 停止原因
         """
+        if self._handoff_committed:
+            # 交接屏障已经确认落库，普通停止信号会触发关闭由工具启动的被测程序。
+            self._close_probe()
+            self._transition(LIVE_STATES, WorkerState.STOPPED)
+            logger.info("任务已保存，等待管理员实例续采: task_id=%s", self.task_id)
+            return
+
         # 仍存活的实例以最后一个周期为"最后一次见到"
         self._close_members()
         # 收尾 flush 没有下一轮重试机会，失败也要继续走完收尾流程
@@ -1219,6 +1320,7 @@ class MonitorWorker(QThread):
             self._flush_buffer(is_teardown=True)
         except Exception:
             logger.error("task_id=%s 收尾 flush 异常", self.task_id, exc_info=True)
+
 
         self.task_model.end_time = self._clock.now()
         self.task_model.status = TaskStatus.STOPPED
@@ -1254,25 +1356,28 @@ class MonitorWorker(QThread):
         except Exception:
             logger.error("task_id=%s 写入停止原因失败", self.task_id, exc_info=True)
 
-    def _save_quality(self) -> None:
+    def _save_quality(self) -> bool:
         """收尾时把周期统计写入 tasks 的数据质量列。主循环异常退出时活动段可能未结束，
         这里按此刻补结束；失败只记日志（数据质量只是辅助信息，不能连累收尾）。"""
         stats = self.cycle_stats
         try:
             stats.end_segment(self._clock.monotonic())
             if not stats.has_data or not self._task_saved:
-                return
+                return True
             quality = self._with_prior_quality(stats.summary())
             self.task_model.quality = quality
-            self.db.tasks.save_quality(self.task_id, quality,
-                                       histograms=self._combined_histograms())
+            if not self.db.tasks.save_quality(
+                    self.task_id, quality, histograms=self._combined_histograms()):
+                return False
             logger.info("task_id=%s 数据质量: 计划 %d 完成 %d 跳过 %d 周期，"
                         "调度延迟 p95 %s ms，采集 p95 %s ms，写库 p95 %s ms",
                         self.task_id, quality.planned_cycles, quality.done_cycles,
                         quality.missed_cycles, quality.lag_p95_ms,
                         quality.collect_p95_ms, quality.write_p95_ms)
+            return True
         except Exception:
             logger.error("task_id=%s 写入数据质量失败", self.task_id, exc_info=True)
+            return False
 
     def _ensure_task_row(self) -> bool:
         """确保任务行已入库（启动时 save_task 失败的补写，走 upsert）"""

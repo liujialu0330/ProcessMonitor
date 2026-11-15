@@ -273,6 +273,32 @@ class SparklineWidget(QWidget):
         """当前绘制序列（测试与调试用）"""
         return self._sampler.series()
 
+    def restart_state(self) -> list:
+        return [
+            {'metric': metric, 'stride': sampler.stride,
+             'points': list(sampler._points),
+             'times': [when.isoformat() if when is not None else None
+                       for when in sampler._times],
+             'pending': list(sampler._pending),
+             'pending_time': sampler._pending_time.isoformat()
+             if sampler._pending_time is not None else None}
+            for metric, sampler in self._samplers.items()]
+
+    def restore_restart_state(self, state: list) -> None:
+        self._samplers.clear()
+        for saved in state:
+            sampler = self._sampler_for(saved['metric'])
+            sampler.stride = saved['stride']
+            sampler._points = list(saved['points'])
+            sampler._times = [datetime.fromisoformat(when) if when is not None else None
+                              for when in saved['times']]
+            sampler._pending = list(saved['pending'])
+            sampler._pending_time = (datetime.fromisoformat(saved['pending_time'])
+                                     if saved['pending_time'] is not None else None)
+        self._sampler = self._sampler_for(self._metric_type)
+        self._sync_height()
+        self.update()
+
     def set_markers(self, markers: Sequence) -> None:
         """设置打点刻度；非 TICK_KINDS 的打点忽略。markers 的元素可以是 (时间, kind)，
         也可以是带 timestamp / kind / label 的打点对象（后者才有悬停文字与右键）。"""

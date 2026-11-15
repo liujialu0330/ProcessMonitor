@@ -79,6 +79,32 @@ def root(**values):
     return inst('app.exe', ROOT_PID, ROOT_CREATE_TIME, **values)
 
 
+def test_target_restart_preserves_group_virtual_counter_base(db, qapp):
+    from core.group_collector import GroupCollector
+    from core.monitor_task import _PreparedRestart
+
+    metric = MetricType.IO_READ_COUNT
+    clock = SteppingClock()
+    value = [100]
+    source = FakeTreeSource(lambda _t: [root(**{metric: value[0]})], clock)
+    worker = MonitorWorker(ROOT_PID, 'app.exe', [metric], db=db,
+                           clock=clock, group_spec=tree_spec(), tree_source=source)
+    worker.collector.collect_metrics([metric])
+    value[0] = 140
+    assert worker.collector.collect_metrics([metric])[metric] == 40
+    new_spec = GroupSpec.tree(6000, 2000)
+    new_source = FakeTreeSource(
+        lambda _t: [inst('app.exe', 6000, 2000, **{metric: value[0]})], clock)
+    collector = GroupCollector(new_spec, source=new_source)
+    worker._adopt_restarted_process(_PreparedRestart(
+        6000, 2000, collector, None, None, new_spec))
+    value[0] = 10000
+    assert worker.collector.collect_metrics([metric])[metric] == 40
+    value[0] = 10007
+    sample = worker.collector.collect_metrics([metric])
+    assert sample[metric] == sample[member_series_key(metric, 'app.exe')] == 47
+
+
 # ========== 任务行 ==========
 
 def test_task_row_records_target_kind_and_spec(db, started):

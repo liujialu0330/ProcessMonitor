@@ -34,7 +34,8 @@ class MetricType:
     MEMORY_USS = "memory_uss"                   # 独占物理内存（USS）
 
     # CPU相关
-    CPU_PERCENT = "cpu_percent"         # CPU使用率
+    CPU_PERCENT = "cpu_percent_total"
+    CPU_PERCENT_LEGACY = "cpu_percent"
     CPU_USER_TIME = "cpu_user_time"     # CPU用户时间
     CPU_SYSTEM_TIME = "cpu_system_time" # CPU系统时间
     CPU_PRIORITY = "cpu_priority"       # 基本优先级
@@ -44,8 +45,8 @@ class MetricType:
     NUM_HANDLES = "num_handles"         # 句柄数 (Windows)
     NUM_GDI_OBJECTS = "num_gdi_objects"     # GDI对象数 (Windows)
     NUM_USER_OBJECTS = "num_user_objects"   # USER对象数 (Windows)
-    NUM_CTX_SWITCHES_VOL = "num_ctx_switches_voluntary"     # 自愿上下文切换
-    # 已废弃：psutil 在 Windows 上只能取到自愿上下文切换，非自愿项恒为 0。
+    NUM_CTX_SWITCHES_VOL = "num_ctx_switches_voluntary"
+    # 已废弃：Windows 返回存活线程的上下文切换总数，无法区分自愿与非自愿。
     # 不再出现在可选指标里，键与显示名、单位、格式化保留，供旧任务数据显示与导出。
     NUM_CTX_SWITCHES_INVOL = "num_ctx_switches_involuntary" # 非自愿上下文切换（已废弃）
 
@@ -65,7 +66,7 @@ class MetricKind(Enum):
     PERCENT = "percent"                     # 百分比
     SECONDS = "seconds"                     # 进程启动以来累计的 CPU 时间（秒）
     COUNT = "count"                         # 当前水位的个数/状态值（取值恒为整数）
-    CUMULATIVE_COUNT = "cumulative_count"   # 进程启动以来只增不减的累计次数
+    CUMULATIVE_COUNT = "cumulative_count"   # 活动累计次数，计数回落时跳过速率区间
     CUMULATIVE_BYTES = "cumulative_bytes"   # 进程启动以来只增不减的累计字节量（KB）
     # 历史峰值，只增不减。仅用于内存峰值，单位与对应的内存指标相同（KB）
     PEAK = "peak"
@@ -75,7 +76,11 @@ class MetricKind(Enum):
 _KB_KINDS = frozenset({MetricKind.BYTES_KB, MetricKind.CUMULATIVE_BYTES, MetricKind.PEAK})
 # 取值恒为整数的种类：显示取整，历史图 Y 轴刻度强制整数
 _INTEGER_KINDS = frozenset({MetricKind.COUNT, MetricKind.CUMULATIVE_COUNT})
-# 单调不减、不是"水位量"的种类：对它们做线性回归得到的"增速"只是累计速率，
+_PRIORITY_CLASS_NAMES = {
+    0x40: '空闲', 0x4000: '低于正常', 0x20: '正常',
+    0x8000: '高于正常', 0x80: '高', 0x100: '实时',
+}
+# 累计活动与历史峰值，不是"水位量"：对它们做线性回归得到的"增速"只是累计速率，
 # 不能外推，也不能据此判断泄漏。SECONDS 也在其中——目前只有 CPU 用户/内核时间
 # 属于这一类，两者都是进程启动以来的累计值。
 _CUMULATIVE_KINDS = frozenset({
@@ -198,9 +203,15 @@ _SPECS = (
     # 两次采集之间的占用率；psutil 首次调用恒为 0，需要预热
     MetricSpec(
         MetricType.CPU_PERCENT, "CPU使用率", "%", "CPU", MetricKind.PERCENT,
-        "进程 CPU 占用率（可超过 100%，按核数累计），适合发现空闲时仍高占用的死循环或忙等",
+        "进程占整机 CPU 时间容量的百分比（0～100%，按逻辑处理器数量归一）；"
+        "与任务管理器对照时请使用同一进程和相近采样间隔",
         needs_priming=True,
         cost=COST_SNAPSHOT),
+    MetricSpec(
+        MetricType.CPU_PERCENT_LEGACY, "CPU使用率（旧版按核累计）", "%", "CPU", MetricKind.PERCENT,
+        "旧版记录：每个逻辑处理器满载记为 100%，多核累计可超过 100%；"
+        "新建任务改用占整机容量的 CPU 使用率",
+        needs_priming=True, deprecated=True, cost=COST_SNAPSHOT),
     # 进程启动以来累计的用户态时间（秒），只增不减
     MetricSpec(
         MetricType.CPU_USER_TIME, "CPU用户时间", "秒", "CPU", MetricKind.SECONDS,
@@ -214,7 +225,7 @@ _SPECS = (
     # 调度优先级是可被改回的整数状态值，不是累计量；无单位
     MetricSpec(
         MetricType.CPU_PRIORITY, "基本优先级", "", "CPU", MetricKind.COUNT,
-        "进程的基本调度优先级（任务管理器同名列），用于确认被测程序的优先级是否被改动",
+        "进程的优先级类，显示为正常、高等名称；原始数据保留 Windows 编码（32 表示正常）",
         cost=COST_CHEAP, group_applicable=False),
 
     # ---------- 系统资源 ----------
@@ -243,13 +254,14 @@ _SPECS = (
         "持续上涨说明窗口或菜单创建后没有销毁",
         requires='windows', in_leak_preset=True, leak_preset_rank=4,
         cost=COST_CHEAP),
-    # 上下文切换是进程启动以来的累计次数，只增不减
+    # Windows 仅累计当前存活线程的切换次数，线程退出时可能回落
     MetricSpec(
-        MetricType.NUM_CTX_SWITCHES_VOL, "自愿上下文切换", "次", "系统资源",
+        MetricType.NUM_CTX_SWITCHES_VOL, "上下文切换", "次", "系统资源",
         MetricKind.CUMULATIVE_COUNT,
-        "累计自愿上下文切换次数（线程主动等待让出 CPU），适合分析线程同步与阻塞",
+        "Windows 当前存活线程的上下文切换次数之和，包含主动等待与被抢占；"
+        "线程退出时可能下降，速率与平均值仅统计有效区间；不能区分自愿与非自愿",
         cost=COST_SNAPSHOT),
-    # 同为累计次数；psutil 在 Windows 上只能取到自愿切换，此项恒为 0，已废弃
+    # Windows 无法区分自愿与非自愿切换，此项恒为 0，已废弃
     MetricSpec(
         MetricType.NUM_CTX_SWITCHES_INVOL, "非自愿上下文切换", "次", "系统资源",
         MetricKind.CUMULATIVE_COUNT,
@@ -393,6 +405,20 @@ def canonical_metric_type(metric_type: str) -> str:
     return LEGACY_METRIC_ALIASES.get(metric_type, metric_type)
 
 
+CPU_USAGE_METRICS = frozenset({MetricType.CPU_PERCENT, MetricType.CPU_PERCENT_LEGACY})
+
+
+def new_task_metric_type(metric_type: str) -> str:
+    """新建任务使用整机 CPU 百分比，历史查询继续按原指标键解释。"""
+    key = canonical_metric_type(metric_type)
+    return MetricType.CPU_PERCENT if key == MetricType.CPU_PERCENT_LEGACY else key
+
+
+def cpu_percent_of_system(percent: float, logical_cpus: int) -> float:
+    """将按核累计的 CPU 百分比换算为整机时间容量占比。"""
+    return round(min(100.0, max(0.0, percent / max(1, logical_cpus))), 1)
+
+
 def _find_spec(key: Optional[str]) -> Optional[MetricSpec]:
     """按键找元数据：先剥掉成员后缀（"指标@成员"取指标部分），再查常规注册表与进程组
     专属注册表；找不到返回 None。"""
@@ -454,10 +480,11 @@ def is_kb_metric(metric_type: str) -> bool:
 
 
 def is_cumulative_metric(metric_type: str) -> bool:
-    """该指标是否单调不减（累计次数/累计字节/CPU 累计时间/历史峰值）。
+    """该指标是否属于累计活动或历史峰值（次数/字节/CPU 时间/峰值）。
 
     这类指标不是水位量：回归斜率只反映累计速率，不能当"增速"外推，也不能据此
-    判断泄漏；判定摘要表与任务卡片应隐藏它们的增速。未知键返回 False。
+    判断泄漏；判定摘要表与任务卡片应隐藏它们的增速。计数器重置或线程退出时可能
+    回落，速率跳过该区间。未知键返回 False。
     """
     return _kind_of(metric_type) in _CUMULATIVE_KINDS
 
@@ -517,6 +544,10 @@ def format_metric_value(
     """格式化指标值为可读字符串"""
     kind = _kind_of(metric_type)
     unit = get_metric_unit(metric_type)
+    if split_member_key(metric_type)[0] == MetricType.CPU_PRIORITY:
+        priority_name = _PRIORITY_CLASS_NAMES.get(value)
+        if priority_name is not None:
+            return priority_name
 
     # 字节类自动选择 KB/MB/GB/TB；分析页可显式传 display_unit，
     # 让同一图表里的统计、悬停、表格与坐标轴始终使用同一个单位。
@@ -557,7 +588,8 @@ def format_metric_delta(
     """
     if delta is None or not math.isfinite(delta):
         return "--"
-    body = format_metric_value(metric_type, abs(delta), display_unit)
+    body = (f'{int(abs(delta)):,}' if split_member_key(metric_type)[0] == MetricType.CPU_PRIORITY
+            else format_metric_value(metric_type, abs(delta), display_unit))
     if _text_is_zero(body):
         return "±0"
     return ("+" if delta > 0 else "-") + body

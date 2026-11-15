@@ -559,6 +559,56 @@ def test_recovery_with_no_candidates_does_nothing(qapp, paths):
         ctx.db.close()
 
 
+def test_committed_restart_recovers_tasks_after_clean_exit(qapp, paths):
+    pid = os.getpid()
+    _seed_running(paths, pid, psutil.Process(pid).create_time())
+    state = {'payload': {'tasks': {'t-live': {'paused': True}}}}
+    ctx = build_context(paths, retention_days=0, restart_state=state)
+    try:
+        assert ctx.previous_session is PreviousSession.CLEAN
+        assert [c.task_id for c in ctx.recovery_candidates] == ['t-live']
+        assert ctx.db.get_task('t-live').status == 'running'
+        assert ctx.reconcile.orphans == 0
+    finally:
+        release_session_lock(ctx)
+        ctx.db.close()
+
+
+def test_restart_read_failure_preserves_running_rows(qapp, paths, monkeypatch):
+    from data.repos.task_repo import TaskRepo
+    pid = os.getpid()
+    _seed_running(paths, pid, psutil.Process(pid).create_time())
+
+    def fail(_self):
+        raise OSError('读取任务暂时失败')
+
+    monkeypatch.setattr(TaskRepo, 'list_running', fail)
+    state = {'payload': {'tasks': {'t-live': {}}}}
+    with pytest.raises(OSError):
+        build_context(paths, retention_days=0, restart_state=state)
+    check = Database(paths.db_path)
+    try:
+        assert check.get_task('t-live').status == 'running'
+        assert len(check.points.fetch(PointQuery('t-live', METRIC))) == 5
+    finally:
+        check.close()
+
+
+def test_restart_retains_waiting_for_exited_target(db):
+    _running_task(db, pid=987654, create_time=100.0)
+    state = {'t-running': {'waiting_target': {'name': 'app.exe'}}}
+    candidates = find_recoverable(db, probe=FakeProcs(), restart_states=state, strict=True)
+    assert [candidate.task_id for candidate in candidates] == ['t-running']
+
+
+def test_restart_indeterminate_target_keeps_handoff_for_retry(db):
+    _running_task(db, pid=987654, create_time=100.0)
+    with pytest.raises(ProbeIndeterminate):
+        find_recoverable(db, probe=_IndeterminateProbe(),
+                         restart_states={'t-running': {}}, strict=True)
+    assert db.get_task('t-running').status == 'running'
+
+
 def test_release_session_lock_swallows_errors(qapp, paths):
     ctx = build_context(paths, retention_days=0)
     try:

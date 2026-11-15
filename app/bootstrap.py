@@ -94,6 +94,7 @@ EXIT_MIGRATION_FAILED = 3
 # 无窗口模式没能开始 IPC 监听时 run() 的返回码：没有管道就收不到任何命令（包括 quit），
 # 留着只会成为一个关不掉的后台进程
 EXIT_IPC_UNAVAILABLE = 4
+EXIT_RESTART_PENDING = 6
 # 无窗口模式启动时发现设置里关闭了"允许命令行与脚本控制"：正常退出（0），pmctl 据此提示
 EXIT_AUTOMATION_DISABLED = 0
 
@@ -161,6 +162,7 @@ class AppContext:
     previous_session: Optional["PreviousSession"] = None
     # 上次异常退出时仍可续采的任务（被测进程还活着）；run_recovery 处理后清空
     recovery_candidates: Tuple["RecoveryCandidate", ...] = ()
+    restart_state: Optional[dict] = None
 
     @property
     def hub(self):
@@ -172,7 +174,8 @@ def build_context(paths: AppPaths, *, registry=None,
                   retention_days: Optional[int] = None,
                   report: Optional["MigrationReport"] = None,
                   legacy_importer=None,
-                  runtime_settings: Optional["RuntimeSettings"] = None) -> AppContext:
+                  runtime_settings: Optional["RuntimeSettings"] = None,
+                  restart_state: Optional[dict] = None) -> AppContext:
     """
     组装 Database / MonitorManager / 维护服务 / 运行服务 / 阻止睡眠守卫（不建 QApplication 与窗口）。
 
@@ -232,8 +235,14 @@ def build_context(paths: AppPaths, *, registry=None,
     candidates: Tuple["RecoveryCandidate", ...] = ()
     if not read_only:
         previous = session_lock.check_previous()
-        if previous is PreviousSession.ABNORMAL:
-            candidates = tuple(find_recoverable(db))
+        if previous is PreviousSession.ABNORMAL or restart_state is not None:
+            try:
+                candidates = tuple(find_recoverable(
+                    db, restart_states=(restart_state or {}).get('payload', {}).get('tasks'),
+                    strict=restart_state is not None))
+            except Exception:
+                db.close()
+                raise
     # 必须在任何监控任务启动之前；此时 manager 刚构造，还没有任务
     if previous in (PreviousSession.OTHER_INSTANCE, PreviousSession.UNKNOWN):
         # 另一个实例仍在运行（或探测权限不足、无法排除它在运行，如上一个实例以管理员身份运行）：
@@ -274,7 +283,8 @@ def build_context(paths: AppPaths, *, registry=None,
                       registry=registry, maintenance=maintenance, reconcile=reconcile,
                       power_guard=power_guard, self_monitor=SelfMonitor(),
                       storage_guard=storage_guard, session_lock=session_lock,
-                      previous_session=previous, recovery_candidates=candidates)
+                      previous_session=previous, recovery_candidates=candidates,
+                      restart_state=restart_state)
 
 
 def schema_not_upgraded(report: "MigrationReport") -> bool:
@@ -615,7 +625,11 @@ def run_recovery(ctx: AppContext, *, auto_marker=None, prompt=None,
                     "（需要续采请使用 %s）: %s", len(candidates), RESUME_ARG,
                     ", ".join(t[:8] for t in outcome.abandoned))
         return outcome
-    outcome = apply_decision(ctx.manager, ctx.db, candidates, selected, auto_marker=auto_marker)
+    kwargs = {}
+    if ctx.restart_state is not None:
+        kwargs['restart_states'] = ctx.restart_state['payload']['tasks']
+    outcome = apply_decision(ctx.manager, ctx.db, candidates, selected,
+                             auto_marker=auto_marker, **kwargs)
     logger.info("续采结果: 续采 %d 个，放弃 %d 个，失败 %d 个", len(outcome.resumed),
                 len(outcome.abandoned), len(outcome.failed))
     return outcome
@@ -707,6 +721,17 @@ def _attach_ipc_to_window(guard, ctx: AppContext, window) -> None:
         launcher=getattr(ctx.services, "launcher", None),
         log_path=getattr(ctx.services, "log_path", None)))
     logger.info("命令行控制已就绪（有窗口模式）")
+
+
+def _attach_elevation(ctx: AppContext, window, guard) -> None:
+    from app.elevation import ElevationController, restore_handoff
+    from utils.elevation import is_elevated
+    if is_elevated():
+        window.setWindowTitle(window.windowTitle() + ' · 管理员')
+    window.elevation_controller = ElevationController(ctx, window, guard)
+    window.monitor_page.presenter.elevation_requested.connect(window.elevation_controller.request)
+    if ctx.restart_state is not None:
+        restore_handoff(ctx, window, guard)
 
 
 def _run_headless(app, guard, paths: AppPaths, idle_exit_s: float, *,
@@ -819,6 +844,17 @@ def run(argv: List[str], *, exit_process: Callable[[int], None] = os._exit,
                 path=_data_dir_failure_path(exc, argv), reason=exc))
         return EXIT_DATA_DIR_UNAVAILABLE
 
+    from core.restart_handoff import await_parent_exit, restart_token, strip_restart_args
+    try:
+        token = restart_token(argv)
+        restart_state = await_parent_exit(paths.data_dir, token) if token is not None else None
+        if token is not None and restart_state is None:
+            return 0
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        message_box(MESSAGE_BOX_TITLE, f'管理员重启未完成，原实例可继续监控。\n{exc}')
+        return EXIT_DATA_DIR_UNAVAILABLE
+    argv = strip_restart_args(argv)
+
     # 日志与全局异常兜底最先初始化，之后任何初始化异常（含 ui/core/data 导入期）都能落日志
     from utils.crash_handler import install_excepthook
     from utils.logger import setup_logging
@@ -868,6 +904,19 @@ def run(argv: List[str], *, exit_process: Callable[[int], None] = os._exit,
     listening = guard.listen()
     _mark(trace, "单实例与命令行监听")
 
+    if restart_state is None:
+        from core.restart_handoff import pending_restart
+        try:
+            restart_state = pending_restart(paths.data_dir)
+        except (OSError, ValueError, KeyError, TypeError):
+            logger.error('读取管理员重启交接记录失败，保留任务与交接记录', exc_info=True)
+            if not background:
+                message_box(MESSAGE_BOX_TITLE, '读取重启交接记录失败，请查看日志后重试。')
+            return EXIT_RESTART_PENDING
+    if background and restart_state is not None:
+        logger.error('有待恢复的管理员重启，请先打开主界面恢复任务，再使用命令行控制')
+        return EXIT_RESTART_PENDING
+
     if background:
         if not listening:
             logger.error("无窗口模式无法开始 IPC 监听，退出（否则没有办法控制或结束它）")
@@ -890,7 +939,15 @@ def run(argv: List[str], *, exit_process: Callable[[int], None] = os._exit,
         return EXIT_MIGRATION_FAILED
     _mark(trace, "迁移")
 
-    ctx = build_context(paths, report=report, legacy_importer=import_legacy_with_progress)
+    kwargs = {'restart_state': restart_state} if restart_state is not None else {}
+    try:
+        ctx = build_context(paths, report=report, legacy_importer=import_legacy_with_progress, **kwargs)
+    except Exception:
+        if restart_state is None:
+            raise
+        logger.error('管理员重启的任务读取失败，保留交接记录', exc_info=True)
+        message_box(MESSAGE_BOX_TITLE, '恢复监控任务失败，已保存数据与交接记录保留，请重试。')
+        return EXIT_RESTART_PENDING
     _mark(trace, "组装")
 
     from ui.main_window import MainWindow
@@ -907,7 +964,9 @@ def run(argv: List[str], *, exit_process: Callable[[int], None] = os._exit,
     start_storage_guard(ctx, window)
     guard.activation_requested.connect(lambda: activate_main_window(window))
     _attach_ipc_to_window(guard, ctx, window)
-    _schedule_recovery(ctx, window, resume_all=RESUME_ARG in argv[1:])
+    _attach_elevation(ctx, window, guard)
+    if restart_state is None:
+        _schedule_recovery(ctx, window, resume_all=RESUME_ARG in argv[1:])
     hint = sync_dir_hint(paths.data_dir)
     if hint:
         logger.warning("%s: %s", hint, paths.data_dir)

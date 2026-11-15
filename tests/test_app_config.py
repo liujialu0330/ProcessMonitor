@@ -21,6 +21,12 @@ def test_defaults():
     assert cfg.get(cfg.close_to_tray) is False
 
 
+def test_legacy_cpu_selection_uses_system_percentage():
+    from utils.metrics import MetricType
+    assert app_config.normalize_metrics(['cpu_percent', 'cpu_percent_total', 'num_threads']) == [
+        MetricType.CPU_PERCENT, MetricType.NUM_THREADS]
+
+
 def test_persist_roundtrip(tmp_path):
     """qconfig.load 到 tmp_path -> set 改值 -> 用新实例重新 load 同路径 -> 值保持"""
     config_path = str(tmp_path / "config.json")

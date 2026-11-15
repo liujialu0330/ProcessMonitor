@@ -95,6 +95,22 @@ def _series(seconds, func):
 
 # ========== aggregates ==========
 
+
+def test_average_counter_rate_uses_all_samples_with_many_duplicate_gaps(db, repo):
+    values = _series(range(20000), lambda s: s % 100)
+    task_id = _seed(db, {'num_ctx_switches_voluntary': values})
+    gaps = [(values[i][0], values[i + 1][0]) for i in range(0, 19999, 10)]
+    result = repo.average_counter_rate(
+        task_id, 'num_ctx_switches_voluntary', gaps=gaps + gaps)
+    assert result == 1
+
+
+@pytest.mark.parametrize('values', [[], [(T0, 1)],
+                                    [(T0, 5), (T0 + timedelta(seconds=1), 2)]])
+def test_average_counter_rate_without_valid_interval_is_unavailable(db, repo, values):
+    task_id = _seed(db, {'num_ctx_switches_voluntary': values})
+    assert repo.average_counter_rate(task_id, 'num_ctx_switches_voluntary') is None
+
 def _py_aggregates(points):
     first_ts = points[0][0]
     xs = [(ts - first_ts).total_seconds() for ts, _ in points]

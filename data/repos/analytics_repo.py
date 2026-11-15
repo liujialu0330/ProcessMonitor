@@ -397,6 +397,35 @@ class AnalyticsRepo:
                 full[5] + edges[3], full[6] + edges[4], full[7] + edges[5],
                 full[8] + edges[6], full[9] + edges[7])
 
+    def average_counter_rate(self, task_id: str, metric: str,
+                             since: Optional[datetime] = None,
+                             until: Optional[datetime] = None, *,
+                             gaps: Sequence[Tuple[datetime, datetime]] = ()) -> Optional[float]:
+        """全量相邻原始样本的时间加权速率；gaps 为本序列的相邻样本断点对。"""
+        lo, hi = ms_range(since, until)
+        cuts = json.dumps(sorted({(to_ms(a), to_ms(b)) for a, b in gaps}))
+        with self._connect('读取累计量平均速率') as conn:
+            sid = series_id(conn, task_id, metric)
+            if sid is None:
+                return None
+            # 断点只解包一次并参与可索引连接，避免每个样本重新扫描整份断点 JSON。
+            row = conn.execute('''
+                WITH cuts AS MATERIALIZED (
+                    SELECT json_extract(value, '$[0]') AS a,
+                           json_extract(value, '$[1]') AS b FROM json_each(?)
+                ), steps AS (
+                    SELECT ts_ms, value,
+                           LAG(ts_ms) OVER (ORDER BY ts_ms) AS previous_ms,
+                           LAG(value) OVER (ORDER BY ts_ms) AS previous_value
+                    FROM samples WHERE series_id = ? AND ts_ms BETWEEN ? AND ?
+                )
+                SELECT SUM(steps.value - previous_value), SUM(ts_ms - previous_ms)
+                FROM steps LEFT JOIN cuts ON cuts.a = previous_ms AND cuts.b = ts_ms
+                WHERE ts_ms > previous_ms AND steps.value >= previous_value AND cuts.a IS NULL
+            ''', (cuts, sid, lo, hi)).fetchone()
+        delta, duration_ms = row
+        return delta / (duration_ms / 1000.0) if duration_ms else None
+
     # ========== 空洞与分桶 ==========
 
     def gaps(self, task_id: str, interval_seconds: float,

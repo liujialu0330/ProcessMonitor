@@ -24,7 +24,8 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 from core import process_catalog
 from core.contracts import UnavailableReason
 from core.system_snapshot import ProcessSample, SnapshotUnavailable, SystemSnapshot
-from utils.metrics import COST_SNAPSHOT, REGISTRY, MetricType
+from utils.metrics import (COST_SNAPSHOT, CPU_USAGE_METRICS, REGISTRY, MetricType,
+                           cpu_percent_of_system)
 
 if TYPE_CHECKING:
     from core.snapshot_hub import SnapshotHub
@@ -169,7 +170,9 @@ SAMPLERS: Dict[str, Sampler] = {
     MetricType.MEMORY_USS: lambda p: _kb(p.memory_full_info().uss),
     # CPU 类。cpu_percent(interval=None) 非阻塞、基于上次调用以来的增量，
     # 首次调用固定返回 0，所以任务开始前要先 prime_cpu()
-    MetricType.CPU_PERCENT: lambda p: float(p.cpu_percent(interval=None)),
+    MetricType.CPU_PERCENT: lambda p: cpu_percent_of_system(
+        p.cpu_percent(interval=None), psutil.cpu_count(logical=True) or 1),
+    MetricType.CPU_PERCENT_LEGACY: lambda p: float(p.cpu_percent(interval=None)),
     MetricType.CPU_USER_TIME: lambda p: float(p.cpu_times().user),
     MetricType.CPU_SYSTEM_TIME: lambda p: float(p.cpu_times().system),
     MetricType.CPU_PRIORITY: lambda p: float(p.nice()),
@@ -230,7 +233,7 @@ _SNAPSHOT_KB_KEYS = frozenset({
 # 从快照派生、不是单个字段的指标（由 ProcessCollector._snapshot_value 计算）：
 # CPU 使用率（user+kernel 差分）、内存使用率（工作集 / 物理内存）、上下文切换（线程求和）
 SNAPSHOT_DERIVED = frozenset({
-    MetricType.CPU_PERCENT, MetricType.MEMORY_PERCENT,
+    *CPU_USAGE_METRICS, MetricType.MEMORY_PERCENT,
     MetricType.NUM_CTX_SWITCHES_VOL, MetricType.NUM_CTX_SWITCHES_INVOL,
 })
 
@@ -341,6 +344,7 @@ class ProcessCollector:
         self._identity_create_time: Optional[float] = None
         # CPU 使用率差分的上一个点：(user+kernel 秒, 快照单调时刻)
         self._cpu_prev: Optional[Tuple[float, float]] = None
+        self._logical_cpus = psutil.cpu_count(logical=True) or 1
         # 回退 psutil 只记一次日志
         self._fallback_logged = False
         # 最近一次 collect_metrics 的数据来源：'snapshot' / 'psutil'（诊断与测试用）
@@ -400,8 +404,10 @@ class ProcessCollector:
         """
         if self._process is None:
             self._process = psutil.Process(self.pid)
-        if metric_type == MetricType.CPU_PERCENT and self._hub is not None:
-            return self._cpu_percent_from_times(self._process)
+        if metric_type in CPU_USAGE_METRICS and self._hub is not None:
+            percent = self._cpu_percent_from_times(self._process)
+            return (cpu_percent_of_system(percent, self._logical_cpus)
+                    if metric_type == MetricType.CPU_PERCENT else percent)
         sampler = SAMPLERS.get(metric_type)
         if sampler is None:
             # 未知指标类型（如更高版本写入的键）：跳过，不写入结果
@@ -463,13 +469,32 @@ class ProcessCollector:
                 self.last_unavailable（每次调用开头清空）。
         """
         self.last_unavailable = {}
+        requested = metric_types
+        metric_types = list(dict.fromkeys(
+            MetricType.CPU_PERCENT_LEGACY if key == MetricType.CPU_PERCENT else key
+            for key in requested))
+        result = _FALLBACK
         if self._hub is not None:
             result = self._collect_from_snapshot(metric_types)
             if result is not _FALLBACK:
                 self.last_source = 'snapshot'
-                return result
-        self.last_source = 'psutil'
-        return self._collect_from_psutil(metric_types)
+        if result is _FALLBACK:
+            self.last_source = 'psutil'
+            result = self._collect_from_psutil(metric_types)
+        if MetricType.CPU_PERCENT not in requested or result is None:
+            return result
+        values = {}
+        unavailable = {}
+        for key in requested:
+            source = MetricType.CPU_PERCENT_LEGACY if key == MetricType.CPU_PERCENT else key
+            if source in result:
+                value = result[source]
+                values[key] = (cpu_percent_of_system(value, self._logical_cpus)
+                               if key == MetricType.CPU_PERCENT else value)
+            if source in self.last_unavailable:
+                unavailable[key] = self.last_unavailable[source]
+        self.last_unavailable = unavailable
+        return values
 
     def _collect_from_psutil(self, metric_types: List[str]) -> Optional[Dict[str, float]]:
         """原路径：全部指标逐进程经 psutil 采集。"""
@@ -653,8 +678,11 @@ class ProcessCollector:
     def _snapshot_value(self, metric_type: str, snapshot: SystemSnapshot,
                         sample: ProcessSample) -> Optional[float]:
         """从快照取一个指标（已换算到存储单位）；取不到返回 None。"""
-        if metric_type == MetricType.CPU_PERCENT:
-            return self._cpu_percent_from(snapshot, sample)
+        if metric_type in CPU_USAGE_METRICS:
+            percent = self._cpu_percent_from(snapshot, sample)
+            if percent is not None and metric_type == MetricType.CPU_PERCENT:
+                return cpu_percent_of_system(percent, self._logical_cpus)
+            return percent
         return read_snapshot_metric(metric_type, snapshot, sample)
 
     def _cpu_percent_from(self, snapshot: SystemSnapshot,
@@ -705,9 +733,11 @@ class ProcessCollector:
             if self._process is None:
                 self._process = psutil.Process(self.pid)
 
-            if metric_type == MetricType.CPU_PERCENT:
+            if metric_type in CPU_USAGE_METRICS:
                 # 单指标采集保持旧语义：使用0.1秒阻塞间隔，更准确
-                return self._process.cpu_percent(interval=0.1)
+                percent = self._process.cpu_percent(interval=0.1)
+                return (cpu_percent_of_system(percent, self._logical_cpus)
+                        if metric_type == MetricType.CPU_PERCENT else percent)
 
             return self._collect_one(metric_type)
 

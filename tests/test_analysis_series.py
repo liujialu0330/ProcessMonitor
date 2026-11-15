@@ -5,7 +5,8 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from core.analysis.series import connect_mask, count_rises, crosses_gap, per_second_rates
+from core.analysis.series import (average_counter_rate, connect_mask, count_rises,
+                                  crosses_gap, per_second_rates)
 
 T0 = datetime(2026, 1, 1, 10, 0, 0)
 
@@ -54,6 +55,18 @@ def test_per_second_rates_skip_gaps_and_zero_intervals():
 
 def test_per_second_rates_with_epoch_seconds():
     assert per_second_rates([(0.0, 1.0), (2.0, 5.0)]) == [(2.0, 2.0)]
+
+
+def test_per_second_rates_skips_counter_drop_after_threads_exit():
+    points = [(0.0, 130.0), (1.0, 5316.0), (2.0, 130.0), (3.0, 140.0)]
+    assert per_second_rates(points) == [(1.0, 5186.0), (3.0, 10.0)]
+
+
+def test_counter_average_weights_valid_intervals_after_reset():
+    points = [(0.0, 100.0), (2.0, 110.0), (3.0, 2.0), (7.0, 42.0)]
+    assert average_counter_rate(points) == pytest.approx(50.0 / 6)
+    assert average_counter_rate(points, [(3.0, 7.0)]) == 5.0
+    assert average_counter_rate([(0.0, 100.0), (1.0, 1.0)]) is None
 
 
 def test_per_second_rates_needs_two_points():

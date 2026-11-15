@@ -360,6 +360,7 @@ class TaskCard(CardWidget):
         # 时间锚点：任务开始、首个样本、最近一次已知的"现在"、结束时间
         self.started_at: Optional[datetime] = None
         self.first_sample_at: Optional[datetime] = None
+        self.last_sample_at: Optional[datetime] = None
         self.now: Optional[datetime] = None
         self.finished_at: Optional[datetime] = None
         self.stop_reason: Optional[StopReason] = None
@@ -372,7 +373,7 @@ class TaskCard(CardWidget):
         self.exit_code: Optional[int] = None
 
         # 采集次数：UI 内存计数，卡片创建时置 0，每次收到 data_updated 加 1，
-        # 不查库（当前没有"重启后恢复运行中任务"的路径）
+        # 管理员重启时连同已有视图一起交接，续采周期接着累加。
         self.count = 0
         self.round_count = 0
         self.live_stats = LiveStats()
@@ -566,7 +567,7 @@ class TaskCard(CardWidget):
 
         # 已运行 · 间隔 · 采集次数（内存计数，非落库条数）作为趋势的辅助上下文
         self.count_label = DataCaptionLabel("")
-        self.count_label.setToolTip("采集次数为本次运行收到的采集周期数（非落库条数）")
+        self.count_label.setToolTip("任务累计收到的采集周期数，管理员重启后继续累加")
         trend_header.addWidget(self.count_label)
         trend_layout.addLayout(trend_header)
 
@@ -821,6 +822,7 @@ class TaskCard(CardWidget):
         """
         if now is not None:
             self.now = now
+            self.last_sample_at = now
             if self.first_sample_at is None:
                 self.first_sample_at = now
             if self.started_at is None:
@@ -886,6 +888,37 @@ class TaskCard(CardWidget):
     def increment_count(self):
         """采集次数+1并刷新文案（内存计数，每次收到 data_updated 调用一次）"""
         self.count += 1
+        self._refresh_running_texts()
+
+    def restart_view(self) -> dict:
+        return {
+            'count': self.count, 'start_values': dict(self.start_values),
+            'pause_reason': self.pause_reason,
+            'last_values': dict(self.last_values), 'trend_metric': self.trend_metric,
+            'first_sample_at': self.first_sample_at.isoformat()
+            if self.first_sample_at is not None else None,
+            'last_sample_at': self.last_sample_at.isoformat()
+            if self.last_sample_at is not None else None,
+            'unavailable': {metric: self.value_labels[metric].toolTip()
+                            for metric in self._unavailable},
+            'sparkline': self.sparkline.restart_state()}
+
+    def restore_restart_view(self, state: dict) -> None:
+        self.start_values = dict(state['start_values'])
+        first = state['first_sample_at']
+        last = state['last_sample_at']
+        self.first_sample_at = datetime.fromisoformat(first) if first is not None else None
+        self.update_values(state['last_values'],
+                           datetime.fromisoformat(last) if last is not None else None)
+        self.count = state['count']
+        self.set_pause_reason(state.get('pause_reason'))
+        for metric, tooltip in state.get('unavailable', {}).items():
+            self._unavailable.add(metric)
+            self.value_labels[metric].setText('不可用')
+            self.value_labels[metric].setToolTip(tooltip)
+        self.sparkline.restore_restart_state(state['sparkline'])
+        self.select_trend_metric(state['trend_metric'])
+        self._refresh_deltas()
         self._refresh_running_texts()
 
     # ========== 基线与打点 ==========

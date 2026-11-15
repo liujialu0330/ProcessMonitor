@@ -244,6 +244,7 @@ def run_env(monkeypatch, app_paths):
                           reconcile=ReconcileResult(0, 0, 0))
 
     monkeypatch.setattr(bootstrap, 'build_context', fake_build_context)
+    monkeypatch.setattr(bootstrap, '_attach_elevation', lambda *_args: None)
     # 绝不在测试机桌面上注册真实全局热键
     monkeypatch.setattr(bootstrap, '_create_marker_hotkey',
                         lambda app, services: events.append('hotkey') or 'hotkey')
@@ -727,6 +728,15 @@ def test_run_background_order(bg_env):
     assert runtime.busy == state['guard'].dispatcher.has_pending
     # 无窗口模式也写阶段快照：报告图片的渲染函数由组合根注入
     assert runtime.stage_renderer.__func__ is bootstrap._HeadlessReportRenderer.stage
+
+
+def test_pending_gui_handoff_is_preserved_on_background_start(bg_env, monkeypatch):
+    events, state, exits, paths = bg_env
+    monkeypatch.setattr('core.restart_handoff.pending_restart',
+                        lambda _directory: {'phase': 'committed'})
+    code = bootstrap.run(['prog', '--background'], exit_process=exits.append)
+    assert code == bootstrap.EXIT_RESTART_PENDING
+    assert 'headless_migrate' not in events and 'build_context' not in events
 
 
 def test_run_background_starts_storage_guard_and_stops_it_on_quit(bg_env, monkeypatch):

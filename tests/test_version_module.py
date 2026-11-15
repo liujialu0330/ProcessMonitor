@@ -67,11 +67,12 @@ def test_release_part_and_prerelease(text, release, pre):
 
 def test_app_version_matches_changelog():
     changelog = Path(__file__).resolve().parent.parent / 'CHANGELOG.md'
-    section = next(line[4:] for line in changelog.read_text(encoding='utf-8').splitlines()
-                   if line.startswith('### '))
-    if section.startswith('未发布'):
-        assert version.is_prerelease(config.APP_VERSION)
+    sections = [line[4:] for line in changelog.read_text(encoding='utf-8').splitlines()
+                if line.startswith('### ')]
+    if version.is_prerelease(config.APP_VERSION):
+        assert sections[0].startswith('未发布')
     else:
+        section = next(section for section in sections if not section.startswith('未发布'))
         assert section.split()[0] == f'v{config.APP_VERSION}'
 
 

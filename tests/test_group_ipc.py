@@ -64,6 +64,12 @@ def start(dispatcher, args, lookup=None):
     return _call(dispatcher, 'start', args)
 
 
+def test_legacy_cpu_argument_starts_with_system_percentage(dispatcher):
+    from utils.metrics import MetricType
+    assert dispatcher._parse_metrics({'metrics': ['cpu_percent', 'cpu_percent_total']}) == (
+        MetricType.CPU_PERCENT,)
+
+
 # ========== tree ==========
 
 def test_start_tree_creates_a_group_task(dispatcher, manager, sleeper):

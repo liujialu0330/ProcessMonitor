@@ -29,6 +29,8 @@ The first launch upgrades older databases to schema v5 and keeps a `.bak_v1` bac
 
 Download the [2.0.2 installer](https://github.com/liujialu0330/ProcessMonitor/releases/tag/v2.0.2), or check for updates from version 1.4.1, 2.0.0 or 2.0.1. In 2.0.0, scroll to the bottom of Settings to reach the update button. The implementation, functional regression, remote CI, performance, installation/uninstallation, and both rollback paths have been validated. The remaining 24-hour soak, device-specific checks, and multi-user trial were not run and are not counted as passes. See the [acceptance record](doc/2.0.0验收记录.md) for the original 2.0 scope and the [fix verification](doc/2.0.2修复验收.md) for the latest patch.
 
+The current public release is **2.0.2**. The system-wide CPU percentage, context-switch and priority display changes, and on-demand administrator restart described below belong to the unreleased source. Version 2.0.2 reports CPU as a per-core total that can exceed 100%. See the [stage verification record](doc/2026-11-15_指标采集与权限优化_阶段验收.md) for the current source's validation scope.
+
 ```bat
 python main.py
 python pmctl.py start --plan D:\plans\window-cycle.json
@@ -51,7 +53,9 @@ ProcessMonitor is a Windows 11 Fluent Design desktop app for keeping an eye on a
 5. Click "Export report" to get a report image, a detail CSV and a summary CSV, ready to attach to a bug report.
 
 ### 🔍 Monitoring
-- **26 metrics, 4 categories** — memory (working set, private bytes, page faults, USS, ...), CPU (usage, user/kernel time, base priority), system (threads, handles, GDI/USER objects, voluntary context switches) and I/O (read/write bytes and counts); names follow Task Manager and every metric has a one-line description, shown as a tooltip in the metric picker
+- **CPU percentage** — New tasks report the process share of total logical-processor time capacity from 0 to 100%. Compare the same process over similar sampling intervals in Task Manager. Historical tasks are labeled as legacy per-core totals and retain their original values in views and exports.
+- **26 metrics, 4 categories** — memory (working set, private bytes, page faults, USS, ...), CPU (usage, user/kernel time, base priority), system (threads, handles, GDI/USER objects, context switches) and I/O (read/write bytes and counts). Every metric has a description in the metric picker.
+- **Windows counter semantics** — Context switches sum the counters of currently live threads and include both voluntary and involuntary switches. Thread exit can reduce the sum. Rate calculations skip those intervals, and average rates weight valid intervals by duration. Priority classes display readable names while raw data retains Windows priority-class codes.
 - **Private bytes as the leak indicator** — the former "virtual memory", "commit size" and "private working set" metrics were identical on Windows and are merged into "private bytes", the primary metric for spotting memory leaks
 - **Honest gaps instead of fake zeros** — when a metric cannot be read, the task card shows "unavailable" with the reason and nothing is recorded for it. Availability depends on process permissions, session, and system interfaces, even when running as administrator; GDI/USER objects of processes in other sessions (e.g. system services) show "not supported"
 - **Cards you can read at a glance** — a status pill (Running / Paused / Ended / Ended abnormally) and elapsed time; each metric shows its change since baseline (median of the 5 samples after the baseline marker) or since start; the sparkline covers "task start until now" with marker ticks
@@ -88,7 +92,7 @@ ProcessMonitor is a Windows 11 Fluent Design desktop app for keeping an eye on a
 - **Crash-resilient storage** — SQLite with WAL mode, automatic retry on failed writes, crash/error logging (5MB x 5 rotation), and automatic recovery of orphaned "running" tasks after an unclean shutdown
 - **Safe database upgrades** — upgrades run in an explicit transaction and roll back on failure, restoring from the automatic backup so old data is never lost
 - **Never freezes on stop** — stopping a task or exiting the app does not block the UI, and all collected data is flushed to disk before exit
-- **Automated test suite** — 4,700+ test cases covering the data layer, migration, collection and scheduling, verdicts and interval statistics, report export, the global hotkey (with a fake backend), update verification, page flows and UI contracts, plus an offscreen smoke test of the whole "start → baseline → two rounds → analysis → export report → close" path; tests use a temporary data directory and never touch real data
+- **Automated test suite** — 5,000+ cases cover storage, migration, collection, scheduling, analysis, exports, updates and UI flows using isolated data directories. Current results are recorded in the [stage verification record](doc/2026-11-15_指标采集与权限优化_阶段验收.md).
 - **Measured performance** — opening a 770k-row history task takes ~1.4s (down from 3.4s pre-v1.2.0; measured on the maintainer's dev machine)
 
 ## 📸 Screenshots
@@ -122,6 +126,7 @@ python main.py
 
 ### Notes
 
+- **On-demand administrator restart preserves the current session.** Selecting USS shows a conditional permission hint. When a target denies access, choose the administrator restart action or continue collecting available metrics. The handoff preserves tasks, samples, baselines, markers, paused and waiting states, draft inputs and card trends. Cancelling Windows authorization or failing to save keeps the original instance running. Elevated windows identify their status in the title. Complete or cancel active CLI wait/export requests before restarting. If the replacement exits after handoff was committed, reopen the GUI to recover before starting a headless instance.
 - **System requirements**: Windows 10/11 (64-bit); use Python 3.11 for source runs and locked dependencies (CI verified on 3.11.9)
 - **Data storage**: `%LOCALAPPDATA%\进程监控助手\data\monitor.db` (SQLite, WAL mode); logs live under `%LOCALAPPDATA%\进程监控助手\logs\`
 - **Auto-update**: checks GitHub Releases on startup and from Settings → About & updates; you can download and run the installer without leaving the app

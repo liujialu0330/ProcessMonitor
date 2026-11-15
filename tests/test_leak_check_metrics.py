@@ -91,8 +91,8 @@ def test_last_metrics_roundtrip_through_config_file(tmp_path):
 # ---------- 说明 ----------
 
 def test_every_metric_has_one_sentence_description():
-    """全部 27 项指标（26 项可选 + 1 项已废弃）都有说明，且键集合与显示名一致"""
-    assert len(METRIC_DESCRIPTIONS) == 27
+    """全部 28 项指标（26 项可选 + 2 项已废弃）都有说明，且键集合与显示名一致"""
+    assert len(METRIC_DESCRIPTIONS) == 28
     assert set(METRIC_DESCRIPTIONS) == set(METRIC_DISPLAY_NAMES)
     for metric, text in METRIC_DESCRIPTIONS.items():
         assert text.strip(), metric
@@ -142,7 +142,7 @@ def test_format_metric_rate_bytes_and_counts():
 
 
 def test_format_metric_rate_not_applicable_for_cumulative_metrics():
-    """累计次数/累计字节/CPU 时间/峰值单调不减，增速不能外推，统一显示为不适用"""
+    """累计活动与历史峰值的增速不能外推，统一显示为不适用"""
     for metric in (MetricType.IO_READ_BYTES, MetricType.IO_WRITE_COUNT,
                    MetricType.MEMORY_NUM_PAGE_FAULTS, MetricType.CPU_USER_TIME,
                    MetricType.MEMORY_PEAK_PAGEFILE, MetricType.NUM_CTX_SWITCHES_VOL):

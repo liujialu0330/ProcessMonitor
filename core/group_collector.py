@@ -14,12 +14,14 @@ last_group（GroupSample）里，由采集线程取走写 task_members、发 mem
 import logging
 from typing import Dict, List, Optional, Sequence
 
+import psutil
+
 from core.contracts import UnavailableReason
 from core.group_aggregator import GroupAggregator, GroupSample, InstanceInfo
 from core.process_tree import GroupSpec, ProcessTreeSource, SnapshotTreeSource
 from core.snapshot_hub import SnapshotHub
 from data.models import TARGET_TREE
-from utils.metrics import (MAX_GROUP_MEMBERS, PROCESS_COUNT, GroupAggregation, MetricType,
+from utils.metrics import (CPU_USAGE_METRICS, MAX_GROUP_MEMBERS, PROCESS_COUNT, GroupAggregation,
                            group_aggregation)
 
 logger = logging.getLogger(__name__)
@@ -44,7 +46,8 @@ class GroupCollector:
             kwargs = {} if max_age_s is None else {'max_age_s': max_age_s}
             source = SnapshotTreeSource(hub, **kwargs)
         self._source = source
-        self._aggregator = GroupAggregator(max_members, label)
+        self._aggregator = GroupAggregator(
+            max_members, label, logical_cpus=psutil.cpu_count(logical=True) or 1)
         # 本周期可接受的最早快照时刻，由 MonitorWorker 每周期设置（同 ProcessCollector）
         self.snapshot_not_before: Optional[float] = None
         # 最近一次 collect_metrics 中无法采集的指标：{指标: 原因}
@@ -109,6 +112,12 @@ class GroupCollector:
         """当前仍存活的实例（收尾时据此补写 task_members 的 last_ms）。"""
         return list(self._aggregator.alive_instances())
 
+    def counter_state(self) -> dict:
+        return self._aggregator.counter_state()
+
+    def restore_counter_state(self, state: dict) -> None:
+        self._aggregator.restore_counter_state(state)
+
     @property
     def members_truncated(self) -> bool:
         return self._aggregator.members_truncated
@@ -118,5 +127,5 @@ class GroupCollector:
         """真正需要逐实例读取的指标：对组不适用的、进程总数与 CPU 使用率（由 CPU 时间差分）
         都不用读。"""
         return [m for m in metric_types
-                if m not in (PROCESS_COUNT, MetricType.CPU_PERCENT)
+                if m != PROCESS_COUNT and m not in CPU_USAGE_METRICS
                 and group_aggregation(m) is not GroupAggregation.NONE]

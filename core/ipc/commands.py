@@ -900,6 +900,7 @@ class CommandDispatcher(QObject):
         self.identity = identity
         self.heartbeat_ms = heartbeat_ms
         self.context: Optional[CommandContext] = None
+        self._restart_suspended = False
         self.wait_service: Optional[WaitService] = None
         self._pending: List[_Pending] = []
         self._wait_jobs: List[_WaitJob] = []
@@ -935,7 +936,10 @@ class CommandDispatcher(QObject):
 
     @property
     def ready(self) -> bool:
-        return self.context is not None
+        return self.context is not None and not self._restart_suspended
+
+    def suspend_for_restart(self, suspended: bool) -> None:
+        self._restart_suspended = suspended
 
     @property
     def commands(self) -> List[str]:
@@ -945,6 +949,13 @@ class CommandDispatcher(QObject):
         """是否有进行中的命令行请求（延迟回复、等待启动的进程、导出）。"""
         return (bool(self._pending) or bool(self._exports)
                 or bool(self.wait_service is not None and self.wait_service.has_waits()))
+
+    def restart_launches(self) -> dict:
+        return dict(self._close_on_stop)
+
+    def restore_restart_launches(self, launches: dict) -> None:
+        self._close_on_stop.update({task_id: tuple(target)
+                                    for task_id, target in launches.items()})
 
     def set_settings(self, settings: CommandSettings) -> None:
         self.settings = settings
@@ -1157,7 +1168,7 @@ class CommandDispatcher(QObject):
     # ---------- 命令：开始 ----------
 
     def _parse_metrics(self, args, target_kind: str = TARGET_PID) -> Tuple[str, ...]:
-        from utils.metrics import (all_metric_types, canonical_metric_type, filter_group_metrics,
+        from utils.metrics import (all_metric_types, new_task_metric_type, filter_group_metrics,
                                    get_metric_display_name, group_selectable_metrics,
                                    group_unsupported_metrics)
         group = target_kind != TARGET_PID
@@ -1174,14 +1185,14 @@ class CommandDispatcher(QObject):
             known = set(group_selectable_metrics() if group else all_metric_types())
             # 对组不适用的指标是"已知但不能用"，与"未知"分开报，免得用户以为拼错了
             inapplicable = group_unsupported_metrics(
-                [canonical_metric_type(m.strip()) for m in value])
+                [new_task_metric_type(m.strip()) for m in value])
             if group and inapplicable:
                 raise CommandError(ERR_INVALID_ARGS, MSG_GROUP_METRICS.format(
                     metrics="、".join(dict.fromkeys(
                         get_metric_display_name(m) for m in inapplicable))))
             metrics, unknown = [], []
             for item in value:
-                key = canonical_metric_type(item.strip())
+                key = new_task_metric_type(item.strip())
                 if key not in known:
                     unknown.append(item)
                 elif key not in metrics:
@@ -1707,6 +1718,8 @@ class CommandDispatcher(QObject):
 
     def tick(self) -> None:
         """检查全部等待条件；每 WAIT_POLL_EVERY_TICKS 次轮询一次等待中的进程。"""
+        if self._restart_suspended:
+            return
         for job in list(self._wait_jobs):
             try:
                 self._check_wait(job)

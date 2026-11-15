@@ -47,14 +47,18 @@ SNAPSHOT = {
         '累计缺页次数，增长过快说明内存被频繁换入换出，适合发现内存紧张或访问模式异常'),
     'memory_uss': ('独占物理内存（USS）', 'KB', False, True,
         '进程独占的物理内存（Unique Set Size，不含共享页），比工作集更接近真实占用；读取开销较大，且对更高权限进程可能因权限不足而不可用'),
-    'cpu_percent': ('CPU使用率', '%', False, False,
-        '进程 CPU 占用率（可超过 100%，按核数累计），适合发现空闲时仍高占用的死循环或忙等'),
+    'cpu_percent_total': ('CPU使用率', '%', False, False,
+        '进程占整机 CPU 时间容量的百分比（0～100%，按逻辑处理器数量归一）；'
+        '与任务管理器对照时请使用同一进程和相近采样间隔'),
+    'cpu_percent': ('CPU使用率（旧版按核累计）', '%', False, False,
+        '旧版记录：每个逻辑处理器满载记为 100%，多核累计可超过 100%；'
+        '新建任务改用占整机容量的 CPU 使用率'),
     'cpu_user_time': ('CPU用户时间', '秒', False, False,
         '累计在用户态运行的 CPU 时间，适合比较各轮操作消耗的计算量'),
     'cpu_system_time': ('CPU系统时间', '秒', False, False,
         '累计在内核态运行的 CPU 时间，偏高多见于大量系统调用或 I/O'),
     'cpu_priority': ('基本优先级', '', True, False,
-        '进程的基本调度优先级（任务管理器同名列），用于确认被测程序的优先级是否被改动'),
+        '进程的优先级类，显示为正常、高等名称；原始数据保留 Windows 编码（32 表示正常）'),
     'num_threads': ('线程数', '个', True, False,
         '进程内的线程总数，持续上涨说明线程创建后没有退出（线程泄漏）'),
     'num_handles': ('句柄数', '个', True, False,
@@ -63,8 +67,9 @@ SNAPSHOT = {
         '位图、画刷、字体等 GDI 资源数，单进程上限 10000，持续上涨会导致界面花屏或崩溃'),
     'num_user_objects': ('USER对象数', '个', True, False,
         '窗口、菜单、光标等 USER 对象数，单进程上限 10000，持续上涨说明窗口或菜单创建后没有销毁'),
-    'num_ctx_switches_voluntary': ('自愿上下文切换', '次', True, False,
-        '累计自愿上下文切换次数（线程主动等待让出 CPU），适合分析线程同步与阻塞'),
+    'num_ctx_switches_voluntary': ('上下文切换', '次', True, False,
+        'Windows 当前存活线程的上下文切换次数之和，包含主动等待与被抢占；'
+        '线程退出时可能下降，速率与平均值仅统计有效区间；不能区分自愿与非自愿'),
     'num_ctx_switches_involuntary': ('非自愿上下文切换', '次', True, False,
         '累计非自愿上下文切换次数（时间片用完被抢占）；已废弃：Windows 上无法采集，恒为 0'),
     'io_read_count': ('I/O 读取次数', '次', True, False,
@@ -89,7 +94,7 @@ AVAILABLE_SNAPSHOT = {
         "memory_nonpaged_pool", "memory_peak_nonpaged_pool", "memory_num_page_faults",
         "memory_uss",
     ],
-    "CPU": ["cpu_percent", "cpu_user_time", "cpu_system_time", "cpu_priority"],
+    "CPU": ["cpu_percent_total", "cpu_user_time", "cpu_system_time", "cpu_priority"],
     "系统资源": [
         "num_threads", "num_handles", "num_gdi_objects", "num_user_objects",
         "num_ctx_switches_voluntary",
@@ -131,13 +136,13 @@ def temp_metric():
 
 # ---------- 键集合 ----------
 
-def test_registry_keys_are_26_available_plus_1_deprecated():
-    assert len(REGISTRY) == 27
+def test_registry_keys_are_26_available_plus_2_deprecated():
+    assert len(REGISTRY) == 28
     assert set(REGISTRY) == _MEMBER_KEYS
     available = [k for k, s in REGISTRY.items() if not s.deprecated]
     assert len(available) == 26
     assert [k for k, s in REGISTRY.items() if s.deprecated] == [
-        MetricType.NUM_CTX_SWITCHES_INVOL]
+        MetricType.CPU_PERCENT_LEGACY, MetricType.NUM_CTX_SWITCHES_INVOL]
     for key, item in REGISTRY.items():
         assert item.key == key
 
@@ -200,7 +205,8 @@ def test_peak_kind_only_for_memory_peaks_in_kb():
 
 def test_requires_and_priming_values():
     assert {s.requires for s in REGISTRY.values()} <= {"", "windows", "admin"}
-    assert [k for k, s in REGISTRY.items() if s.needs_priming] == [MetricType.CPU_PERCENT]
+    assert [k for k, s in REGISTRY.items() if s.needs_priming] == [
+        MetricType.CPU_PERCENT, MetricType.CPU_PERCENT_LEGACY]
     assert spec(MetricType.MEMORY_USS).requires == "admin"
     assert spec(MetricType.NUM_GDI_OBJECTS).requires == "windows"
 
@@ -267,7 +273,7 @@ def _old_sparkline_min_span(key, reference):
         return max(abs(reference) * 0.01, 64.0)
     if integer:
         return 4.0
-    if key in ("memory_percent", "cpu_percent"):
+    if key in ("memory_percent", "cpu_percent", "cpu_percent_total"):
         return 1.0
     return abs(reference) * 0.01
 
@@ -309,5 +315,5 @@ def test_unregistering_restores_tables(temp_metric):
     assert temp_metric.key not in METRIC_DISPLAY_NAMES
     assert "测试分组" not in AVAILABLE_METRICS
     assert temp_metric.key not in LEAK_CHECK_PRESET
-    assert len(REGISTRY) == 27
+    assert len(REGISTRY) == 28
     assert AVAILABLE_METRICS == AVAILABLE_SNAPSHOT

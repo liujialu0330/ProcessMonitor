@@ -15,7 +15,7 @@ from qfluentwidgets import (
 )
 
 from utils.metrics import (
-    AVAILABLE_METRICS, GROUP_REGISTRY, LEAK_CHECK_PRESET, PROCESS_COUNT,
+    AVAILABLE_METRICS, GROUP_REGISTRY, LEAK_CHECK_PRESET, PROCESS_COUNT, MetricType,
     get_metric_description, get_metric_display_name, group_selectable_metrics
 )
 
@@ -101,6 +101,10 @@ class MetricSelectorDialog(MessageBoxBase):
         for widget in (self.preset_combo, self.preset_name, self.save_preset_button):
             saved_row.addWidget(widget)
         self.viewLayout.addLayout(saved_row)
+        self.permission_hint = CaptionLabel(
+            '独占物理内存（USS）读取高权限进程时可能需要管理员权限，开始监控时会检查。', self)
+        self.permission_hint.setWordWrap(True)
+        self.viewLayout.addWidget(self.permission_hint)
         self.group_hint_label = None
         if self.group_mode:
             self.group_hint_label = CaptionLabel(GROUP_HINT, self)
@@ -268,6 +272,8 @@ class MetricSelectorDialog(MessageBoxBase):
             checkbox.isChecked() for metric, checkbox in self.metric_checkboxes.items()
             if metric != PROCESS_COUNT)
         self.yesButton.setEnabled(has_selection)
+        self.permission_hint.setVisible(
+            self.metric_checkboxes[MetricType.MEMORY_USS].isChecked())
 
     def get_selected(self) -> List[str]:
         """

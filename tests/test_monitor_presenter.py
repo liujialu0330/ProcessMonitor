@@ -893,7 +893,9 @@ def test_stop_of_unknown_task_still_removes_it(presenter, manager, services):
 
 
 def test_unavailable_hint_mentions_admin_only_for_access_denied(presenter, manager, board,
-                                                                services):
+                                                                services, monkeypatch):
+    monkeypatch.setattr('ui.presenters.monitor_presenter.is_elevated', lambda: False)
+    services.dialogs.push('confirm', False)
     task_id = _add_task(manager)
     gdi, uss = MetricType.NUM_GDI_OBJECTS, MetricType.MEMORY_USS
 
@@ -911,6 +913,39 @@ def test_unavailable_hint_mentions_admin_only_for_access_denied(presenter, manag
 def test_unavailable_for_unknown_task_is_ignored(presenter, manager, services):
     manager.metrics_unavailable.emit("ghost", {MetricType.MEMORY_USS: UnavailableReason.ERROR})
     assert services.notifier.notices == []
+
+
+def test_permission_restart_prompt_is_once_per_task(presenter, manager, services,
+                                                    qapp, monkeypatch):
+    monkeypatch.setattr('ui.presenters.monitor_presenter.is_elevated', lambda: False)
+    services.dialogs.push('confirm', True)
+    task_id = _add_task(manager)
+    requested = []
+    presenter.elevation_requested.connect(lambda: requested.append(True))
+    for _ in range(2):
+        manager.metrics_unavailable.emit(
+            task_id, {MetricType.MEMORY_USS: UnavailableReason.ACCESS_DENIED})
+    qapp.processEvents()
+    assert requested == [True]
+    assert len(services.dialogs.calls_of('confirm')) == 1
+    assert services.notifier.last().action.text == '以管理员身份重启'
+    manager.metrics_unavailable.emit(
+        task_id, {MetricType.NUM_HANDLES: UnavailableReason.ACCESS_DENIED})
+    qapp.processEvents()
+    assert len(services.dialogs.calls_of('confirm')) == 1
+
+
+def test_elevated_instance_shows_actual_denial_without_restart_loop(
+        presenter, manager, services, qapp, monkeypatch):
+    monkeypatch.setattr('ui.presenters.monitor_presenter.is_elevated', lambda: True)
+    task_id = _add_task(manager)
+    manager.metrics_unavailable.emit(
+        task_id, {MetricType.MEMORY_USS: UnavailableReason.ACCESS_DENIED})
+    qapp.processEvents()
+    assert services.dialogs.calls_of('confirm') == []
+    assert services.notifier.last().action is None
+    assert '当前已以管理员身份运行' in services.notifier.last().content
+    assert '采集全部' not in services.notifier.last().content
 
 
 def test_task_error_infobar_is_persistent(presenter, manager, services):

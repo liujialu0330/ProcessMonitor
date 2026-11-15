@@ -44,7 +44,9 @@ class RecoveryOutcome:
     failed: Tuple[str, ...] = ()
 
 
-def find_recoverable(db, *, probe: ProcessProbe = probe_process) -> List[RecoveryCandidate]:
+def find_recoverable(db, *, probe: ProcessProbe = probe_process,
+                     restart_states: Optional[dict] = None,
+                     strict: bool = False) -> List[RecoveryCandidate]:
     """库里 running 的任务中，被测进程仍存活且创建时间一致的（按开始时间升序）。
 
     读库失败返回空列表（随后的启动校正照常收尾）。"""
@@ -52,10 +54,13 @@ def find_recoverable(db, *, probe: ProcessProbe = probe_process) -> List[Recover
         running = db.tasks.list_running()
     except Exception:
         logger.error("读取遗留的运行中任务失败，不提供续采", exc_info=True)
+        if strict:
+            raise
         return []
     candidates: List[RecoveryCandidate] = []
     for task in running:
-        if not _target_alive(task, probe):
+        waiting = (restart_states or {}).get(task.task_id, {}).get('waiting_target')
+        if not waiting and not _target_alive(task, probe, strict=strict):
             continue
         candidates.append(RecoveryCandidate(
             task_id=task.task_id, process_name=task.process_name, pid=task.pid,
@@ -67,12 +72,14 @@ def find_recoverable(db, *, probe: ProcessProbe = probe_process) -> List[Recover
     return candidates
 
 
-def _target_alive(task, probe: ProcessProbe) -> bool:
+def _target_alive(task, probe: ProcessProbe, *, strict: bool = False) -> bool:
     if task.target_kind == TARGET_NAME:
         return True
     try:
         found = probe(task.pid)
     except ProbeIndeterminate:
+        if strict:
+            raise
         # 无法确认被测进程在不在：不续采（续采要的是"确定还活着、还是同一个"）
         logger.info("无法确认任务 %s 的被测进程 (PID %s) 是否仍在运行，不提供续采",
                     task.task_id[:8], task.pid)
@@ -97,7 +104,8 @@ def _same_name(expected: Optional[str], actual: Optional[str]) -> bool:
 
 
 def apply_decision(manager, db, candidates: Sequence[RecoveryCandidate],
-                   selected_ids: Iterable[str], *, auto_marker=None) -> RecoveryOutcome:
+                   selected_ids: Iterable[str], *, auto_marker=None,
+                   restart_states: Optional[dict] = None) -> RecoveryOutcome:
     """执行用户的选择：选中的任务续采，其余（放弃的，以及续采失败的）按孤儿任务收尾。
 
     Args:
@@ -117,7 +125,9 @@ def apply_decision(manager, db, candidates: Sequence[RecoveryCandidate],
             abandoned.append(candidate.task_id)
             continue
         try:
-            ok = manager.recover_task(candidate.task_id)
+            state = (restart_states or {}).get(candidate.task_id)
+            ok = (manager.recover_task(candidate.task_id, restart_state=state)
+                  if state is not None else manager.recover_task(candidate.task_id))
         except Exception:
             logger.error("续采任务失败: task_id=%s", candidate.task_id, exc_info=True)
             ok = False

@@ -78,6 +78,7 @@ from ui.widgets.monitor.process_picker import (
     ERROR_WAIT_NEEDS_NAME, ResolveError,
 )
 from utils.metrics import filter_group_metrics, get_metric_display_name
+from utils.elevation import is_elevated
 
 logger = logging.getLogger(__name__)
 
@@ -229,6 +230,7 @@ class MonitorPresenter(QObject):
 
     history_requested = pyqtSignal(str)
     quick_marker_feedback = pyqtSignal(str, str, str)
+    elevation_requested = pyqtSignal()
 
     def __init__(self, manager, services: UiServices, form, board, host: QWidget,
                  parent: Optional[QObject] = None, *,
@@ -279,6 +281,9 @@ class MonitorPresenter(QObject):
         # 当前显示中的错误提示 {(task_id, 内容): 提示对象}：错误提示不自动消失，
         # 同一任务同一错误重复上报时不再叠加
         self._error_bars: Dict[Tuple[str, str], Any] = {}
+        self._permission_prompted: Set[str] = set()
+        self._permission_metrics: Dict[str, Set[str]] = {}
+        self._permission_prompt_pending = False
         # 打点回显与撤销；卡片迷你图打点刻度的右键菜单也在这里
         self._marker_feedback = MarkerFeedback(manager, services, host, self._tasks.get)
         # 每个任务一个迷你图右键菜单流程：菜单弹出后是非阻塞的，动作触发时流程对象必须还在，
@@ -897,7 +902,9 @@ class MonitorPresenter(QObject):
         落库；这里只把方案记到卡片上（悬停提示与"同配置再测"沿用）。"""
         card = self.board.card(task_id)
         if card is not None:
-            card.set_started_at(self.services.clock.now())
+            info = self.manager.get_task_info(task_id)
+            card.set_started_at(info.start_time if info is not None and info.start_time is not None
+                                else self.services.clock.now())
         self._adopt_external_plan(task_id)
         self._request_live_stats(task_id)
         self._sync_counts()
@@ -915,6 +922,10 @@ class MonitorPresenter(QObject):
         card = self.board.card(task_id)
         if card is not None:
             card.setToolTip(plan_summary(plan))
+
+    def adopt_recovered_plans(self) -> None:
+        for task_id in self.active_task_ids():
+            self._adopt_external_plan(task_id)
 
     def on_members_changed(self, task_id: str) -> None:
         """进程组的成员集合变了：刷新卡片的成员摘要。"""
@@ -1249,10 +1260,96 @@ class MonitorPresenter(QObject):
             f"{get_metric_display_name(metric)}（{unavailable_reason_text(reason)}）"
             for metric, reason in reasons.items())
         content = f"{items}，这些指标不会记录数据。"
-        if UnavailableReason.ACCESS_DENIED in reasons.values():
-            content += "以管理员身份运行本工具可采集全部指标。"
-        self.services.notifier.warning(
-            self.host, "部分指标无法采集", content, UNAVAILABLE_INFOBAR_MS)
+        denied = {metric for metric, reason in reasons.items()
+                  if reason is UnavailableReason.ACCESS_DENIED}
+        action = None
+        if denied:
+            if is_elevated():
+                content += "当前已以管理员身份运行，目标进程仍拒绝读取这些指标。"
+            else:
+                content += "可尝试以管理员身份运行后重新采集。"
+                action = NoticeAction('以管理员身份重启', self.elevation_requested.emit)
+                self._permission_metrics.setdefault(task_id, set()).update(denied)
+                if task_id not in self._permission_prompted and not self._permission_prompt_pending:
+                    self._permission_prompt_pending = True
+                    QTimer.singleShot(0, self._offer_elevation)
+        self.services.notifier.route(
+            'task.metrics_unavailable', 'warning', '部分指标无法采集', content,
+            anchor=self.host, key=f'metrics-unavailable-{task_id}', action=action,
+            duration=-1 if action is not None else UNAVAILABLE_INFOBAR_MS)
+
+    def _offer_elevation(self) -> None:
+        self._permission_prompt_pending = False
+        ids = set(self._permission_metrics) - self._permission_prompted
+        self._permission_prompted.update(ids)
+        metrics = {metric for task_id in ids
+                   if task_id in self._tasks and self._tasks[task_id].active
+                   for metric in self._permission_metrics[task_id]}
+        if not metrics or is_elevated():
+            return
+        names = '、'.join(get_metric_display_name(metric) for metric in sorted(metrics))
+        content = (f'{names}因权限不足无法读取。管理员重启后将沿用当前任务、基线和打点，'
+                   '重启期间会有短暂采集中断。取消 Windows 授权可继续当前监控。')
+        if self.services.dialogs.confirm(
+                self._dialog_parent(), '部分指标需要更高权限', content,
+                '保存任务并以管理员重启', '继续采集可用指标'):
+            self.elevation_requested.emit()
+
+    def suspend_for_restart(self, suspended: bool) -> None:
+        self.auto_marker.suspend_for_restart(suspended)
+        if suspended:
+            self._tick_timer.stop()
+            self._wait_timer.stop()
+        else:
+            self._sync_tick_timer()
+            self._sync_wait_timer()
+
+    def restart_ui_state(self) -> dict:
+        waits = []
+        for wait_id, request in self._waits.items():
+            deadline = self.wait_service.deadline_of(wait_id)
+            waits.append({
+                'name': request.name, 'metrics': list(request.metrics),
+                'interval': request.interval, 'note': request.note,
+                'plan': request.plan.to_dict() if request.plan is not None else None,
+                'target_kind': request.target_kind, 'scenario': request.scenario,
+                'build': request.build,
+                'deadline': deadline.isoformat() if deadline is not None else None})
+        launches = {
+            task_id: {'spec': entry.launch.to_json(), 'close': entry.close_on_stop,
+                      'target': self._close_targets.get(task_id)}
+            for task_id, entry in self._tasks.items()
+            if entry.active and entry.launch is not None}
+        cards = {task_id: self.board.card(task_id).restart_view()
+                 for task_id in self.active_task_ids() if self.board.card(task_id) is not None}
+        return {'draft': self.form.restart_draft(), 'waits': waits,
+                'launches': launches, 'cards': cards}
+
+    def restore_restart_ui(self, state: dict) -> None:
+        for task_id, saved in state.get('cards', {}).items():
+            card = self.board.card(task_id)
+            if card is not None:
+                card.restore_restart_view(saved)
+        for task_id, launch in state.get('launches', {}).items():
+            entry = self._tasks.get(task_id)
+            if entry is not None:
+                entry.launch = LaunchSpec.from_json(launch['spec'])
+                entry.close_on_stop = launch['close']
+                if launch['target'] is not None:
+                    self._close_targets[task_id] = tuple(launch['target'])
+        for saved in state.get('waits', []):
+            data = dict(saved)
+            deadline = data.pop('deadline')
+            timeout = ((datetime.fromisoformat(deadline) - self.services.clock.now()).total_seconds()
+                       if deadline is not None else None)
+            if timeout is not None and timeout <= 0:
+                self._warn(f'{data["name"]}等待进程启动已超时')
+                continue
+            plan = data.pop('plan')
+            self.on_wait_requested(WaitRequest(
+                **data, plan=AutomationPlan.from_dict(plan) if plan is not None else None,
+                timeout_s=timeout))
+        self.form.restore_restart_draft(state['draft'])
 
     def on_error(self, task_id: str, error_msg: str) -> None:
         """错误提示不自动消失；同一任务的同一错误仍在显示时不再叠加

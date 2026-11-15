@@ -349,8 +349,7 @@ def test_monotonic_counters_bracketed(snapshotter, target, field, ps_key):
 
 
 def test_context_switches_bracketed(snapshotter, target):
-    # 全部线程的上下文切换次数之和只增不减（线程退出后其计数并入进程，不会倒退）；
-    # 对应 psutil num_ctx_switches().voluntary
+    # 本用例中的线程保持存活，对应 psutil num_ctx_switches().voluntary 的总和。
     _, _, values, snap_a, snap_b = sandwich(snapshotter, target)
     assert_bracketed(f'{target.label}.context_switches',
                      _sample_ctx(snap_a, target.pid), _sample_ctx(snap_b, target.pid),

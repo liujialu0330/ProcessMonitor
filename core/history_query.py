@@ -38,7 +38,7 @@ from data.models import DataPoint, Marker
 from data.repos.analytics_repo import Bucket, MetricAggregates
 from data.repos.point_repo import PointQuery
 from utils.metrics import (
-    VALUE_CLASS_LEVEL, VALUE_CLASS_PEAK, VALUE_CLASS_RATE, member_series_key, spec,
+    VALUE_CLASS_LEVEL, VALUE_CLASS_PEAK, VALUE_CLASS_RATE, MetricType, member_series_key, spec,
     split_member_key, value_class)
 
 logger = logging.getLogger(__name__)
@@ -528,6 +528,9 @@ def _query_data(db, request: HistoryRequest, task_info, anchor: Optional[datetim
         if stats is not None:
             span = agg.span_seconds
             average = (agg.last_value - agg.first_value) / span if span > 0 else None
+            if split_member_key(metric)[0] == MetricType.NUM_CTX_SWITCHES_VOL:
+                average = db.analytics.average_counter_rate(
+                    task_id, metric, since=stats_since, until=until, gaps=gaps)
             in_stats = [p.value for p in rate_series
                         if stats_since is None or p.timestamp > stats_since]
             rate_stats = RateStats(average, max(in_stats) if in_stats else None)

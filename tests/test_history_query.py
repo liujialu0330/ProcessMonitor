@@ -387,6 +387,48 @@ def test_peak_metric_counts_rises(db):
     assert snapshot.peak_rises == PeakRises(count=2, total=80.0)
 
 
+def test_context_switch_average_excludes_thread_exit_drop(db):
+    metric = MetricType.NUM_CTX_SWITCHES_VOL
+    task = _seed_series(db, [100.0, 160.0, 2.0, 122.0], metric=metric)
+    snapshot = run_history_query(db, _request(task.task_id, 'all', metric=metric))
+    assert [point.value for point in snapshot.rate_series] == [1.0, 2.0]
+    assert snapshot.rate_stats.average_per_second == 1.5
+    assert snapshot.rate_stats.peak_per_second == 2.0
+
+
+@pytest.mark.parametrize('max_buckets', [1, 2, 100])
+@pytest.mark.parametrize('member', ['', '@worker.exe'])
+def test_context_switch_average_uses_raw_samples_despite_chart_decimation(
+        db, max_buckets, member):
+    metric = MetricType.NUM_CTX_SWITCHES_VOL + member
+    task = _seed_series(db, [0, 10, 0, 1, 0, 1], interval=1, metric=metric)
+    result = run_history_query(db, _request(
+        task.task_id, metric=metric, max_buckets=max_buckets, table_limit=2))
+    assert result.rate_stats.average_per_second == 4
+
+
+def test_context_switch_average_respects_frozen_range_gaps_and_recovery(db):
+    metric = MetricType.NUM_CTX_SWITCHES_VOL
+    task = _seed_series(db, [0, 10, 99, 100, 200, 210, 211, 999],
+                        interval=1, metric=metric, skip=[2, 3],
+                        markers=[(5, '续采', 'recover')])
+    result = run_history_query(db, _request(
+        task.task_id, 'custom', metric=metric,
+        since=BASE, until=BASE + timedelta(seconds=6), max_buckets=1))
+    # 0→1 的 10 次与 5→6 的 1 次有效；空洞、续采边界与冻结终点外均跳过。
+    assert result.rate_stats.average_per_second == 5.5
+
+
+def test_context_switch_average_weights_actual_valid_elapsed_time(db):
+    metric = MetricType.NUM_CTX_SWITCHES_VOL
+    task = _seed_series(db, [], interval=10, metric=metric)
+    db.save_data_points([
+        DataPoint(task.task_id, BASE + timedelta(seconds=t), value, metric)
+        for t, value in [(0, 0), (1, 10), (3, 0), (7, 8)]])
+    result = run_history_query(db, _request(task.task_id, metric=metric, max_buckets=1))
+    assert result.rate_stats.average_per_second == pytest.approx(18 / 5)
+
+
 # ---------- 失败归类 ----------
 
 def _raise_storage(*a, **k):

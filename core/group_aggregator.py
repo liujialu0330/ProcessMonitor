@@ -23,12 +23,14 @@
   不写，形成空洞，不能写成 0。
 """
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from core.contracts import UnavailableReason
 from core.process_tree import InstanceKey, InstanceReading, Observation
-from utils.metrics import (MAX_GROUP_MEMBERS, PROCESS_COUNT, GroupAggregation, MetricType,
+from utils.metrics import (CPU_USAGE_METRICS, MAX_GROUP_MEMBERS, PROCESS_COUNT,
+                           GroupAggregation, MetricType, cpu_percent_of_system,
                            group_aggregation, member_series_key, normalize_member_key)
 
 logger = logging.getLogger(__name__)
@@ -93,9 +95,11 @@ def _info(instance: InstanceReading) -> InstanceInfo:
 class GroupAggregator:
     """一个组任务一个实例，有状态（实例的累计起点、CPU 差分起点、已建成员），只由采集线程用。"""
 
-    def __init__(self, max_members: int = MAX_GROUP_MEMBERS, label: str = ''):
+    def __init__(self, max_members: int = MAX_GROUP_MEMBERS, label: str = '', *,
+                 logical_cpus: int = 1):
         self._max_members = max_members
         self._label = label
+        self._logical_cpus = logical_cpus
         # 成员键 → 显示名（原名，取最先出现的实例）；先到先得，占位终身保留
         self._tracked: Dict[str, str] = {}
         self._truncated = False
@@ -121,6 +125,54 @@ class GroupAggregator:
 
     def alive_instances(self) -> Tuple[InstanceInfo, ...]:
         return tuple(self._alive.values())
+
+    def counter_state(self) -> dict:
+        """保存累计总量与终身成员占位；实例差分起点不跨越无人观测的交接空档。"""
+        return {
+            'totals': dict(self._cum_total),
+            'members': [
+                {'key': key, 'name': name,
+                 'totals': {metric: value for (member, metric), value
+                            in self._cum_member.items() if member == key}}
+                for key, name in self._tracked.items()],
+            'truncated': self._truncated,
+        }
+
+    def restore_counter_state(self, state: dict) -> None:
+        """新采集器恢复已观测的累计值，首个实例读数重新建立差分起点。"""
+        totals = self._restore_totals(state['totals'])
+        tracked: Dict[str, str] = {}
+        members: Dict[Tuple[str, str], float] = {}
+        for member in state['members']:
+            key, name = member['key'], member['name']
+            if (not isinstance(name, str) or not name
+                    or key != normalize_member_key(name) or key in tracked):
+                raise ValueError('进程组交接成员无效')
+            tracked[key] = name
+            members.update({(key, metric): value for metric, value
+                            in self._restore_totals(member['totals']).items()})
+        if len(tracked) > self._max_members or not isinstance(state['truncated'], bool):
+            raise ValueError('进程组交接成员状态无效')
+        self._cum_total = totals
+        self._cum_member = members
+        self._tracked = tracked
+        self._truncated = state['truncated']
+        self._cum_prev.clear()
+        self._cpu_prev.clear()
+        self._cpu_valid_once = False
+        self._alive.clear()
+        self._signature = None
+
+    @staticmethod
+    def _restore_totals(values: dict) -> Dict[str, float]:
+        restored = {}
+        for metric, value in values.items():
+            if (group_aggregation(metric) is not GroupAggregation.DELTA_SUM
+                    or isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or value < 0):
+                raise ValueError('进程组交接累计值无效')
+            restored[metric] = float(value)
+        return restored
 
     # ---------- CPU 预热 ----------
 
@@ -154,8 +206,8 @@ class GroupAggregator:
                 values[metric] = float(len(instances))
             elif not present:
                 continue
-            elif metric == MetricType.CPU_PERCENT:
-                self._emit_cpu_total(values, unavailable, instances, cpu_total)
+            elif metric in CPU_USAGE_METRICS:
+                self._emit_cpu_total(values, unavailable, instances, cpu_total, metric)
             elif agg is GroupAggregation.SUM:
                 if (None, metric) in sums:
                     values[metric] = sums[(None, metric)]
@@ -213,7 +265,7 @@ class GroupAggregator:
         aggregation = {m: (GroupAggregation.SUM if m == PROCESS_COUNT
                            else group_aggregation(m)) for m in metrics}
         level = [m for m in metrics if aggregation[m] is GroupAggregation.SUM
-                 and m not in (PROCESS_COUNT, MetricType.CPU_PERCENT)]
+                 and m != PROCESS_COUNT and m not in CPU_USAGE_METRICS]
         delta = [m for m in metrics if aggregation[m] is GroupAggregation.DELTA_SUM]
         return _Plan(aggregation, level, delta)
 
@@ -257,7 +309,7 @@ class GroupAggregator:
         now = observation.taken_monotonic
         total: Optional[float] = None
         by_member: Dict[str, float] = {}
-        if MetricType.CPU_PERCENT not in plan.aggregation:
+        if not CPU_USAGE_METRICS.intersection(plan.aggregation):
             self._drop_dead_cpu(instances)
             return total, by_member
         for instance in instances:
@@ -286,16 +338,20 @@ class GroupAggregator:
             for key in [k for k in self._cpu_prev if k not in alive]:
                 del self._cpu_prev[key]
 
-    def _emit_cpu_total(self, values, unavailable, instances, cpu_total) -> None:
+    def _emit_cpu_total(self, values, unavailable, instances, cpu_total, metric) -> None:
         if cpu_total is not None:
             self._cpu_valid_once = True
-            values[MetricType.CPU_PERCENT] = round(cpu_total, 1)
+            values[metric] = self._cpu_value(cpu_total, metric)
         elif self._cpu_valid_once:
             # 全部实例都是新出现的（如每轮整体重建）：没有差分起点的实例不计入，合计为 0
-            values[MetricType.CPU_PERCENT] = 0.0
+            values[metric] = 0.0
         elif all(i.cpu_seconds is None for i in instances):
-            unavailable[MetricType.CPU_PERCENT] = UnavailableReason.ERROR
+            unavailable[metric] = UnavailableReason.ERROR
         # 否则：还没有任何实例带差分起点，本周期不写（不写 0.0 冒充数据）
+
+    def _cpu_value(self, value: float, metric: str) -> float:
+        return (cpu_percent_of_system(value, self._logical_cpus)
+                if metric == MetricType.CPU_PERCENT else round(value, 1))
 
     @staticmethod
     def _reason(instances: Sequence[InstanceReading], metric: str) -> UnavailableReason:
@@ -311,7 +367,6 @@ class GroupAggregator:
                        by_member: Dict[str, List[InstanceReading]], plan: _Plan, sums,
                        delta_seen, cpu_by_member) -> Tuple[MemberSnapshot, ...]:
         """把各成员的值写进 values（键为 指标@成员键）并生成成员快照。"""
-        cpu_known = MetricType.CPU_PERCENT in values
         snapshots: List[MemberSnapshot] = []
         for key, name in self._tracked.items():
             count = len(by_member.get(key, ()))
@@ -323,9 +378,9 @@ class GroupAggregator:
                     member_values[metric] = float(count)
                 elif count == 0:
                     continue
-                elif metric == MetricType.CPU_PERCENT:
-                    if cpu_known:
-                        member_values[metric] = round(cpu_by_member.get(key, 0.0), 1)
+                elif metric in CPU_USAGE_METRICS:
+                    if metric in values:
+                        member_values[metric] = self._cpu_value(cpu_by_member.get(key, 0.0), metric)
                 elif agg is GroupAggregation.SUM:
                     if (key, metric) in sums:
                         member_values[metric] = sums[(key, metric)]

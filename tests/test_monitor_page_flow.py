@@ -256,13 +256,41 @@ def test_data_updated_shows_values_delta_and_count(page, manager):
     assert card.count_label.text() == "已运行 1 秒 · 每 1 秒 · 2 次采集"
 
 
-def test_metrics_unavailable_marks_card(page, manager, services):
+def test_metrics_unavailable_marks_card(page, manager, services, monkeypatch):
+    monkeypatch.setattr('ui.presenters.monitor_presenter.is_elevated', lambda: False)
+    services.dialogs.push('confirm', False)
     task_id = _add_card(manager)
     manager.metrics_unavailable.emit(
         task_id, {MetricType.NUM_GDI_OBJECTS: UnavailableReason.ACCESS_DENIED})
     card = page.board.cards()[task_id]
     assert card.value_labels[MetricType.NUM_GDI_OBJECTS].text() == "不可用"
     assert "以管理员身份运行" in services.notifier.last("warning").content
+
+
+def test_restart_ui_preserves_waiting_request_and_draft(page, manager, services, db, qapp):
+    from core.automation.plan import AutomationPlan
+    from ui.widgets.monitor.new_task_form import WaitRequest
+    request = WaitRequest(
+        'later.exe', (MetricType.MEMORY_PRIVATE,), 3,
+        note='扫描等待', plan=AutomationPlan(timed_marker_seconds=30), timeout_s=60)
+    page.presenter.on_wait_requested(request)
+    page.form.note_input.setText('尚未开始的测试备注')
+    page.presenter.suspend_for_restart(True)
+    saved = page.presenter.restart_ui_state()
+    new_manager = MonitorManager(db)
+    restored = make_monitor_page(db, new_manager, services)
+    try:
+        restored.presenter.restore_restart_ui(saved)
+        assert len(restored.presenter.wait_ids()) == 1
+        wait_id = restored.presenter.wait_ids()[0]
+        actual = restored.presenter.wait_service.request_of(wait_id)
+        assert actual.name == 'later.exe' and actual.plan == request.plan
+        assert restored.form.note_input.text() == '尚未开始的测试备注'
+        assert restored.presenter.wait_service.deadline_of(wait_id) is not None
+    finally:
+        restored.presenter.suspend_for_restart(True)
+        restored.presenter.shutdown_live_stats()
+        restored.close()
 
 
 def test_stop_button_confirms_then_requests_stop(page, manager, services, monkeypatch):

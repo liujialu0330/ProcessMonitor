@@ -27,7 +27,7 @@ from data.errors import StorageError
 from data.models import (MARKER_KINDS, TARGET_KINDS, TARGET_NAME, TARGET_PID, TARGET_TREE,
                          Marker, QualityStats, TaskRecord)
 from data.repos.point_repo import PointQuery
-from utils.metrics import PROCESS_COUNT
+from utils.metrics import PROCESS_COUNT, new_task_metric_type
 from utils.thread_utils import shutdown_thread
 import config
 
@@ -297,7 +297,7 @@ class MonitorManager(QObject):
         if len(scenario.strip()) > 120 or len(build.strip()) > 120:
             raise ValueError('场景和版本各不能超过 120 个字符')
         group_spec: Optional[GroupSpec] = None
-        metric_types = list(metric_types)
+        metric_types = list(dict.fromkeys(new_task_metric_type(key) for key in metric_types))
         if target_kind == TARGET_TREE:
             group_spec = GroupSpec.tree(pid, create_time)
         elif target_kind == TARGET_NAME:
@@ -387,7 +387,7 @@ class MonitorManager(QObject):
         task.release_restart_policy_seed()
         return True
 
-    def recover_task(self, task_id: str) -> bool:
+    def recover_task(self, task_id: str, *, restart_state: Optional[dict] = None) -> bool:
         """
         工具重启后续采：用库里的任务行重建采集线程（任务 ID、开始时间与已有数据都不变），
         目标进程仍在运行且创建时间一致时才有意义（由调用方事先判定，见 core.session_recovery）。
@@ -423,6 +423,7 @@ class MonitorManager(QObject):
                          if group_spec is not None and self._tree_source_factory is not None
                          else None),
             restart_count=restarts, recovering=True, start_time=record.start_time,
+            restart_state=restart_state,
             **self._worker_options)
         # 共享打点查询优先取运行中模型，续采不能只在数据库里保留方案身份。
         task.task_model.scenario = record.scenario
@@ -431,7 +432,10 @@ class MonitorManager(QObject):
         self._connect_worker(task)
         self._register_worker(task)
         logger.info("续采任务: task_id=%s pid=%s", task_id, record.pid)
-        return self.start_task(task_id)
+        started = self.start_task(task_id)
+        if started and restart_state is not None and restart_state.get('paused'):
+            self.task_paused.emit(task_id)
+        return started
 
     def set_worker_options(self, **options) -> None:
         """设定之后新建的任务线程的额外构造参数（exit_probe_factory / restart_finder /
@@ -712,6 +716,20 @@ class MonitorManager(QObject):
         """退出后不再自动重试；只允许协调器在写库线程结束后做最后一次显式补存。"""
         self._shutting_down = True
         self._pending_write_timer.stop()
+
+    def cancel_restart_preparation(self) -> None:
+        """交接准备失败时恢复任务与写入重试入口。"""
+        self._shutting_down = False
+        for task in self._tasks.values():
+            task.cancel_handoff()
+        self._schedule_pending_writes()
+
+    def prepare_restart_writes(self, *, deadline: float) -> bool:
+        """以轮询等待元数据探针，结果交付与待写设置全部保存后才允许交接。"""
+        if any(thread.is_alive() for thread in self._probe_threads.values()):
+            return False
+        return (self._join_target_probes(deadline, 0)
+                and self.flush_pending_task_writes(deadline=deadline))
 
     def _retry_pending_task_writes(self) -> None:
         if not self._shutting_down:

@@ -100,6 +100,7 @@ class AutoMarkerService(QObject):
         self._clock = clock
         self._watcher_factory = watcher_factory or make_log_watcher
         self._tracked: Dict[str, _Tracked] = {}
+        self._suspended = False
         # 处理出错已记过 ERROR 的任务（同一任务只记一次，解除跟踪时清除）
         self._failed: Set[str] = set()
 
@@ -182,6 +183,9 @@ class AutoMarkerService(QObject):
         for task_id in list(self._tracked):
             self._process_safely(task_id)
 
+    def suspend_for_restart(self, suspended: bool) -> None:
+        self._suspended = suspended
+
     def _process_safely(self, task_id: str) -> None:
         try:
             self.process(task_id)
@@ -196,6 +200,8 @@ class AutoMarkerService(QObject):
     def process(self, task_id: str) -> None:
         """处理一个任务：同步暂停状态 → 定时打点 → 日志打点 → 阶段快照 → 判断停止条件。
         暂停/恢复命令成功后立即调用一次，可让恢复时刻精确到命令发出的那一刻。"""
+        if self._suspended:
+            return
         tracked = self._tracked.get(task_id)
         if tracked is None or tracked.stop_reason is not None:
             return

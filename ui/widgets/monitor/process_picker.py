@@ -362,6 +362,21 @@ class ProcessPicker(QWidget):
     def set_text(self, text: str) -> None:
         self.combo.set_text(text)
 
+    def restart_selection(self) -> dict:
+        target = self.combo.current_data()
+        return {'text': self.text(), 'target': (
+            {'pid': target.pid, 'name': target.name, 'create_time': target.create_time}
+            if target is not None else None)}
+
+    def restore_restart_selection(self, state: dict) -> None:
+        selected = state.get('target')
+        if selected is None:
+            self.set_text(state['text'])
+            return
+        target = Target(**selected)
+        targets = [item for item in self.targets() if item.pid != target.pid] + [target]
+        self.combo.set_items([(item_text(item), item) for item in targets], keep=target)
+
     def set_placeholder(self, text: Optional[str]) -> None:
         """搜索框的占位文字（目标类型不同提示不同）；None 恢复默认。读取进程列表期间
         仍显示"正在读取进程列表…"，结束后恢复到这里设的文字。"""

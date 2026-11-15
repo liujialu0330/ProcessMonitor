@@ -1,5 +1,7 @@
 """遥测值的可见格式契约。"""
-from utils.metrics import MetricType, format_metric_value
+import pytest
+
+from utils.metrics import MetricType, format_metric_delta, format_metric_value
 
 
 def test_metric_values_are_compact_and_scannable():
@@ -25,3 +27,17 @@ def test_metric_values_format_by_kind():
     assert format_metric_value(MetricType.CPU_USER_TIME, 1.5) == "1.50 秒"
     assert format_metric_value(MetricType.CPU_PRIORITY, 8.0) == "8"
     assert format_metric_value(MetricType.NUM_CTX_SWITCHES_VOL, 1234.0) == "1,234 次"
+
+
+@pytest.mark.parametrize('value, name', [
+    (0x40, '空闲'), (0x4000, '低于正常'), (0x20, '正常'),
+    (0x8000, '高于正常'), (0x80, '高'), (0x100, '实时'), (8, '8'),
+])
+def test_windows_priority_class_has_readable_name(value, name):
+    assert format_metric_value(MetricType.CPU_PRIORITY, value) == name
+
+
+def test_priority_delta_keeps_numeric_difference():
+    assert format_metric_delta(MetricType.CPU_PRIORITY, 0x20) == '+32'
+    assert format_metric_delta(MetricType.CPU_PRIORITY, -0x40) == '-64'
+    assert format_metric_delta(MetricType.CPU_PRIORITY, 0) == '±0'

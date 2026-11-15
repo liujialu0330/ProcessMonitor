@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import config
-from utils.metrics import LEAK_CHECK_PRESET, canonical_metric_type, all_metric_types
+from utils.metrics import LEAK_CHECK_PRESET, new_task_metric_type, all_metric_types
 
 
 class ConfigValidator:
@@ -79,14 +79,14 @@ def range_field(group, key, default, validator):
 
 def normalize_metrics(value) -> List[str]:
     """把配置里读出的指标列表归一：非列表/未知键丢弃，旧键经
-    canonical_metric_type 归一，去重保序；结果为空则回落到"泄漏排查"预设。"""
+    new_task_metric_type 归一，去重保序；结果为空则回落到"泄漏排查"预设。"""
     known = set(all_metric_types())
     result: List[str] = []
     if isinstance(value, (list, tuple)):
         for item in value:
             if not isinstance(item, str):
                 continue
-            key = canonical_metric_type(item)
+            key = new_task_metric_type(item)
             if key in known and key not in result:
                 result.append(key)
     return result or list(LEAK_CHECK_PRESET)
