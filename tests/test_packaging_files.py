@@ -117,13 +117,22 @@ def _release_yml() -> str:
     return _text(PROJECT_ROOT / ".github" / "workflows" / "release.yml")
 
 
-def test_release_workflow_allows_tags_manual_and_isolated_validation_branch():
+@pytest.mark.parametrize('workflow, events, push', [
+    ('ci.yml', {'push', 'pull_request', 'workflow_dispatch'},
+     {'branches': ['main', 'release-validation-*']}),
+    ('perf.yml', {'push', 'schedule', 'workflow_dispatch'},
+     {'branches': ['release-validation-*']}),
+    ('gui-smoke.yml', {'push', 'workflow_dispatch'},
+     {'branches': ['release-validation-*']}),
+    ('release.yml', {'push', 'workflow_dispatch'},
+     {'tags': ['v*'], 'branches': ['release-validation-*']}),
+])
+def test_workflows_allow_neutral_validation_branch(workflow, events, push):
     yaml = pytest.importorskip("yaml")
-    data = yaml.safe_load(_release_yml())
+    data = yaml.safe_load(_text(PROJECT_ROOT / '.github' / 'workflows' / workflow))
     triggers = data.get("on", data.get(True))
-    assert set(triggers) == {"push", "workflow_dispatch"}
-    assert triggers["push"] == {
-        "tags": ["v*"], "branches": ["release-validation-*"]}
+    assert set(triggers) == events
+    assert triggers['push'] == push
 
 
 def test_release_workflow_builds_and_smokes_but_never_publishes():
