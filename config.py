@@ -8,10 +8,10 @@ import os
 
 # 应用信息
 APP_NAME = "进程监控助手"
-# 预发布期间带后缀（2.0.0-beta.N / 2.0.0-rc.N），正式发布时改为 2.0.0。读取方：窗口标题、
+# 预发布期间带后缀（X.Y.Z-beta.N / X.Y.Z-rc.N），正式发布时使用 X.Y.Z。读取方：窗口标题、
 # 关于页、更新检查（按 SemVer 比较，带后缀的低于同号正式版）、库 meta 的写入版本、
 # build\gen_version_info.py（文件版本四元组）与 build.bat（安装包文件名与 /DMyAppVersion）
-APP_VERSION = "2.0.2"
+APP_VERSION = "2.0.3"
 
 # GitHub 仓库信息（自动更新用）
 GITHUB_OWNER = "liujialu0330"

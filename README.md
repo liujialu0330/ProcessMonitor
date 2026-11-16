@@ -17,7 +17,9 @@ English | [简体中文](./README.zh-CN.md)
 
 </div>
 
-## Version 2.0.2
+## Version 2.0.3
+
+Version 2.0.3 reports CPU usage as a share of total system capacity and adds on-demand administrator restart with task, baseline, pause, wait and UI state handoff. It also corrects context-switch and priority display semantics, preserves process-group counters across restarts, and computes context-switch averages from full raw samples. See the [2.0.3 release notes](doc/2.0.3发布说明.md).
 
 Version 2.0.2 makes a live analysis, its report image, CSV files and evidence bundle use the same frozen data boundary, so samples written after export starts cannot appear only in the files. It also fixes the Monitor page plan and task action menus disappearing immediately, and fixes Settings card ownership and dynamic-height clipping. See the [2.0.2 fix verification](doc/2.0.2修复验收.md).
 
@@ -27,9 +29,7 @@ Version `2.0.0` adds process trees and same-name process groups, automatic marke
 
 The first launch upgrades older databases to schema v5 and keeps a `.bak_v1` backup. Large databases may take time to migrate; the default data directory stays the same. Keep enough free disk space and read the [upgrade and rollback notes](CHANGELOG.md).
 
-Download the [2.0.2 installer](https://github.com/liujialu0330/ProcessMonitor/releases/tag/v2.0.2), or check for updates from version 1.4.1, 2.0.0 or 2.0.1. In 2.0.0, scroll to the bottom of Settings to reach the update button. The implementation, functional regression, remote CI, performance, installation/uninstallation, and both rollback paths have been validated. The remaining 24-hour soak, device-specific checks, and multi-user trial were not run and are not counted as passes. See the [acceptance record](doc/2.0.0验收记录.md) for the original 2.0 scope and the [fix verification](doc/2.0.2修复验收.md) for the latest patch.
-
-The current public release is **2.0.2**. The system-wide CPU percentage, context-switch and priority display changes, and on-demand administrator restart described below belong to the unreleased source. Version 2.0.2 reports CPU as a per-core total that can exceed 100%. See the [stage verification record](doc/2026-11-15_指标采集与权限优化_阶段验收.md) for the current source's validation scope.
+Download the [2.0.3 installer](https://github.com/liujialu0330/ProcessMonitor/releases/tag/v2.0.3), or check for updates from version 1.4.1, 2.0.0, 2.0.1 or 2.0.2. In 2.0.0, scroll to the bottom of Settings to reach the update button. Source-stage checks are documented in the [metrics and elevation verification record](doc/2026-11-15_指标采集与权限优化_阶段验收.md). Historical performance, installation and rollback results are in the [2.0 acceptance record](doc/2.0.0验收记录.md).
 
 ```bat
 python main.py
