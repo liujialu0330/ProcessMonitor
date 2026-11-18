@@ -88,20 +88,18 @@ def start(self):
     # 只约束这个测试启动的实例，失败时也会正常收尾，不留下监控进程。
     QTimer.singleShot(25000, self.quit)
 HeadlessRuntime.start = start
-last_command = None
+next_command = 1
 def control():
-    global last_command
-    path = audit / 'control.json'
+    global next_command
+    path = audit / f'control-{next_command}.json'
     if not path.exists():
         return
     request = json.loads(path.read_text(encoding='utf-8'))
-    if request['id'] == last_command:
-        return
-    last_command = request['id']
     if request['action'] == 'stage':
         runtime.auto_marker.stage_snapshot_due.emit(
             request['task_id'], request['directory'], 1)
-    write('reply.json', {'id': last_command, 'state': state()})
+    write(f'reply-{next_command}.json', state())
+    next_command += 1
 timer = None
 original_trace = bootstrap._report_trace
 def ready(trace):
@@ -170,12 +168,14 @@ class _Server:
 
     def inspect(self, action='inspect', **kwargs):
         self.sequence += 1
-        temporary = self.audit / 'control.tmp'
-        temporary.write_text(json.dumps({'id': self.sequence, 'action': action, **kwargs}),
+        # 每条指令独占路径，避免在 Windows 上替换子进程正在读的文件。
+        path = self.audit / f'control-{self.sequence}.json'
+        temporary = path.with_suffix('.tmp')
+        temporary.write_text(json.dumps({'action': action, **kwargs}),
                              encoding='utf-8')
-        temporary.replace(self.audit / 'control.json')
-        return _json_when(self.audit / 'reply.json', lambda d: d['id'] == self.sequence,
-                          process=self.process, log=self.log)['state']
+        temporary.replace(path)
+        return _json_when(self.audit / f'reply-{self.sequence}.json',
+                          process=self.process, log=self.log)
 
 
 @contextlib.contextmanager

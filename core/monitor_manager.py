@@ -164,6 +164,8 @@ class MonitorManager(QObject):
     # 某任务的打点有变化（新增、改名、删除、换基线、暂停/恢复系统打点）(task_id)：
     # 卡片与分析页据此重新读取打点，不必各自轮询
     markers_changed = pyqtSignal(str)
+    # 改名落库后先通知正在展示该任务的分析页作废旧名称，再由 markers_changed 刷新。
+    marker_renamed = pyqtSignal(str)
     # 暂停 / 恢复成功 (task_id)：无论命令来自监控页、托盘还是命令行（IPC），界面都据此
     # 同步卡片状态
     task_paused = pyqtSignal(str)
@@ -1172,7 +1174,7 @@ class MonitorManager(QObject):
     def rename_marker(self, marker_id: int, label: str,
                       task_id: Optional[str] = None) -> bool:
         """
-        修改打点名称（不改变类型：基线改名后仍是基线），成功后发 markers_changed。
+        修改打点名称并保留原有类型。改名成功先发 marker_renamed，再发 markers_changed。
 
         Args:
             marker_id: 打点ID
@@ -1187,12 +1189,15 @@ class MonitorManager(QObject):
         if not label or self._reject_marker_write(self._marker_owner.get(marker_id, task_id)):
             return False
         try:
+            # 相邻区间可能仍显示上一个快照里的名字；相同值确认以当前记录为准。
+            if self.db.markers.get_label(marker_id) == label:
+                return True
             changed = self.db.markers.update_label(marker_id, label)
         except StorageError:
             logger.error("修改打点失败: marker_id=%s", marker_id, exc_info=True)
             return False
         if changed:
-            self._emit_markers_changed_for(marker_id, task_id)
+            self._emit_markers_changed_for(marker_id, task_id, renamed=True)
         return changed
 
     def delete_marker(self, marker_id: int, task_id: Optional[str] = None) -> bool:
@@ -1430,11 +1435,14 @@ class MonitorManager(QObject):
             except StorageError:
                 logger.error("恢复旧基线失败: marker_id=%s", marker_id, exc_info=True)
 
-    def _emit_markers_changed_for(self, marker_id: int, task_id: Optional[str]) -> None:
+    def _emit_markers_changed_for(self, marker_id: int, task_id: Optional[str], *,
+                                  renamed: bool = False) -> None:
         owner = self._marker_owner.get(marker_id, task_id)
         if owner is None:
             logger.warning("打点 %s 的所属任务未知，未发出 markers_changed", marker_id)
             return
+        if renamed:
+            self.marker_renamed.emit(owner)
         self.markers_changed.emit(owner)
 
     def delete_task_data(self, task_id: str, *, allow_reference: bool = False) -> bool:

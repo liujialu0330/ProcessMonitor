@@ -341,14 +341,15 @@ class ComparisonChart(OverlayChart):
         self.chart_widget.setLabel('bottom', {ALIGN_ROUNDS: '完整操作轮', ALIGN_RELATIVE: '相对时间',
                                               ALIGN_ABSOLUTE: '绝对时间'}[alignment])
 
-    def hover_text(self, index):
+    def _hover_parts(self, index: int) -> List[str]:
         if self._alignment != ALIGN_ROUNDS:
-            return super().hover_text(index)
+            return super()._hover_parts(index)
         x = self._x[index]
-        values = self.values_at(x)
-        return ' · '.join([f'第 {x:g} 轮', *[
-            f'{s.name} {self._formatter(value) if value is not None and math.isfinite(value) else "—"}'
-            for s, value in zip(self._series, values)]])
+        parts = [f'第 {x:g} 轮']
+        for series, value in zip(self._series, self.values_at(x)):
+            reading = self._formatter(value) if value is not None and math.isfinite(value) else "—"
+            parts.append(f'{series.name} {reading}')
+        return parts
 
 
 def render_comparison_image(entries, metrics, focus_metric, alignment):

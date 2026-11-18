@@ -15,11 +15,12 @@
 """
 import dataclasses
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 from PyQt5.QtCore import QPoint
 
+from core.conclusion_text import FORMAT_MARKDOWN, FORMAT_TEXT
 from core.monitor_manager import MonitorManager
 from core.workers.member_snapshots_worker import MemberBundle, load_member_bundle
 from data.models import DataPoint, MonitorTask
@@ -35,7 +36,9 @@ from tests.test_monitor_worker_clock import started  # noqa: F401
 from ui.formatting import (
     GROUP_USAGE_NOTE, MEMBER_TOTAL_OPTION, MEMBER_USAGE_NOTE, SUMMARY_COLUMNS)
 from ui.viewmodels.analysis_vm import EMPTY_MEMBER_NO_DATA, MemberOption
-from utils.metrics import MetricType, split_member_key
+from ui.widgets.analysis.export_flow import WAIT_ANALYSIS
+from ui.widgets.analysis.toolbar import EXPORT_EVIDENCE
+from utils.metrics import MetricType, member_series_key, split_member_key
 
 MEM = MetricType.MEMORY_PRIVATE
 GDI = MetricType.NUM_GDI_OBJECTS
@@ -224,6 +227,28 @@ def test_member_selection_keeps_export_on_aggregate_analysis(make_page, seesaw_m
     assert vm.select_member("a.exe")
     assert vm.view_analysis() is not aggregate
     assert vm.export_analysis() is aggregate
+
+
+def test_rename_from_member_view_retries_without_combining_old_member_labels(
+        make_page, seesaw_members, manager, member_runner):
+    vm = open_group(make_page(), seesaw_members)
+    at = vm.last_analysis.snapshot(MEM).points[2].timestamp
+    marker = manager.add_marker(vm.current_task_id, "准备完成", at, kind='baseline')
+    assert vm.select_member("a.exe")
+    assert vm.view_analysis().markers[0].id == marker.id
+
+    member_runner.fail = True
+    assert vm.rename_marker(vm.view_analysis().markers[0], "开始操作")
+    assert vm.export_analysis() is None
+    assert vm.current_member == "a.exe"
+    member_runner.fail = False
+    vm.refresh()
+
+    assert vm.current_member == "a.exe"
+    assert [(m.id, m.label, m.kind) for m in vm.view_analysis().markers] == [
+        (marker.id, "开始操作", 'baseline')]
+    assert vm.export_analysis() is vm.last_analysis
+    assert vm.report_job().markers[0].label == "开始操作"
 
 
 def test_member_view_survives_auto_refresh(make_page, runner, member_runner, seesaw_members):
@@ -449,15 +474,46 @@ def test_member_that_disappears_falls_back_to_totals(make_page, member_runner, s
     assert page.summary_table.metrics() == [MEM, COUNT]
 
 
-def test_member_load_failure_keeps_previous_members(make_page, member_runner, seesaw_members):
+def test_member_load_failure_keeps_previous_members_and_blocks_export(
+        make_page, db, member_runner, seesaw_members):
     page = make_page()
     vm = open_group(page, seesaw_members)
     vm.select_member("a.exe")
+    previous = vm.export_analysis()
+    member_metric = member_series_key(MEM, "a.exe")
+    latest = previous.snapshot(MEM).task_last_at + timedelta(seconds=5)
+    assert db.save_data_points([
+        DataPoint(seesaw_members.task_id, latest, 25_000.0, MEM),
+        DataPoint(seesaw_members.task_id, latest, 20_000.0, member_metric),
+    ])
     member_runner.fail = True
-    vm._start_query(auto_refresh=True)
+    vm.refresh()
     assert vm.current_member == "a.exe"
     assert [o.key for o in vm.member_options] == ["a.exe", "app.exe", "b.exe"]
-    assert page.summary_table.metrics()[0] == f"{MEM}@a.exe"
+    assert page.summary_table.metrics()[0] == member_metric
+    assert vm.last_analysis.snapshot(MEM).task_last_at == latest
+    assert vm.last_analysis.member_snapshots[member_metric] is previous.member_snapshots[member_metric]
+    assert "成员数据加载失败" in page.analysis_hint.text()
+    assert "上次成功加载" in page.analysis_hint.text()
+    assert vm.report_job() is None and not page.export_flow.run(EXPORT_EVIDENCE)
+    assert page.services.notifier.last('warning').title == WAIT_ANALYSIS[0]
+    assert vm.export_worker is None
+    for member in (None, "a.exe"):
+        assert vm.select_member(member)
+        for fmt in (FORMAT_TEXT, FORMAT_MARKDOWN):
+            page.verdict_banner.copy_actions[fmt].trigger()
+            assert page.services.notifier.last('warning').title == WAIT_ANALYSIS[0]
+            assert page.services.dialogs.calls_of('copy_text') == []
+
+    member_runner.fail = False
+    vm.refresh()
+    ready = vm.export_analysis()
+    assert ready.member_snapshots[member_metric].points[-1].value == 20_000.0
+    assert ready.snapshot(MEM).task_last_at == ready.member_snapshots[member_metric].task_last_at == latest
+    assert vm.report_job() is not None and "成员数据加载失败" not in page.analysis_hint.text()
+    assert vm.select_member(None)
+    assert page.export_flow.copy_conclusion(FORMAT_TEXT)
+    assert "a.exe" in page.services.dialogs.last_call('copy_text')['text']
 
 
 def test_changing_task_resets_member_view(make_page, db, seesaw_members, started):  # noqa: F811

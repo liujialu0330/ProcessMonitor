@@ -13,7 +13,7 @@ import pytest
 
 from core.analysis.trend import Verdict
 from core.history_query import (
-    BASELINE_RANGE_KEY, CHART_MAX_BUCKETS, DEFAULT_RANGE_KEY, RANGE_KEYS,
+    BASELINE_RANGE_KEY, CHART_MAX_BUCKETS, CUSTOM_RANGE_KEY, DEFAULT_RANGE_KEY, RANGE_KEYS,
     TABLE_POINT_LIMIT, TIME_RANGE_SECONDS, HistoryRequest, HistorySnapshot, PeakRises,
     build_request, compute_since, run_history_query,
 )
@@ -294,6 +294,22 @@ def test_baseline_only_off_uses_display_start(db):
     assert snapshot.baseline.value == 12.0
 
 
+def test_baseline_median_and_count_stop_at_the_next_process_start(db):
+    task = _seed_series(db, [10, 20, 30, 900, 950, 999], interval=1,
+                        markers=[(1, "基线", 'baseline'), (3, "重启", 'restart')])
+    snapshot = run_history_query(db, build_request(task.task_id, MEM, 'all', baseline_only=False))
+    assert snapshot.baseline.value == 25 and snapshot.baseline.sample_count == 2
+    assert not snapshot.baseline_comparable and snapshot.stats['count'] == 3
+
+
+def test_custom_range_ending_after_restart_waits_for_its_first_sample(db):
+    task = _seed_series(db, [1, 2], interval=1, markers=[(3, "重启", 'restart')])
+    request = build_request(task.task_id, MEM, 'custom', since=BASE, until=BASE + timedelta(seconds=4))
+    snapshot = run_history_query(db, request)
+    assert snapshot.segment_number == 2 and snapshot.stats is None
+    assert snapshot.total_count == 2
+
+
 def test_latest_baseline_marker_wins(db):
     task = _seed_series(db, list(range(50)), markers=[
         (5, "旧基线", 'baseline'), (20, "新基线", 'baseline')])
@@ -307,6 +323,23 @@ def test_baseline_after_all_data_gives_no_stats(db):
     snapshot = run_history_query(db, _request(task.task_id, 'all'))
     assert snapshot.stats is None and snapshot.judgement is None
     assert snapshot.baseline.value is None and snapshot.baseline.sample_count == 0
+
+
+@pytest.mark.parametrize('end, count', [(9, 10), (30, 0), (31, 0)])
+def test_custom_range_with_unsampled_baseline_uses_selected_end(db, end, count):
+    task = _seed_series(db, range(10), markers=[(30, "基线", 'baseline')])
+    request = _request(task.task_id, CUSTOM_RANGE_KEY, since=BASE,
+                       until=BASE + timedelta(minutes=end))
+    snapshot = run_history_query(db, request)
+
+    assert snapshot.total_count == 10
+    assert snapshot.request.until == BASE + timedelta(minutes=9)
+    assert snapshot.baseline.sample_count == 0
+    if count:
+        assert snapshot.stats['count'] == count and snapshot.stats_since == BASE
+    else:
+        assert snapshot.stats is None and snapshot.judgement is None
+        assert snapshot.stats_since == BASE + timedelta(minutes=30)
     assert snapshot.total_count == 10
 
 
@@ -336,6 +369,56 @@ def test_rounds_use_baseline_and_user_markers(db):
         (30, "暂停", 'pause')])
     snapshot = run_history_query(db, _request(task.task_id, 'all'))
     assert [(r.label, r.delta) for r in snapshot.rounds] == [("第1轮", 10.0), ("第2轮", 20.0)]
+
+
+@pytest.mark.parametrize('restart', [False, True], ids=['frozen-anchor', 'restart'])
+def test_round_medians_use_same_samples_when_selected_range_changes(db, restart):
+    markers = [(1, "开始操作", 'user'), (5, "结束操作", 'user')]
+    if restart:
+        markers.append((8, "被测程序重启", 'restart'))
+    task = _seed_series(db, [i * 100 for i in range(8)] + [800, 20_000, 40_000, 60_000],
+                        markers=markers)
+    anchor = BASE + timedelta(minutes=11 if restart else 8)
+
+    def selected_through(minute):
+        return run_history_query(db, _request(
+            task.task_id, CUSTOM_RANGE_KEY, anchor=anchor, since=BASE,
+            until=BASE + timedelta(minutes=minute)))
+
+    entire = (selected_through(7) if restart else
+              run_history_query(db, _request(task.task_id, 'all', anchor=anchor)))
+    shorter = selected_through(6)
+    assert shorter.total_count < entire.total_count
+    expected = 300 if restart else 350
+    assert [(r.label, r.delta) for r in shorter.rounds] == [("结束操作", expected)]
+    assert shorter.rounds == entire.rounds
+    assert selected_through(4).rounds == []
+
+
+def test_frozen_markers_keep_user_baseline_order_at_the_same_timestamp(db, monkeypatch):
+    task = _seed_series(db, range(50), markers=[
+        (10, "进入页面", 'user'), (10, "准备完成", 'baseline'), (10, "打开窗口", 'user'),
+        (30, "关闭窗口", 'user')])
+    frozen = tuple(db.markers.list(task.task_id))
+    first, baseline, opened, closed = frozen
+    assert first.id < baseline.id < opened.id
+    assert db.markers.update_label(baseline.id, "新基线名称")
+
+    def disallow_read(_task_id):
+        pytest.fail("显式提供打点后又读取了打点仓储")
+
+    monkeypatch.setattr(db.markers, 'list', disallow_read)
+    request = _request(task.task_id, analysis=True)
+    snapshot = run_history_query(db, request, markers=frozen)
+    assert snapshot.ok and snapshot.baseline.marker == baseline
+    assert [(r.label, r.delta) for r in snapshot.rounds] == [
+        ("准备完成", 0), ("打开窗口", 0), ("关闭窗口", 20)]
+    assert [(i.start_marker_id, i.end_marker_id) for i in snapshot.intervals] == [
+        (None, first.id), (first.id, baseline.id), (baseline.id, opened.id),
+        (opened.id, closed.id), (closed.id, None)]
+
+    empty = run_history_query(db, request, markers=())
+    assert empty.ok and empty.markers == [] and empty.baseline is None and empty.rounds == []
 
 
 def test_single_user_marker_gives_no_rounds(db):
@@ -440,7 +523,7 @@ def _raise_storage(*a, **k):
     ("analytics", "last_point_timestamp"),
     ("points", "fetch"),
     ("analytics", "aggregates"),
-    ("analytics", "value_near"),
+    ("analytics", "value_near_with_count"),
     ("analytics", "gaps"),
     ("analytics", "legacy_buckets"),
     ("markers", "list"),

@@ -57,6 +57,14 @@ class MarkerRepo:
                 ''', params).fetchall()
                 return [row_to_marker(row) for row in rows]
 
+    def get_label(self, marker_id: int) -> Optional[str]:
+        """按持久化 ID 读取当前名称，记录已删除时返回 None。"""
+        with storage_errors(f"读取打点 {marker_id} "):
+            with self._factory.connect() as conn:
+                row = conn.execute(
+                    'SELECT label FROM task_markers WHERE id = ?', (marker_id,)).fetchone()
+                return row[0] if row is not None else None
+
     def update_label(self, marker_id: int, label: str) -> bool:
         """改打点文字；返回是否命中。"""
         with storage_errors(f"修改打点 {marker_id} "):

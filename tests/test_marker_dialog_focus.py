@@ -10,7 +10,8 @@ from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QWidget
 from qfluentwidgets import SubtitleLabel
 
-from ui.components.dialogs import MarkerDialog, marker_target_text
+from ui.components.dialogs import MARKER_LABEL_MAX_LENGTH, MarkerDialog, marker_target_text
+from ui.services.dialogs import QtDialogs
 
 
 def _parent():
@@ -28,6 +29,57 @@ def test_marker_dialog_focuses_label_edit_on_show(qapp):
     try:
         assert dialog.focusWidget() is dialog.label_edit
         assert dialog.label_edit.selectedText() == "基线"
+    finally:
+        dialog.close()
+        parent.close()
+
+
+def test_rename_dialog_preserves_the_full_existing_name(qapp):
+    parent = _parent()
+    parent.show()
+    old_name = '满幅扫描完成🧪' * 12
+    recorded_at = datetime(2026, 11, 18, 9, 15, 32)
+
+    def inspect_and_save(dialog):
+        dialog.show()
+        qapp.processEvents()
+        assert [w.text() for w in dialog.findChildren(SubtitleLabel)] == ['重命名打点']
+        assert dialog.target_label.text() == 'demo.exe · PID 1234'
+        assert '09:15:32' in dialog.time_label.text()
+        assert dialog.focusWidget() is dialog.label_edit
+        assert dialog.label_edit.selectedText() == old_name
+        return True
+
+    try:
+        actual = QtDialogs(run_dialog=inspect_and_save).ask_marker_label(
+            parent, old_name, recorded_at, process_name='demo.exe', pid=1234, renaming=True)
+        assert actual == old_name
+    finally:
+        parent.close()
+
+
+def test_rename_input_at_length_limit_keeps_complete_characters(qapp):
+    parent = _parent()
+    dialog = MarkerDialog('短名称', parent, renaming=True)
+    try:
+        prefix = '验' * (MARKER_LABEL_MAX_LENGTH - 1)
+        dialog.label_edit.setText(prefix + '🧪')
+        assert dialog.label_edit.text() == prefix
+        assert dialog.get_label() == prefix
+    finally:
+        dialog.close()
+        parent.close()
+
+
+def test_rename_filters_isolated_surrogates_in_old_and_edited_names(qapp):
+    parent = _parent()
+    dialog = MarkerDialog('旧' + chr(0xd800) + '🧪', parent, renaming=True)
+    try:
+        assert dialog.get_label() == '旧🧪'
+        dialog.label_edit.setText(chr(0xdc00))
+        assert dialog.label_edit.text() == '' and not dialog.yesButton.isEnabled()
+        dialog.label_edit.setText('新名称')
+        assert dialog.yesButton.isEnabled()
     finally:
         dialog.close()
         parent.close()

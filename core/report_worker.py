@@ -19,7 +19,7 @@ from core.report import (MEMBER_SUMMARY_TITLE, SUMMARY_HEADER, build_report_csv_
                          member_summary_table, report_rows)
 from core.workers.base import BackgroundTask, CancelToken
 from data.database import Database
-from data.models import TARGET_PID, MonitorTask
+from data.models import TARGET_PID, Marker, MonitorTask
 from data.repos.point_repo import PointQuery
 from utils.metrics import member_series_key
 
@@ -46,10 +46,14 @@ class ReportJob:
     metadata: Tuple[str, ...] = ()
     summary_rows: Tuple[tuple, ...] = ()
     gap_seconds: Optional[float] = None
-    # 分析页当前快照的原始数据边界（闭区间）。None 沿用全任务导出，供自动导出、
-    # 命令行等没有界面分析范围的调用方兼容使用。
+    # 带分析快照时只导出这个闭区间。仅导出原始数据时两端可不限。
     data_since: Optional[datetime] = None
     data_until: Optional[datetime] = None
+    # 带分析快照的导出固定打点名称和顺序，避免写明细时遇到改名而与图片、摘要不一致。
+    # 仅导出原始数据且没有分析快照时，仍由工作线程读取数据库。
+    markers: Optional[Tuple[Marker, ...]] = None
+    # 空分析也可导出任务元数据；写文件前才到达的首个样本属于下一批。
+    empty_samples: bool = False
 
     def paths(self) -> List[str]:
         return [p for p in (self.image_path, self.csv_path, self.summary_path) if p]
@@ -138,7 +142,9 @@ class ReportWorker(BackgroundTask):
             task.task_id, FETCH_BATCH_SIZE, since=self.job.data_since,
             until=self.job.data_until, **options)
         try:
-            markers = self.db.markers.list(task.task_id)
+            markers = self.job.markers
+            if markers is None:
+                markers = self.db.markers.list(task.task_id)
 
             def _points():
                 nonlocal processed
@@ -156,6 +162,8 @@ class ReportWorker(BackgroundTask):
                     f.write(line + '\n')
                 writer = csv.writer(f)
                 writer.writerow(build_report_csv_header(task))
+                if self.job.empty_samples:
+                    return 0, 0
                 for row in report_rows(task, _points(), markers, self.job.gap_seconds):
                     if token.is_cancelled:
                         break

@@ -8,7 +8,6 @@ from ui import theme_tokens as tokens
 from ui.components.sparkline import LINE_COLOR
 from ui.theme_tokens import qcolor
 from ui.components.task_card import format_clock
-from utils.metrics import format_metric_value
 
 
 class _Preview(QWidget):
@@ -114,8 +113,7 @@ class TaskListRow(CardWidget):
                 f'CaptionLabel {{ background: {tokens.pill_background(tone, True)}; border-radius: 9px; }}')
         self.elapsed.setText(format_clock(card.running_seconds() or 0))
         metric = card.trend_metric
-        text = (format_metric_value(metric, card.last_values[metric])
-                if metric in card.last_values else '—')
+        text = card.value_text(metric) or '—'
         self.value.setText(f'{text}  {card.delta_text(metric, compact=True) if metric else ""}')
         self.value.setToolTip(card.sparkline_label.text() + '\n' + self.value.text())
         self.verdict.setText(card.live_verdict())

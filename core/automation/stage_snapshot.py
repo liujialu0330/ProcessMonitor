@@ -8,7 +8,7 @@ AutoMarkerService 到期发 stage_snapshot_due(task_id, 目录, 序号)，本模
 
 一次写入分三段：
 1. 工作线程（StageAnalysisWorker）：建目录、读任务、按"全部"范围逐指标查分析快照
-   （与分析页同一 run_history_query，分桶有上限，数据再多也是有界的）；
+   （与分析页共用 AnalysisBoundary 查询边界和分桶上限）；
 2. 界面线程：用注入的 renderer 离屏渲染报告图片（图表是控件，只能在界面线程画；
    渲染函数在界面层，core 不反向依赖 ui，故由组装方注入）；
 3. 工作线程（ReportWorker）：写图片与摘要 CSV（先写 .tmp，全部成功再原子替换）。
@@ -29,11 +29,11 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from PyQt5.QtCore import QObject, pyqtSignal
 
-from core.history_query import (DEFAULT_RANGE_KEY, TaskAnalysis, build_request,
-                                run_history_query)
+from core.history_query import DEFAULT_RANGE_KEY, AnalysisBoundary, TaskAnalysis, build_request
 from core.report import metadata_lines, summary_rows
 from core.report_worker import ReportJob, ReportWorker
 from core.workers.base import BackgroundTask, CancelToken, TaskError
+from data.errors import StorageError
 from data.models import MonitorTask
 
 logger = logging.getLogger(__name__)
@@ -105,20 +105,20 @@ class StageAnalysisWorker(BackgroundTask):
         except OSError as exc:
             logger.warning("阶段快照目录无法创建: %s", self.directory, exc_info=True)
             raise TaskError(ERR_MAKE_DIR.format(detail=exc)) from exc
-        task = self.db.tasks.get(self.task_id)
+        boundary = AnalysisBoundary.read(self.db, self.task_id)
+        task = boundary.task
         if task is None or task.start_time is None:
             raise TaskError(ERR_NO_TASK)
-        snapshots = {}
-        for metric in task.metric_types:
-            if token.is_cancelled:
-                return None
-            snapshot = run_history_query(
-                self.db, build_request(self.task_id, metric, DEFAULT_RANGE_KEY, analysis=True))
-            if snapshot.error is not None:
-                # run_history_query 已带堆栈记过日志
-                raise TaskError(ERR_READ.format(detail=snapshot.error))
-            snapshots[metric] = snapshot
+        request = build_request(self.task_id, None, DEFAULT_RANGE_KEY, analysis=True)
+        snapshots = boundary.query_metrics(self.db, request, task.metric_types,
+                                           is_cancelled=lambda: token.is_cancelled)
+        if snapshots is None:
+            return None
         return task, TaskAnalysis(self.task_id, DEFAULT_RANGE_KEY, snapshots)
+
+    def failure_message(self, exc: Exception) -> str:
+        detail = super().failure_message(exc)
+        return ERR_READ.format(detail=detail) if isinstance(exc, StorageError) else detail
 
 
 @dataclass

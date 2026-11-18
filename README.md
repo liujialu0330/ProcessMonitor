@@ -29,7 +29,7 @@ Version `2.0.0` adds process trees and same-name process groups, automatic marke
 
 The first launch upgrades older databases to schema v5 and keeps a `.bak_v1` backup. Large databases may take time to migrate; the default data directory stays the same. Keep enough free disk space and read the [upgrade and rollback notes](CHANGELOG.md).
 
-Download the [2.0.3 installer](https://github.com/liujialu0330/ProcessMonitor/releases/tag/v2.0.3), or check for updates from version 1.4.1, 2.0.0, 2.0.1 or 2.0.2. In 2.0.0, scroll to the bottom of Settings to reach the update button. Source-stage checks are documented in the [metrics and elevation verification record](doc/2026-11-15_指标采集与权限优化_阶段验收.md). Historical performance, installation and rollback results are in the [2.0 acceptance record](doc/2.0.0验收记录.md).
+Download the [2.0.3 installer](https://github.com/liujialu0330/ProcessMonitor/releases/tag/v2.0.3), or check for updates from version 1.4.1, 2.0.0, 2.0.1 or 2.0.2. In 2.0.0, scroll to the bottom of Settings to reach the update button. Pre-release checks for 2.0.3 are recorded in the [metrics and elevation verification record](doc/2026-11-15_指标采集与权限优化_阶段验收.md). Historical performance, installation and rollback results are in the [2.0 acceptance record](doc/2.0.0验收记录.md).
 
 ```bat
 python main.py
@@ -43,6 +43,8 @@ Save, import, or export plans from the monitoring page. Notes allow up to 2,000 
 ProcessMonitor is a Windows 11 Fluent Design desktop app for keeping an eye on any running process. Pick a process by PID or from a live list, choose from 26 metrics across memory, CPU, system and I/O categories, and watch the numbers update on a configurable sampling interval — from every second up to once an hour. Every sample is persisted locally; the Analysis page gives each metric a verdict, round-by-round increases and trend charts, lets you compare up to four test runs, and exports a report image plus CSV files in one click.
 
 ## ✨ Features
+
+The features below follow the current source. Check the entry for your installed version in the [Changelog](CHANGELOG.md).
 
 ### 🧭 Recommended workflow: hunting leaks
 
@@ -70,10 +72,13 @@ ProcessMonitor is a Windows 11 Fluent Design desktop app for keeping an eye on a
 ### 📊 Analysis & Reports
 - **Verdict summary** — one row per metric: baseline, current, change since baseline, mean increase per round, growth rate ± confidence interval · R², recent trend, verdict and GDI/USER quota usage, with the basis spelled out (e.g. "since baseline 16:37:33 · 2h15m · 8,100 points"); with too few samples (under 30 points or too short a span) it says "Not enough data" instead of extrapolating scary numbers
 - **Sensible statistics** — with a baseline, only data after it is counted; cumulative metrics (CPU time, I/O bytes and counts, ...) are plotted as per-second rates with an average rate instead of an extrapolated growth rate; peak metrics show how many times they rose; sampling gaps break the curve and are shaded
-- **Trend charts** — small multiples (one chart per metric) or a single Δ% overlay, linked crosshairs, min/max bands that keep peaks and valleys; absolute or relative time axis; drag a range on the overview strip to re-run the statistics on it; right-click a chart to add a marker, set the baseline, rename or delete markers
-- **Marker intervals** — the focused metric split at the baseline and every round: duration, start/end values, increase, rate, peak and "vs. previous round"; click a row to zoom into it; a detail table (with "vs. previous" and "vs. baseline") is one tab away
-- **Task comparison** — pick a second task (e.g. before and after a fix) to overlay the same metric's change from each task's own starting point on a relative time axis, with both round-by-round tables side by side
+- **Trend charts** — compare small multiples with a shared crosshair or switch to a Δ% overlay. Choose absolute or relative time. Min/max bands preserve peaks and valleys. Drag the overview selection and release to recalculate its statistics. Right-click a chart to add or rename a marker, set the baseline, or delete a marker.
+- **Marker intervals** — see duration, start and end values, change, rate, peak and the difference from the previous round. Click a row to zoom to that interval. Sample details show each reading and its change from the previous sample and from the baseline.
+- **Task comparison** — compare up to four tasks by round, relative time or absolute time. The comparison panel shows per-metric verdicts and per-round increases across the selected tasks.
 - **One-click report** — a report image (verdicts + small-multiple charts), a detail CSV (metadata lines, elapsed seconds, blank rows at gaps, a final marker column) and a metric × interval summary CSV; or export only the CSV, only the image, or copy the image; files are written to a temp file first and only replace the target on success, in the background, and the folder opens only when you click
+- **Memory unit** — choose Auto, KB, MB or GB in Monitor or Analysis. Both pages remember the same choice. Use KB to compare small increases in working set, private bytes or USS, including in recorded samples. Changes from the previous sample and the baseline use their own scale, so a 32 KB increase stays visible with totals in GB.
+- **Marker interval controls** — select an interval and press **F2** or click **Rename marker** (重命名打点). Choose an endpoint when both have markers. On a narrow chart, pause over the plot to see the full reading when the title line is shortened.
+- **Report readiness** — wait for the selected time range to load before exporting a task report or copying the conclusion. If member data or the verdicts for individual starts fail to load, refresh Analysis before exporting or copying.
 - **Auto-refresh for running tasks** — the Analysis page follows the live data with a refresh interval that adapts to the data volume; all loading runs in the background, so large tasks never freeze the UI
 - **Controlled cleanup** — delete a finished task from the Analysis page's More menu, with confirmation; database cleanup and compaction are unavailable while any task is running or an export is in progress
 
@@ -92,7 +97,7 @@ ProcessMonitor is a Windows 11 Fluent Design desktop app for keeping an eye on a
 - **Crash-resilient storage** — SQLite with WAL mode, automatic retry on failed writes, crash/error logging (5MB x 5 rotation), and automatic recovery of orphaned "running" tasks after an unclean shutdown
 - **Safe database upgrades** — upgrades run in an explicit transaction and roll back on failure, restoring from the automatic backup so old data is never lost
 - **Never freezes on stop** — stopping a task or exiting the app does not block the UI, and all collected data is flushed to disk before exit
-- **Automated test suite** — 5,000+ cases cover storage, migration, collection, scheduling, analysis, exports, updates and UI flows using isolated data directories. Current results are recorded in the [stage verification record](doc/2026-11-15_指标采集与权限优化_阶段验收.md).
+- **Automated test suite** — 5,000+ cases cover storage, migration, collection, scheduling, analysis, exports, updates and UI flows using isolated data directories. See the [latest source verification record](doc/2026-11-18_分析交互与导出一致性_阶段验收.md).
 - **Measured performance** — opening a 770k-row history task takes ~1.4s (down from 3.4s pre-v1.2.0; measured on the maintainer's dev machine)
 
 ## 📸 Screenshots

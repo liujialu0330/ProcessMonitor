@@ -50,6 +50,8 @@ class SampleTable(CardWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._points: Sequence = ()
+        self._metric_type: Optional[str] = None
         self._data_font = data_font(TypeScale.BODY)
 
         self.data_table = TableWidget(self)
@@ -112,7 +114,8 @@ class SampleTable(CardWidget):
 
     def set_points(self, points: Sequence, metric_type: Optional[str],
                    total_count: Optional[int] = None, display_unit: str = '',
-                   baseline_value: Optional[float] = None) -> None:
+                   baseline_value: Optional[float] = None, *,
+                   memory_unit: Optional[str] = None) -> None:
         """
         填充表格并更新提示。
 
@@ -123,6 +126,7 @@ class SampleTable(CardWidget):
             display_unit: 图表当前固定的显示单位（数值列与图表、统计条同单位）
             baseline_value: 基线值；None 时"较基线"列显示 "--"
         """
+        self._points, self._metric_type = points, metric_type
         self.table_hint_label.setText(table_hint_text(len(points), total_count))
         count = len(points)
 
@@ -141,7 +145,7 @@ class SampleTable(CardWidget):
                                if baseline_value is not None else EMPTY_CELL)
                 texts = (
                     dp.timestamp.strftime(DETAIL_TIME_FORMAT),
-                    format_metric_value(metric_type, dp.value, display_unit=display_unit),
+                    format_metric_value(metric_type, dp.value, display_unit, memory_unit=memory_unit),
                     previous,
                     vs_baseline,
                     f"{dp.value:.4f}",
@@ -155,9 +159,21 @@ class SampleTable(CardWidget):
             # 表格本就未开启排序（TableWidget 默认不排序），此处只需恢复界面更新
             self.data_table.setUpdatesEnabled(True)
 
+    def set_value_unit(self, display_unit: str, memory_unit: str) -> None:
+        """只更新绝对值列，保留行选择、滚动位置及差值。"""
+        self.data_table.setUpdatesEnabled(False)
+        try:
+            for row, point in enumerate(reversed(self._points)):
+                item = self.data_table.item(row, 1)
+                item.setText(format_metric_value(self._metric_type, point.value, display_unit,
+                                                 memory_unit=memory_unit))
+        finally:
+            self.data_table.setUpdatesEnabled(True)
+
     def clear(self) -> None:
         """清空表格，提示恢复默认文案。"""
         self.data_table.setRowCount(0)
+        self._points, self._metric_type = (), None
         self.table_hint_label.setText(HINT_DEFAULT)
 
     def set_raw_values(self, visible: bool) -> None:

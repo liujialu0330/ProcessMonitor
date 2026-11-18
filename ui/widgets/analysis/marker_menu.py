@@ -27,19 +27,22 @@ MenuItem = Tuple[str, Callable[[], bool], bool]
 class MarkerEditFlow(QObject):
     """右键打点编辑：生成菜单项并执行（对话框 + 视图模型命令 + 失败提示）。"""
 
-    def __init__(self, vm, services, host, parent=None):
+    def __init__(self, vm, services, host, parent=None, *, read_only: bool = False):
         super().__init__(parent)
         self._vm = vm
         self._services = services
         self._host = host
+        self._read_only = read_only
         self.last_menu: Optional[RoundMenu] = None
 
     def items(self, x: float, marker) -> List[MenuItem]:
         """(文本, 执行函数, 是否可用) 列表，顺序即菜单顺序。"""
-        editable = marker is not None and getattr(marker, 'kind', 'user') not in SYSTEM_KINDS
+        editable = (not self._read_only and marker is not None
+                    and getattr(marker, 'kind', 'user') not in SYSTEM_KINDS)
         is_baseline = editable and marker.kind == 'baseline'
+        can_add = not self._read_only and self._vm.current_task_id is not None
         return [
-            (ADD_TEXT, lambda: self.add_at(x), self._vm.current_task_id is not None),
+            (ADD_TEXT, lambda: self.add_at(x), can_add),
             (BASELINE_TEXT, lambda: self.set_baseline(marker), editable and not is_baseline),
             (RENAME_TEXT, lambda: self.rename(marker), editable),
             (DELETE_TEXT, lambda: self.delete(marker), editable),
@@ -101,11 +104,15 @@ class MarkerEditFlow(QObject):
         return False
 
     def rename(self, marker) -> bool:
+        if (self._read_only or marker is None or marker.kind not in ('user', 'baseline')
+                or marker.id is None or marker.task_id != self._vm.current_task_id):
+            return False
         label = self._services.dialogs.ask_marker_label(
             self._host.window(), marker.label, marker.timestamp,
             process_name=getattr(self._vm.current_task, 'process_name', ''),
-            pid=getattr(self._vm.current_task, 'pid', None))
-        if label is None or not label.strip() or label.strip() == marker.label:
+            pid=getattr(self._vm.current_task, 'pid', None), renaming=True)
+        label = (label or '').strip()
+        if marker.task_id != self._vm.current_task_id or not label:
             return False
         if self._vm.rename_marker(marker, label):
             return True

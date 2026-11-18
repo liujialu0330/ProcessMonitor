@@ -5,7 +5,8 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import config
-from utils.metrics import LEAK_CHECK_PRESET, new_task_metric_type, all_metric_types
+from utils.metrics import (
+    LEAK_CHECK_PRESET, MEMORY_DISPLAY_UNITS, all_metric_types, new_task_metric_type)
 
 
 class ConfigValidator:
@@ -265,6 +266,8 @@ class SettingsDefinition:
     # 声明成 ConfigItem 是为了 qconfig 保存时把它一并写回
     config_version = value_field(CONFIG_VERSION_KEY, "", CURRENT_CONFIG_VERSION)
     monitor_view = option_field('Monitor', 'View', 'cards', OptionsValidator(['cards', 'list']))
+    memory_display_unit = option_field(
+        'Display', 'MemoryUnit', 'auto', OptionsValidator(MEMORY_DISPLAY_UNITS))
     metric_presets = value_field('Monitor', 'MetricPresets', {}, MetricPresetsValidator())
     default_metric_preset = value_field('Monitor', 'DefaultMetricPreset', '', ShortTextValidator())
     guide_started = value_field('Guide', 'Started', False, BoolValidator())

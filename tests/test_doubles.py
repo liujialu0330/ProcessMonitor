@@ -116,7 +116,7 @@ def test_scripted_dialogs_none_is_a_valid_preset():
     assert dialogs.ask_save_path(None, "保存", "a.csv", "CSV 文件 (*.csv)") is None
     assert dialogs.last_call("ask_marker_label") == {
         "parent": None, "default_label": "基线", "timestamp": clicked_at,
-        "process_name": "", "pid": None}
+        "process_name": "", "pid": None, "renaming": False}
 
 
 def test_scripted_marker_dialog_records_process_and_pid():

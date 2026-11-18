@@ -27,7 +27,8 @@ class PageScaffold(QScrollArea):
     属性：
         container: 滚动区内的容器控件
         title_label / subtitle_label: 页标题与副标题（副标题为空时隐藏）
-        header_layout: 页头整行（标题组 | 伸缩 | 命令区）
+        header_layout: 页头整行（可伸缩的标题组 | 命令区）
+        title_layout: 页头左侧纵向标题组
         command_layout: 页头右侧命令区，按添加顺序从左到右排列
         content_layout: 页头之下的内容区（纵向，区块间距 SECTION_SPACING）
         breakpoints: 档位广播器（按页面宽度 = 内容区宽度分 compact / regular / wide），页内控件
@@ -59,15 +60,14 @@ class PageScaffold(QScrollArea):
         self.header_layout = QHBoxLayout()
         self.header_layout.setSpacing(HEADER_COMMAND_SPACING)
 
-        title_group = QVBoxLayout()
-        title_group.setSpacing(HEADER_TITLE_SPACING)
+        self.title_layout = QVBoxLayout()
+        self.title_layout.setSpacing(HEADER_TITLE_SPACING)
         self.title_label = PageTitleLabel(title)
-        title_group.addWidget(self.title_label)
+        self.title_layout.addWidget(self.title_label)
         self.subtitle_label = CaptionLabel(subtitle)
         self.subtitle_label.setVisible(bool(subtitle))
-        title_group.addWidget(self.subtitle_label)
-        self.header_layout.addLayout(title_group)
-        self.header_layout.addStretch(1)
+        self.title_layout.addWidget(self.subtitle_label)
+        self.header_layout.addLayout(self.title_layout, 1)
 
         self.command_layout = QHBoxLayout()
         self.command_layout.setSpacing(HEADER_COMMAND_SPACING)

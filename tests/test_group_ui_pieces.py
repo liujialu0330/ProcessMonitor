@@ -431,21 +431,31 @@ def test_member_worker_delivers_bundle_on_result_ready(qapp, db, started):  # no
     assert received[0].request.request_seq == 3 and received[0].snapshots
 
 
-def test_member_worker_reports_failure_as_bundle_error(qapp, db, monkeypatch):
+@pytest.mark.parametrize('failure, is_storage', [
+    (RuntimeError("成员统计异常"), False),
+    (StorageError("成员数据读取失败"), True),
+])
+def test_member_worker_reports_failure_as_bundle_error(qapp, db, monkeypatch, failure, is_storage):
     import core.workers.member_snapshots_worker as module
+    from ui.viewmodels.analysis_vm import synchronous_member_runner
 
     def boom(*_args, **_kwargs):
-        raise RuntimeError("读库失败")
+        raise failure
     monkeypatch.setattr(module, 'load_member_snapshots', boom)
-    worker = MemberSnapshotsWorker(db, MemberRequest("x", (MEM,), 'all', request_seq=4))
+    request = MemberRequest("x", (MEM,), 'all', request_seq=4)
+    worker = MemberSnapshotsWorker(db, request)
     received, failed = [], []
     worker.result_ready.connect(received.append)
     worker.failed.connect(failed.append)
     worker.start()
     assert process_events_until(lambda: bool(received), timeout=10)
     worker.wait(3000)
-    assert isinstance(received[0], MemberBundle) and received[0].error and not received[0].snapshots
-    assert failed
+    assert len(failed) == 1 and str(failure) in failed[0]
+    synchronous_member_runner(db)(request, received.append)
+    assert len(received) == 2
+    for bundle in received:
+        assert isinstance(bundle, MemberBundle) and not bundle.snapshots
+        assert str(failure) in bundle.error and bundle.storage_error is is_storage
 
 
 def test_member_request_options_only_include_given_values():

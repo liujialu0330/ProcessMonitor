@@ -103,6 +103,20 @@ def test_tick_strings_use_thousands_and_unit_decimals(qapp):
     assert axis.tickStrings([512.0], 1.0, 512.0) == ['0.5']
 
 
+def test_byte_axis_omits_levels_finer_than_label_precision(qapp):
+    axis = MetricAxisItem(orientation='left')
+    axis.set_display_unit('GB', max_decimals=10)
+    low, high = 2 * GB - 0.00015, 2 * GB + 0.00015
+
+    levels = axis.tickValues(low, high, 400)
+    labels = []
+    for spacing, values in levels:
+        assert spacing / GB >= 1e-10
+        visible = [value for value in values if low <= value <= high]
+        labels.extend(axis.tickStrings(visible, 1.0, spacing))
+    assert labels == ['1.9999999999', '2.0000000000', '2.0000000001']
+
+
 def test_date_axis_hides_ms_when_ticks_fall_on_whole_seconds(qapp):
     """亚秒层级但刻度都在整秒上：不显示「.000」；真有毫秒时才显示。"""
     from datetime import datetime

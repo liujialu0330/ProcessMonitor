@@ -3,13 +3,18 @@
 无打点时的提示，以及 [打点区间 | 采集明细] 子视图切换；相对时间格式。
 """
 import uuid
+from dataclasses import replace
 from datetime import datetime, timedelta
 
 import pytest
+from PyQt5.QtCore import Qt
+from PyQt5.QtTest import QTest
 
 from core.history_query import build_request, run_history_query
 from data.models import DataPoint, MonitorTask
+from tests.helpers import process_events_until
 from ui.formatting import INTERVAL_HEADERS, format_relative
+from ui.layout_breakpoints import COMPACT
 from ui.widgets.analysis.interval_table import (EMPTY_HINT, VIEW_INTERVALS, VIEW_SAMPLES,
                                                 IntervalTable, LowerViews)
 from utils.metrics import MetricType
@@ -74,8 +79,105 @@ def test_no_markers_single_interval_with_hint(table, db):
     table.set_intervals(HANDLES, snapshot.intervals, markers)
     assert [r[0] for r in table.row_texts()] == ["开始 → 结束"]
     assert table.hint_label.text() == EMPTY_HINT
+    table.table.setCurrentCell(0, 0)
+    assert not table.rename_button.isEnabled()
     table.clear()
     assert table.row_texts() == [] and table.title_label.text() == "打点区间"
+    assert not table.rename_button.isEnabled()
+
+
+def test_interval_with_system_marker_ids_has_no_editable_endpoint(table, db):
+    snapshot, _markers = _snapshot(db, markers=())
+    task_id = snapshot.request.task_id
+    pause = db.markers.add(task_id, BASE, '开始', kind='pause')
+    resume = db.markers.add(task_id, BASE + timedelta(seconds=99), '结束', kind='resume')
+    snapshot = run_history_query(db, build_request(task_id, HANDLES, 'all', analysis=True))
+    # 查询本身会滤掉系统边界；控件即使收到系统记录的真实 ID，也应拒绝改名。
+    interval, = snapshot.intervals
+    table.set_intervals(HANDLES, [replace(interval, start_marker_id=pause, end_marker_id=resume)],
+                        snapshot.markers)
+    table.table.setCurrentCell(0, 0)
+    assert [row[0] for row in table.row_texts()] == ['开始 → 结束']
+    assert not table.rename_button.isEnabled()
+
+
+def test_refresh_tracks_selected_marker_ids_without_zooming_again(table, db):
+    snapshot, markers = _snapshot(db, markers=((25, '采样'),) * 4)
+    table.set_intervals(HANDLES, snapshot.intervals, markers)
+    task_id = snapshot.request.task_id
+    zoomed = []
+    table.interval_activated.connect(lambda start, end: zoomed.append((start, end)))
+    table.table.setCurrentCell(1, 0)
+    assert zoomed == [(markers[0].timestamp, markers[1].timestamp)]
+
+    # 多段同名且同一时刻，插入更早的打点后，原来的第 2 行变成第 3 行。
+    db.markers.add(task_id, BASE + timedelta(seconds=5), '预热')
+    refreshed = run_history_query(db, snapshot.request)
+    table.set_intervals(HANDLES, refreshed.intervals, refreshed.markers)
+    current = table.table.currentRow()
+    assert current == 2
+    selected = table.interval_at(current)
+    assert (selected.start_marker_id, selected.end_marker_id) == (markers[0].id, markers[1].id)
+    assert table.rename_button.isEnabled() and len(zoomed) == 1
+
+    assert db.markers.delete(markers[1].id)
+    refreshed = run_history_query(db, snapshot.request)
+    table.set_intervals(HANDLES, refreshed.intervals, refreshed.markers)
+    assert table.table.currentRow() == -1 and not table.table.selectionModel().hasSelection()
+    assert not table.rename_button.isEnabled() and len(zoomed) == 1
+
+
+def test_f2_directly_edits_the_only_real_endpoint(table, db):
+    snapshot, markers = _snapshot(db, markers=((25, '开始'),))
+    table.set_intervals(HANDLES, snapshot.intervals, markers)
+    table.show()
+    table.activateWindow()
+    table.table.setCurrentCell(0, 0)
+    table.table.setFocus()
+    assert process_events_until(table.table.hasFocus)
+    renamed = []
+    table.rename_requested.connect(renamed.append)
+    QTest.keyClick(table.table, Qt.Key_F2)
+    assert renamed == markers and table.rename_menu is None
+
+
+@pytest.mark.parametrize('endpoint', [0, 1], ids=['start', 'end'])
+def test_keyboard_rename_selects_the_right_marker_at_identical_time_and_name(
+        table, db, endpoint):
+    snapshot, markers = _snapshot(db, markers=((25, '结束'), (25, '结束')))
+    table.set_intervals(HANDLES, snapshot.intervals, markers)
+    table.set_tier(COMPACT)
+    table.resize(680, 280)
+    table.show()
+    table.activateWindow()
+    table.table.setFocus()
+    assert process_events_until(table.table.hasFocus)
+    assert table.row_texts()[1][0] == '结束 → 结束'
+    assert table.rename_button.isVisible()
+
+    renamed, zoomed = [], []
+    table.rename_requested.connect(renamed.append)
+    table.interval_activated.connect(lambda start, end: zoomed.append((start, end)))
+    cell = table.table.visualItemRect(table.table.item(1, 0))
+    QTest.mouseClick(table.table.viewport(), Qt.LeftButton, pos=cell.center())
+    assert zoomed == [(markers[0].timestamp, markers[1].timestamp)]
+    assert table.rename_button.isEnabled()
+
+    QTest.keyClick(table.table, Qt.Key_F2)
+    menu = table.rename_menu
+    assert menu is not None and menu.isVisible()
+    try:
+        actions = menu.actions()
+        assert len(actions) == 2
+        assert actions[0].text().startswith('起点') and actions[1].text().startswith('终点')
+        assert all('结束' in action.text() for action in actions)
+        if endpoint == 1:
+            QTest.keyClick(menu.view, Qt.Key_Down)
+        QTest.keyClick(menu.view, Qt.Key_Return)
+        assert [marker.id for marker in renamed] == [markers[endpoint].id]
+        assert len(zoomed) == 1
+    finally:
+        menu.close()
 
 
 def test_lower_views_switch(qapp):

@@ -47,7 +47,8 @@ from core.workers.member_snapshots_worker import (
     MemberBundle, MemberRequest, MemberSnapshotsWorker, load_member_bundle)
 from core.workers.segments_worker import (
     SegmentsBundle, SegmentsRequest, SegmentsWorker, load_segments_bundle)
-from data.models import TARGET_PID
+from data.errors import StorageError
+from data.models import TARGET_PID, Marker
 from ui.viewmodels.history_vm import HistoryViewModel
 from utils.metrics import member_series_key, split_member_key
 
@@ -173,7 +174,12 @@ def synchronous_segments_runner(db) -> SegmentsRunner:
 def synchronous_member_runner(db) -> MemberRunner:
     """同步执行成员加载的执行器（测试与注入了同步查询执行器的场合用）。"""
     def run(request: MemberRequest, on_done: Callable[[MemberBundle], None]) -> None:
-        on_done(load_member_bundle(db, request))
+        try:
+            bundle = load_member_bundle(db, request)
+        except Exception as exc:
+            bundle = MemberBundle(request, error=str(exc) or type(exc).__name__,
+                                  storage_error=isinstance(exc, StorageError))
+        on_done(bundle)
     return run
 
 
@@ -239,6 +245,7 @@ class _Batch:
     segments_started: bool = False
     segments_pending: bool = False
     segments: Optional[List[SegmentAnalysis]] = None
+    segments_error: Optional[str] = None
 
     @property
     def parts_done(self) -> bool:
@@ -302,6 +309,7 @@ class AnalysisViewModel(HistoryViewModel):
         self.time_mode: str = TIME_ABSOLUTE
         self.custom_range: Optional[Tuple[datetime, datetime]] = None
         self.last_analysis: Optional[TaskAnalysis] = None
+        self._renamed_snapshot_seq: Optional[int] = None
         self.compare_task_id: Optional[str] = None
         self.compare_task_ids: Tuple[str, ...] = ()
         self._compare_injected = injected
@@ -318,6 +326,9 @@ class AnalysisViewModel(HistoryViewModel):
         self._compare_gate = LatestRequestGate()
         self._compare_parts: Dict[int, _CompareBatch] = {}
         self._report_worker: Optional[ReportWorker] = None
+        marker_renamed = getattr(manager, 'marker_renamed', None)
+        if marker_renamed is not None:
+            marker_renamed.connect(self._on_marker_renamed)
 
     # ========== 只读属性 ==========
 
@@ -342,9 +353,40 @@ class AnalysisViewModel(HistoryViewModel):
         并在明细末尾附成员汇总。这是既有产品口径，集中到这里避免图片、摘要和 CSV 分别
         读取 ``view_analysis()`` / ``last_analysis`` 而意外混用成员与合计。
         """
-        return self.last_analysis
+        analysis = self.last_analysis
+        if (analysis is None or analysis.task_id != self.current_task_id
+                or self._displayed_scope != self._query_scope()
+                or analysis.segments_error is not None
+                or analysis.member_error is not None or self._has_old_marker_labels()):
+            return None
+        return analysis
+
+    def _has_old_marker_labels(self) -> bool:
+        analysis = self.last_analysis
+        return (analysis is not None and analysis.task_id == self.current_task_id
+                and analysis.request_seq == self._renamed_snapshot_seq)
+
+    @pyqtSlot(str)
+    def _on_marker_renamed(self, task_id: str) -> None:
+        if task_id == self.current_task_id:
+            if self.last_analysis is not None and self.last_analysis.task_id == task_id:
+                self._renamed_snapshot_seq = self.last_analysis.request_seq
+            if self.compare_task_ids:
+                self._clear_comparison()
+        elif task_id in self.compare_task_ids:
+            primary = self.last_snapshot
+            if (primary is not None and primary.request.task_id == self.current_task_id
+                    and not self._dispatch_scheduled and self._gate.current not in self._inflight
+                    and not self._has_old_marker_labels()):
+                self._refresh_compare()
+            else:
+                # 主任务恢复时须重读已结束的对比项。
+                self._clear_comparison()
 
     # ========== 范围与视图 ==========
+
+    def _query_scope(self) -> tuple:
+        return (*super()._query_scope(), self.custom_range)
 
     def set_range(self, range_key: str) -> None:
         """切换预设范围（自定义范围请用 set_custom_range）；会清除自定义范围。"""
@@ -420,13 +462,9 @@ class AnalysisViewModel(HistoryViewModel):
             self.custom_range_changed.emit(None, None)
             self.range_reset.emit(DEFAULT_RANGE_KEY)
         if task.task_id != self.current_task_id:
-            self._compare_gate.invalidate()
-            self._compare_parts.clear()
             self.compare_task_ids = tuple(t for t in self.compare_task_ids if t != task.task_id)
             self.compare_task_id = next(iter(self.compare_task_ids), None)
-            self.last_compare = None
-            self.compare_ready.emit(None)
-        if task.task_id != self.current_task_id:
+            self._clear_comparison()
             self._reset_members()
         super()._apply_selection(task, preferred_metric)
 
@@ -537,6 +575,7 @@ class AnalysisViewModel(HistoryViewModel):
         if bundle.error is None:
             batch.segments = bundle.segments
         else:
+            batch.segments_error = bundle.error
             logger.warning("逐段判定加载失败，沿用上一次的结果: %s", bundle.error)
         self._finish_batch(batch)
 
@@ -568,10 +607,17 @@ class AnalysisViewModel(HistoryViewModel):
         if failed is not None and focus.error is None:
             # 任一指标读取失败都按整批失败处理（摘要表不能缺行却不说明）
             focus = replace(focus, error=failed.error, storage_error=failed.storage_error)
+        if (focus.error is None and batch.bundle is not None and batch.bundle.error
+                and self._has_old_marker_labels()):
+            # 改名后不能把新合计与仍带旧名称的缓存成员曲线拼成同一份分析。
+            focus = replace(focus, error=batch.bundle.error,
+                            storage_error=batch.bundle.storage_error)
         members, bundle = self._members_of(batch)
         self._pending_analysis = TaskAnalysis(
             batch.task_id, batch.range_key, snapshots, batch.seq, batch.auto_refresh,
-            member_snapshots=members, segments=self._segments_of(batch))
+            member_snapshots=members, segments=self._segments_of(batch),
+            member_error=batch.bundle.error if batch.bundle is not None else None,
+            segments_error=batch.segments_error)
         self._pending_bundle = bundle
         try:
             self._apply_snapshot(focus, forced)
@@ -596,13 +642,15 @@ class AnalysisViewModel(HistoryViewModel):
         return min(endpoints)
 
     def _emit_snapshot(self, snapshot: HistorySnapshot) -> None:
-        if self._pending_analysis is not None:
-            self.last_analysis = self._pending_analysis
+        analysis = self._pending_analysis
+        if analysis is not None:
+            self.last_analysis = analysis
             self._reconcile_members(self._pending_bundle)
             if not self._publish_analysis():
                 # 选着的成员在这个范围内没有数据：页面已切到空状态，合计结果留着供切回
                 self.last_snapshot = snapshot
                 return
+            snapshot = analysis.snapshot(self.current_metric) or snapshot
         self._publish_snapshot(snapshot)
         self._refresh_compare(requery=not snapshot.request.auto_refresh)
 
@@ -702,10 +750,8 @@ class AnalysisViewModel(HistoryViewModel):
             snapshot = analysis.member_snapshot(metric, member)
             if snapshot is not None and snapshot.points:
                 shown[member_series_key(metric, member)] = snapshot
-        return TaskAnalysis(
-            analysis.task_id, analysis.range_key, shown, analysis.request_seq,
-            analysis.auto_refresh if auto_refresh is None else auto_refresh,
-            member_snapshots=analysis.member_snapshots, segments=analysis.segments)
+        return replace(analysis, snapshots=shown,
+                       auto_refresh=analysis.auto_refresh if auto_refresh is None else auto_refresh)
 
     def shown_snapshots(self) -> List[HistorySnapshot]:
         """当前视图里有数据的快照（页面算相对时间原点用）。"""
@@ -777,14 +823,17 @@ class AnalysisViewModel(HistoryViewModel):
             raise ValueError('最多同时对比 4 个任务（含当前任务）')
         self.compare_task_ids = ids
         self.compare_task_id = next(iter(ids), None)
+        self._clear_comparison()
+        if ids:
+            self._refresh_compare(requery=True)
+
+    def _clear_comparison(self) -> None:
         self._compare_gate.invalidate()
         self._compare_parts.clear()
         for worker in tuple(self._comparison_workers):
             worker.cancel()
         self.last_compare = None
         self.compare_ready.emit(None)
-        if ids:
-            self._refresh_compare(requery=True)
 
     def _refresh_compare(self, requery: bool = True) -> None:
         primary = self.last_snapshot
@@ -932,7 +981,11 @@ class AnalysisViewModel(HistoryViewModel):
         return bool(self.current_task_id) and self._manager.set_baseline(
             self.current_task_id, marker.id)
 
-    def rename_marker(self, marker, label: str) -> bool:
+    def rename_marker(self, marker: Marker, label: str) -> bool:
+        # 对话框打开期间任务可能切换，不能把旧打点当成当前任务的打点写回。
+        if marker.task_id != self.current_task_id or marker.id is None or marker.kind not in (
+                'user', 'baseline'):
+            return False
         return self._manager.rename_marker(marker.id, label, self.current_task_id)
 
     def delete_marker(self, marker) -> bool:
@@ -943,16 +996,16 @@ class AnalysisViewModel(HistoryViewModel):
     def report_job(self, *, image=None, image_path: Optional[str] = None,
                    csv_path: Optional[str] = None,
                    summary_path: Optional[str] = None) -> Optional[ReportJob]:
-        """按当前任务与分析结果组装导出任务；未选任务时为 None。"""
+        """按当前任务与分析结果组装导出任务；当前分析尚未就绪时为 None。"""
         task = self.current_task
-        if task is None:
-            return None
         analysis = self.export_analysis()
+        if task is None or analysis is None:
+            return None
         scope = export_scope(analysis)
         end_time = scope.until
         if end_time is None and not self._current_is_running():
             end_time = task.end_time or task.last_sample_at
-        rows = summary_rows(analysis.snapshots) if analysis is not None else []
+        rows = summary_rows(analysis.snapshots)
         # 采样数与范围都取已显示的分析快照，不能使用运行中任务列表里可能滞后的冗余计数。
         metadata = metadata_lines(
             task, exported_at=self._services.clock.now(),
@@ -964,7 +1017,7 @@ class AnalysisViewModel(HistoryViewModel):
             image_path=image_path, image=image, metadata=tuple(metadata),
             summary_rows=tuple(tuple(r) for r in rows),
             gap_seconds=gap_threshold_seconds(task.interval),
-            data_since=scope.since, data_until=scope.until)
+            data_since=scope.since, data_until=scope.until, markers=tuple(analysis.markers))
 
     def start_export(self, job: ReportJob,
                      worker_factory: Optional[Callable] = None) -> Optional[str]:

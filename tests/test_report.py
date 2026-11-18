@@ -4,9 +4,11 @@
 文字与离屏渲染。
 """
 import csv
+import json
 import os
 import uuid
 from datetime import datetime, timedelta
+from zipfile import ZipFile
 
 import pytest
 from PyQt5.QtGui import QColor, QImage
@@ -19,7 +21,9 @@ from core.report import (
     export_scope, interval_spans, metadata_lines, paths_from_image_choice, report_rows, summary_rows,
     task_basename)
 from core.workers.base import CancelToken
+from data.errors import StorageError
 from data.models import DataPoint, Marker, MonitorTask
+from tests.helpers import process_events_until
 from utils.metrics import MetricType
 
 BASE = datetime(2026, 7, 16, 16, 0, 0)
@@ -128,10 +132,9 @@ def test_intervals_match_split_intervals_semantics(db):
     snapshot = _analysis(db, task).snapshot(MEM)
     points = [(BASE + timedelta(seconds=s), 100.0 + s) for s in range(100)]
     markers = db.markers.list(task.task_id)
-    expected = split_intervals(points, [Boundary(m.timestamp, m.label, 'user') for m in markers])
+    expected = split_intervals(points, [Boundary(m.timestamp, m.label, m.kind, m.id) for m in markers])
     got = snapshot.intervals
-    assert [(i.start, i.end, i.sample_count, i.delta, i.peak) for i in got] == \
-        [(i.start, i.end, i.sample_count, i.delta, i.peak) for i in expected]
+    assert got == expected
     assert interval_spans(got, markers)[0] == ("开始", "基线")
 
 
@@ -516,6 +519,206 @@ def test_round_delta_rows_need_two_markers(db):
     users = _seed_rounds(db, ((20, "A", 'user'), (30, "暂停", 'pause'), (50, "B", 'user')))
     rows = round_delta_rows(_analysis(db, users))
     assert [row.label for row in rows] == ["A → B"]
+
+
+def test_coincident_markers_keep_their_own_ids_and_round_names_after_rename(qapp, db, tmp_path):
+    from core.report import round_delta_rows
+
+    task = _seed_rounds(db, ((30, "同名", 'baseline'), (30, "暂停", 'pause'),
+                             (30, "同名", 'user'), (30, "同名", 'user')))
+    base, _pause, middle, last = db.markers.list(task.task_id)
+    previous = _analysis(db, task).snapshot(MEM)
+    assert db.markers.update_label(middle.id, "打开窗口")
+
+    analysis = _analysis(db, task)
+    snapshot = analysis.snapshot(MEM)
+    assert [(i.start_marker_id, i.end_marker_id) for i in snapshot.intervals] == [
+        (None, base.id), (base.id, middle.id), (middle.id, last.id), (last.id, None)]
+    assert [(i.delta, i.sample_count) for i in snapshot.intervals] == [
+        (i.delta, i.sample_count) for i in previous.intervals]
+    assert [r.label for r in snapshot.rounds] == ["打开窗口", "同名"]
+    assert [r.label for r in round_delta_rows(analysis)] == ["同名 → 打开窗口", "打开窗口 → 同名"]
+    results, errors = _command_export(db, task, tmp_path, ['summary'])
+    assert not errors
+    with open(results[0]['paths'][0], encoding='utf-8-sig', newline='') as stream:
+        rows = list(csv.DictReader(line for line in stream if not line.startswith(METADATA_PREFIX)))
+    for metric in ('私有字节', '句柄数'):
+        coincident = [row for row in rows if row['指标'] == metric
+                      and row['起点'] == row['终点']]
+        assert [row['区间'] for row in coincident] == ["同名 → 打开窗口", "打开窗口 → 同名"]
+
+
+@pytest.mark.parametrize('source', ['pmctl', 'stage'])
+def test_report_batch_freezes_marker_names_before_reading_other_metrics(
+        qapp, db, tmp_path, monkeypatch, source):
+    from core.automation.stage_snapshot import StageAnalysisWorker
+    from core.ipc.commands import TaskAnalysisWorker
+
+    task = _seed(db, markers=((30, "预热完成"),))
+    original = db.markers.list
+    reads = []
+
+    def rename_after_read(task_id):
+        markers = original(task_id)
+        reads.append(task_id)
+        if len(reads) == 1:
+            db.markers.update_label(markers[0].id, "进入静置")
+        return markers
+
+    monkeypatch.setattr(db.markers, 'list', rename_after_read)
+    if source == 'pmctl':
+        worker = TaskAnalysisWorker(db, task.task_id, task.metric_types, analysis=True)
+        analysis = worker.execute(CancelToken())
+    else:
+        worker = StageAnalysisWorker(db, task.task_id, str(tmp_path))
+        _, analysis = worker.execute(CancelToken())
+    assert reads == [task.task_id]
+    assert original(task.task_id)[0].label == "进入静置"
+    assert all(s.markers[0].label == "预热完成" for s in analysis.snapshots.values())
+    assert {row[2] for row in summary_rows(analysis.snapshots)} == {
+        "开始 → 预热完成", "预热完成 → 结束"}
+
+
+@pytest.mark.parametrize('source', ['pmctl', 'stage'])
+def test_batch_keeps_sample_cutoff_across_restart_and_member_queries(
+        qapp, db, tmp_path, monkeypatch, source):
+    from core.automation.stage_snapshot import StageAnalysisWorker
+    from core.ipc.commands import TaskAnalysisWorker
+    from utils.metrics import member_series_key
+
+    member = member_series_key(HANDLES, 'worker.exe')
+    task = _task()
+    task.target_kind, task.status, task.end_time = 'tree', 'running', None
+    db.save_task(task)
+    db.save_data_points([DataPoint(task.task_id, BASE + timedelta(seconds=i), 100 + i, metric)
+                         for i in range(30) for metric in (MEM, HANDLES, member)])
+    db.markers.add(task.task_id, BASE + timedelta(seconds=10), "第一次重启", 'restart')
+    db.markers.add(task.task_id, BASE + timedelta(seconds=29), "基线", 'baseline')
+    cutoff = BASE + timedelta(seconds=29)
+    aggregate = db.analytics.aggregates
+
+    def restart_during_analysis(*args, **kwargs):
+        result = aggregate(*args, **kwargs)
+        monkeypatch.setattr(db.analytics, 'aggregates', aggregate)
+        at = cutoff + timedelta(seconds=1)
+        db.markers.add(task.task_id, at, "第二次重启", 'restart')
+        db.save_data_points([DataPoint(task.task_id, at, 9999, m) for m in (MEM, HANDLES, member)])
+        return result
+
+    monkeypatch.setattr(db.analytics, 'aggregates', restart_during_analysis)
+    if source == 'stage':
+        _, analysis = StageAnalysisWorker(db, task.task_id, str(tmp_path)).execute(CancelToken())
+    else:
+        analysis = TaskAnalysisWorker(db, task.task_id, task.metric_types,
+                                      analysis=True).execute(CancelToken())
+        assert member in analysis.member_snapshots
+        assert [part.number for part in analysis.segments] == [1, 2]
+        assert analysis.segments[0].sample_count == 10
+    for snap in (*analysis.snapshots.values(), *analysis.member_snapshots.values()):
+        assert snap.task_last_at == snap.request.until == cutoff
+        assert [m.label for m in snap.markers] == ["第一次重启", "基线"]
+        assert snap.segment_count == 2 and snap.total_count == 30
+        assert snap.baseline.value == 129 and snap.baseline.sample_count == 1
+    fresh = run_history_query(db, build_request(task.task_id, HANDLES, 'all', analysis=True))
+    assert fresh.segment_count == 3 and fresh.stats['count'] == 1
+
+
+def _command_export(db, task, directory, kinds, writer_factory=None, *, evidence=False):
+    from app.bootstrap import render_report_image_for_ipc
+    from core.ipc.commands import CommandContext, CommandDispatcher
+    from core.monitor_manager import MonitorManager
+
+    manager = MonitorManager(db=db)
+    dispatcher = CommandDispatcher(app_version='2.0.3')
+    dispatcher.set_context(CommandContext(manager, db, None,
+                                          report_renderer=render_report_image_for_ipc,
+                                          export_worker_factory=writer_factory))
+    results, errors = [], []
+    run = dispatcher.start_export(task.task_id, str(directory), kinds, evidence=evidence,
+                                  on_done=results.append,
+                                  on_failed=lambda code, message: errors.append((code, message)))
+    assert process_events_until(lambda: (results or errors) and not run._workers, timeout=10)
+    assert not manager.has_running_exports()
+    return results, errors
+
+
+@pytest.mark.parametrize('failed_metric', [MEM, HANDLES])
+def test_failed_metric_aborts_combined_export_and_a_retry_writes_markers(
+        qapp, db, tmp_path, monkeypatch, failed_metric):
+    task = _seed(db)
+    output = tmp_path / 'reports'
+    aggregate = db.analytics.aggregates
+
+    def read(task_id, metric, **kwargs):
+        if metric == failed_metric:
+            raise StorageError("指标读取失败")
+        return aggregate(task_id, metric, **kwargs)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(db.analytics, 'aggregates', read)
+        results, errors = _command_export(db, task, output, ['csv', 'summary'])
+    assert not results and len(errors) == 1 and "指标读取失败" in errors[0][1]
+    assert list(output.iterdir()) == []
+    results, errors = _command_export(db, task, output, ['csv', 'summary'])
+    assert results and not errors
+    with open(next(p for p in results[0]['paths'] if '摘要' not in os.path.basename(p)),
+              encoding='utf-8-sig', newline='') as file:
+        records = csv.DictReader(line for line in file if not line.startswith('# '))
+        assert [r['打点'] for r in records if r['打点']] == ["基线", "第 1 轮", "第 2 轮"]
+
+
+@pytest.mark.parametrize('initial_count', [0, 30])
+def test_running_command_csv_and_summary_use_the_same_snapshot(
+        qapp, db, tmp_path, initial_count):
+    task = _seed(db, offsets=range(initial_count), markers=((3, "已有打点"),))
+    task.status, task.end_time = 'running', None
+    db.save_task(task)
+    jobs = []
+
+    def start_writer(database, job):
+        jobs.append(job)
+        db.add_marker(task.task_id, BASE + timedelta(seconds=30), "新打点")
+        db.save_data_points(_points(task, [30, 31]))
+        return ReportWorker(database, job)
+
+    results, errors = _command_export(db, task, tmp_path, ['csv', 'summary'], start_writer)
+    assert not errors and results[0]['rows'] == initial_count
+    assert [m.label for m in jobs[0].markers] == ["已有打点"]
+    assert jobs[0].data_until == (BASE + timedelta(seconds=29) if initial_count else None)
+    with open(jobs[0].csv_path, encoding='utf-8-sig', newline='') as file:
+        rows = list(csv.DictReader(line for line in file if not line.startswith('# ')))
+    assert len(rows) == initial_count
+    assert [r['打点'] for r in rows if r['打点']] == (["已有打点"] if initial_count else [])
+    with open(jobs[0].summary_path, encoding='utf-8-sig', newline='') as file:
+        summary = list(csv.reader(line for line in file if not line.startswith(METADATA_PREFIX)))
+    assert summary[0] == list(SUMMARY_HEADER)
+    assert bool(summary[1:]) == bool(initial_count)
+    results, errors = _command_export(db, task, tmp_path, ['csv'])
+    assert not errors and results[0]['rows'] == initial_count + 2
+    with open(results[0]['paths'][0], encoding='utf-8-sig') as file:
+        assert "新打点" in file.read()
+
+
+def test_empty_task_evidence_keeps_csv_headers_and_insufficient_verdict(qapp, db, tmp_path):
+    task = _seed(db, offsets=(), markers=())
+    results, errors = _command_export(db, task, tmp_path, [], evidence=True)
+    assert not errors and results[0]['rows'] == 0
+
+    with ZipFile(results[0]['paths'][0]) as archive:
+        assert any(name.endswith('.png') for name in archive.namelist())
+        csv_names = [name for name in archive.namelist() if name.endswith('.csv')]
+        assert len(csv_names) == 2
+        for name in csv_names:
+            lines = archive.read(name).decode('utf-8-sig').splitlines()
+            assert f'{METADATA_PREFIX}采集次数: 0' in lines
+            actual = list(csv.reader(line for line in lines if not line.startswith(METADATA_PREFIX)))
+            expected = SUMMARY_HEADER if name.endswith('_摘要.csv') else build_report_csv_header(task)
+            assert actual == [list(expected)]
+        verdict = json.loads(archive.read('task.json'))['verdict']
+        assert verdict['overall'] == 'insufficient'
+        assert len(verdict['metrics']) == len(task.metric_types)
+        assert all(metric['reason'] == 'no_data' and metric['samples'] == 0
+                   for metric in verdict['metrics'])
 
 
 def test_metadata_items_fields_and_optional_parts(db):

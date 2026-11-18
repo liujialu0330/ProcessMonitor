@@ -40,6 +40,7 @@ from ui.widgets.analysis.verdict_banner import BASIS_PREFIX
 logger = logging.getLogger(__name__)
 
 NO_DATA = ("暂无可导出数据", "请先选择有数据的任务")
+WAIT_ANALYSIS = ("分析结果尚未就绪", "请等待分析刷新完成，或点击「刷新」后重试")
 MAINTENANCE = ("暂时无法导出", "正在清理数据库，请稍后再导出")
 BUSY = ("正在导出", "上一次导出尚未完成")
 EVIDENCE_DIALOG_TITLE = "导出证据包"
@@ -97,6 +98,9 @@ class AnalysisExportFlow(QObject):
         if task is None or vm.last_analysis is None or not vm.last_analysis.has_data:
             self._warn(NO_DATA, 2000)
             return False
+        if vm.export_analysis() is None:
+            self._warn(WAIT_ANALYSIS, 2000)
+            return False
         if kind == EXPORT_COPY:
             return self._copy()
         if vm.export_worker is not None:
@@ -143,6 +147,10 @@ class AnalysisExportFlow(QObject):
         if existing and not self._services.dialogs.confirm(
                 self._host.window(), "文件已存在",
                 "以下文件已存在，是否覆盖？\n" + "\n".join(existing), "覆盖"):
+            return False
+        # 保存对话框会运行嵌套事件循环，确认路径时重新核对所选任务和分析结果。
+        if vm.current_task_id != task.task_id or vm.export_analysis() is None:
+            self._warn(WAIT_ANALYSIS, 2000)
             return False
         image = None
         if 'image_path' in targets or kind == EXPORT_EVIDENCE:
@@ -284,6 +292,10 @@ class AnalysisExportFlow(QObject):
         if (task is None or analysis is None or not analysis.has_data or summary is None
                 or table is None):
             self._warn(NO_DATA, 2000)
+            return False
+        analysis = vm.export_analysis()
+        if analysis is None:
+            self._warn(WAIT_ANALYSIS, 2000)
             return False
         try:
             options = vm.member_options if vm.is_group_task else []

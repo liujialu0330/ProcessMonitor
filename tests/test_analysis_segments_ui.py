@@ -23,7 +23,7 @@ from core.analysis.trend import Judgement, LinearFit, Verdict
 from core.history_query import (
     HistorySnapshot, SegmentAnalysis, TaskAnalysis, build_request, load_segments)
 from core.monitor_manager import MonitorManager
-from data.models import Marker
+from data.models import DataPoint, Marker
 from tests.doubles import FakeClock
 from tests.factories import make_analysis_page, make_services
 from tests.helpers import SyncHistoryRunner, process_events_until
@@ -140,14 +140,17 @@ def test_stale_segments_result_is_dropped(qapp, db, manager, services):
     assert len(rec.analyses) == 1 and rec.analyses[0].range_key == '1h'
 
 
-def test_segments_load_failure_keeps_previous_segments(qapp, db, manager, services, caplog):
-    _seed(db, [RISING, FLAT])
+def test_segments_load_failure_keeps_previous_segments_and_blocks_export(
+        qapp, db, manager, services, caplog):
+    task, _ = _seed(db, [RISING, FLAT])
     runner = RecordingSegmentsRunner(db)
     vm = make_vm(db, manager, services, runner)
     rec = Recorder(vm)
     vm.reload_tasks()
     first = rec.analyses[-1].segments
     assert first
+    latest = vm.last_snapshot.task_last_at + timedelta(seconds=task.interval)
+    assert db.save_data_points([DataPoint(task.task_id, latest, 25_000.0, MEM)])
 
     def failing(request, on_done):
         on_done(SegmentsBundle(request, error="读库失败"))
@@ -157,6 +160,13 @@ def test_segments_load_failure_keeps_previous_segments(qapp, db, manager, servic
         vm.refresh()
     assert rec.analyses[-1].segments == first
     assert any("逐段判定加载失败" in r.getMessage() for r in caplog.records)
+    assert vm.last_snapshot.task_last_at == latest
+    assert vm.export_analysis() is None and vm.report_job() is None
+
+    vm._segments_runner = runner
+    vm.refresh()
+    assert vm.export_analysis().segments[-1].sample_count == first[-1].sample_count + 1
+    assert vm.report_job().data_until == latest
 
 
 def test_custom_range_in_an_earlier_segment_requeries_the_last_segment(

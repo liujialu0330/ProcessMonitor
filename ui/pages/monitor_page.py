@@ -1,7 +1,7 @@
 """
 监控页面
 
-只做组装：页面骨架（页头：标题 · 配额摘要 · [刷新进程]）+ 新建任务表单（NewTaskForm）
+只做组装：页面骨架（标题、配额摘要与视图设置）+ 新建任务表单（NewTaskForm）
 + 任务面板（TaskBoard），业务流程（开始/等待进程启动/停止/打点/同配置再测、manager
 信号响应、提示与确认框）全部在 MonitorPresenter。
 
@@ -18,6 +18,7 @@ from qfluentwidgets import CaptionLabel, FluentIcon, TransparentToolButton, Segm
 from app_config import cfg, update_values
 
 from core.monitor_manager import MonitorManager
+from ui.components.memory_unit_selector import MemoryUnitSelector
 from ui.presenters.monitor_presenter import MonitorPresenter
 from ui.services import UiServices
 from ui.widgets.monitor.new_task_form import NewTaskForm
@@ -54,10 +55,10 @@ class MonitorPage(PageScaffold):
         self.manager = manager
         self.services = services
 
-        # 页头命令区：配额摘要 · [刷新进程]
+        self.subtitle_label.setWordWrap(True)
         self.summary_label = CaptionLabel("", self.container)
-        self.add_header_widget(self.summary_label)
-        self.command_layout.setAlignment(self.summary_label, Qt.AlignVCenter)
+        self.summary_label.setWordWrap(True)
+        self.title_layout.addWidget(self.summary_label)
         self.refresh_button = TransparentToolButton(FluentIcon.SYNC, self.container)
         self.refresh_button.setToolTip("重新读取进程列表（F5）")
 
@@ -76,6 +77,10 @@ class MonitorPage(PageScaffold):
         self.view_switch.currentItemChanged.connect(self._set_view_mode)
         self.add_header_widget(self.view_switch)
         self.board.set_view_mode(cfg.get(cfg.monitor_view))
+        self.memory_unit_selector = MemoryUnitSelector(self)
+        self.add_header_widget(self.memory_unit_selector)
+        self.board.set_memory_unit(self.memory_unit_selector.unit())
+        self.memory_unit_selector.unit_changed.connect(self.board.set_memory_unit)
 
         self.board.summary_changed.connect(self.summary_label.setText)
         self.refresh_button.clicked.connect(self.refresh_processes)

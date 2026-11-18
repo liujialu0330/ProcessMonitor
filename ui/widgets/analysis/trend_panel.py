@@ -38,7 +38,8 @@ from ui.widgets.analysis.overview_strip import OverviewStrip
 from ui.widgets.analysis.summary_table import pill_style
 from ui.widgets.history.chart_view import ChartView, value_axis_title
 from ui.widgets.history.common import CARD_PADDING_H
-from utils.metrics import VALUE_CLASS_RATE, get_metric_display_name, split_member_key
+from utils.metrics import (
+    VALUE_CLASS_RATE, get_metric_display_name, is_memory_capacity_metric, split_member_key)
 
 # 焦点大图、小倍数单图的绘图区最小高度
 FOCUS_CHART_MIN_HEIGHT = 280
@@ -197,9 +198,15 @@ class FoldedMetricRow(QWidget):
         layout.addWidget(self.pill)
         qconfig.themeChanged.connect(self._on_theme_changed)
 
-    def set_snapshot(self, snapshot: HistorySnapshot) -> None:
-        row = build_summary_row(self.metric, snapshot)
-        self.value_label.setText(row.text("current"))
+    def set_reading(self, text: str, memory_unit: str) -> None:
+        self.value_label.setText(text)
+        text_width = self.value_label.fontMetrics().horizontalAdvance(text)
+        self.value_label.setFixedWidth(max(FOLDED_VALUE_WIDTH, text_width + 2))
+        self.sparkline.set_memory_unit(memory_unit)
+
+    def set_snapshot(self, snapshot: HistorySnapshot, memory_unit: str = 'auto') -> None:
+        row = build_summary_row(self.metric, snapshot, memory_unit=memory_unit)
+        self.set_reading(row.text("current"), memory_unit)
         self._verdict, self._dimmed = row.text("verdict"), row.dimmed
         self.pill.setText(self._verdict)
         self.pill.setToolTip(row.tooltips.get("verdict", ""))
@@ -288,7 +295,8 @@ class FoldedPanel(CardWidget):
     def rows(self) -> Dict[str, FoldedMetricRow]:
         return dict(self._rows)
 
-    def set_rows(self, items: Sequence, expanded: bool, expandable: int) -> None:
+    def set_rows(self, items: Sequence, expanded: bool, expandable: int,
+                 memory_unit: str = 'auto') -> None:
         """items 为 [(指标, 快照)]（显示顺序）；expandable 为可展开的指标数（展开后仍要
         留着"收起"按钮）。行按指标复用，自动刷新不闪烁。"""
         self._expanded = expanded
@@ -307,7 +315,7 @@ class FoldedPanel(CardWidget):
             else:
                 self.rows_layout.removeWidget(row)
             self.rows_layout.insertWidget(index, row)
-            row.set_snapshot(snapshot)
+            row.set_snapshot(snapshot, memory_unit)
         self._rows = {metric: self._rows[metric] for metric in wanted}
         self.title_label.setText(EXPANDED_TITLE if expanded
                                  else FOLDED_TITLE.format(count=len(items)))
@@ -337,6 +345,7 @@ class TrendPanel(QWidget):
         # 当前档位允许的最大列数：小图数量随展开/切焦点变化时据此重算列数
         self._max_columns = small_multiple_columns(REGULAR)
         self._view_mode = 'small'
+        self._memory_unit = 'auto'
         self._origin: Optional[float] = None
 
         self.focus_chart = ChartView(self)
@@ -369,8 +378,7 @@ class TrendPanel(QWidget):
 
         self.overlay_chart = OverlayChart(self)
         self.overlay_chart.set_chart_min_height(OVERLAY_MIN_HEIGHT)
-        self.overlay_chart.enable_context_menu()
-        self.overlay_chart.context_menu_requested.connect(self.context_menu_requested)
+        self._wire_chart(self.overlay_chart)
         self.overlay_legend = SeriesLegend(self)
         self.overlay_note = CaptionLabel("", self)
         self.overlay_note.setVisible(False)
@@ -430,11 +438,27 @@ class TrendPanel(QWidget):
     def view_mode(self) -> str:
         return self._view_mode
 
+    def _hover_charts(self) -> tuple:
+        if self._view_mode == VIEW_OVERLAY:
+            return self.focus_chart, self.overlay_chart
+        return (self.focus_chart, *self._small.values())
+
     def is_interacting(self) -> bool:
-        return (any(c.is_interacting() for c in self.charts().values())
-                or self.overlay_chart.is_interacting())
+        return self.overview.is_dragging() or any(c.is_interacting() for c in self._hover_charts())
 
     # ---------- 数据 ----------
+
+    def set_memory_unit(self, unit: str) -> None:
+        self._memory_unit = unit
+        self.focus_chart.set_memory_unit(unit)
+        for metric, chart in self._small.items():
+            chart.set_memory_unit(unit)
+            chart.set_title(value_axis_title(
+                split_member_key(metric)[0], chart.display_unit, chart.is_rate))
+        for metric, row in self.folded_panel.rows().items():
+            if is_memory_capacity_metric(metric):
+                reading = build_summary_row(metric, self._snapshots[metric], memory_unit=unit)
+                row.set_reading(reading.text("current"), unit)
 
     def set_analysis(self, analysis: TaskAnalysis, keep_view: bool = False, *,
                      order: Optional[Sequence[str]] = None,
@@ -518,7 +542,8 @@ class TrendPanel(QWidget):
             self._layout_grid()
         self.grid_host.setVisible(bool(charts))
         self.folded_panel.set_rows([(m, self._snapshots[m]) for m in folded], self._expanded,
-                                   len([m for m in others if m not in self._anomalous]))
+                                   len([m for m in others if m not in self._anomalous]),
+                                   self._memory_unit)
         if not keep_view:
             self.focus_chart.reset_view()
             for chart in self._small.values():
@@ -526,6 +551,7 @@ class TrendPanel(QWidget):
 
     def _make_small(self) -> ChartView:
         chart = ChartView(self.grid_host, compact=True)
+        chart.set_memory_unit(self._memory_unit)
         chart.set_tools_visible(False)
         chart.set_chart_min_height(SMALL_CHART_MIN_HEIGHT)
         self._wire_chart(chart)
@@ -563,13 +589,19 @@ class TrendPanel(QWidget):
             self._sharing_x = False
 
     def _sync_crosshair(self, source: ChartView, x) -> None:
-        for chart in self.charts().values():
+        charts = self._hover_charts()
+        if source not in charts:
+            return
+        for chart in charts:
             if chart is not source:
                 chart.set_crosshair(x)
 
     # ---------- 视图 ----------
 
     def set_view_mode(self, mode: str) -> None:
+        if self._view_mode != mode:
+            for chart in self._hover_charts():
+                chart.hide_hover()
         self._view_mode = mode
         self.stack.setCurrentIndex(1 if mode == VIEW_OVERLAY else 0)
 

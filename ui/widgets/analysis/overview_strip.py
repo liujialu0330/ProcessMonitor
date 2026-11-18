@@ -10,9 +10,9 @@ from datetime import datetime
 from typing import Optional, Sequence, Tuple
 
 import pyqtgraph as pg
-from PyQt5.QtCore import pyqtSignal
-from PyQt5.QtGui import QColor
-from PyQt5.QtWidgets import QSizePolicy, QVBoxLayout, QWidget
+from PyQt5.QtCore import QEvent, QPointF, Qt, pyqtSignal
+from PyQt5.QtGui import QColor, QCursor, QMouseEvent
+from PyQt5.QtWidgets import QApplication, QSizePolicy, QVBoxLayout, QWidget
 from qfluentwidgets import CaptionLabel, qconfig
 
 from ui.chart_theme import SELECTION_ALPHA, chart_colors, is_transparent, make_transparent
@@ -33,6 +33,7 @@ class OverviewStrip(QWidget):
         self._xs: list = []
         self._ys: list = []
         self._programmatic = False
+        self._committed_region: Optional[Tuple[float, float]] = None
 
         self.time_axis = ContextDateAxisItem(orientation='bottom')
         self.time_axis.setTickFont(data_font(TypeScale.CAPTION))
@@ -49,6 +50,7 @@ class OverviewStrip(QWidget):
         self.region.sigRegionChangeFinished.connect(self._on_region_finished)
         self.plot.addItem(self.region, ignoreBounds=True)
         self.region.setVisible(False)
+        self.plot.viewport().installEventFilter(self)
 
         self.hint_label = CaptionLabel(HINT_TEXT, self)
         layout = QVBoxLayout(self)
@@ -65,11 +67,42 @@ class OverviewStrip(QWidget):
     def has_data(self) -> bool:
         return bool(self._xs)
 
+    def is_dragging(self) -> bool:
+        """拖动整个选区或其边缘时，分析页稍后刷新，避免把未松手的选区重置。"""
+        if self._drag_active() and not QApplication.mouseButtons() & Qt.LeftButton:
+            self._cancel_drag()
+        return self.isVisible() and self.region.isVisible() and self._drag_active()
+
+    def _drag_active(self) -> bool:
+        return self.region.moving or any(line.moving for line in self.region.lines)
+
+    def _cancel_drag(self) -> None:
+        if self._programmatic or not self._drag_active():
+            return
+        # 松手可能交给了另一个窗口。走图形视口的释放路径，让场景和拖动手柄一起收尾。
+        viewport = self.plot.viewport()
+        pos = QCursor.pos()
+        release = QMouseEvent(QEvent.MouseButtonRelease, QPointF(viewport.mapFromGlobal(pos)),
+                              QPointF(pos), Qt.LeftButton, Qt.NoButton, Qt.NoModifier)
+        self._programmatic = True
+        try:
+            QApplication.sendEvent(viewport, release)
+            if self._committed_region is not None:
+                self.region.setRegion(self._committed_region)
+        finally:
+            self._programmatic = False
+
+    def eventFilter(self, obj, event):
+        if event.type() in (QEvent.Hide, QEvent.WindowDeactivate, QEvent.UngrabMouse):
+            self._cancel_drag()
+        return super().eventFilter(obj, event)
+
     def x_bounds(self) -> Optional[Tuple[float, float]]:
         return (self._xs[0], self._xs[-1]) if self._xs else None
 
     def set_series(self, points: Sequence) -> None:
         """整段走势（需有 timestamp / value，按时间升序）；选区重置为整段。"""
+        self._cancel_drag()
         self._xs = [p.timestamp.timestamp() for p in points]
         self._ys = [p.value for p in points]
         self.curve.setData(self._xs, self._ys)
@@ -77,6 +110,8 @@ class OverviewStrip(QWidget):
         if self._xs:
             self.plot.setXRange(self._xs[0], self._xs[-1], padding=0.01)
             self.set_region(None)
+        else:
+            self._committed_region = None
 
     def clear(self) -> None:
         self.set_series([])
@@ -92,6 +127,7 @@ class OverviewStrip(QWidget):
         self._programmatic = True
         try:
             self.region.setRegion(values)
+            self._committed_region = self.region_values()
         finally:
             self._programmatic = False
 
@@ -116,6 +152,7 @@ class OverviewStrip(QWidget):
         low, high = max(low, self._xs[0]), min(high, self._xs[-1])
         if high <= low:
             return
+        self._committed_region = (low, high)
         self.region_selected.emit(datetime.fromtimestamp(low), datetime.fromtimestamp(high))
 
     # ---------- 主题 ----------
@@ -144,11 +181,10 @@ class OverviewStrip(QWidget):
         self.curve.setPen(pg.mkPen(color=colors['overview_curve'], width=1))
         fill = QColor(colors['selection'])
         fill.setAlpha(SELECTION_ALPHA)
-        self.region.setBrush(pg.mkBrush(fill))
-        # 悬停态也按主题取色（pyqtgraph 默认悬停填充取构造时的蓝色、边线悬停为红色）
-        hover_fill = QColor(colors['selection'])
-        hover_fill.setAlpha(min(255, SELECTION_ALPHA * 2))
-        self.region.setHoverBrush(pg.mkBrush(hover_fill))
+        # 选区通常覆盖整条时间轴；鼠标经过时只强调可拖动的边缘。
+        brush = pg.mkBrush(fill)
+        self.region.setBrush(brush)
+        self.region.setHoverBrush(brush)
         edge = QColor(colors['selection'])
         for line in self.region.lines:
             line.setPen(pg.mkPen(color=edge, width=2))

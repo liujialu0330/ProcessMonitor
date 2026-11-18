@@ -763,13 +763,21 @@ class AnalyticsRepo:
     # ========== 基线取值 ==========
 
     def value_near(self, task_id: str, metric: str, ts: datetime, n: int = 5,
-                   after_only: bool = False) -> Optional[float]:
+                   after_only: bool = False, *, until: Optional[datetime] = None) -> Optional[float]:
         """
         时间上最接近 ts 的 n 个点的中位数（n 为偶数时取中间两值平均），用作基线等参考值。
         距离相同时较早的点优先；点数不足 n 时用全部可用点；没有可用点返回 None。
         after_only=True 时只取时间 >= ts 的点（"基线值取其后 n 个样本中位数"）。
+        until 是可选的采样截止时间，计算中位数时包含该时刻的样本。
         语义与 core.analysis.intervals.value_near 一致，只是直接走主键取候选点。
         """
+        value, _ = self.value_near_with_count(task_id, metric, ts, n, after_only, until=until)
+        return value
+
+    def value_near_with_count(self, task_id: str, metric: str, ts: datetime, n: int = 5,
+                              after_only: bool = False, *, until: Optional[datetime] = None
+                              ) -> Tuple[Optional[float], int]:
+        """一起返回中位数和实际参与计算的点数，供基线说明使用。"""
         if ts is None:
             raise TypeError('ts 不能为 None')
         check_time(ts, 'ts')
@@ -778,23 +786,24 @@ class AnalyticsRepo:
         # ts 是时刻类边界，与样本同一取整规则（见 data.mappers 模块说明）：取整后不早于它的
         # 样本算 ts 及之后，其余在 ts 之前
         pivot = to_ms(ts)
+        _, upper = ms_range(None, until)
         with self._connect('读取基线值') as conn:
             sid = series_id(conn, task_id, metric)
             if sid is None:
-                return None
+                return None, 0
             after = conn.execute(
-                'SELECT ts_ms, value FROM samples WHERE series_id = ? AND ts_ms >= ? '
-                'ORDER BY ts_ms ASC LIMIT ?', (sid, pivot, n)).fetchall()
+                'SELECT ts_ms, value FROM samples WHERE series_id = ? AND ts_ms BETWEEN ? AND ? '
+                'ORDER BY ts_ms ASC LIMIT ?', (sid, pivot, upper, n)).fetchall()
             before = [] if after_only else conn.execute(
-                'SELECT ts_ms, value FROM samples WHERE series_id = ? AND ts_ms < ? '
-                'ORDER BY ts_ms DESC LIMIT ?', (sid, pivot, n)).fetchall()
+                'SELECT ts_ms, value FROM samples WHERE series_id = ? AND ts_ms <= ? '
+                'ORDER BY ts_ms DESC LIMIT ?', (sid, min(pivot - 1, upper), n)).fetchall()
         candidates = sorted(
             ((from_ms(r['ts_ms']), r['value']) for r in [*before, *after]),
             key=lambda p: p[0])
         if not candidates:
-            return None
+            return None, 0
         nearest = sorted(candidates, key=lambda p: abs((p[0] - ts).total_seconds()))[:n]
-        return float(statistics.median(v for _, v in nearest))
+        return float(statistics.median(v for _, v in nearest)), len(nearest)
 
     # ========== 计数与锚点 ==========
 

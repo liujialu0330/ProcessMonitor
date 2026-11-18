@@ -88,6 +88,7 @@ class TaskBoard(QWidget):
         self._limit = 0
         self._summary = ""
         self._view_mode = 'cards'
+        self._memory_unit = 'auto'
         self._rows = {}
         self._row_timer = QTimer(self)
         self._row_timer.setInterval(1000)
@@ -167,6 +168,7 @@ class TaskBoard(QWidget):
             for card_signal, board_signal in _FORWARDED:
                 getattr(card, card_signal).connect(getattr(self, board_signal))
         self._cards[card.task_id] = card
+        card.set_memory_unit(self._memory_unit)
         if card.is_finished:
             self._finished_layout.insertWidget(0, card)
         else:
@@ -288,7 +290,14 @@ class TaskBoard(QWidget):
         if mode not in ('cards', 'list'):
             return
         self._view_mode = mode
+        self._refresh_rows()
         self._refresh()
+
+    def set_memory_unit(self, unit: str) -> None:
+        self._memory_unit = unit
+        for card in self._cards.values():
+            card.set_memory_unit(unit)
+        self._refresh_rows()
 
     def _refresh_rows(self):
         if self._view_mode == 'list':

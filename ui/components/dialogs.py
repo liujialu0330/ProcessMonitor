@@ -33,20 +33,27 @@ class MarkerDialog(InputDialogBase):
 
     def __init__(self, default_label: str, parent=None,
                  timestamp: Optional[datetime] = None, *,
-                 process_name: str = '', pid: Optional[int] = None):
+                 process_name: str = '', pid: Optional[int] = None, renaming: bool = False):
         super().__init__(parent)
         self.timestamp = timestamp if timestamp is not None else datetime.now()
-        self.viewLayout.addWidget(SubtitleLabel("打点", self))
+        title = "重命名打点" if renaming else "打点"
+        self.setWindowTitle(title)
+        self.viewLayout.addWidget(SubtitleLabel(title, self))
         self.target_label = CaptionLabel(marker_target_text(process_name, pid), self)
         self.target_label.setVisible(bool(self.target_label.text()))
         self.viewLayout.addWidget(self.target_label)
-        self.time_label = BodyLabel(
-            f"已在 {self.timestamp.strftime('%H:%M:%S')} 记录，可修改名称", self)
+        stamp = (f"打点时间  {self.timestamp:%Y-%m-%d %H:%M:%S}" if renaming
+                 else f"已在 {self.timestamp:%H:%M:%S} 记录，可修改名称")
+        self.time_label = BodyLabel(stamp, self)
         self.viewLayout.addWidget(self.time_label)
 
         self.label_edit = LineEdit(self)
+        # 命令行记录的旧名可能长于界面新增上限；Qt 按 UTF-16 码元计数。
+        old_length = (len(default_label.encode('utf-16-le', errors='surrogatepass')) // 2
+                      if renaming else 0)
+        self.label_edit.setMaxLength(max(MARKER_LABEL_MAX_LENGTH, old_length))
         self.label_edit.setText(default_label)
-        self.label_edit.setMaxLength(MARKER_LABEL_MAX_LENGTH)
+        self.label_edit.setAccessibleName("打点名称")
         self.label_edit.setPlaceholderText("名称，如：第 3 轮建模")
         self.label_edit.setClearButtonEnabled(True)
         self.label_edit.selectAll()
@@ -56,15 +63,21 @@ class MarkerDialog(InputDialogBase):
         self.cancelButton.setText("取消")
         self.widget.setMinimumWidth(380)
         # 名称为空时不能保存（禁用后回车触发的 click 也不会生效）
-        self.label_edit.textChanged.connect(self._update_yes_enabled)
-        self._update_yes_enabled()
+        self.label_edit.textChanged.connect(self._update_label)
+        self._update_label(self.label_edit.text())
         # 回车直接确认
         self.label_edit.returnPressed.connect(self.yesButton.click)
         # 弹出后焦点给输入框并全选默认名称：直接打字即覆盖（基类默认焦点在"保存"上）
         self.set_focus_widget(self.label_edit)
 
-    def _update_yes_enabled(self, *_args) -> None:
-        self.yesButton.setEnabled(bool(self.label_edit.text().strip()))
+    def _update_label(self, text: str) -> None:
+        # Qt 在长度上限处粘贴时可能只留下半个 emoji，不能把孤立代理码元交给 SQLite。
+        valid = text.encode('utf-8', errors='ignore').decode('utf-8')
+        if text != valid:
+            cursor = self.label_edit.cursorPosition()
+            self.label_edit.setText(valid)
+            self.label_edit.setCursorPosition(min(cursor, self.label_edit.cursorPosition()))
+        self.yesButton.setEnabled(bool(valid.strip()))
 
     def get_label(self) -> str:
         """输入的名称（已去除首尾空白）。"""

@@ -43,7 +43,7 @@ from ui.formatting import (
 from ui.typography import DataCaptionLabel, MetricValueLabel
 from utils.metrics import (
     format_metric_delta, format_metric_value, get_metric_description,
-    get_metric_display_name
+    get_metric_display_name, is_memory_capacity_metric
 )
 
 # 状态胶囊：(文案, 浅色主题色, 深色主题色)。CaptionLabel.setTextColor 只需设置一次
@@ -351,6 +351,7 @@ class TaskCard(CardWidget):
         # 本任务各指标首个有效值（"比开始时"的参照）与最新值 {指标类型: 值}
         self.start_values: Dict[str, float] = {}
         self.last_values: Dict[str, float] = {}
+        self._memory_unit = 'auto'
         # 当前无法采集的指标：变化量显示 "--"，之后采到值即恢复
         self._unavailable: Set[str] = set()
 
@@ -810,6 +811,30 @@ class TaskCard(CardWidget):
 
     # ========== 数据更新 ==========
 
+    def set_memory_unit(self, unit: str) -> None:
+        if self._memory_unit == unit:
+            return
+        self._memory_unit = unit
+        for metric in self.last_values:
+            if is_memory_capacity_metric(metric) and metric not in self._unavailable:
+                self._show_value(metric)
+        self.sparkline.set_memory_unit(unit)
+
+    def value_text(self, metric: Optional[str]) -> Optional[str]:
+        """返回按当前偏好格式化的读数，或该指标的不可用状态。"""
+        if metric in self._unavailable:
+            return '不可用'
+        value = self.last_values.get(metric)
+        if value is None:
+            return None
+        return format_metric_value(metric, value, memory_unit=self._memory_unit)
+
+    def _show_value(self, metric: str) -> None:
+        text = self.value_text(metric) or '--'
+        label = self.value_labels[metric]
+        label.setText(text)
+        label.setToolTip(f"{get_metric_display_name(metric)}：{text}")
+
     def update_values(self, values: dict, now: Optional[datetime] = None):
         """
         批量更新指标显示值与变化量，并把这批值追加到迷你趋势图（每个指标各一条曲线，
@@ -829,8 +854,7 @@ class TaskCard(CardWidget):
                 self.started_at = now
         own = {}
         for metric_type, value in values.items():
-            value_label = self.value_labels.get(metric_type)
-            if value_label is None:
+            if metric_type not in self.value_labels:
                 continue
             own[metric_type] = value
             self.start_values.setdefault(metric_type, value)
@@ -838,10 +862,7 @@ class TaskCard(CardWidget):
             self.live_stats.add(metric_type, value, now)
             self._unavailable.discard(metric_type)
 
-            formatted_value = format_metric_value(metric_type, value)
-            value_label.setText(formatted_value)
-            value_label.setToolTip(
-                f"{get_metric_display_name(metric_type)}：{formatted_value}")
+            self._show_value(metric_type)
 
         # 暂停期间 core 不采集、不 emit data_updated，本方法根本不会被调用，
         # 趋势图自然随之静止，无需额外判断暂停状态

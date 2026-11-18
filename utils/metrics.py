@@ -311,6 +311,10 @@ KB_UNIT_DIVISORS: Dict[str, float] = {
     "TB": 1024.0 ** 3,
 }
 
+# 手动显示时保留约 1 KB 量级的精度，几十 KB 的增长切到 MB 或 GB 仍能看出来。
+MEMORY_UNIT_DECIMALS = {"KB": 2, "MB": 3, "GB": 6}
+MEMORY_DISPLAY_UNITS = ("auto", *MEMORY_UNIT_DECIMALS)
+
 # 迷你图/图表纵轴最小跨度：字节类 max(当前值 1%, 64 KB)；计数类至少 4；
 # 百分比至少 1 个百分点；其余按当前值 1%
 MIN_SPAN_BYTES_KB = 64.0
@@ -479,6 +483,17 @@ def is_kb_metric(metric_type: str) -> bool:
     return _kind_of(metric_type) in _KB_KINDS
 
 
+def is_memory_capacity_metric(metric_type: Optional[str]) -> bool:
+    """内存水位和历史峰值使用容量单位，区别于同样以 KB 存储的 I/O 累计量。"""
+    return _kind_of(metric_type) in (MetricKind.BYTES_KB, MetricKind.PEAK)
+
+
+def fixed_memory_unit(metric_type: Optional[str], preference: Optional[str]) -> Optional[str]:
+    if preference in MEMORY_UNIT_DECIMALS and is_memory_capacity_metric(metric_type):
+        return preference
+    return None
+
+
 def is_cumulative_metric(metric_type: str) -> bool:
     """该指标是否属于累计活动或历史峰值（次数/字节/CPU 时间/峰值）。
 
@@ -540,7 +555,8 @@ def _compact_number(number: float, decimals: int = 2) -> str:
 
 
 def format_metric_value(
-        metric_type: str, value: float, display_unit: str = None) -> str:
+        metric_type: str, value: float, display_unit: str = None, *,
+        memory_unit: Optional[str] = None) -> str:
     """格式化指标值为可读字符串"""
     kind = _kind_of(metric_type)
     unit = get_metric_unit(metric_type)
@@ -552,9 +568,15 @@ def format_metric_value(
     # 字节类自动选择 KB/MB/GB/TB；分析页可显式传 display_unit，
     # 让同一图表里的统计、悬停、表格与坐标轴始终使用同一个单位。
     if kind in _KB_KINDS:
-        unit = display_unit or display_unit_for(metric_type, value)
+        fixed = fixed_memory_unit(metric_type, memory_unit)
+        unit = fixed or display_unit or display_unit_for(metric_type, value)
         divisor = KB_UNIT_DIVISORS.get(unit, 1.0)
-        return f"{_compact_number(value / divisor)} {unit}"
+        decimals = MEMORY_UNIT_DECIMALS.get(fixed, 2)
+        number = _compact_number(value / divisor, decimals)
+        if fixed and value != 0 and number in ("0", "-0"):
+            bound = "<" if value > 0 else ">-"
+            return f"{bound}{10 ** -decimals:.{decimals}f} {unit}"
+        return f"{number} {unit}"
     # 百分比，保留 1 位小数
     if kind is MetricKind.PERCENT:
         return f"{value:,.1f}{unit}"

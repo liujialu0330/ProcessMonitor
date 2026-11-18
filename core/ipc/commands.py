@@ -72,7 +72,7 @@ from core.monitor_manager import default_marker_kind
 from core.monitor_task import SYSTEM_CLOCK
 from core.plans import MAX_NOTE_CHARS
 from core.wait_service import WAIT_FAILED_AMBIGUOUS, WAIT_FAILED_TIMEOUT, WaitMatch, WaitService
-from core.workers.base import BackgroundTask, CancelToken
+from core.workers.base import BackgroundTask, CancelToken, TaskError
 from data.errors import StorageError
 from data.models import TARGET_KINDS, TARGET_NAME, TARGET_PID, TARGET_TREE
 
@@ -512,7 +512,7 @@ def compute_verdict(analysis, stop_reason: Optional[StopReason] = None, *,
 # ---------- 后台线程 ----------
 
 class TaskAnalysisWorker(BackgroundTask):
-    """在后台按"全部"范围逐指标跑 run_history_query，结果为 TaskAnalysis。"""
+    """按同一采样截止时间与打点列表读取全部指标、成员与启动段。"""
 
     def __init__(self, db, task_id: str, metrics: Sequence[str], *, analysis: bool,
                  parent=None):
@@ -523,23 +523,25 @@ class TaskAnalysisWorker(BackgroundTask):
         self.analysis = analysis
 
     def execute(self, token: CancelToken):
-        from core.history_query import (TaskAnalysis, build_request, load_member_snapshots,
-                                        load_segments, run_history_query)
-        snapshots = {}
-        for metric in self.metrics:
-            if token.is_cancelled:
-                return None
-            request = build_request(self.task_id, metric, ANALYSIS_RANGE_KEY,
-                                    analysis=self.analysis)
-            snapshots[metric] = run_history_query(self.db, request)
+        from core.history_query import (AnalysisBoundary, TaskAnalysis, build_request,
+                                        load_member_snapshots, load_segments)
+        boundary = AnalysisBoundary.read(self.db, self.task_id)
+        if boundary.task is None:
+            raise TaskError(MSG_TASK_NOT_FOUND.format(task_id=self.task_id))
+        request = build_request(self.task_id, None, ANALYSIS_RANGE_KEY, analysis=self.analysis)
+        snapshots = boundary.query_metrics(self.db, request, self.metrics,
+                                           is_cancelled=lambda: token.is_cancelled)
+        if snapshots is None:
+            return None
         # 进程组任务的成员序列（pid 任务没有，得到空字典）
         members = load_member_snapshots(self.db, self.task_id, self.metrics, ANALYSIS_RANGE_KEY,
-                                        analysis=self.analysis,
+                                        analysis=self.analysis, boundary=boundary,
                                         is_cancelled=lambda: token.is_cancelled)
         if members is None:
             return None
         # 逐启动段判定：重启续接过的任务，更早的段各查一遍（没有重启不多查）
         segments = load_segments(self.db, self.task_id, self.metrics, snapshots, members,
+                                 boundary=boundary,
                                  is_cancelled=lambda: token.is_cancelled)
         if segments is None:
             return None
@@ -787,10 +789,17 @@ class ExportRun:
         return {k: candidate + suffixes[k] for k in self.kinds}
 
     def _write(self, analysis) -> None:
-        from core.report import gap_threshold_seconds, metadata_lines, summary_rows
+        from core.report import export_scope, gap_threshold_seconds, metadata_lines, summary_rows
         from core.report_worker import ReportJob, ReportWorker
         ctx = self.ctx
         task = self.task
+        if analysis is not None:
+            for snapshot in (*analysis.snapshots.values(), *analysis.member_snapshots.values()):
+                if not snapshot.ok:
+                    self._fail(ERR_INTERNAL, MSG_ANALYSIS_FAILED.format(
+                        detail=snapshot.error or MSG_TASK_NOT_FOUND.format(task_id=task.task_id)))
+                    return
+        scope = export_scope(analysis)
         paths = self._paths()
         image = None
         if EXPORT_KIND_REPORT in paths:
@@ -803,14 +812,19 @@ class ExportRun:
         rows = summary_rows(analysis.snapshots) if (
             analysis is not None and EXPORT_KIND_SUMMARY in paths) else []
         running = ctx.manager.is_task_active(task.task_id)
-        end_time = None if running else (task.end_time or task.last_sample_at)
+        end_time = scope.until or (None if running else (task.end_time or task.last_sample_at))
+        sample_count = scope.sample_count if analysis is not None else (task.sample_count or None)
         metadata = metadata_lines(task, exported_at=ctx.clock.now(), range_text=EXPORT_RANGE_TEXT,
-                                  sample_count=task.sample_count or None, end_time=end_time)
+                                  sample_count=sample_count,
+                                  end_time=end_time)
         job = ReportJob(task=task, csv_path=paths.get(EXPORT_KIND_CSV),
                         summary_path=paths.get(EXPORT_KIND_SUMMARY),
                         image_path=paths.get(EXPORT_KIND_REPORT), image=image,
                         metadata=tuple(metadata), summary_rows=tuple(tuple(r) for r in rows),
-                        gap_seconds=gap_threshold_seconds(task.interval))
+                        gap_seconds=gap_threshold_seconds(task.interval),
+                        markers=tuple(analysis.markers) if analysis is not None else None,
+                        data_since=scope.since, data_until=scope.until,
+                        empty_samples=analysis is not None and not analysis.has_data)
         if self.evidence:
             worker = self._evidence_worker(job, analysis)
         else:

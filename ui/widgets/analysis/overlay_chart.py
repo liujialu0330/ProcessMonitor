@@ -69,6 +69,7 @@ class OverlayChart(ChartView):
         self._metric_type = None
         self._rate = False
         self._band = []
+        self._band_times.clear()
         reference = max(self._series, key=lambda s: len(s.xs), default=None)
         self._x = list(reference.xs) if reference else []
         self._y = list(reference.ys) if reference else []
@@ -111,7 +112,7 @@ class OverlayChart(ChartView):
             self._curve_items.append(curve)
         self._draw_markers(colors)
 
-    def hover_text(self, index: int) -> str:
+    def _hover_parts(self, index: int) -> List[str]:
         x_val = self._x[index]
         if self._relative_origin is not None:
             head = format_relative(x_val - self._relative_origin)
@@ -119,11 +120,11 @@ class OverlayChart(ChartView):
             head = datetime.fromtimestamp(x_val).strftime(DETAIL_TIME_FORMAT)
         parts = [head]
         for item in self._series:
-            i = nearest_index(list(item.xs), x_val)
+            i = nearest_index(item.xs, x_val)
             parts.append(f"{item.name} {self._formatter(item.ys[i])}")
-        return " · ".join(parts)
+        return parts
 
     def values_at(self, x: float) -> List[Optional[float]]:
         """各曲线在 x 处（最近点）的值。"""
-        return [item.ys[nearest_index(list(item.xs), x)] if len(item.xs) else None
+        return [item.ys[nearest_index(item.xs, x)] if len(item.xs) else None
                 for item in self._series]

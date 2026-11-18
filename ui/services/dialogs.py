@@ -49,7 +49,7 @@ class Dialogs(Protocol):
 
     def ask_marker_label(self, parent: QWidget, default_label: str,
                          timestamp: datetime, *, process_name: str = '',
-                         pid: Optional[int] = None) -> Optional[str]:
+                         pid: Optional[int] = None, renaming: bool = False) -> Optional[str]:
         """打点名称输入框（显示"进程名 · PID"与点击时刻 timestamp）：保存返回去除首尾
         空白的名称，取消返回 None。"""
         ...
@@ -130,10 +130,10 @@ class QtDialogs:
 
     def ask_marker_label(self, parent: QWidget, default_label: str,
                          timestamp: datetime, *, process_name: str = '',
-                         pid: Optional[int] = None) -> Optional[str]:
+                         pid: Optional[int] = None, renaming: bool = False) -> Optional[str]:
         """打点名称输入框（MarkerDialog）。"""
         dialog = MarkerDialog(default_label, parent, timestamp=timestamp,
-                              process_name=process_name, pid=pid)
+                              process_name=process_name, pid=pid, renaming=renaming)
         return self._run_and_dispose(dialog, dialog.get_label, None)
 
     def choose_metrics(self, parent: QWidget, selected: Sequence[str], *,

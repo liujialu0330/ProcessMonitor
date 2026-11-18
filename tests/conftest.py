@@ -79,6 +79,25 @@ def qapp():
     yield app
 
 
+@pytest.fixture(autouse=True)
+def _restore_virtual_cursor():
+    from PyQt5.QtGui import QCursor
+    from PyQt5.QtWidgets import QApplication
+
+    app = QApplication.instance()
+    position = (QCursor.pos() if isinstance(app, QApplication)
+                and app.platformName() == 'offscreen' else None)
+    yield
+    app = QApplication.instance()
+    if not isinstance(app, QApplication) or app.platformName() != 'offscreen':
+        return
+    # 引导提示按光标位置找屏幕。离屏拖动测试可以把虚拟光标留在屏幕外。
+    if position is None or app.screenAt(position) is None:
+        position = app.primaryScreen().geometry().center()
+    if QCursor.pos() != position:
+        QCursor.setPos(position)
+
+
 # 释放泄漏控件前等待其子线程结束的上限（毫秒）
 _LEAKED_THREAD_WAIT_MS = 3000
 # 只释放本项目的控件类（界面层与测试替身）：pyqtgraph 等第三方库自己持有的无父菜单/面板
@@ -119,7 +138,7 @@ def leaked_top_level_widgets(app, before) -> list:
 
 
 @pytest.fixture(autouse=True)
-def _dispose_leaked_widgets():
+def _dispose_leaked_widgets(_restore_virtual_cursor):
     """
     每个用例结束后释放它留下的、仍存活的无父顶层控件（页面、主窗口、卡片、图表等）。
 

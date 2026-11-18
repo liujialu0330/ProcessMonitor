@@ -23,7 +23,7 @@ AnalysisExportFlow，右键打点编辑在 MarkerEditFlow；页面只把信号�
 """
 import dataclasses
 import logging
-from typing import TYPE_CHECKING, Callable, List, Optional, Set
+from typing import TYPE_CHECKING, Callable, List, Optional, Sequence, Set, Tuple
 
 from PyQt5.QtCore import QTimer
 from PyQt5.QtGui import QImage
@@ -31,6 +31,7 @@ from PyQt5.QtWidgets import QSizePolicy, QStackedWidget, QVBoxLayout, QWidget
 from qfluentwidgets import CaptionLabel, FluentIcon, IndeterminateProgressBar, TogglePushButton
 
 from core.history_query import CUSTOM_RANGE_KEY, RANGE_KEYS, HistorySnapshot, TaskAnalysis
+from ui.components.memory_unit_selector import MemoryUnitSelector
 from ui.formatting import (
     GROUP_USAGE_NOTE, MEMBER_USAGE_NOTE, basis_text, build_member_rows, build_table_row,
     group_verdict_summary, member_view_summary, overall_summary, refresh_status_text,
@@ -59,7 +60,7 @@ from ui.widgets.history.chart_view import chart_display_unit
 from ui.widgets.page_scaffold import PageScaffold
 from ui.widgets.task_selector import TaskSelector
 from ui.window_state import AnalysisMemory
-from utils.metrics import PROCESS_COUNT, VALUE_CLASS_RATE, split_member_key
+from utils.metrics import PROCESS_COUNT, VALUE_CLASS_RATE, is_memory_capacity_metric, split_member_key
 
 if TYPE_CHECKING:
     from core.monitor_manager import MonitorManager
@@ -95,10 +96,13 @@ class AnalysisPage(PageScaffold):
         # 最近一次拿到分析结果的时刻（结论条的"N 秒前"）
         self._analysis_at = None
         self._init_ui()
+        self.trend_panel.set_memory_unit(self.memory_unit_selector.unit())
+        self.memory_unit_selector.unit_changed.connect(self._on_memory_unit)
         self.breakpoints.tier_changed.connect(self._apply_tier)
         self._apply_tier(self.breakpoints.tier)
         self.auto_refresh = HistoryAutoRefresh(self.vm, self._should_skip_refresh, parent=self)
-        self.marker_flow = MarkerEditFlow(self.vm, services, self, parent=self)
+        self.marker_flow = MarkerEditFlow(
+            self.vm, services, self, parent=self, read_only=getattr(db, 'read_only', False))
         self.export_flow = AnalysisExportFlow(
             self.vm, services, self, self.render_report, parent=self)
         self._connect()
@@ -119,6 +123,8 @@ class AnalysisPage(PageScaffold):
         self.add_section(self.reference_controls)
         self.add_section(self.task_library)
         # 编辑与批量管理按需展开，首屏优先显示当前任务的结论和区间数据。
+        self.memory_unit_selector = MemoryUnitSelector(self)
+        self.add_header_widget(self.memory_unit_selector)
         self.reference_toggle = TogglePushButton(FluentIcon.TAG, '场景与参考', self)
         self.reference_toggle.setToolTip('编辑测试场景、版本和参考基线')
         self.reference_toggle.toggled.connect(self.reference_controls.setVisible)
@@ -142,7 +148,7 @@ class AnalysisPage(PageScaffold):
         self.member_panel = MemberVerdictPanel()
         self.compare_panel = ComparePanel()
         self.compare_panel.setVisible(False)
-        self.lower_views = LowerViews()
+        self.lower_views = LowerViews(read_only=getattr(self.db, 'read_only', False))
         self.interval_table = self.lower_views.interval_table
         self.sample_table = self.lower_views.sample_table
         self.trend_panel = TrendPanel()
@@ -213,6 +219,7 @@ class AnalysisPage(PageScaffold):
         trend.metric_activated.connect(vm.select_metric)
         self.interval_table.interval_activated.connect(
             lambda start, end: trend.zoom_to(start.timestamp(), end.timestamp()))
+        self.interval_table.rename_requested.connect(self.marker_flow.rename)
         self.verdict_banner.copy_requested.connect(self.export_flow.copy_conclusion)
         self.export_flow.status_changed.connect(self._on_export_status)
         # 视图模型 → 控件
@@ -240,7 +247,8 @@ class AnalysisPage(PageScaffold):
         vm.error.connect(lambda title, content: self.services.notifier.error(self, title, content))
 
     def _set_tab_order(self):
-        controls = [self.reference_toggle, self.task_library.toggle_button,
+        controls = [self.memory_unit_selector.combo, self.reference_toggle,
+                    self.task_library.toggle_button,
                     self.task_selector.search_edit, self.task_selector.combo,
                     self.toolbar.compare_button, self.toolbar.export_button,
                     self.toolbar.refresh_button, self.toolbar.more_button,
@@ -249,7 +257,7 @@ class AnalysisPage(PageScaffold):
                     self.reference_controls.save_button, self.reference_controls.reference_button,
                     self.reference_controls.star_button, self.reference_controls.compare_button,
                     self.summary_table.table,
-                    self.interval_table.table]
+                    self.interval_table.rename_button, self.interval_table.table]
         for first, second in zip(controls, controls[1:]):
             QWidget.setTabOrder(first, second)
 
@@ -394,6 +402,9 @@ class AnalysisPage(PageScaffold):
     def _on_selection_changed(self, task_id: Optional[str], metric: Optional[str],
                               _explicit: bool) -> None:
         self.task_selector.select_by_id(task_id, silent=True)
+        snapshot = self.vm.last_snapshot
+        if snapshot is not None and snapshot.request.task_id != task_id:
+            self.interval_table.clear()
         self.reference_controls.set_task(self.vm.current_task)
         reference = self.vm.last_reference
         current = self.vm.current_task
@@ -430,11 +441,8 @@ class AnalysisPage(PageScaffold):
         """analysis 是当前视图的结果：合计视图的指标键是指标本身，成员视图是 指标@成员键。"""
         vm = self.vm
         order = ordered_metrics(analysis)
-        snapshots = [(m, analysis.snapshots[m]) for m in order]
-        basis = next((basis_text(s) for _m, s in snapshots if s.stats), "")
-        rows = self._table_rows(snapshots, analysis)
+        snapshots, basis = self._show_summary_table(analysis, order)
         focus = vm.series_key(vm.current_metric)
-        self.summary_table.set_rows(rows, basis, focus=focus)
         self.verdict_banner.set_summary(self._banner_summary(snapshots, analysis))
         self.verdict_banner.set_basis(basis)
         self._analysis_at = self.services.clock.now()
@@ -445,6 +453,25 @@ class AnalysisPage(PageScaffold):
         self._update_analysis_hint(analysis)
         vm.refresh_reference(vm.last_analysis)
 
+    def _show_summary_table(self, analysis: TaskAnalysis, order: Sequence[str]
+                            ) -> Tuple[List[Tuple[str, HistorySnapshot]], str]:
+        snapshots = [(m, analysis.snapshots[m]) for m in order]
+        basis = next((basis_text(s) for _m, s in snapshots if s.stats), "")
+        self.summary_table.set_rows(self._table_rows(snapshots, analysis), basis,
+                                    focus=self.vm.series_key(self.vm.current_metric))
+        return snapshots, basis
+
+    def _on_memory_unit(self, unit: str) -> None:
+        self.trend_panel.set_memory_unit(unit)
+        analysis = self.vm.view_analysis()
+        if (analysis is None or analysis.task_id != self.vm.current_task_id
+                or self.content_stack.currentWidget() is not self.body):
+            return
+        self._show_summary_table(analysis, ordered_metrics(analysis))
+        snapshot = analysis.snapshot(self.trend_panel.focus_metric())
+        if snapshot is not None and is_memory_capacity_metric(snapshot.request.metric):
+            display_unit = self._show_intervals(snapshot)
+            self.sample_table.set_value_unit(display_unit, unit)
 
     def _refresh_task_identity(self, task_id):
         self.vm.reload_tasks()
@@ -463,6 +490,14 @@ class AnalysisPage(PageScaffold):
     def _update_analysis_hint(self, analysis):
         snapshots = list(analysis.snapshots.values())
         hints = []
+        if analysis.member_error is not None:
+            hints.append('成员数据加载失败，请刷新分析后再导出或复制结论')
+            if analysis.member_snapshots:
+                hints.append('成员读数来自上次成功加载')
+        if analysis.segments_error is not None:
+            hints.append('分段判定加载失败，请刷新分析后再导出或复制结论')
+            if analysis.segments:
+                hints.append('分段判定来自上次成功加载')
         if snapshots and all(s.baseline is None for s in snapshots):
             hints.append('尚未设置基线：预热稳定后打一次点，或在趋势图上右键设为基线')
         judged = [s for s in snapshots if s.judgement is not None]
@@ -483,13 +518,15 @@ class AnalysisPage(PageScaffold):
         指标@成员键作 metric，点击与焦点就都落在成员的序列上。"""
         vm = self.vm
         member = vm.current_member
+        unit = self.memory_unit_selector.unit()
         if member is None:
             note = GROUP_USAGE_NOTE if vm.is_group_task else None
-            return [build_table_row(m, s, usage_note=note) for m, s in snapshots]
+            return [build_table_row(m, s, usage_note=note, memory_unit=unit) for m, s in snapshots]
         count = self._member_instance_count(analysis, member)
         note = MEMBER_USAGE_NOTE.format(count=count) if count > 1 else None
         return [dataclasses.replace(
-                    build_table_row(split_member_key(m)[0], s, usage_note=note), metric=m)
+                    build_table_row(split_member_key(m)[0], s, usage_note=note, memory_unit=unit),
+                    metric=m)
                 for m, s in snapshots]
 
     def _member_instance_count(self, analysis: TaskAnalysis, member: str) -> int:
@@ -524,20 +561,28 @@ class AnalysisPage(PageScaffold):
         instances = {o.key: o.instances for o in vm.member_options}
         return build_member_rows(vm.last_analysis, names, instances)
 
-    def _on_snapshot(self, snapshot: HistorySnapshot) -> None:
-        """snapshot 的指标键在成员视图里是 指标@成员键。"""
+    def _show_intervals(self, snapshot: HistorySnapshot) -> str:
         metric = snapshot.request.metric
-        self.trend_panel.set_focus(metric)
+        memory_unit = self.memory_unit_selector.unit()
         chart = self.trend_panel.charts().get(metric)
         if chart is not None and not chart.is_rate:
             unit = chart.display_unit
         else:
-            unit = chart_display_unit(metric, [p.value for p in snapshot.buckets])
-        self.interval_table.set_intervals(metric, snapshot.intervals, snapshot.markers, unit)
+            unit = chart_display_unit(metric, [p.value for p in snapshot.buckets], memory_unit)
+        self.interval_table.set_intervals(metric, snapshot.intervals, snapshot.markers, unit,
+                                         memory_unit=memory_unit)
+        return unit
+
+    def _on_snapshot(self, snapshot: HistorySnapshot) -> None:
+        """snapshot 的指标键在成员视图里是 指标@成员键。"""
+        metric = snapshot.request.metric
+        self.trend_panel.set_focus(metric)
+        unit = self._show_intervals(snapshot)
         baseline = snapshot.baseline
         self.sample_table.set_points(
             snapshot.points, metric, snapshot.total_count or None, unit,
-            baseline_value=baseline.value if baseline is not None else None)
+            baseline_value=baseline.value if baseline is not None else None,
+            memory_unit=self.memory_unit_selector.unit())
         if self.vm.range_key != CUSTOM_RANGE_KEY:
             rate = snapshot.value_class == VALUE_CLASS_RATE
             self.trend_panel.overview.set_series(

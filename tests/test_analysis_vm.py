@@ -9,16 +9,21 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from core.history_query import CUSTOM_RANGE_KEY, DEFAULT_RANGE_KEY, TaskAnalysis, run_history_query
+from core.history_query import (
+    CUSTOM_RANGE_KEY, DEFAULT_RANGE_KEY, HistorySnapshot, TaskAnalysis, build_request,
+    run_history_query)
 from core.monitor_manager import MonitorManager
-from data.models import DataPoint, MonitorTask
+from core.report_worker import ReportWorker
+from core.workers.base import CancelToken
+from data.errors import StorageError
+from data.models import DataPoint, Marker, MonitorTask
 from tests.doubles import FakeClock
 from tests.factories import make_services
 from tests.helpers import ManualHistoryRunner, SyncHistoryRunner, process_events_until
 from ui.viewmodels.analysis_vm import (
     COMPARE_MISSING_METRIC, EXPORT_BUSY, EXPORT_MAINTENANCE, AnalysisViewModel,
     analysis_origin, range_text)
-from ui.viewmodels.history_vm import EMPTY_LOAD_FAILED
+from ui.viewmodels.history_vm import EMPTY_LOAD_FAILED, ERROR_LOAD_FAILED
 from utils.metrics import MetricType
 
 BASE = datetime(2026, 7, 16, 16, 0, 0)
@@ -28,11 +33,11 @@ GDI = MetricType.NUM_GDI_OBJECTS
 
 
 def seed(db, name="demo.exe", start=BASE, metrics=(MEM, HANDLES), samples=120,
-         slope=10.0, markers=()):
+         slope=10.0, markers=(), *, target_kind='pid'):
     task = MonitorTask(
         task_id=str(uuid.uuid4()), pid=4321, process_name=name, metric_types=list(metrics),
         interval=1.0, start_time=start, end_time=start + timedelta(seconds=samples),
-        status="stopped", sample_count=samples,
+        status="stopped", sample_count=samples, target_kind=target_kind,
         last_sample_at=start + timedelta(seconds=samples - 1))
     db.save_task(task)
     db.save_data_points([
@@ -241,6 +246,83 @@ def test_compare_task_without_metric_explains(qapp, db, manager, services):
     assert rec.compares[-1].message == COMPARE_MISSING_METRIC
 
 
+def test_renaming_finished_comparison_refreshes_rounds_and_drops_inflight_old_label(
+        qapp, db, manager, services):
+    other = seed(db, name="old.exe", start=BASE - timedelta(days=1), metrics=(MEM,),
+                 markers=((10, "准备"), (20, "操作")))
+    task = seed(db, metrics=(MEM,))
+    runner = ManualHistoryRunner(db)
+    vm = make_vm(db, manager, services, runner)
+    vm.reload_tasks()
+    runner.complete_all()
+    primary = vm.last_analysis
+    vm.set_compare_task(other.task_id)
+    runner.complete_all()
+    assert vm.last_compare.other.rounds[0].label == "操作"
+
+    marker = db.markers.list(other.task_id)[1]
+    assert manager.rename_marker(marker.id, "打开窗口", other.task_id)
+    assert vm.last_compare is None
+    request, deliver = runner.pending.pop()
+    previous = run_history_query(db, request)
+    assert manager.rename_marker(marker.id, "关闭窗口", other.task_id)
+    deliver(previous)
+    assert vm.last_compare is None
+    runner.complete_all()
+
+    assert vm.current_task_id == task.task_id and vm.last_analysis is primary
+    assert vm.compare_task_ids == (other.task_id,)
+    assert vm.last_compare.other.rounds[0].label == "关闭窗口"
+
+
+def test_renamed_comparison_task_is_reread_when_primary_recovers(qapp, db, manager, services):
+    other = seed(db, start=BASE - timedelta(days=1), metrics=(MEM,),
+                 markers=((5, "准备"), (15, "旧轮次")))
+    task = seed(db, metrics=(MEM,), markers=((5, "原主点"),))
+    task.status, task.end_time = 'running', None
+    db.save_task(task)
+    services.task_status.set_running(task.task_id)
+    runner = ManualHistoryRunner(db)
+    vm = make_vm(db, manager, services, runner)
+    rec = Recorder(vm)
+    vm.reload_tasks()
+    runner.complete_all()
+    vm.set_compare_task(other.task_id)
+    runner.complete_all()
+    assert rec.compares[-1].other.rounds[0].label == "旧轮次"
+
+    main_marker = vm.last_analysis.markers[0]
+    other_marker = vm.last_compare.other.markers[-1]
+    assert manager.rename_marker(main_marker.id, "新主点", task.task_id)
+    assert vm.last_compare is None and rec.compares[-1] is None
+    assert manager.rename_marker(other_marker.id, "第一次改名", other.task_id)
+    runner.complete_all()
+    assert vm.last_compare.primary.markers[0].label == "新主点"
+    assert vm.last_compare.other.rounds[0].label == "第一次改名"
+
+    vm.refresh()
+    before = len(runner.requests)
+    assert manager.rename_marker(other_marker.id, "刷新中的改名", other.task_id)
+    assert len(runner.requests) == before and vm.last_compare is None
+    runner.complete_all()
+    assert len(runner.requests) == before + 1
+    assert vm.last_compare.other.rounds[0].label == "刷新中的改名"
+
+    vm.refresh()
+    runner.fail("主任务读取失败")
+    assert vm.last_analysis is None
+    assert manager.rename_marker(other_marker.id, "最终轮次", other.task_id)
+    assert vm.last_compare is None and rec.compares[-1] is None
+    assert not runner.pending
+
+    before = len(runner.requests)
+    vm.on_tick()
+    runner.complete_all()
+    assert [r.task_id for r in runner.requests[before:]] == [task.task_id, other.task_id]
+    assert vm.current_task_id == task.task_id and vm.compare_task_ids == (other.task_id,)
+    assert vm.last_compare.other.rounds[0].label == "最终轮次"
+
+
 def test_marker_commands_go_through_manager_and_requery(qapp, db, manager, services):
     task = seed(db)
     runner = SyncHistoryRunner(db)
@@ -264,6 +346,244 @@ def test_marker_commands_go_through_manager_and_requery(qapp, db, manager, servi
     assert kinds == {"预热完成": "user", "第一轮": "baseline"}
     assert vm.delete_marker(user)
     assert [m.label for m in manager.list_markers(task.task_id)] == ["预热完成"]
+
+
+def test_rename_rejects_foreign_system_and_unsaved_markers(qapp, db, manager, services):
+    other = seed(db, start=BASE - timedelta(days=1), markers=((15, "另一任务"),))
+    task = seed(db)
+    pause_id = db.markers.add(task.task_id, BASE, "暂停", 'pause')
+    vm = make_vm(db, manager, services)
+    vm.reload_tasks()
+    snapshot = vm.export_analysis()
+
+    assert not vm.rename_marker(db.markers.list(other.task_id)[0], "误改")
+    assert not vm.rename_marker(Marker(task.task_id, BASE, "暂停", pause_id, 'pause'), "误改")
+    assert not vm.rename_marker(Marker(task.task_id, BASE, "未保存"), "误改")
+    assert [m.label for m in db.markers.list(other.task_id)] == ["另一任务"]
+    assert [m.label for m in db.markers.list(task.task_id)] == ["暂停"]
+    assert vm.export_analysis() is snapshot
+
+
+@pytest.mark.parametrize('member_error, aggregate_index, expected_storage', [
+    (RuntimeError("成员计算失败"), None, False),
+    (StorageError("成员读取失败"), None, True),
+    (StorageError("成员读取失败"), 0, False),
+    (RuntimeError("成员计算失败"), 1, True),
+])
+def test_rename_refresh_keeps_failure_category_and_prioritizes_aggregate(
+        qapp, db, manager, services, monkeypatch, member_error, aggregate_index, expected_storage):
+    task = seed(db, markers=((5, "原名"),), target_kind='tree')
+    runner = ManualHistoryRunner(db)
+    vm = make_vm(db, manager, services, runner)
+    vm.reload_tasks()
+    runner.complete_all()
+    assert vm.is_group_task and vm.current_task_id == task.task_id
+    rec = Recorder(vm)
+    seen = []
+    apply = vm._apply_snapshot
+
+    def record_result(snapshot, forced=False):
+        seen.append((snapshot.error, snapshot.storage_error))
+        apply(snapshot, forced)
+
+    def fail_members(_task_id):
+        raise member_error
+
+    monkeypatch.setattr(vm, '_apply_snapshot', record_result)
+    monkeypatch.setattr(db.members, 'member_series', fail_members)
+    assert vm.rename_marker(vm.last_analysis.markers[0], "新名")
+    message = str(member_error)
+    if aggregate_index is not None:
+        message = "合计指标读取失败" if expected_storage else "合计指标计算失败"
+        runner.fail(message, index=aggregate_index, storage_error=expected_storage)
+    runner.complete_all()
+
+    assert seen == [(message, expected_storage)]
+    assert len(rec.errors) == 1 and message in rec.errors[0][1]
+    assert vm.export_analysis() is None
+
+
+@pytest.mark.parametrize(('retry_succeeds', 'refresh_in_progress'),
+                         [(True, False), (False, False), (True, True)])
+def test_stopped_task_rename_refresh_notifies_and_retries_only_once(
+        qapp, db, manager, services, retry_succeeds, refresh_in_progress):
+    task = seed(db, metrics=(MEM,), markers=((5, "原名"),))
+    runner = ManualHistoryRunner(db)
+    vm = make_vm(db, manager, services, runner)
+    vm.reload_tasks()
+    runner.complete_all()
+    rec = Recorder(vm)
+    assert not services.task_status.is_running(task.task_id)
+    if refresh_in_progress:
+        vm.refresh()
+    assert vm.rename_marker(vm.last_analysis.markers[0], "新名")
+    if refresh_in_progress:
+        runner.complete()  # 已被改名取代的手动刷新先返回
+    runner.fail("趋势计算出错", storage_error=False)
+    assert db.markers.list(task.task_id)[0].label == "新名"
+    assert vm.last_analysis.markers[0].label == "原名" and vm.report_job() is None
+    assert len(rec.errors) == 1
+    title, detail = rec.errors[0]
+    assert "刷新失败" in title and "趋势计算出错" in detail and "重试" in detail
+
+    before = len(runner.requests)
+    vm.on_tick()
+    vm.on_tick()
+    assert len(runner.requests) == before + 1 and len(runner.pending) == 1
+    if retry_succeeds:
+        runner.complete()
+    else:
+        runner.fail("仍然无法计算", storage_error=False)
+        assert vm.report_job() is None
+    vm.on_tick()
+    vm.on_tick()
+    assert len(runner.requests) == before + 1
+    if not retry_succeeds:
+        vm.refresh()
+        runner.complete_all()
+    assert vm.report_job().markers[0].label == "新名"
+
+
+@pytest.mark.parametrize('preset', [True, False], ids=['preset', 'different-custom-bounds'])
+@pytest.mark.parametrize('edit_again', [False, True], ids=['range-load', 'merged-marker-update'])
+def test_range_load_failure_after_marker_edit_reports_the_new_query(
+        qapp, db, manager, services, preset, edit_again):
+    task = seed(db, metrics=(MEM,), markers=((5, "原名"),))
+    runner = ManualHistoryRunner(db)
+    vm = make_vm(db, manager, services, runner)
+    vm.reload_tasks()
+    runner.complete_all()
+    if not preset:
+        vm.set_custom_range(BASE, BASE + timedelta(seconds=40))
+        runner.complete_all()
+    rec = Recorder(vm)
+    marker = vm.last_analysis.markers[0]
+    assert vm.rename_marker(marker, "新名")
+    if preset:
+        vm.set_range('10m')
+    else:
+        vm.set_custom_range(BASE + timedelta(seconds=10), BASE + timedelta(seconds=50))
+    if edit_again:
+        assert vm.rename_marker(marker, "再次改名")
+
+    runner.fail("选区加载失败", index=-1)
+    runner.complete_all()  # 先前请求的迟到结果不能覆盖失败状态。
+    assert not vm.is_busy and vm.last_snapshot is None and vm.last_analysis is None
+    assert rec.empty == [EMPTY_LOAD_FAILED]
+    assert rec.errors == [(ERROR_LOAD_FAILED, "选区加载失败")]
+    before = len(runner.requests)
+    vm.on_tick()
+    assert len(runner.requests) == before
+    assert db.markers.list(task.task_id)[0].label == ("再次改名" if edit_again else "新名")
+
+
+def test_focus_load_failure_after_a_marker_edit_reports_the_new_query(
+        qapp, db, manager, services):
+    task = seed(db, markers=((5, "原名"),))
+    runner = ManualHistoryRunner(db)
+    vm = make_vm(db, manager, services, runner)
+    vm.reload_tasks()
+    runner.complete_all()
+    assert vm.last_snapshot.request.metric == MEM
+
+    rec = Recorder(vm)
+    vm.refresh()
+    vm.select_metric(HANDLES)
+    assert vm.rename_marker(vm.last_analysis.markers[0], "新名")
+    runner.fail("新指标读取失败", index=-1)
+    runner.complete_all()
+
+    assert not vm.is_busy and vm.current_metric == HANDLES
+    assert vm.last_snapshot is None and vm.last_analysis is None
+    assert rec.empty == [EMPTY_LOAD_FAILED]
+    assert rec.errors == [(ERROR_LOAD_FAILED, "新指标读取失败")]
+    before = len(runner.requests)
+    vm.on_tick()
+    assert len(runner.requests) == before
+    assert db.markers.list(task.task_id)[0].label == "新名"
+
+
+def test_switching_tasks_discards_the_previous_marker_retry(qapp, db, manager, services):
+    other = seed(db, start=BASE - timedelta(days=1), metrics=(MEM,))
+    task = seed(db, metrics=(MEM,), markers=((5, "原名"),))
+    runner = ManualHistoryRunner(db)
+    vm = make_vm(db, manager, services, runner)
+    vm.reload_tasks()
+    runner.complete_all()
+    assert vm.rename_marker(vm.last_analysis.markers[0], "新名")
+    runner.fail("打点刷新失败")
+
+    vm.select_task(other.task_id)
+    vm.select_task(task.task_id)
+    rec = Recorder(vm)
+    runner.fail("任务加载失败", index=-1)
+    runner.complete_all()
+    assert rec.empty == [EMPTY_LOAD_FAILED]
+    assert rec.errors == [(ERROR_LOAD_FAILED, "任务加载失败")]
+    before = len(runner.requests)
+    vm.on_tick()
+    assert len(runner.requests) == before
+
+
+def test_task_analysis_uses_markers_from_first_successful_snapshot(db):
+    task = seed(db, markers=((5, "真实打点"),))
+    marker = db.markers.list(task.task_id)[0]
+    vm_snapshots = {metric: run_history_query(db, build_request(task.task_id, metric, 'all'))
+                    for metric in task.metric_types}
+    failed = HistorySnapshot(vm_snapshots[MEM].request, error="读库失败")
+    assert TaskAnalysis(task.task_id, 'all', {MEM: failed}).markers == []
+    assert TaskAnalysis(task.task_id, 'all', {
+        MEM: failed, HANDLES: vm_snapshots[HANDLES],
+    }).markers == [marker]
+
+
+def test_rename_freezes_started_export_and_waits_for_successful_refresh(
+        qapp, db, manager, services, tmp_path):
+    task = seed(db, metrics=(MEM,), markers=((15, "旧名称"),))
+    task.status, task.end_time = 'running', None
+    db.save_task(task)
+    runner = ManualHistoryRunner(db)
+    vm = make_vm(db, manager, services, runner)
+    vm.reload_tasks()
+    runner.complete_all()
+    previous = vm.report_job(csv_path=str(tmp_path / "before.csv"),
+                             summary_path=str(tmp_path / "before-summary.csv"))
+
+    marker = vm.export_analysis().markers[0]
+    # 监控卡也走管理器改名；分析页应同时失效旧快照。
+    assert manager.rename_marker(marker.id, "新名称", task.task_id)
+    assert vm.export_analysis() is None and vm.report_job() is None
+    runner.fail("读取失败")
+    assert vm.report_job() is None
+    vm.refresh()
+    runner.complete_all()
+    current = vm.report_job(csv_path=str(tmp_path / "after.csv"),
+                            summary_path=str(tmp_path / "after-summary.csv"))
+
+    for job, label in ((previous, "旧名称"), (current, "新名称")):
+        assert ReportWorker(db, job).execute(CancelToken()).row_count == 120
+        with open(job.csv_path, encoding='utf-8-sig') as detail:
+            rows = [row for row in csv.reader(detail) if row and row[0][:4] == "2026"]
+        assert [row[-1] for row in rows if row[-1]] == [label]
+        with open(job.summary_path, encoding='utf-8-sig') as summary:
+            rows = [row for row in csv.reader(summary) if row and row[0] == "私有字节"]
+        assert [row[2] for row in rows] == [f"开始 → {label}", f"{label} → 结束"]
+
+
+def test_switch_task_while_rename_refresh_is_pending(qapp, db, manager, services):
+    other = seed(db, start=BASE - timedelta(days=1), metrics=(MEM,))
+    task = seed(db, metrics=(MEM,), markers=((15, "旧名称"),))
+    runner = ManualHistoryRunner(db)
+    vm = make_vm(db, manager, services, runner)
+    vm.reload_tasks()
+    runner.complete_all()
+    assert vm.rename_marker(vm.export_analysis().markers[0], "新名称")
+    assert vm.select_task(other.task_id) and vm.report_job() is None
+    runner.complete_all()
+    assert vm.report_job().task.task_id == other.task_id
+    assert vm.select_task(task.task_id) and vm.report_job() is None
+    runner.complete_all()
+    assert [m.label for m in vm.report_job().markers] == ["新名称"]
 
 
 def test_export_command_writes_files_and_unregisters(qapp, db, manager, services, tmp_path):

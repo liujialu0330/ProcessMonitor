@@ -67,6 +67,7 @@ class MemberBundle:
     snapshots: Dict[str, HistorySnapshot] = field(default_factory=dict)
     summaries: tuple = ()
     error: Optional[str] = None
+    storage_error: bool = False
 
 
 def load_member_bundle(db, request: MemberRequest,
@@ -116,4 +117,5 @@ class MemberSnapshotsWorker(BackgroundTask):
         logger.error("进程组成员曲线加载失败", exc_info=exc)
         message = self.failure_message(exc)
         self.failed.emit(message)
-        self.result_ready.emit(MemberBundle(self._request, error=message))
+        self.result_ready.emit(MemberBundle(self._request, error=message,
+                                            storage_error=isinstance(exc, StorageError)))

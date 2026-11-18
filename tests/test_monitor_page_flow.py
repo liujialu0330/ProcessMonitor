@@ -10,16 +10,17 @@ import os
 from datetime import timedelta
 
 import pytest
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import QPoint, Qt
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QWidget
 
 from core.contracts import StopReason, UnavailableReason
 from core.monitor_manager import MonitorManager
 from tests.doubles import DEFAULT_FAKE_NOW, FakePreferences, FakeProcessQuery
-from tests.factories import make_monitor_page, make_services
-from tests.helpers import process_events_until, stop_and_join
+from tests.factories import make_main_window, make_monitor_page, make_services
+from tests.helpers import dispose_widget, process_events_until, stop_and_join
 from ui.components.metric_selector import MetricSelectorDialog
+from ui.components.task_card import TaskCard
 from ui.services import InfoBarNotifier
 from utils.metrics import (
     AVAILABLE_METRICS, LEAK_CHECK_PRESET, MetricType, get_metric_description
@@ -107,6 +108,34 @@ def test_startup_lists_processes_selects_none_and_form_is_expanded(page):
     assert page.form.details.isVisible() and not page.form.expand_button.isVisible()
     assert page.board.empty_state.isVisible()
     assert page.summary_label.text() == "运行中 0/5"
+
+
+def test_long_quota_summary_fits_monitor_at_minimum_window_width(qapp, db, manager, services):
+    window = make_main_window(db, manager, services)
+    try:
+        window.resize(window.minimumWidth(), 740)
+        window.show()
+        page = window.monitor_page
+        _wait_process_list(page)
+        finished = TaskCard('finished', 'demo.exe', 1001, [MetricType.MEMORY_PRIVATE])
+        finished.set_finished(StopReason.USER, DEFAULT_FAKE_NOW)
+        page.board.add_card(finished)
+        page.board.add_waiting('waiting', 'worker.exe')
+        page.board.set_counts(5, 5)
+        qapp.processEvents()
+
+        assert page.summary_label.text() == "运行中 5/5 · 等待启动 1 · 已结束 1"
+        viewport = page.viewport()
+        assert page.widget().width() <= viewport.width()
+        combo = page.memory_unit_selector.combo
+        assert combo.isVisible()
+        assert combo.mapTo(viewport, combo.rect().topRight()).x() < viewport.width()
+        assert finished.mapTo(viewport, QPoint(finished.width() - 1, 0)).x() < viewport.width()
+        subtitle_right = page.subtitle_label.mapTo(viewport, page.subtitle_label.rect().topRight()).x()
+        switch_left = page.view_switch.mapTo(viewport, QPoint()).x()
+        assert 0 < switch_left - subtitle_right <= page.header_layout.spacing() + 1
+    finally:
+        dispose_widget(window)
 
 
 def test_default_metrics_is_leak_check_preset(page):

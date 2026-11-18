@@ -22,14 +22,16 @@
 """
 import bisect
 from datetime import datetime
+from html import escape
 from typing import Callable, List, Optional, Sequence, Tuple
+from weakref import ref
 
 import numpy as np
 import pyqtgraph as pg
 from pyqtgraph import exporters
-from PyQt5.QtCore import QEvent, QPointF, Qt, pyqtSignal
-from PyQt5.QtGui import QColor, QPainter, QPixmap
-from PyQt5.QtWidgets import QHBoxLayout, QSizePolicy, QVBoxLayout
+from PyQt5.QtCore import QEvent, QPointF, QRect, QSize, Qt, pyqtSignal
+from PyQt5.QtGui import QColor, QHelpEvent, QPainter, QPixmap
+from PyQt5.QtWidgets import QHBoxLayout, QSizePolicy, QToolTip, QVBoxLayout
 from qfluentwidgets import (CardWidget, FluentIcon, StrongBodyLabel, TransparentToolButton,
                             qconfig)
 
@@ -44,11 +46,14 @@ from ui.formatting import (
 from ui.typography import DataCaptionLabel, TypeScale, data_font, ui_font
 from ui.widgets.history.common import CARD_PADDING_H, DETAIL_TIME_FORMAT
 from utils.metrics import (
-    VALUE_CLASS_RATE, format_metric_value, get_metric_display_name,
-    get_metric_display_unit, is_integer_metric, split_member_key)
+    VALUE_CLASS_RATE, fixed_memory_unit, format_metric_value,
+    get_metric_display_name, get_metric_display_unit, is_integer_metric, is_memory_capacity_metric,
+    split_member_key)
 
 # 保留约 360px 的有效读图高度，同时允许高窗口自动拉伸
 CHART_MIN_HEIGHT = 340
+# 容量纵轴在深度缩放时也能分开不足 1 KB 的刻度。
+CAPACITY_AXIS_DECIMALS = 10
 # 导出图片的像素宽度
 EXPORT_WIDTH = 1600
 # 悬停吸附计算的限流频率（Hz）
@@ -111,10 +116,14 @@ def value_axis_title(metric_type: Optional[str], display_unit: str,
     return f"{name}（{display_unit}）" if display_unit else name
 
 
-def chart_display_unit(metric_type: Optional[str], values: Sequence[float]) -> str:
+def chart_display_unit(metric_type: Optional[str], values: Sequence[float],
+                       memory_unit: Optional[str] = None) -> str:
     """整张图（以及同屏统计、明细、悬停）共用的显示单位：按绝对值最大的点选取。"""
     if not metric_type:
         return ''
+    fixed = fixed_memory_unit(metric_type, memory_unit)
+    if fixed:
+        return fixed
     reference_value = max((abs(value) for value in values), default=0.0)
     return get_metric_display_unit(metric_type, reference_value)
 
@@ -177,12 +186,41 @@ def nearest_index(x_array: Sequence[float], x: float) -> int:
     return idx - 1 if (x - before) <= (after - x) else idx
 
 
+class _HoverReadout(DataCaptionLabel):
+    """读数在标题行剩余的宽度内显示，长打点名不参与卡片或滚动页的尺寸计算。"""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setTextFormat(Qt.PlainText)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+
+    def sizeHint(self) -> QSize:
+        return QSize(0, self.fontMetrics().height())
+
+    def minimumSizeHint(self) -> QSize:
+        return self.sizeHint()
+
+    def displayed_text(self) -> str:
+        return self.fontMetrics().elidedText(self.text(), Qt.ElideRight,
+                                             self.contentsRect().width(), Qt.TextSingleLine)
+
+    def paintEvent(self, event) -> None:
+        rect = self.contentsRect()
+        painter = QPainter(self)
+        self.style().drawItemText(painter, rect, Qt.AlignLeft | Qt.AlignVCenter | Qt.TextSingleLine,
+                                  self.palette(), self.isEnabled(), self.displayed_text(),
+                                  self.foregroundRole())
+
+
 class ChartView(CardWidget):
     """趋势图卡片：工具行（悬停读数 + 保存/复制图标）+ pyqtgraph 绘图区。
 
     保存/复制只发信号：选择路径、提示结果由页面负责（需要对话框与提示服务），
     控件提供 export_png / grab_pixmap 完成实际导出。
     """
+
+    # Qt 全应用共用一个 tooltip，清理十字线时只收起本图显示的读数。
+    _active_readout_tip = None
 
     save_requested = pyqtSignal()
     copy_requested = pyqtSignal()
@@ -198,6 +236,7 @@ class ChartView(CardWidget):
         self._compact = compact
         # min/max 带 [(epoch 秒, 下沿, 上沿)]，与空洞一起决定分段
         self._band: List[Tuple[float, float, float]] = []
+        self._band_times: List[float] = []
         self._band_items: list = []
         self._relative_origin: Optional[float] = None
         self._context_menu = False
@@ -207,8 +246,11 @@ class ChartView(CardWidget):
         self._y: List[float] = []
         self._metric_type: Optional[str] = None
         self._display_unit = ''
+        self._memory_unit = 'auto'
         # 打点（按时间升序，含基线与暂停/恢复）：图上画竖线，悬停读数据此提示所处区间
         self._markers: list = []
+        self._marker_times: List[float] = []
+        self._marker_labels: List[str] = []
         # 空洞 (前一点, 后一点)，epoch 秒；曲线在此断开并画阴影
         self._gaps: List[Tuple[float, float]] = []
         # 当前曲线是否为每秒速率序列（累计类指标）
@@ -218,6 +260,9 @@ class ChartView(CardWidget):
         self._gap_items: list = []
 
         self._pressed = False
+        # 联动的图也显示十字线，只有光标所在图可以通知其余图清除读数。
+        self._pointer_hover = False
+        self._hover_index: Optional[int] = None
         self._interacting = False
         self._interaction_callback: Optional[Callable[[bool], None]] = None
 
@@ -263,9 +308,8 @@ class ChartView(CardWidget):
         self.title_label = StrongBodyLabel("", self)
         self.title_label.setVisible(False)
         toolbar.addWidget(self.title_label)
-        self.hover_label = DataCaptionLabel("", self)
-        toolbar.addWidget(self.hover_label)
-        toolbar.addStretch()
+        self.hover_label = _HoverReadout(self)
+        toolbar.addWidget(self.hover_label, 1)
         self.save_png_button = TransparentToolButton(FluentIcon.SAVE, self)
         self.save_png_button.setToolTip("保存图表为图片")
         self.save_png_button.clicked.connect(self.save_requested)
@@ -401,18 +445,31 @@ class ChartView(CardWidget):
             self._x = []
             self._y = []
 
-        self._display_unit = chart_display_unit(metric_type, self._y)
-        # 计数类指标强制整数刻度（速率是小数，不强制）；字节类的刻度间距按显示单位选取
-        self.value_axis.set_display_unit(
-            self._display_unit,
-            integer_only=bool(metric_type) and not rate and is_integer_metric(metric_type))
-
+        self._update_value_axis()
         self._redraw()
-        self._set_axis_label('left', value_axis_title(metric_type, self._display_unit, rate))
         self._set_axis_label('bottom', TIME_AXIS_TITLE)
 
         if not keep_view:
             self.reset_view()
+
+    def set_memory_unit(self, unit: str) -> None:
+        if unit == self._memory_unit:
+            return
+        self._memory_unit = unit
+        if not is_memory_capacity_metric(self._metric_type):
+            return
+        self._update_value_axis()
+        if self._hover_index is not None:
+            self._hide_readout_tip()
+            self.hover_label.setText(self.hover_text(self._hover_index))
+
+    def _update_value_axis(self) -> None:
+        metric = self._metric_type
+        self._display_unit = chart_display_unit(metric, self._y, self._memory_unit)
+        self.value_axis.set_display_unit(
+            self._display_unit, integer_only=not self._rate and is_integer_metric(metric),
+            max_decimals=CAPACITY_AXIS_DECIMALS if is_memory_capacity_metric(metric) else 4)
+        self._set_axis_label('left', value_axis_title(metric, self._display_unit, self._rate))
 
     def set_band(self, buckets: Optional[Sequence]) -> None:
         """设置 min/max 带（需有 start / end / min / max 的时间桶，按时间升序；None 或空
@@ -423,6 +480,7 @@ class ChartView(CardWidget):
                       else (bucket.start,))
             for ts in stamps:
                 self._band.append((ts.timestamp(), bucket.min, bucket.max))
+        self._band_times = [t for t, _low, _high in self._band]
         self._redraw()
 
     def set_title(self, text: str) -> None:
@@ -444,6 +502,8 @@ class ChartView(CardWidget):
         self.time_axis.set_relative_origin(origin)
         self._set_axis_label(
             'bottom', TIME_AXIS_TITLE if origin is None else RELATIVE_TIME_AXIS_TITLE)
+        if self._hover_index is not None:
+            self.hover_label.setText(self.hover_text(self._hover_index))
 
     @property
     def compact(self) -> bool:
@@ -507,6 +567,9 @@ class ChartView(CardWidget):
         self._gaps = []
         self._rate = False
         self._band = []
+        self._band_times.clear()
+        self._marker_times.clear()
+        self._marker_labels.clear()
         self.value_axis.set_display_unit('')
         self._redraw()
 
@@ -571,7 +634,7 @@ class ChartView(CardWidget):
 
     def _band_segments(self) -> List[List[Tuple[float, float, float]]]:
         """把带按空洞切成连续段（跨空洞的相邻两点不相连）。"""
-        mask = connect_mask([t for t, _lo, _hi in self._band], self._gaps)
+        mask = connect_mask(self._band_times, self._gaps)
         segments, current = [], []
         for item, linked in zip(self._band, mask):
             current.append(item)
@@ -603,13 +666,15 @@ class ChartView(CardWidget):
         """x 处最近的带点的 (min, max)；没有带时为 None。"""
         if not self._band:
             return None
-        _t, low, high = self._band[nearest_index([t for t, _lo, _hi in self._band], x)]
+        _t, low, high = self._band[nearest_index(self._band_times, x)]
         return low, high
 
     def _draw_markers(self, colors: dict) -> None:
         """打点竖线：用户打点虚线 + 编号徽标，基线实线 + "基线"，暂停/恢复底部浅色短线，
         系统事件（异常退出/重启/续采）彩色点划线 + 底部短标签。"""
         marker_color = colors['marker']
+        self._marker_times.clear()
+        self._marker_labels.clear()
         user_pen = pg.mkPen(color=marker_color, width=1, style=Qt.DashLine)
         baseline_pen = pg.mkPen(color=marker_color, width=2)
         system_pen = pg.mkPen(color=colors['system_marker'], width=2)
@@ -636,6 +701,8 @@ class ChartView(CardWidget):
                                        span=(0, SYSTEM_MARKER_SPAN))
             else:
                 tooltip = f"{badge} {marker.label} · {time_text}"
+                self._marker_times.append(pos)
+                self._marker_labels.append(f"{badge} {marker.label}")
                 line = pg.InfiniteLine(
                     pos=pos, angle=90, movable=False,
                     pen=baseline_pen if kind == MARKER_BASELINE else user_pen,
@@ -677,6 +744,9 @@ class ChartView(CardWidget):
 
     def hover_text(self, index: int) -> str:
         """第 index 个绘制点的悬停读数：时间 · 值 · 所处打点区间（若有，带编号徽标）。"""
+        return " · ".join(self._hover_parts(index))
+
+    def _hover_parts(self, index: int) -> List[str]:
         x_val = self._x[index]
         if self._relative_origin is not None:
             time_str = format_relative(x_val - self._relative_origin)
@@ -686,62 +756,73 @@ class ChartView(CardWidget):
             formatted_value = format_per_second(self._metric_type, self._y[index])
         else:
             formatted_value = format_metric_value(
-                self._metric_type, self._y[index], display_unit=self._display_unit)
-        text = f"{time_str} · {formatted_value}"
+                self._metric_type, self._y[index], self._display_unit, memory_unit=self._memory_unit)
+        if self._compact:
+            return [formatted_value, time_str]
         band = self.band_range_at(x_val)
         if band is not None and not self._rate:
-            low, high = (format_metric_value(self._metric_type, v, display_unit=self._display_unit)
+            low, high = (format_metric_value(self._metric_type, v, self._display_unit,
+                                             memory_unit=self._memory_unit)
                          for v in band)
-            text += f"（{low} – {high}）"
+            formatted_value += f"（{low} – {high}）"
         # 区间说明只看用户打点与基线（暂停/恢复不是一轮操作的边界）
-        labelled = [(m, badge) for m, badge in zip(self._markers, marker_badges(self._markers))
-                    if badge is not None]
-        context = marker_context(
-            [m.timestamp.timestamp() for m, _ in labelled],
-            [f"{badge} {m.label}" for m, badge in labelled], x_val)
+        context = marker_context(self._marker_times, self._marker_labels, x_val)
+        parts = [time_str, formatted_value]
         if context:
-            text += f" · {context}"
-        return text
+            parts.append(context)
+        return parts
 
     def show_hover_at(self, x: float) -> Optional[int]:
         """把十字线吸附到与 x（epoch 秒）最近的绘制点并显示读数；无数据返回 None。"""
         if not self._x:
             return None
-        idx = self.set_crosshair(x)
-        self._update_interaction()
-        self.hover_moved.emit(self._x[idx])
+        idx = nearest_index(self._x, x)
+        changed = not self._pointer_hover or idx != self._hover_index
+        self._pointer_hover = True
+        self._display_crosshair(idx)
+        if changed:
+            self.hover_moved.emit(self._x[idx])
         return idx
 
     def set_crosshair(self, x: Optional[float]) -> Optional[int]:
         """只移动十字线与读数（联动其他图时用，不发 hover_moved）；x 为 None 时隐藏。"""
-        if x is None or not self._x:
+        self._pointer_hover = False
+        idx = nearest_index(self._x, x) if self._x and x is not None else None
+        self._display_crosshair(idx)
+        return idx
+
+    def _display_crosshair(self, idx: Optional[int]) -> None:
+        if idx != self._hover_index:
+            self._hide_readout_tip()
+        if idx is None:
             self.crosshair_line.setVisible(False)
             self.hover_label.setText("")
-            return None
-        idx = nearest_index(self._x, x)
-        self.crosshair_line.setPos(self._x[idx])
-        self.crosshair_line.setVisible(True)
-        self.hover_label.setText(self.hover_text(idx))
-        return idx
+        elif idx != self._hover_index:
+            self.crosshair_line.setPos(self._x[idx])
+            self.crosshair_line.setVisible(True)
+            self.hover_label.setText(self.hover_text(idx))
+        self._hover_index = idx
+        self._update_interaction()
 
     def hide_hover(self) -> None:
         """隐藏十字线并清空读数。"""
-        was_visible = self.crosshair_line.isVisible()
+        was_local = self._pointer_hover
         self.set_crosshair(None)
-        self._update_interaction()
-        if was_visible:
+        if was_local:
             self.hover_moved.emit(None)
 
     def _on_mouse_moved(self, evt) -> None:
         """SignalProxy 回调（evt 是单元素元组）：鼠标在绘图区内时吸附，离开时隐藏。"""
-        if not self._x:
+        # 限流器可能在光标已经进入下一张图后才交付上一张图的移动。
+        if not self._x or not self.chart_widget.viewport().underMouse() or not self.isVisible():
             return
         pos = evt[0]
-        plot_item = self.chart_widget.getPlotItem()
-        if not plot_item.sceneBoundingRect().contains(pos):
-            self.hide_hover()
+        view_box = self.chart_widget.getPlotItem().vb
+        if not view_box.sceneBoundingRect().contains(pos):
+            if self._pointer_hover:
+                self.hide_hover()
             return
-        self.show_hover_at(plot_item.vb.mapSceneToView(pos).x())
+        self.show_hover_at(view_box.mapSceneToView(pos).x())
 
     # ---------- 交互状态（供自动刷新判断是否跳过） ----------
 
@@ -761,14 +842,47 @@ class ChartView(CardWidget):
         if self._interaction_callback is not None:
             self._interaction_callback(state)
 
+    def _show_readout_tip(self, event: QHelpEvent) -> bool:
+        # 移到标题会离开绘图区，完整值应在当前采样位置就能查看。
+        text = self.hover_label.text()
+        if (not self._pointer_hover or self._hover_index is None or not text
+                or text == self.hover_label.displayed_text()):
+            return False
+        pos = self.chart_widget.mapToScene(event.pos())
+        if not self.chart_widget.getPlotItem().vb.sceneBoundingRect().contains(pos):
+            return False
+        lines = [escape(part) for part in self._hover_parts(self._hover_index)]
+        item_tip = next((item.toolTip() for item in self.chart_widget.scene().items(pos)
+                         if item.toolTip()), "")
+        if item_tip:
+            lines.append(escape(item_tip))
+        text = '<qt>' + '<br>'.join(lines) + '</qt>'
+        QToolTip.showText(event.globalPos(), text,
+                          self.chart_widget.viewport(), QRect(event.pos(), QSize(1, 1)))
+        ChartView._active_readout_tip = (ref(self), text)
+        return True
+
+    def _hide_readout_tip(self) -> None:
+        active = ChartView._active_readout_tip
+        if active is not None and active[0]() is self:
+            ChartView._active_readout_tip = None
+            if QToolTip.text() == active[1]:
+                QToolTip.hideText()
+
     def eventFilter(self, obj, event):
         """鼠标离开图表时清空十字线与读数；记录视口上的按下/松开。"""
         event_type = event.type()
-        if obj is self.chart_widget and event_type == QEvent.Leave:
+        if obj is self.chart_widget and event_type in (QEvent.Leave, QEvent.Hide):
             self._pressed = False
-            self.hide_hover()
+            # 下一张图可能已经接管十字线。上一张图的离开事件只结束自己的悬停。
+            if self._pointer_hover or event_type == QEvent.Hide:
+                self.hide_hover()
+            else:
+                self._update_interaction()
         elif obj is self.chart_widget.viewport():
-            if event_type == QEvent.MouseButtonPress:
+            if event_type == QEvent.ToolTip and self._show_readout_tip(event):
+                return True
+            elif event_type == QEvent.MouseButtonPress:
                 self._pressed = True
                 self._update_interaction()
             elif event_type == QEvent.MouseButtonRelease:
@@ -803,6 +917,9 @@ class ChartView(CardWidget):
         绘图区背景透明，由卡片提供底色（写死的底色在 Mica 与悬停下会露出色差矩形）。"""
         colors = chart_colors()
         make_transparent(self.chart_widget)
+        self.chart_widget.viewport().setStyleSheet(
+            f"QToolTip {{ color: {colors['text']}; background-color: {colors['surface']}; "
+            f"border: 1px solid {colors['crosshair']}; padding: 4px; }}")
         axis_pen = pg.mkPen(color=colors['axis'])
         text_pen = pg.mkPen(color=colors['text'])
         for axis_name in ('bottom', 'left'):

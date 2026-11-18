@@ -158,6 +158,7 @@ class SummaryTable(CardWidget):
         self.table.verticalHeader().hide()
         self.table.verticalHeader().setDefaultSectionSize(ROW_HEIGHT)
         self.table.setEditTriggers(TableWidget.NoEditTriggers)
+        self.table.setTabKeyNavigation(False)
         self.table.setSelectionBehavior(TableWidget.SelectRows)
         self.table.setSelectionMode(TableWidget.SingleSelection)
         self.table.setWordWrap(False)

@@ -8,6 +8,7 @@
 视图模型注入同步查询执行器（SyncHistoryRunner）与立即执行的 defer，用户操作后结果
 当场可见；导出走真实后台线程（ThreadRegistry 登记），用 process_events_until 等完成。
 """
+import csv
 import dataclasses
 import os
 import uuid
@@ -18,8 +19,9 @@ from PyQt5.QtCore import QEvent, Qt
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import QApplication
 
-from core.history_query import CUSTOM_RANGE_KEY
+from core.history_query import CUSTOM_RANGE_KEY, run_history_query
 from core.monitor_manager import MonitorManager
+from data.database import Database
 from data.errors import StorageError
 from data.models import DataPoint, MonitorTask
 from tests.doubles import FakeClock, ScriptedDialogs
@@ -30,7 +32,7 @@ from ui.pages.analysis_page import TASK_HAS_NO_DATA
 from ui.formatting import SUMMARY_COLUMNS
 from ui.services import QtDialogs
 from ui.viewmodels.analysis_vm import TIME_RELATIVE, VIEW_OVERLAY, VIEW_SMALL
-from ui.widgets.analysis.export_flow import MAINTENANCE, NO_DATA
+from ui.widgets.analysis.export_flow import MAINTENANCE, NO_DATA, WAIT_ANALYSIS
 from ui.widgets.analysis.interval_table import VIEW_SAMPLES
 from ui.widgets.analysis.marker_menu import ADD_TEXT, BASELINE_TEXT, DELETE_TEXT, RENAME_TEXT
 from ui.widgets.analysis.toolbar import EXPORT_COPY, EXPORT_CSV, EXPORT_REPORT
@@ -84,8 +86,8 @@ def runner(db):
 def make_page(qapp, db, manager, services, runner):
     pages = []
 
-    def build():
-        page = make_analysis_page(db, manager, services, worker_runner=runner,
+    def build(*, worker_runner=runner):
+        page = make_analysis_page(db, manager, services, worker_runner=worker_runner,
                                   defer=lambda fn: fn())
         page.resize(1280, 1600)
         pages.append(page)
@@ -105,6 +107,18 @@ def loaded(make_page, db, manager):
     page.show()
     page.select_task(task.task_id)
     return page, task
+
+
+@pytest.fixture
+def manual_page(make_page, db, manager):
+    """已显示一个单指标任务，后续查询由测试决定何时返回。"""
+    task = _seed(db, manager, metrics=[MEM], samples=30, baseline=10, markers=())
+    runner = ManualHistoryRunner(db)
+    page = make_page(worker_runner=runner)
+    page.show()
+    runner.complete_all()
+    assert page.current_task_id == task.task_id
+    return page, task, runner
 
 
 # ---------------------------------------------------------------- 载入与焦点
@@ -146,6 +160,100 @@ def test_focus_switch_reuses_batch(loaded, runner):
     page.lower_views.set_view(VIEW_SAMPLES)
     assert page.lower_views.stack.currentWidget() is page.sample_table
     assert page.sample_table.row_texts()
+
+
+def test_tab_moves_from_summary_to_rename_then_interval_table(qapp, loaded):
+    page, _task = loaded
+    summary = page.summary_table.table
+    intervals = page.interval_table.table
+    rename = page.interval_table.rename_button
+    page.activateWindow()
+    summary.setFocus(Qt.TabFocusReason)
+    qapp.processEvents()
+    assert summary.hasFocus()
+
+    summary.setCurrentCell(0, 0)
+    QTest.keyClick(summary, Qt.Key_Down)
+    assert page.current_metric == HANDLES
+    intervals.setCurrentCell(0, 0)
+    assert rename.isEnabled()
+    QTest.keyClick(summary, Qt.Key_Tab)
+    assert rename.hasFocus()
+    QTest.keyClick(rename, Qt.Key_Tab)
+    assert intervals.hasFocus()
+    QTest.keyClick(intervals, Qt.Key_Tab, Qt.ShiftModifier)
+    assert rename.hasFocus()
+    QTest.keyClick(rename, Qt.Key_Tab, Qt.ShiftModifier)
+    assert summary.hasFocus()
+
+
+@pytest.mark.parametrize('width', [820, 1010, 1420])
+def test_hover_keeps_chart_layout_and_selected_range(make_page, db, manager, runner, width):
+    label = '满幅7000产品10次验证_开始' * 4
+    task = _seed(db, manager, markers=((200, label),))
+    page = make_page()
+    page.resize(width, 820)
+    page.show()
+    page.select_task(task.task_id)
+    panel = page.trend_panel
+    panel.expand_all()
+    panel.zoom_to((BASE + timedelta(seconds=50)).timestamp(),
+                  (BASE + timedelta(seconds=500)).timestamp())
+    page.ensureWidgetVisible(panel.overview)
+    QTest.qWait(50)
+    charts = list(panel.charts().values())
+
+    def layout_state():
+        return (page.container.width(), page.verticalScrollBar().value(), panel.columns(),
+                [c.geometry().getRect() for c in charts],
+                [c.chart_widget.geometry().getRect() for c in charts])
+
+    initial = layout_state()
+    ranges = [c.chart_widget.getPlotItem().vb.viewRange() for c in charts]
+    region = panel.overview.region_values()
+    queries = len(runner.requests)
+    assert len(charts) >= 3
+    for source, offset in ((charts[0], 100), (charts[1], 300), (charts[-1], 450)):
+        source.show_hover_at((BASE + timedelta(seconds=offset)).timestamp())
+        QTest.qWait(25)
+        assert all(c.crosshair_line.isVisible() for c in charts)
+        assert layout_state() == initial
+        assert [c.chart_widget.getPlotItem().vb.viewRange() for c in charts] == ranges
+        assert panel.overview.region_values() == region and page.vm.range_key == 'all'
+        assert page.current_metric == MEM and len(runner.requests) == queries
+    charts[-1].hide_hover()
+    assert all(not c.crosshair_line.isVisible() for c in charts)
+
+
+def test_leaving_previous_chart_does_not_clear_the_new_hover(loaded):
+    page, _task = loaded
+    panel = page.trend_panel
+    panel.expand_all()
+    focus, small = panel.focus_chart, next(iter(panel.small_charts().values()))
+    focus.show_hover_at(focus.x_values[5])
+    small.show_hover_at(small.x_values[-2])
+    QApplication.sendEvent(focus.chart_widget, QEvent(QEvent.Leave))
+    assert all(c.crosshair_line.isVisible() for c in panel.charts().values())
+    small.hide_hover()
+    assert not panel.is_interacting()
+
+
+def test_hover_links_only_the_displayed_trend_charts(loaded):
+    page, _task = loaded
+    panel = page.trend_panel
+    panel.expand_all()
+    small = next(iter(panel.small_charts().values()))
+    focus = panel.focus_chart
+    small.show_hover_at(small.x_values[-1])
+    assert ' · ' in small.hover_label.text() and '打点' not in small.hover_label.text()
+    assert '打点' in focus.hover_label.text()
+    page.vm.set_view_mode(VIEW_OVERLAY)
+    assert not panel.is_interacting() and not small.crosshair_line.isVisible()
+    overlay = panel.overlay_chart
+    overlay.show_hover_at(overlay.x_values[5])
+    assert focus.crosshair_line.isVisible() and not small.crosshair_line.isVisible()
+    page.vm.set_view_mode(VIEW_SMALL)
+    assert not overlay.crosshair_line.isVisible() and not panel.is_interacting()
 
 
 def test_empty_state_and_task_without_data(make_page, db, services):
@@ -329,6 +437,190 @@ def test_interval_row_click_zooms_trend(loaded):
 # ---------------------------------------------------------------- 打点编辑与删除
 
 
+def test_interval_rename_baseline_updates_chart_adjacent_rows_and_export(
+        make_page, db, manager, services, tmp_path):
+    task = _seed(db, manager, status='running', metrics=[MEM], samples=60,
+                 baseline=10, markers=((40, '扫描结束'),))
+    services.task_status.set_running(task.task_id)
+    baseline, last = db.markers.list(task.task_id)
+    page = make_page()
+    page.show()
+    page.select_task(task.task_id)
+    intervals = page.interval_table
+    before = intervals.row_texts()
+    assert [row[0] for row in before] == ['开始 → 基线', '基线 → 扫描结束', '扫描结束 → 结束']
+
+    new_name = '静置结束,开始扫描'
+    services.dialogs.push('ask_marker_label', f'  {new_name}  ')
+    intervals.table.setCurrentCell(0, 0)
+    assert intervals.rename_button.isVisible() and intervals.rename_button.isEnabled()
+    QTest.mouseClick(intervals.rename_button, Qt.LeftButton)
+    call = services.dialogs.last_call('ask_marker_label')
+    assert (call['renaming'], call['default_label'], call['timestamp']) == (
+        True, '基线', baseline.timestamp)
+    assert (call['process_name'], call['pid']) == (task.process_name, task.pid)
+    expected = [dataclasses.replace(baseline, label=new_name), last]
+    assert page.trend_panel.focus_chart.markers == expected
+    after = intervals.row_texts()
+    spans = [f'开始 → {new_name}', f'{new_name} → 扫描结束', '扫描结束 → 结束']
+    assert [row[0] for row in after] == spans
+    assert [row[1:] for row in after] == [row[1:] for row in before]
+
+    reader = Database(db.db_path, read_only=True)
+    try:
+        assert reader.markers.list(task.task_id) == expected
+    finally:
+        reader.close()
+
+    _export_report_to(page, services, tmp_path)
+    assert process_events_until(
+        lambda: not services.threads.entries() and services.notifier.messages('success'),
+        timeout=20)
+    with (tmp_path / 'demo_摘要.csv').open(encoding='utf-8-sig', newline='') as file:
+        summary = csv.DictReader(line for line in file if not line.startswith('# '))
+        assert [row['区间'] for row in summary if row['指标'] == '私有字节'] == spans
+    with (tmp_path / 'demo.csv').open(encoding='utf-8-sig', newline='') as file:
+        details = csv.DictReader(line for line in file if not line.startswith('# '))
+        assert [row['打点'] for row in details if row['打点']] == [new_name, last.label]
+
+
+def test_interval_rename_cancel_blank_and_unchanged_do_not_write(loaded, manager, services):
+    page, _task = loaded
+    intervals = page.interval_table
+    intervals.table.setCurrentCell(0, 0)
+    before = intervals.row_texts()
+    changed = []
+    manager.markers_changed.connect(changed.append)
+    for answer in (None, '   ', ' 基线 '):
+        services.dialogs.push('ask_marker_label', answer)
+        intervals.rename_button.click()
+    assert len(services.dialogs.calls_of('ask_marker_label')) == 3
+    assert not changed and intervals.row_texts() == before
+    assert not services.notifier.messages('error')
+
+
+def test_interval_rename_can_retry_after_a_write_failure(loaded, db, services, monkeypatch):
+    page, task = loaded
+    intervals = page.interval_table
+    intervals.table.setCurrentCell(0, 0)
+    before = db.markers.list(task.task_id)
+
+    def fail(*_args):
+        raise StorageError('数据库写入失败')
+
+    with monkeypatch.context() as patch:
+        patch.setattr(db.markers, 'update_label', fail)
+        services.dialogs.push('ask_marker_label', '预热完成')
+        intervals.rename_button.click()
+        assert services.notifier.last('error').title == '重命名失败'
+        assert db.markers.list(task.task_id) == page.trend_panel.focus_chart.markers == before
+        assert intervals.row_texts()[0][0] == '开始 → 基线'
+
+    services.dialogs.push('ask_marker_label', '预热完成')
+    intervals.rename_button.click()
+    assert intervals.row_texts()[0][0] == '开始 → 预热完成'
+    assert page.vm.export_analysis().markers[0].label == '预热完成'
+
+
+def test_interval_rename_does_not_follow_a_task_switch(loaded, db, manager, services):
+    page, first = loaded
+    second = _seed(db, manager, name='other.exe', metrics=[MEM], samples=60,
+                   baseline=10, markers=())
+    page.vm.reload_tasks()
+    page.select_task(first.task_id)
+    before = [db.markers.list(task.task_id) for task in (first, second)]
+
+    def switch_task():
+        page.select_task(second.task_id)
+        return '新名称'
+
+    services.dialogs.push('ask_marker_label', switch_task)
+    page.interval_table.table.setCurrentCell(0, 0)
+    page.interval_table.rename_button.click()
+    assert page.current_task_id == second.task_id
+    assert [db.markers.list(task.task_id) for task in (first, second)] == before
+
+
+def test_second_rename_can_restore_the_displayed_name_before_refresh_returns(
+        manual_page, db, services):
+    page, task, runner = manual_page
+    baseline, = db.markers.list(task.task_id)
+    intervals = page.interval_table
+    intervals.table.setCurrentCell(0, 0)
+    services.dialogs.push('ask_marker_label', '预热完成', baseline.label)
+    intervals.rename_button.click()
+
+    # 第一次改名已落库并被采入查询结果，页面此时仍显示旧名称。
+    request, deliver = runner.pending.pop()
+    delayed = run_history_query(db, request)
+    assert [m.label for m in delayed.markers] == ['预热完成']
+    assert intervals.row_texts()[0][0] == f'开始 → {baseline.label}'
+    intervals.rename_button.click()
+    assert db.markers.list(task.task_id) == [baseline]
+
+    deliver(delayed)
+    assert page.vm.export_analysis() is None
+    runner.complete_all()
+    assert list(page.vm.export_analysis().markers) == [baseline]
+    assert intervals.row_texts()[0][0] == f'开始 → {baseline.label}'
+
+
+def test_switching_task_clears_selected_interval_while_its_data_loads(
+        manual_page, db, manager):
+    page, _task, runner = manual_page
+    new_task = _seed(db, manager, name='其他任务.exe', start=BASE + timedelta(hours=1),
+                     metrics=[MEM], samples=30, baseline=None, markers=((12, '新阶段'),))
+    intervals = page.interval_table
+    intervals.table.setCurrentCell(0, 0)
+    assert intervals.rename_button.isEnabled()
+    zoomed = []
+    intervals.interval_activated.connect(lambda start, end: zoomed.append((start, end)))
+
+    page.select_task(new_task.task_id)
+    assert runner.pending and intervals.row_texts() == []
+    assert intervals.table.currentRow() == -1 and not intervals.rename_button.isEnabled()
+    runner.complete_all()
+    assert intervals.row_texts()[0][0] == '开始 → 新阶段'
+    assert not intervals.table.selectionModel().hasSelection() and not zoomed
+
+
+def test_interval_rename_disabled_for_read_only_task(qapp, db, manager, services):
+    task = _seed(db, manager, metrics=[MEM], samples=30, baseline=10, markers=((20, '第 1 轮'),))
+    reader = Database(db.db_path, read_only=True)
+    page = make_analysis_page(reader, MonitorManager(db=reader), services,
+                              worker_runner=SyncHistoryRunner(reader), defer=lambda fn: fn())
+    try:
+        page.show()
+        page.select_task(task.task_id)
+        intervals = page.interval_table
+        assert intervals.row_texts()[0][0] == '开始 → 基线'
+        intervals.table.setCurrentCell(0, 0)
+        page.activateWindow()
+        intervals.table.setFocus()
+        assert process_events_until(intervals.table.hasFocus)
+        renamed = []
+        intervals.rename_requested.connect(renamed.append)
+        assert not intervals.rename_button.isEnabled()
+        intervals.rename_button.click()
+        QTest.keyClick(intervals.table, Qt.Key_F2)
+        assert not renamed and not services.dialogs.calls_of('ask_marker_label')
+
+        chart = page.trend_panel.focus_chart
+        regular = next(m for m in chart.markers if m.kind == 'user')
+        chart.context_menu_requested.emit(regular.timestamp.timestamp(), regular,
+                                          chart.mapToGlobal(chart.rect().center()))
+        menu = page.marker_flow.last_menu
+        try:
+            assert [(a.text(), a.isEnabled()) for a in menu.actions() if a.text()] == [
+                (ADD_TEXT, False), (BASELINE_TEXT, False), (RENAME_TEXT, False), (DELETE_TEXT, False)]
+        finally:
+            menu.close()
+    finally:
+        page.auto_refresh.stop()
+        page.close()
+        reader.close()
+
+
 def test_marker_menu_items_and_edits(loaded, db, services):
     page, task = loaded
     flow, dialogs = page.marker_flow, services.dialogs
@@ -436,6 +728,81 @@ def test_export_without_data_warns(make_page, services):
     page.toolbar.export_requested.emit(EXPORT_REPORT)
     assert services.notifier.last('warning').title == NO_DATA[0]
     assert services.dialogs.calls_of('ask_save_path') == []
+
+
+def test_export_waits_for_renamed_marker_before_asking_for_a_file(
+        manual_page, manager, services):
+    page, task, runner = manual_page
+    marker, = page.vm.export_analysis().markers
+    assert manager.rename_marker(marker.id, '预热完成', task.task_id)
+    assert runner.pending
+
+    page.toolbar.export_requested.emit(EXPORT_CSV)
+    notice = services.notifier.last('warning')
+    assert (notice.title, notice.content) == WAIT_ANALYSIS
+    assert not services.dialogs.calls_of('ask_save_path')
+    assert not manager.has_running_exports()
+
+    runner.complete_all()
+    assert [m.label for m in page.vm.export_analysis().markers] == ['预热完成']
+    services.dialogs.push('ask_save_path', None)
+    page.toolbar.export_requested.emit(EXPORT_CSV)
+    assert len(services.dialogs.calls_of('ask_save_path')) == 1
+
+
+@pytest.mark.parametrize('from_custom_range', [False, True])
+def test_export_waits_for_current_time_range(manual_page, manager, services, from_custom_range):
+    page, _task, runner = manual_page
+    if from_custom_range:
+        assert page.vm.set_custom_range(BASE, BASE + timedelta(seconds=8))
+        runner.complete_all()
+
+    previous = page.vm.last_analysis
+    start, end = BASE + timedelta(seconds=12), BASE + timedelta(seconds=24)
+    assert page.vm.set_custom_range(start, end)
+    assert runner.pending and page.vm.last_analysis is previous
+    assert page.vm.report_job() is None
+    page.toolbar.export_requested.emit(EXPORT_CSV)
+    assert services.notifier.last('warning').title == WAIT_ANALYSIS[0]
+    assert not services.dialogs.calls_of('ask_save_path')
+    assert not manager.has_running_exports()
+
+    runner.complete_all()
+    job = page.vm.report_job()
+    assert (job.data_since, job.data_until) == (start, end)
+    assert any(line.startswith('# 范围: 自定义') for line in job.metadata)
+
+
+@pytest.mark.parametrize('change', ['rename', 'switch_task', 'switch_range'])
+def test_export_rechecks_analysis_after_the_save_dialog(
+        manual_page, db, manager, services, tmp_path, change):
+    page, task, runner = manual_page
+    marker, = page.vm.export_analysis().markers
+    destination = tmp_path / '原任务.csv'
+
+    def choose_file():
+        if change == 'rename':
+            assert manager.rename_marker(marker.id, '扫描开始', task.task_id)
+            assert page.vm.export_analysis() is None
+        elif change == 'switch_task':
+            other = _seed(db, manager, start=BASE + timedelta(hours=1), metrics=[MEM],
+                          samples=30, baseline=None, markers=())
+            page.select_task(other.task_id)
+            # 新任务已有可导出的分析，仍不能沿用原任务的保存对话框。
+            runner.complete_all()
+            assert page.vm.export_analysis().task_id == other.task_id
+        else:
+            assert page.vm.set_custom_range(BASE, BASE + timedelta(seconds=10))
+        return str(destination)
+
+    services.dialogs.push('ask_save_path', choose_file)
+    page.toolbar.export_requested.emit(EXPORT_CSV)
+    notice = services.notifier.last('warning')
+    assert (notice.title, notice.content) == WAIT_ANALYSIS
+    assert len(services.dialogs.calls_of('ask_save_path')) == 1
+    assert page.vm.export_worker is None and not manager.has_running_exports()
+    assert not destination.exists()
+    runner.complete_all()
 
 
 # ---------------------------------------------------------------- 任务对比

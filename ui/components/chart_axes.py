@@ -48,12 +48,12 @@ def convert_tick_levels(
     return converted
 
 
-def decimals_for_spacing(scaled_spacing: float) -> int:
-    """按显示单位下的刻度间距决定刻度文本的小数位数（间距 ≥ 1 取整，最多 4 位）。"""
+def decimals_for_spacing(scaled_spacing: float, maximum: int = 4) -> int:
+    """按显示单位下的刻度间距决定小数位数，间距 ≥ 1 时取整。"""
     scaled_spacing = abs(scaled_spacing)
     if not math.isfinite(scaled_spacing) or scaled_spacing <= 0 or scaled_spacing >= 1:
         return 0
-    return min(4, max(0, math.ceil(-math.log10(scaled_spacing))))
+    return min(maximum, max(0, math.ceil(-math.log10(scaled_spacing))))
 
 
 class MetricAxisItem(pg.AxisItem):
@@ -67,22 +67,29 @@ class MetricAxisItem(pg.AxisItem):
         super().__init__(*args, **kwargs)
         self.display_unit = ''
         self.integer_only = False
+        self._max_decimals = 4
 
-    def set_display_unit(self, display_unit: str, integer_only: bool = False) -> None:
+    def set_display_unit(self, display_unit: str, integer_only: bool = False, *,
+                         max_decimals: int = 4) -> None:
         """设置当前视图固定的单位与整数刻度开关，并使旧绘图缓存失效。"""
         self.display_unit = display_unit or ''
         self.integer_only = bool(integer_only)
+        self._max_decimals = max_decimals
         self.picture = None
         self.update()
 
     def tickSpacing(self, minVal, maxVal, size):
         divisor = display_divisor(self.display_unit)
         levels = super().tickSpacing(minVal / divisor, maxVal / divisor, size)
+        if not self.integer_only:
+            # 比最小可显示步长更密的刻度会标出相同读数。
+            minimum = 10 ** -self._max_decimals
+            levels = [level for level in levels if level[0] >= minimum] or [(minimum, 0.0)]
         return convert_tick_levels(levels, divisor, self.integer_only)
 
     def tickStrings(self, values, scale, spacing):
         divisor = display_divisor(self.display_unit)
-        decimals = decimals_for_spacing(spacing * scale / divisor)
+        decimals = decimals_for_spacing(spacing * scale / divisor, self._max_decimals)
         if self.integer_only:
             decimals = 0
         return [f"{value * scale / divisor:,.{decimals}f}" for value in values]

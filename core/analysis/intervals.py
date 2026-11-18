@@ -20,6 +20,7 @@ class Boundary:
     timestamp: datetime
     label: str
     kind: str
+    marker_id: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,9 @@ class IntervalStats:
     peak: Optional[float]
     sample_count: int
     delta_vs_previous: Optional[float]   # 本区间 delta - 上一区间 delta，用于判断每轮增量是否收敛
+    # 时间和名称都可以重复，只有持久化 ID 能唯一确定区间两端的打点。
+    start_marker_id: Optional[int] = None
+    end_marker_id: Optional[int] = None
 
 
 def _sorted_points(points: Sequence[Point]) -> List[Point]:
@@ -114,6 +118,8 @@ def split_intervals(points: Sequence[Point], boundaries: Sequence[Boundary], *,
             peak=peak,
             sample_count=len(values),
             delta_vs_previous=delta_vs_previous,
+            start_marker_id=left.marker_id,
+            end_marker_id=right.marker_id,
         ))
         prev_delta = delta
     return result

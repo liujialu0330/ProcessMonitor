@@ -283,11 +283,12 @@ class ScriptedDialogs:
                             confirm_text=confirm_text, cancel_text=cancel_text)
 
     def ask_marker_label(self, parent, default_label: str, timestamp: datetime, *,
-                         process_name: str = '', pid: Optional[int] = None
+                         process_name: str = '', pid: Optional[int] = None,
+                         renaming: bool = False
                          ) -> Optional[str]:
         return self._answer('ask_marker_label', parent=parent,
                             default_label=default_label, timestamp=timestamp,
-                            process_name=process_name, pid=pid)
+                            process_name=process_name, pid=pid, renaming=renaming)
 
     def choose_metrics(self, parent, selected: Sequence[str], *,
                        group: bool = False) -> Optional[List[str]]:

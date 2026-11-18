@@ -243,6 +243,8 @@ class HistoryViewModel(QObject):
         self._was_running = False
         # 定时刷新连续读库失败时只提示一次；成功取回一次结果后复位
         self._refresh_error_notified = False
+        self._marker_retry_task: Optional[str] = None
+        self._displayed_scope: Optional[tuple] = None
         # 定时刷新是否应跳过（如用户正在看明细/悬停图表），由 HistoryAutoRefresh 设置
         self._refresh_guard: Callable[[], bool] = lambda: False
         # 打点变化触发的静默重查：结果不受"跳过定时刷新"的判断影响
@@ -468,6 +470,10 @@ class HistoryViewModel(QObject):
         task_id = self.current_task_id
         if not task_id or self._refresh_guard():
             return
+        if task_id == self._marker_retry_task and not self.has_pending_query:
+            self._marker_retry_task = None
+            self._start_query(auto_refresh=True, forced=True)
+            return
         if self._services.task_status.is_running(task_id):
             self._was_running = True
             if self.has_pending_query:
@@ -487,8 +493,14 @@ class HistoryViewModel(QObject):
         """
         if not task_id or task_id != self.current_task_id:
             return
+        self._refresh_error_notified = False
+        self._marker_retry_task = task_id
         if self.is_busy:
-            self._request_load()
+            # 新选中的指标或范围加载失败时，旧画面已经不对应当前选择。
+            shown = self.last_snapshot
+            keep_view = (shown is not None and shown.request.metric == self.current_metric
+                         and self._displayed_scope == self._query_scope())
+            self._request_load(marker_refresh=keep_view)
             return
         self._start_query(auto_refresh=True, forced=True)
 
@@ -496,6 +508,7 @@ class HistoryViewModel(QObject):
         """让在途与已排队的查询全部作废（不等待线程，线程自行跑完后结果被丢弃）。"""
         self._dispatch_scheduled = False
         self._gate.invalidate()
+        self._marker_retry_task = None
         self._set_busy(False)
 
     def set_refresh_guard(self, guard: Callable[[], bool]) -> None:
@@ -511,6 +524,8 @@ class HistoryViewModel(QObject):
 
     def _apply_selection(self, task, preferred_metric: Optional[str]) -> None:
         """选中任务：指标优先沿用 preferred_metric，不属于该任务时回到首指标。"""
+        if task.task_id != self.current_task_id:
+            self._marker_retry_task = None
         metrics = list(task.metric_types)
         if preferred_metric in metrics:
             metric = preferred_metric
@@ -522,6 +537,7 @@ class HistoryViewModel(QObject):
         self.selection_changed.emit(task.task_id, metric, not self.selection_is_auto)
 
     def _clear_selection(self) -> None:
+        self._marker_retry_task = None
         self.current_task_id = None
         self.current_metric = None
         self.metrics_changed.emit([])
@@ -563,9 +579,14 @@ class HistoryViewModel(QObject):
     def _cached_anchor(self, task_id: str):
         return self._anchor_value if self._anchor_task_id == task_id else None
 
-    def _request_load(self) -> None:
+    def _query_scope(self) -> tuple:
+        return self.current_task_id, self.range_key
+
+    def _request_load(self, *, marker_refresh: bool = False) -> None:
         """用户操作触发的加载：立即作废在途结果并置忙，查询推迟到下一轮事件循环发出，
         同一轮内的多次请求只发一次（按发出时的最新状态）。"""
+        if not marker_refresh:
+            self._marker_retry_task = None
         self._gate.invalidate()
         self._set_busy(True)
         if self._dispatch_scheduled:
@@ -619,8 +640,11 @@ class HistoryViewModel(QObject):
             return
 
         if snapshot.error is not None:
-            if auto:
-                # 定时刷新失败：保持已显示的数据；存储故障让用户知道，但连续失败只提示一次
+            if self._marker_retry_task == request.task_id and not self._refresh_error_notified:
+                self._refresh_error_notified = True
+                self.error.emit("打点已更新，分析刷新失败",
+                                f"{snapshot.error}。将自动重试一次，也可点击“刷新”。")
+            elif auto:
                 logger.warning("分析页自动刷新失败，保持当前显示: %s", snapshot.error)
                 if snapshot.storage_error and not self._refresh_error_notified:
                     self._refresh_error_notified = True
@@ -629,10 +653,8 @@ class HistoryViewModel(QObject):
                 self._show_empty(*EMPTY_LOAD_FAILED)
                 self.error.emit(ERROR_LOAD_FAILED, snapshot.error)
             return
-        if auto:
-            self._refresh_error_notified = False
-
         if snapshot.task_missing:
+            self._marker_retry_task = None
             if not auto:
                 self.error.emit(*ERROR_TASK_MISSING)
             return
@@ -640,6 +662,8 @@ class HistoryViewModel(QObject):
         if auto and not forced and self._refresh_guard():
             return
 
+        self._refresh_error_notified = False
+        self._marker_retry_task = None
         self._anchor_task_id = request.task_id
         self._anchor_value = snapshot.task_last_at
 
@@ -653,6 +677,7 @@ class HistoryViewModel(QObject):
             self._show_empty(*(EMPTY_NO_DATA_IN_RANGE if self.range_key != 'all'
                                else EMPTY_NO_DATA))
             return
+        self._displayed_scope = self._query_scope()
         self._emit_snapshot(snapshot)
 
     # ========== 输出 ==========
@@ -669,6 +694,7 @@ class HistoryViewModel(QObject):
 
     def _show_empty(self, title: str, detail: str) -> None:
         self.last_snapshot = None
+        self._displayed_scope = None
         self.empty_state.emit(title, detail)
 
     def _set_busy(self, value: bool) -> None:

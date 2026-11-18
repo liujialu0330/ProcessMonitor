@@ -68,7 +68,9 @@ _SERIES_DARK = (tokens.DATA[1], '#FFB454', '#C4B5FD', '#7AB8FF', '#FCD34D',
 # 绘图区（pyqtgraph GraphicsView）透明：背景画刷置空之外，视口还会按调色板自动填充
 # （Qt 默认浅灰），只在祖先样式表恰好写了 background: transparent 时才看不出来，
 # 所以在控件自身上声明，不依赖所在页面
-TRANSPARENT_VIEW_QSS = "background: transparent; border: none;"
+TRANSPARENT_VIEW_QSS = (
+    "QGraphicsView, QWidget#qt_scrollarea_viewport { background: transparent; border: none; }"
+)
 
 
 def make_transparent(view) -> None:

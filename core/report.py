@@ -451,8 +451,8 @@ def round_delta_rows(analysis: "TaskAnalysis") -> List[RoundDeltaRow]:
     按起点升序。"与上轮差"相对表内上一行：第一轮为 None（区间表里它对比的是预热段，不是一轮）。
     """
     columns: List[str] = []
-    bounds: Dict[Tuple[datetime, datetime], Tuple[str, str, float]] = {}
-    values: Dict[Tuple[datetime, datetime], Dict[str, Optional[float]]] = {}
+    bounds: Dict[Tuple[datetime, datetime, int, int], Tuple[str, str, float]] = {}
+    values: Dict[Tuple[datetime, datetime, int, int], Dict[str, Optional[float]]] = {}
     for metric, snapshot in analysis.snapshots.items():
         if not metric or not snapshot.intervals:
             continue
@@ -462,7 +462,8 @@ def round_delta_rows(analysis: "TaskAnalysis") -> List[RoundDeltaRow]:
         for item, (left, right) in zip(snapshot.intervals, spans):
             if item.start not in marks or item.end not in marks:
                 continue
-            key = (item.start, item.end)
+            # 同一时刻连续打点会有多个零时长区间，按端点 ID 区分，才能逐轮展示名称。
+            key = (item.start, item.end, item.start_marker_id or 0, item.end_marker_id or 0)
             bounds.setdefault(key, (left, right, item.duration_seconds))
             values.setdefault(key, {})[metric] = item.delta
 

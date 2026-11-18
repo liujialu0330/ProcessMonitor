@@ -12,6 +12,7 @@ import io
 
 import pytest
 from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QPainter
 
 from ui.components.sparkline import (
     MIN_SPAN_BYTES_KB, MIN_SPAN_COUNT, MIN_SPAN_PERCENT, SparklineWidget,
@@ -155,6 +156,30 @@ def test_paint_no_crash(qapp):
 
     stderr_output = stderr_capture.getvalue()
     assert "Traceback" not in stderr_output
+
+
+def test_paints_capacity_extrema_in_selected_memory_unit(qapp, monkeypatch):
+    widget = SparklineWidget(metric_type=MetricType.MEMORY_PRIVATE)
+    widget.append(2_097_152.0)
+    widget.append(2_097_216.0)
+    widget.resize(360, widget.height())
+    labels = []
+    draw_text = QPainter.drawText
+
+    def record_text(painter, rect, flags, text):
+        labels.append((flags, text))
+        return draw_text(painter, rect, flags, text)
+
+    monkeypatch.setattr(QPainter, 'drawText', record_text)
+    widget.grab()
+    assert labels == [(Qt.AlignRight | Qt.AlignTop, '2 GB'),
+                      (Qt.AlignRight | Qt.AlignBottom, '2 GB')]
+
+    labels.clear()
+    widget.set_memory_unit('KB')
+    widget.grab()
+    assert labels == [(Qt.AlignRight | Qt.AlignTop, '2,097,216 KB'),
+                      (Qt.AlignRight | Qt.AlignBottom, '2,097,152 KB')]
 
 
 # ---------- 打点刻度 ----------

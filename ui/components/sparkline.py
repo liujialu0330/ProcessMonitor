@@ -217,6 +217,7 @@ class SparklineWidget(QWidget):
         super().__init__(parent)
         self._max_points = max_points
         self._metric_type = metric_type
+        self._memory_unit = 'auto'
         # 每个指标一条缓冲区（键为指标类型；未指定指标时键为 None）
         self._samplers: Dict[Optional[str], TrendDownsampler] = {}
         self._sampler = self._sampler_for(metric_type)
@@ -232,6 +233,10 @@ class SparklineWidget(QWidget):
         if sampler is None:
             sampler = self._samplers[metric_type] = TrendDownsampler(self._max_points)
         return sampler
+
+    def set_memory_unit(self, unit: str) -> None:
+        self._memory_unit = unit
+        self.update()
 
     def append(self, value: float, timestamp: Optional[datetime] = None) -> None:
         """向当前显示的指标追加一个采集点并触发重绘；timestamp 为采集时间（画打点刻度要用）"""
@@ -419,10 +424,10 @@ class SparklineWidget(QWidget):
             font = painter.font()
             font.setPixelSize(10)
             painter.setFont(font)
-            painter.drawText(self.rect().adjusted(4, 0, -4, 0), Qt.AlignRight | Qt.AlignTop,
-                             format_metric_value(self._metric_type, max(values)))
-            painter.drawText(self.rect().adjusted(4, 0, -4, 0), Qt.AlignRight | Qt.AlignBottom,
-                             format_metric_value(self._metric_type, min(values)))
+            rect = self.rect().adjusted(4, 0, -4, 0)
+            for edge, value in ((Qt.AlignTop, max(values)), (Qt.AlignBottom, min(values))):
+                text = format_metric_value(self._metric_type, value, memory_unit=self._memory_unit)
+                painter.drawText(rect, Qt.AlignRight | edge, text)
         painter.end()
 
     def _paint_ticks(self, painter: QPainter, width: int, height: int) -> None:

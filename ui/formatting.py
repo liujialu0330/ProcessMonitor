@@ -444,7 +444,7 @@ def marker_context(
     Returns:
         形如 "打点「标记 2」后 3分钟" 的文本；x 早于全部打点时返回 None。
     """
-    index = bisect.bisect_right(list(marker_times), x) - 1
+    index = bisect.bisect_right(marker_times, x) - 1
     if index < 0:
         return None
     elapsed = format_duration(x - marker_times[index])
@@ -490,7 +490,8 @@ def percent_change(value: float, reference: Optional[float]) -> Optional[float]:
     return (value - reference) / abs(reference) * 100.0
 
 
-def build_summary_row(metric: str, snapshot: Optional["HistorySnapshot"]) -> SummaryRow:
+def build_summary_row(metric: str, snapshot: Optional["HistorySnapshot"], *,
+                      memory_unit: Optional[str] = None) -> SummaryRow:
     """
     判定摘要表一行：基线（无基线时为开始值）/ 当前 / 较基线（Δ 与 %）/ 每轮均增 /
     增速 ±CI · R²（累计量为平均速率、峰值类为抬升次数）/ 末段趋势（最后一个打点之后）/
@@ -508,13 +509,13 @@ def build_summary_row(metric: str, snapshot: Optional["HistorySnapshot"]) -> Sum
     start = snapshot.baseline.value if use_baseline else stats['first']
     last = stats['last']
     unit = display_unit_for(metric, max(abs(start), abs(last))) if is_kb_metric(metric) else None
-    texts["current"] = format_metric_value(metric, last, display_unit=unit)
+    texts["current"] = format_metric_value(metric, last, unit, memory_unit=memory_unit)
     if snapshot.baseline_foreign:
         # 基线属于另一个启动段（另一个进程）：它既不能当起点，也不能拿来算增量
         texts["baseline"] = texts["delta"] = BASELINE_DASH
         tips["baseline"] = tips["delta"] = snapshot.baseline_note
     else:
-        texts["baseline"] = format_metric_value(metric, start, display_unit=unit)
+        texts["baseline"] = format_metric_value(metric, start, unit, memory_unit=memory_unit)
         tips["baseline"] = ("基线打点之后 5 个样本的中位数" if use_baseline
                             else "统计范围内最早一次采集的值（尚无基线）")
         delta = last - start
@@ -599,14 +600,15 @@ def usage_percent_text(value: float, limit: float) -> str:
 
 
 def build_table_row(metric: str, snapshot: Optional["HistorySnapshot"], *,
-                    usage_note: Optional[str] = None) -> SummaryRow:
+                    usage_note: Optional[str] = None,
+                    memory_unit: Optional[str] = None) -> SummaryRow:
     """分析页判定摘要表的一行：在 build_summary_row 的基础上——平稳行的增速、每轮均增
     写 "—"；上限占比只写百分比（原文 "62.0% / 10000" 进 tooltip）；样本不足的行带
     note（判定胶囊后的 ⓘ，tooltip 写原因）。
 
     usage_note 非 None 表示该行的上限占比不适用（进程组合计、有多个实例的成员：GDI/USER
     对象数的 10000 上限是单个进程的口径）：有上限的指标写 "—"，usage_note 作为 tooltip。"""
-    row = build_summary_row(metric, snapshot)
+    row = build_summary_row(metric, snapshot, memory_unit=memory_unit)
     texts, tips = dict(row.texts), dict(row.tooltips)
     if texts["verdict"] == verdict_text(Verdict.STABLE):
         for column in ("rate", "per_round"):
@@ -1032,10 +1034,12 @@ INTERVAL_HEADERS =("区间", "时长", "起值", "终值", "Δ", "速率", "峰�
 
 
 def interval_row_texts(metric: str, item, span: Sequence[str],
-                       display_unit: Optional[str] = None) -> List[str]:
+                       display_unit: Optional[str] = None, *,
+                       memory_unit: Optional[str] = None) -> List[str]:
     """打点区间表一行文本（列顺序见 INTERVAL_HEADERS）；span 为 (左标签, 右标签)。"""
     def value(v: Optional[float]) -> str:
-        return format_metric_value(metric, v, display_unit=display_unit) if v is not None else STAT_EMPTY
+        return (format_metric_value(metric, v, display_unit, memory_unit=memory_unit)
+                if v is not None else STAT_EMPTY)
 
     if item.rate_per_hour is None:
         rate = STAT_EMPTY
