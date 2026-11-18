@@ -44,7 +44,7 @@ ProcessMonitor is a Windows 11 Fluent Design desktop app for keeping an eye on a
 
 ## ✨ Features
 
-The features below follow the current source. Check the entry for your installed version in the [Changelog](CHANGELOG.md).
+For the features and fixes in your installed version, see its entry in the [Changelog](CHANGELOG.md).
 
 ### 🧭 Recommended workflow: hunting leaks
 
@@ -59,7 +59,7 @@ The features below follow the current source. Check the entry for your installed
 - **26 metrics, 4 categories** — memory (working set, private bytes, page faults, USS, ...), CPU (usage, user/kernel time, base priority), system (threads, handles, GDI/USER objects, context switches) and I/O (read/write bytes and counts). Every metric has a description in the metric picker.
 - **Windows counter semantics** — Context switches sum the counters of currently live threads and include both voluntary and involuntary switches. Thread exit can reduce the sum. Rate calculations skip those intervals, and average rates weight valid intervals by duration. Priority classes display readable names while raw data retains Windows priority-class codes.
 - **Private bytes as the leak indicator** — the former "virtual memory", "commit size" and "private working set" metrics were identical on Windows and are merged into "private bytes", the primary metric for spotting memory leaks
-- **Honest gaps instead of fake zeros** — when a metric cannot be read, the task card shows "unavailable" with the reason and nothing is recorded for it. Availability depends on process permissions, session, and system interfaces, even when running as administrator; GDI/USER objects of processes in other sessions (e.g. system services) show "not supported"
+- **Missing readings** appear as "unavailable" in the task card and list. Check the card for the reason. The metric value is left blank for that sample. Availability depends on process permissions, the session and system interfaces, even when running as administrator. GDI/USER object counts for processes in other sessions, such as system services, appear as "not supported".
 - **Cards you can read at a glance** — a status pill (Running / Paused / Ended / Ended abnormally) and elapsed time; each metric shows its change since baseline (median of the 5 samples after the baseline marker) or since start; the sparkline covers "task start until now" with marker ticks
 - **Markers without breaking your flow** — the card's "Marker" button, the tray menu and a global hotkey (Ctrl+Alt+M by default, configurable in Settings), all numbered "Baseline / Round N" automatically; pausing and resuming add system markers
 - **Wait for the process to launch** — start waiting before the target runs; monitoring begins with your chosen settings the moment it appears, so you can watch start-up too
