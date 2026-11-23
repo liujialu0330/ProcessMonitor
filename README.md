@@ -75,7 +75,7 @@ The command-line switch is under **设置 → 监控默认值 → 允许命令�
 | Time ranges, metrics and report fields | [Product guide](doc/PRD_进程监控助手.md) |
 | Source layout and Windows packaging | [Architecture](doc/代码架构说明.md) · [Build guide](build/README_打包说明.md) |
 
-The v2.0.4 installer includes memory-unit switching and marker renaming from the interval table. Markdown formatting in the update dialog is documented under **未发布** (Unreleased). [Changelog](CHANGELOG.md#未发布)
+The v2.0.4 installer includes memory-unit switching and marker renaming from the interval table. [2.0.4 release notes](doc/2.0.4发布说明.md)
 
 <details>
 <summary>Run from source and test</summary>
